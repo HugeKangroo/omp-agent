@@ -456,6 +456,10 @@ integration("B3b native submit abort after actual creation but held acknowledgem
     stats.counters.submitRequests === 1 && stats.counters.actualCreates === 1);
   const created = await service.stats();
   expect(created.jobs[0]?.state).toBe("running");
+  const pendingOperation = await waitForRecord(session, "pending held acknowledgement is unknown before abort", (operation) =>
+    operation.dispatch === "sent" && operation.externalState === "unknown");
+  expect(pendingOperation.accepted).toBe(false);
+  expect(pendingOperation.externalJobId).toBeNull();
   const aborting = session.abort();
   await pending;
   await aborting;

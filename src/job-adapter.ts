@@ -821,9 +821,29 @@ export class JobAdapter {
       }, true);
     }
 
+    // Cross the real transport boundary before any POST can reach the service.
+    // Once the request is allowed to leave, acceptance is not knowable here:
+    // not_dispatched would be a false zero-effect claim, and reconciliation
+    // must consider this operation unresolved.
     operation.dispatch = "sent";
+    operation.externalState = "unknown";
     operation.updatedAt = this.now();
-    this.persist();
+    try {
+      this.persist();
+    } catch (error) {
+      // No request was attempted. Restore the truthful pre-dispatch facts and
+      // report the host-record failure; never claim a job was created.
+      operation.dispatch = "not_started";
+      operation.externalState = "not_dispatched";
+      operation.lastError = `pre-dispatch host record write failed; nothing was sent: ${errorMessage(error)}`;
+      this.finishCall(operation, call, "error", operation.lastError);
+      try {
+        this.persist();
+      } catch {
+        // The host record remains unavailable; the transport still never ran.
+      }
+      throw new JobAdapterError(operation.lastError);
+    }
     try {
       const response = await this.request("POST", "/jobs", {
         operationId: operation.operationId,

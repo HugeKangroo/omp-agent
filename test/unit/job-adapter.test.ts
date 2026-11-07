@@ -481,7 +481,12 @@ describe("JobAdapter prototype flow", () => {
     const initial = await waitFor("early not-found cancellation", async () => {
       const operation = adapter.snapshot(operationId);
       if (!operation) return undefined;
-      return operation.cancelIntent?.attempts === 1 && operation.externalState === "unknown"
+      const stats = await service.stats();
+      const notFound = operation.observations.some((observation) => observation.source === "cancel_not_found");
+      return stats.counters.cancelRequests === 1
+        && stats.counters.actualCreates === 0
+        && operation.cancelIntent?.attempts === 1
+        && notFound
         ? operation
         : undefined;
     });
@@ -949,8 +954,14 @@ describe("B3b model-call abort and local wait lifecycle", () => {
     const pending = adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     await waitFor("held submit reached service", async () => (await service.stats()).counters.submitRequests === 1 ? true : undefined);
     owner.navigate("session_switch", "replacement-session");
+    const withheld = pending.then(
+      () => { throw new Error("expected the detached submit result to be withheld"); },
+      (error: unknown) => {
+        expect(String(error)).toContain("result withheld");
+      },
+    );
     await service.releaseSubmit();
-    await expect(pending).rejects.toThrow(/result withheld/);
+    await withheld;
     expect((await service.stats()).counters.actualCreates).toBe(1);
     const record = JSON.parse(await readFile(recordPath, "utf8")) as {
       operations: Array<Record<string, unknown>>;
@@ -1007,5 +1018,113 @@ describe("B3b model-call abort and local wait lifecycle", () => {
     expect(String(operation.lastError)).toMatch(/exceeds 16384 bytes/);
     await waitFor("oversize stream cancellation", async () => responseClosed ? true : undefined);
     expect(requests).toBe(1);
+  });
+});
+
+describe("B3b pending submit state", () => {
+  test("an actually created job with a held acknowledgement is unknown and unresolved before the answer", async () => {
+    const { service, adapter, branch, recordPath } = await setup();
+    await service.configure({ holdSubmitAck: true });
+    const pending = adapter.submit(contextFor(branch), {
+      expectedTaskRevision: 1,
+      payload: "alpha-prototype-payload",
+    });
+    await waitFor("actual create before held acknowledgement", async () => {
+      const stats = await service.stats();
+      return stats.counters.submitRequests === 1 && stats.counters.actualCreates === 1 ? stats : undefined;
+    });
+    const operationId = adapter.operationIds[0]!;
+    const held = adapter.snapshot(operationId)!;
+    expect(held).toMatchObject({
+      operationId,
+      dispatch: "sent",
+      externalState: "unknown",
+      accepted: false,
+      externalJobId: null,
+      taskRevision: 1,
+    });
+    expect(adapter.unresolvedOperationIds()).toContain(operationId);
+    const persisted = JSON.parse(await readFile(recordPath, "utf8")) as { operations: Array<Record<string, unknown>> };
+    expect(persisted.operations[0]).toMatchObject({
+      operationId,
+      callId: held.callId,
+      payloadDigest: held.payloadDigest,
+      dispatch: "sent",
+      externalState: "unknown",
+      accepted: false,
+      externalJobId: null,
+      taskRevision: 1,
+    });
+    expect((await service.stats()).jobs[0]?.state).toBe("running");
+
+    await service.releaseSubmitAck();
+    const answered = await pending;
+    const operation = answered.details?.operation as Record<string, unknown>;
+    expect(operation.operationId).toBe(operationId);
+    expect(operation.callId).toBe(held.callId);
+    expect(operation.payloadDigest).toBe(held.payloadDigest);
+    expect(operation.taskRevision).toBe(1);
+    expect(operation.externalState).toBe("running");
+    expect(operation.accepted).toBe(true);
+    const stats = await service.stats();
+    expect(stats.counters.submitRequests).toBe(1);
+    expect(stats.counters.actualCreates).toBe(1);
+  });
+
+  test("a held accept before creation is unknown and sent while no remote job exists", async () => {
+    const { service, adapter, branch, recordPath } = await setup();
+    await service.configure({ holdSubmitAccept: true });
+    const pending = adapter.submit(contextFor(branch), {
+      expectedTaskRevision: 1,
+      payload: "alpha-prototype-payload",
+    });
+    await waitFor("held submit before creation", async () => {
+      const stats = await service.stats();
+      return stats.counters.submitRequests === 1 && stats.counters.actualCreates === 0 ? stats : undefined;
+    });
+    const operationId = adapter.operationIds[0]!;
+    const held = adapter.snapshot(operationId)!;
+    expect(held).toMatchObject({ operationId, dispatch: "sent", externalState: "unknown", accepted: false });
+    expect(adapter.unresolvedOperationIds()).toContain(operationId);
+    const persisted = JSON.parse(await readFile(recordPath, "utf8")) as { operations: Array<Record<string, unknown>> };
+    expect(persisted.operations[0]).toMatchObject({ operationId, dispatch: "sent", externalState: "unknown" });
+    expect((await service.stats()).counters.actualCreates).toBe(0);
+
+    await service.releaseSubmit();
+    const answered = await pending;
+    expect((answered.details?.operation as Record<string, unknown>).externalState).toBe("running");
+    const stats = await service.stats();
+    expect(stats.counters.submitRequests).toBe(1);
+    expect(stats.counters.actualCreates).toBe(1);
+  });
+
+  test("a refusal before transport keeps not_dispatched and sends no POST", async () => {
+    const controller = new AbortController();
+    const { service, adapter, branch, recordPath } = await setupWithOwnerCallbacks({
+      onEvent: (event) => {
+        if (event.type === "capability_admission_allowed") controller.abort("revoked before transport");
+      },
+    });
+    const result = await adapter.submit(contextFor(branch), {
+      expectedTaskRevision: 1,
+      payload: "alpha-prototype-payload",
+    }, controller.signal);
+    expect(result.isError).toBe(true);
+    expect(result.details?.aborted).toBe(true);
+    expect(result.details?.abortReason).toBe("caller_before_dispatch");
+    const operation = result.details?.operation as Record<string, unknown>;
+    expect(operation).toMatchObject({
+      dispatch: "not_started",
+      externalState: "not_dispatched",
+      accepted: false,
+      externalJobId: null,
+      taskRevision: 1,
+    });
+    expect(adapter.unresolvedOperationIds()).not.toContain(operation.operationId as string);
+    const record = JSON.parse(await readFile(recordPath, "utf8")) as { operations: Array<Record<string, unknown>> };
+    expect(record.operations[0]).toMatchObject({ dispatch: "not_started", externalState: "not_dispatched" });
+    const stats = await service.stats();
+    expect(stats.counters.submitRequests).toBe(0);
+    expect(stats.counters.actualCreates).toBe(0);
   });
 });
