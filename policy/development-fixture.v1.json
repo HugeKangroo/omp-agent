@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "policyId": "omp-agent.g1a-development-fixture",
+  "policyVersion": 1,
+  "scope": "development-fixture",
+  "description": "Development-only G1-A fixture policy. It proves admission and enforcement mechanics; it is not a product policy or a product guarantee.",
+  "managedTool": {
+    "name": "agent_write_deliverable",
+    "deliverablePath": "deliverable.txt",
+    "maxContentBytes": 4096
+  },
+  "preToolCheck": {
+    "required": true,
+    "businessToolRecheck": true
+  }
+}
