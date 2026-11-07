@@ -8,6 +8,7 @@ import {
   classifyAdmissionReceipt,
   encodedUtf8Bytes,
   requirementProjection,
+  requirementsDigest,
   revisionBaselineMatches,
   type RequirementSource,
 } from "../../src/task-requirements.ts";
@@ -116,5 +117,39 @@ describe("admission receipt compatibility", () => {
     expect(revisionBaselineMatches(1, 1)).toBe(true);
     expect(revisionBaselineMatches(1, 2)).toBe(false);
     expect(revisionBaselineMatches(null, 1)).toBe(false);
+  });
+});
+
+describe("frozen requirements digest", () => {
+  test("is stable across property insertion order and preserves text bytes", () => {
+    const first = source(1, "第一行\nsecond 😀 line");
+    const reordered: RequirementSource = {
+      previousRevision: null,
+      committedAt: first.committedAt,
+      observedAt: first.observedAt,
+      text: first.text,
+      source: first.source,
+      sessionId: first.sessionId,
+      messageId: first.messageId,
+      kind: first.kind,
+      revision: first.revision,
+    };
+    expect(requirementsDigest([first])).toBe(requirementsDigest([reordered]));
+    expect(requirementsDigest([first])).toMatch(/^requirements-digest-v1:sha256:[0-9a-f]{64}$/);
+    expect(requirementsDigest([{ ...first, text: "第一行\nsecond 😀 line!" }])).not.toBe(requirementsDigest([first]));
+  });
+
+  test("an amendment changes the digest while the caller cannot mutate the returned identity", () => {
+    const original = source(1, "Keep the full\nmulti-line requirement 😀");
+    const before = requirementsDigest([original]);
+    original.text = "mutated after digest";
+    expect(before).toBe(requirementsDigest([source(1, "Keep the full\nmulti-line requirement 😀")]));
+    expect(requirementsDigest([source(1, "Keep the full\nmulti-line requirement 😀"), source(2, "Amendment.")]))
+      .not.toBe(before);
+  });
+
+  test("max ledger bounds are reused rather than a second source framework", () => {
+    const over = Array.from({ length: MAX_REQUIREMENT_SOURCES + 1 }, (_, index) => source(index + 1, "x"));
+    expect(() => requirementsDigest(over)).toThrow(RequirementBoundsError);
   });
 });

@@ -15,7 +15,13 @@ import {
 } from "node:fs/promises";
 import path from "node:path";
 import { createFileAudit, type AuditEvent, type AuditSink } from "./audit.ts";
+import {
+  CandidateRegistry,
+  type CandidateReadPort,
+  type FrozenTaskRef,
+} from "./execution-candidates.ts";
 import { writeJsonAtomicSync } from "./host-record.ts";
+import { requirementsDigest } from "./task-requirements.ts";
 import {
   subjectFromContext,
   type OmpToolContext,
@@ -172,6 +178,7 @@ interface PreparedRun {
   sourceBytes: number;
   sourceSha256: string;
   inputs: PreparedInput[];
+  requirementsDigest: string;
   interpreter: string;
   interpreterArgs: string[];
   childEnv: NodeJS.ProcessEnv;
@@ -324,6 +331,22 @@ function runtimeSnapshot(info: ExecutionRuntimeInfo): ExecutionRuntimeInfo {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * Registration errors can embed host-private archive paths. When the final
+ * conversation/task visibility withholds output and artifact references, the
+ * model projection must still report that registration failed without
+ * exposing those paths. The projection does not expose paths.
+ */
+function withheldRegistrationError(error: unknown): string {
+  const code = typeof error === "object" && error !== null && typeof (error as { code?: unknown }).code === "string"
+    ? (error as { code: string }).code
+    : null;
+  const safeCode = code !== null && /^[A-Za-z0-9_.-]{1,40}$/.test(code) ? code : null;
+  return safeCode === null
+    ? "candidate registration failed; diagnostic withheld because model visibility is withheld"
+    : `candidate registration failed: ${safeCode}; diagnostic withheld because model visibility is withheld`;
 }
 
 function absolute(value: string, label: string): string {
@@ -1105,6 +1128,9 @@ interface RunModelViewFacts {
   };
   watchdog: WatchdogOutcome;
   hostRecordErrors: { afterSpawn: string | null; finalRecord: string | null; artifactExport: string | null };
+  requirementsDigest: string;
+  candidateRegistration: { registered: number; idempotent: number } | null;
+  candidateRegistrationError: string | null;
   output: {
     observedBytes: number;
     retainedBytes: number;
@@ -1195,6 +1221,8 @@ function renderRunModelView(facts: RunModelViewFacts, window: ModelViewWindow): 
     lines.push(`- relativePath=${modelString(rejection.relativePath)} reason=${modelString(rejection.reason)}`);
   }
   lines.push(`attempts limit=${facts.attemptBudget.limit} attempted=${facts.attemptBudget.attempted} dispatched=${facts.attemptBudget.dispatched} reserved=${facts.attemptBudget.reserved} remaining=${Math.max(0, facts.attemptBudget.limit - facts.attemptBudget.attempted - facts.attemptBudget.reserved)}`);
+  lines.push(`requirementsDigest=${modelString(facts.requirementsDigest)}`);
+  lines.push(`candidateRegistration=${facts.candidateRegistration === null ? "none" : JSON.stringify(facts.candidateRegistration)} candidateRegistrationError=${modelString(facts.candidateRegistrationError)}`);
   lines.push(`hostRecordRef=${modelString(facts.hostRecordRef)} hostOwned=true scriptReadable=false`);
   lines.push("note: exit code 0 and exported artifacts are candidate generation only; the task is not accepted. No model claim is verification evidence.");
   lines.push(MODEL_VIEW_IO_CONTRACT);
@@ -1239,6 +1267,7 @@ function assembleRunResponse(
     ownerId: facts.ownerId,
     taskRevision: facts.taskRevision,
     anchorMessageId: facts.anchorMessageId,
+    requirementsDigest: facts.requirementsDigest,
     runtime: facts.runtime,
     runtimeVersion: facts.runtimeVersion,
     source: { ...facts.source },
@@ -1249,6 +1278,8 @@ function assembleRunResponse(
       ? Object.fromEntries(Object.entries(facts.hostRecordErrors)
         .map(([key, value]) => [key, scalar(value, MODEL_VIEW_SCALAR_CHARS)]))
       : { ...facts.hostRecordErrors },
+    candidateRegistration: facts.candidateRegistration === null ? null : { ...facts.candidateRegistration },
+    candidateRegistrationError: facts.candidateRegistrationError,
     output: {
       observedBytes: facts.output.observedBytes,
       retainedBytes: facts.output.retainedBytes,
@@ -1348,6 +1379,8 @@ export class ExecutionAdapter {
   private readonly now: () => string;
   private readonly newId: () => string;
   private readonly runtimes: Record<ExecutionRuntime, ExecutionRuntimeInfo>;
+  private readonly candidateRegistry: CandidateRegistry;
+  readonly candidates: CandidateReadPort;
   private readonly budgets = new Map<string, RunBudget>();
   private readonly unsubscribe: () => void;
   private active: ActiveRun | undefined;
@@ -1399,6 +1432,8 @@ export class ExecutionAdapter {
     this.recordWriter = config.recordWriter ?? writeJsonAtomicSync;
     this.now = config.now ?? (() => new Date().toISOString());
     this.newId = config.id ?? (() => randomUUID());
+    this.candidateRegistry = new CandidateRegistry({ now: this.now, id: this.newId });
+    this.candidates = this.candidateRegistry.readPort();
     if (!existsSync(this.root)) throw new ExecutionAdapterError("Host execution root does not exist.");
     if (!existsSync(this.launcherPath)) throw new ExecutionAdapterError("Trusted execution launcher is unavailable.");
     if (!existsSync(this.sandboxExecPath)) throw new ExecutionAdapterError("sandbox-exec is unavailable; refusing execution.");
@@ -1667,10 +1702,29 @@ export class ExecutionAdapter {
       if (this.owner.bindingStatus().state !== "attached") {
         return errorResult("the conversation binding detached before preparation; no process was started.");
       }
+      // Freeze the requirements identity at the actual admission point. Later
+      // preparation, callbacks or amendments must never relabel this run with
+      // a newer owner revision or digest.
+      const frozenRequirementsDigest = requirementsDigest(fresh.requirementSources);
+      const frozenTask: FrozenTaskRef = {
+        ownerId: decision.ownerId,
+        taskId: decision.taskId,
+        taskRevision: decision.taskRevision,
+        requirementsDigest: frozenRequirementsDigest,
+      };
       runId = `run-${this.newId()}`;
       const callId = `call-${this.newId()}`;
       const runtimeInfo = runtimeSnapshot(this.runtimes[args.runtime]);
-      const prepared = await this.prepare(runId, callId, args, decision.taskId, decision.taskRevision, runtimeInfo, signal);
+      const prepared = await this.prepare(
+        runId,
+        callId,
+        args,
+        decision.taskId,
+        decision.taskRevision,
+        frozenRequirementsDigest,
+        runtimeInfo,
+        signal,
+      );
       preparedRoot = prepared.runRoot;
       if (this.disposed || signal?.aborted) {
         await rm(prepared.runRoot, { recursive: true, force: true });
@@ -1712,6 +1766,7 @@ export class ExecutionAdapter {
         taskId: decision.taskId,
         ownerId: decision.ownerId,
         taskRevision: decision.taskRevision,
+        requirementsDigest: frozenRequirementsDigest,
         anchorMessageId: decision.anchorMessageId,
         capabilityId: this.capabilityId,
         runtime: args.runtime,
@@ -1874,6 +1929,71 @@ export class ExecutionAdapter {
         finalRecordError = `final host record write failed: ${errorMessage(error)}`;
         safeAudit(this.audit, { type: "execution_record_write_failed", runId, error: finalRecordError });
       }
+      // Register actual archived candidates only after the trusted archive
+      // path has completed. The frozen task/digest was captured at admission;
+      // a callback above may have revised the owner, but this old run can never
+      // be relabeled as the new revision. Registration failure is recorded and
+      // never changes the real execution, artifact or cost facts.
+      let candidateRegistration: { registered: number; idempotent: number } | null = null;
+      let candidateRegistrationError: string | null = null;
+      let candidateRegistrationErrorWhenWithheld: string | null = null;
+      if (artifacts.length > 0) {
+        try {
+          candidateRegistration = await this.candidateRegistry.register({
+            task: frozenTask,
+            runId,
+            callId: prepared.callId,
+            privateRoot: this.root,
+            source: {
+              path: prepared.sourcePath,
+              bytes: prepared.sourceBytes,
+              sha256: prepared.sourceSha256,
+            },
+            inputs: prepared.inputs.map((input) => ({
+              id: input.id,
+              path: input.stagedPath,
+              bytes: input.bytes,
+              sha256: input.sha256,
+            })),
+            artifacts: artifacts.map((artifact) => ({
+              artifactId: artifact.artifactId,
+              relativePath: artifact.relativePath,
+              archivePath: path.join(prepared.artifactRoot, `${artifact.artifactId}.bin`),
+              bytes: artifact.bytes,
+              sha256: artifact.sha256,
+            })),
+            provenance: {
+              spawned: outcome.spawned,
+              pid: outcome.pid,
+              pgid: outcome.pgid,
+              exitCode: outcome.exitCode,
+              signal: outcome.signal,
+              stopReason: outcome.stopReason,
+              terminatedByHost: outcome.terminatedByHost,
+              groupGone: outcome.groupGone,
+              launchStage: outcome.launchStage,
+              durationMs: outcome.durationMs,
+              watchdogArmed: outcome.watchdog.armed,
+              watchdogTerminated: outcome.watchdog.watchdogTerminated,
+              watchdogControlError: outcome.watchdog.controlError,
+              afterSpawnHostRecordError: outcome.hostRecordError,
+              finalRecordError,
+              artifactExportError,
+            },
+            registeredAt: this.now(),
+          });
+        } catch (error) {
+          candidateRegistrationError = errorMessage(error).slice(0, 500);
+          candidateRegistrationErrorWhenWithheld = withheldRegistrationError(error);
+          safeAudit(this.audit, {
+            type: "execution_candidate_registration_failed",
+            runId,
+            taskId: decision.taskId,
+            taskRevision: decision.taskRevision,
+            error: candidateRegistrationError,
+          });
+        }
+      }
       // The final record callback is a trusted host callback. It may
       // synchronously navigate, detach or revise the live task. Re-read the
       // actual session/task immediately before projecting model-visible output;
@@ -1965,6 +2085,11 @@ export class ExecutionAdapter {
           finalRecord: finalRecordError,
           artifactExport: artifactExportError,
         },
+        requirementsDigest: frozenTask.requirementsDigest,
+        candidateRegistration,
+        candidateRegistrationError: visible || candidateRegistrationError === null
+          ? candidateRegistrationError
+          : candidateRegistrationErrorWhenWithheld,
         output: {
           observedBytes: outcome.observedBytes,
           retainedBytes: outcome.retainedBytes,
@@ -2032,6 +2157,9 @@ export class ExecutionAdapter {
         : "conversation binding or task reachability changed after the run; output and artifact paths remain in the host record";
       return boundedRunResponse({
         ...facts,
+        candidateRegistrationError: finalVisible || candidateRegistrationError === null
+          ? candidateRegistrationError
+          : candidateRegistrationErrorWhenWithheld,
         bindingAfter: { ...finalBindingAfterAudit },
         taskAfterStatus: finalTaskAfterAudit?.status ?? null,
         taskStillReachable: finalTaskAfterAudit !== undefined,
@@ -2129,12 +2257,23 @@ export class ExecutionAdapter {
     args: Extract<ExecutionArguments, { action: "run" }>,
     taskId: string,
     taskRevision: number,
+    requirementsDigestValue: string,
     runtimeInfo: ExecutionRuntimeInfo,
     signal?: AbortSignal,
   ): Promise<PreparedRun> {
     const runRoot = await mkdtemp(path.join(this.root, "run-"));
     try {
-      return await this.prepareIn(runRoot, runId, callId, args, taskId, taskRevision, runtimeInfo, signal);
+      return await this.prepareIn(
+        runRoot,
+        runId,
+        callId,
+        args,
+        taskId,
+        taskRevision,
+        requirementsDigestValue,
+        runtimeInfo,
+        signal,
+      );
     } catch (error) {
       // A preparation failure never leaves a private staging tree behind and
       // never starts untrusted code. The failure itself is audited.
@@ -2158,6 +2297,7 @@ export class ExecutionAdapter {
     args: Extract<ExecutionArguments, { action: "run" }>,
     taskId: string,
     taskRevision: number,
+    requirementsDigestValue: string,
     runtimeInfo: ExecutionRuntimeInfo,
     signal?: AbortSignal,
   ): Promise<PreparedRun> {
@@ -2306,6 +2446,7 @@ export class ExecutionAdapter {
       sourceBytes: sourceBytes.length,
       sourceSha256,
       inputs,
+      requirementsDigest: requirementsDigestValue,
       interpreter,
       interpreterArgs,
       childEnv,

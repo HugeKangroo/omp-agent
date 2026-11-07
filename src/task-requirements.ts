@@ -7,6 +7,8 @@
  * validates model JSON, task acceptance or evidence.
  */
 
+import { createHash } from "node:crypto";
+
 export const REQUIREMENTS_SCHEMA_VERSION = 1 as const;
 export const MAX_REQUIREMENT_SOURCES = 32;
 /** Full JSON-encoded UTF-8 requirement source ledger. */
@@ -40,6 +42,34 @@ export interface RequirementSource {
  * One shared encoding helper for every byte limit. String `.length` is never
  * used for a byte bound; the same JSON encoding is persisted and projected.
  */
+export const REQUIREMENTS_DIGEST_VERSION = "requirements-digest-v1" as const;
+
+/**
+ * Stable digest of the complete authoritative requirement ledger. It encodes
+ * only the named source fields, in ledger order and in a fixed field order, so
+ * object insertion order cannot change the identity. Text, newlines and
+ * multi-byte characters are hashed exactly as observed; understanding is not
+ * part of the ledger and cannot change this digest.
+ */
+export function requirementsDigest(sources: readonly RequirementSource[]): string {
+  assertSourceLedgerBounds(sources);
+  const encoded = JSON.stringify({
+    version: REQUIREMENTS_DIGEST_VERSION,
+    sources: sources.map((source) => ({
+      revision: source.revision,
+      kind: source.kind,
+      messageId: source.messageId,
+      sessionId: source.sessionId,
+      source: source.source,
+      text: source.text,
+      observedAt: source.observedAt,
+      committedAt: source.committedAt,
+      previousRevision: source.previousRevision,
+    })),
+  });
+  return `${REQUIREMENTS_DIGEST_VERSION}:sha256:${createHash("sha256").update(encoded, "utf8").digest("hex")}`;
+}
+
 export function encodedUtf8Bytes(value: unknown): number {
   const json = JSON.stringify(value);
   if (json === undefined) throw new RequirementBoundsError("TOO_LARGE: value is not JSON-encodable; the byte bound cannot be proven.");
