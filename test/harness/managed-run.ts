@@ -83,7 +83,7 @@ const EXTRA_TOOL_PATH = path.join(REPO_ROOT, "test/fixtures/extra-tool.mjs");
 const MAX_FRAME = 1024 * 1024;
 const MAX_LOGICAL_FRAME = 64 * 1024 * 1024;
 
-class RpcFrameDecoder {
+export class RpcFrameDecoder {
   private chunk: { id: string; count: number; size: number; parts: Buffer[]; bytes: number } | undefined;
 
   decode(line: string): Frame | undefined {

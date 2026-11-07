@@ -11,6 +11,7 @@
     "check": "bun run typecheck && bun test test/unit",
     "test": "bun test test/unit",
     "test:omp": "bun run scripts/test-omp.ts",
+    "test:entry": "bun run scripts/test-entry.ts",
     "typecheck": "bun x tsc --noEmit"
   },
   "devDependencies": {
