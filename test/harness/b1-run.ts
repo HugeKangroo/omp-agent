@@ -24,6 +24,11 @@ const EXPECTED_TOOLS = ["agent_task", "agent_test_capability", "agent_untrusted_
 export interface B1RunOptions {
   scenario: string;
   timeoutMs?: number;
+  /**
+   * Narrow opt-in for native navigation/session scenarios. The default stays
+   * --no-session; when enabled, journals live only under the private temp root.
+   */
+  persistSessions?: boolean;
 }
 
 export class B1OmpSession {
@@ -32,7 +37,9 @@ export class B1OmpSession {
   readonly statePath: string;
   readonly auditPath: string;
   readonly fixtureAuditPath: string;
+  readonly fixtureSnapshotPath: string;
   readonly configPath: string;
+  readonly sessionDir: string | undefined;
   readonly frames: Frame[] = [];
   readonly scenario: string;
   promptSent = false;
@@ -54,14 +61,18 @@ export class B1OmpSession {
     statePath: string;
     auditPath: string;
     fixtureAuditPath: string;
+    fixtureSnapshotPath: string;
     configPath: string;
+    sessionDir: string | undefined;
   }, scenario: string) {
     this.root = values.root;
     this.workspace = values.workspace;
     this.statePath = values.statePath;
     this.auditPath = values.auditPath;
     this.fixtureAuditPath = values.fixtureAuditPath;
+    this.fixtureSnapshotPath = values.fixtureSnapshotPath;
     this.configPath = values.configPath;
+    this.sessionDir = values.sessionDir;
     this.scenario = scenario;
   }
 
@@ -71,6 +82,8 @@ export class B1OmpSession {
     await mkdir(workspacePath, { mode: 0o700 });
     const workspace = await realpath(workspacePath);
     await mkdir(path.join(root, "agent"), { mode: 0o700 });
+    const sessionDir = options.persistSessions === true ? path.join(root, "sessions") : undefined;
+    if (sessionDir) await mkdir(sessionDir, { mode: 0o700 });
     const configPath = path.join(root, "config.yml");
     await writeFile(configPath, JSON.stringify({
       enabledProviders: [],
@@ -95,10 +108,12 @@ export class B1OmpSession {
     const statePath = path.join(root, "b1-state.json");
     const auditPath = path.join(root, "b1-audit.jsonl");
     const fixtureAuditPath = path.join(root, "fixture-audit.jsonl");
+    const fixtureSnapshotPath = path.join(root, "fixture-snapshot.json");
     await writeFile(statePath, "", { mode: 0o600 });
     await writeFile(auditPath, "", { mode: 0o600 });
     await writeFile(fixtureAuditPath, "", { mode: 0o600 });
-    const session = new B1OmpSession({ root, workspace, statePath, auditPath, fixtureAuditPath, configPath }, options.scenario);
+    await writeFile(fixtureSnapshotPath, "", { mode: 0o600 });
+    const session = new B1OmpSession({ root, workspace, statePath, auditPath, fixtureAuditPath, fixtureSnapshotPath, configPath, sessionDir }, options.scenario);
     return session;
   }
 
@@ -120,6 +135,7 @@ export class B1OmpSession {
     env.OMP_PROFILE = "default";
     env.B1_FIXTURE_SCENARIO = this.scenario;
     env.B1_FIXTURE_AUDIT = this.fixtureAuditPath;
+    env.B1_FIXTURE_SNAPSHOT = this.fixtureSnapshotPath;
     env.OMP_AGENT_B1_STATE_PATH = this.statePath;
     env.OMP_AGENT_B1_WORKSPACE_ROOT = this.workspace;
     env.OMP_AGENT_B1_AUDIT_PATH = this.auditPath;
@@ -132,7 +148,8 @@ export class B1OmpSession {
     return [
       "--mode", "rpc", "--no-ui", "--no-tools",
       "--no-extensions", "--no-skills", "--no-rules", "--no-context-files", "--no-lsp", "--no-pty",
-      "--no-session", "--no-title", "--no-prewalk", "--approval-mode", "yolo",
+      ...(this.sessionDir ? ["--session-dir", this.sessionDir] : ["--no-session"]),
+      "--no-title", "--no-prewalk", "--approval-mode", "yolo",
       "--config", this.configFile(),
       "--model", `${B1_PROVIDER}/${B1_MODEL}`,
       "--thinking", "off",
@@ -214,6 +231,53 @@ export class B1OmpSession {
     await Bun.sleep(150);
   }
 
+  /**
+   * Drive a local extension command. A slash command does not invoke an agent,
+   * so completion is the matching prompt_result with agentInvoked=false; an
+   * ACK or a guessed sleep is not completion.
+   */
+  async command(message: string): Promise<Frame> {
+    if (!this.admitted) throw new Error("Refusing to send a command before B1 admission.");
+    if (!message.startsWith("/")) throw new Error("Local commands must start with '/'.");
+    const id = `b1-command-${++this.sequence}`;
+    const startIndex = this.frames.length;
+    this.promptSent = true;
+    this.send({ type: "prompt", id, message });
+    await this.waitFor(() => this.frames.some((frame) => frame.type === "response" && frame.id === id), "command acknowledgement", 10_000);
+    const acknowledgement = this.frames.find((frame) => frame.type === "response" && frame.id === id)!;
+    if (acknowledgement.success !== true) throw new Error(`OMP rejected command: ${String(acknowledgement.error)}`);
+    await this.waitFor(() => this.result(id, startIndex) !== undefined, `command prompt_result ${id}`, 15_000);
+    const result = this.result(id, startIndex)!;
+    if (result.frame.status !== "completed") throw new Error(`OMP command ${id} failed: ${JSON.stringify(result.frame.error ?? result.frame)}`);
+    if (result.frame.agentInvoked !== false) throw new Error(`OMP command ${id} unexpectedly invoked an agent.`);
+    const failure = this.providerFailure(startIndex, result.index);
+    if (failure) throw new Error(`OMP command ${id} saw a provider failure: ${failure}`);
+    await Bun.sleep(100);
+    return result.frame;
+  }
+
+  /** Native RPC session replacement; used only by navigation/session tests. */
+  async newSession(): Promise<Frame> {
+    if (!this.admitted) throw new Error("Refusing to replace the session before B1 admission.");
+    return this.request("new_session");
+  }
+
+  async fixtureSnapshot(): Promise<Frame | undefined> {
+    const value = await this.json(this.fixtureSnapshotPath);
+    return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Frame : undefined;
+  }
+
+  async waitForFixture(label: string, predicate: (value: Frame) => boolean, timeoutMs = 10_000): Promise<Frame> {
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+      const value = await this.fixtureSnapshot();
+      if (value && predicate(value)) return value;
+      if (this.failure || this.exited) throw new Error(`${label}: ${this.failure?.message ?? "OMP exited"}\n${this.stderr}`);
+      if (Date.now() >= deadline) throw new Error(`${label}: timed out\n${this.stderr}\n${JSON.stringify(this.frames.slice(-8))}`);
+      await Bun.sleep(20);
+    }
+  }
+
   private result(id: string, startIndex: number): { frame: Frame; index: number } | undefined {
     for (let index = startIndex; index < this.frames.length; index += 1) {
       const frame = this.frames[index]!;
@@ -245,6 +309,7 @@ export class B1OmpSession {
       state: await this.json(this.statePath),
       audit: await this.jsonl(this.auditPath),
       fixtureAudit: await this.jsonl(this.fixtureAuditPath),
+      fixtureSnapshot: await this.fixtureSnapshot(),
       counter: await this.json(path.join(this.root, "capability-counter.json")),
       stderr: this.stderr,
       workspaceEntries: (await readdir(this.workspace)).sort(),

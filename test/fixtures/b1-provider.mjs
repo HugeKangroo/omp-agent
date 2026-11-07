@@ -115,7 +115,7 @@ export default function b1FixtureProvider(pi) {
           if (turn === 0) {
             call = { type: "toolCall", id: "b1-start", name: "agent_task", arguments: { action: "start", understanding: "authorized task" } };
           } else if (turn === 1) {
-            call = { type: "toolCall", id: "b1-progress-1", name: "agent_test_capability", arguments: { action: "progress" } };
+            call = { type: "toolCall", id: "b1-progress-1", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
           } else if (turn === 2) {
             text = "The task is established. A background progress result may follow.";
             injectBackground();
@@ -131,7 +131,7 @@ export default function b1FixtureProvider(pi) {
               type: "toolCall",
               id: "b1-background-progress",
               name: "agent_test_capability",
-              arguments: { action: "progress" },
+              arguments: { action: "progress", expectedTaskRevision: 1 },
             };
           } else {
             text = "DONE: background progressed the existing task only.";
@@ -176,7 +176,7 @@ export default function b1FixtureProvider(pi) {
           } else if (turn === 1) {
             call = { type: "toolCall", id: "b1-cancel", name: "agent_task", arguments: { action: "cancel" } };
           } else if (turn === 2) {
-            call = { type: "toolCall", id: "b1-late-progress", name: "agent_test_capability", arguments: { action: "progress" } };
+            call = { type: "toolCall", id: "b1-late-progress", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
           } else {
             text = "DONE: cancellation was checked at the capability entry.";
           }
@@ -198,9 +198,31 @@ export default function b1FixtureProvider(pi) {
           } else if (turn === 2) {
             call = { type: "toolCall", id: "b1-cancel", name: "agent_task", arguments: { action: "cancel" } };
           } else if (turn === 3) {
-            call = { type: "toolCall", id: "b1-late-progress", name: "agent_test_capability", arguments: { action: "progress" } };
+            call = { type: "toolCall", id: "b1-late-progress", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
           } else {
             text = "DONE: a later genuine user turn cancelled the task.";
+          }
+        } else if (scenario === "navigation-detach") {
+          // Prompt-content dispatch keeps this scenario stable even if OMP
+          // replaces the provider instance when a fresh session is created.
+          const lastMessage = context.messages.at(-1);
+          const lastUser = [...context.messages].reverse().find((message) => message.role === "user");
+          const promptText = textOf(lastUser?.content);
+          if (lastMessage?.role === "toolResult") {
+            if (promptText.includes("AFTER_NAVIGATION")) text = "DONE: the detached capability was refused.";
+            else if (promptText.includes("FRESH_SESSION")) text = "DONE: the fresh session capability was refused.";
+            else if (promptText.includes("SECOND_OBSERVATION")) text = "DONE: the later same-branch capability was admitted.";
+            else text = "DONE: first prompt created the task.";
+          } else if (promptText.includes("OWN_TASK")) {
+            call = { type: "toolCall", id: "b1-start", name: "agent_task", arguments: { action: "start", understanding: "navigation binding test task" } };
+          } else if (promptText.includes("SECOND_OBSERVATION")) {
+            call = { type: "toolCall", id: "b1-progress", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
+          } else if (promptText.includes("AFTER_NAVIGATION")) {
+            call = { type: "toolCall", id: "b1-detached-progress", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
+          } else if (promptText.includes("FRESH_SESSION")) {
+            call = { type: "toolCall", id: "b1-fresh-session-progress", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
+          } else {
+            text = "UNEXPECTED_NAVIGATION_PROMPT";
           }
         } else if (scenario === "background-inspect") {
           if (turn === 0) {
@@ -212,6 +234,39 @@ export default function b1FixtureProvider(pi) {
             call = { type: "toolCall", id: "b1-inspect", name: "agent_task", arguments: { action: "inspect" } };
           } else {
             text = "DONE: background inspection only read the existing task.";
+          }
+        } else if (scenario === "revise") {
+          if (turn === 0) {
+            call = { type: "toolCall", id: "b1-start", name: "agent_task", arguments: { action: "start", understanding: "initial understanding" } };
+          } else if (turn === 1) {
+            call = { type: "toolCall", id: "b1-progress-before", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
+          } else if (turn === 2) {
+            text = "DONE: first prompt created the task.";
+          } else if (turn === 3) {
+            call = { type: "toolCall", id: "b1-revise-1", name: "agent_task", arguments: { action: "revise", understanding: "revised understanding" } };
+          } else if (turn === 4) {
+            // Same genuine user turn, same host message: a retry must not add
+            // a second source record or bump the revision again.
+            call = { type: "toolCall", id: "b1-revise-2", name: "agent_task", arguments: { action: "revise" } };
+          } else if (turn === 5) {
+            call = { type: "toolCall", id: "b1-stale-progress", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
+          } else if (turn === 6) {
+            call = { type: "toolCall", id: "b1-progress-after", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 2 } };
+          } else {
+            text = "DONE: requirement amendment accepted once.";
+          }
+        } else if (scenario === "background-revise") {
+          if (turn === 0) {
+            call = { type: "toolCall", id: "b1-start", name: "agent_task", arguments: { action: "start", understanding: "authorized task" } };
+          } else if (turn === 1) {
+            text = "A background revision claim may follow.";
+            injectBackground();
+          } else if (turn === 2) {
+            call = { type: "toolCall", id: "b1-background-revise", name: "agent_task", arguments: { action: "revise", understanding: "background claims revision" } };
+          } else if (turn === 3) {
+            call = { type: "toolCall", id: "b1-background-progress", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
+          } else {
+            text = "DONE: background revision was refused; authorized progress continued.";
           }
         } else {
           text = `UNEXPECTED_SCENARIO: ${scenario}`;

@@ -214,7 +214,7 @@ describe("conversational task ownership", () => {
     const backgroundBranch = [...branch, assistant("assistant-1", "user-1"), background("background-1", "assistant-1")];
     expect(owner.closeTurn({ sessionId: SESSION, branch, messages: [messageOf(user("user-1", "leaf-1", "Please handle the managed task."))] })).toBe(true);
 
-    const first = owner.admit(subject(backgroundBranch), "test-progress");
+    const first = owner.admit(subject(backgroundBranch), "test-progress", 1);
     expect(first).toMatchObject({
       allowed: true,
       taskId: created.task.taskId,
@@ -225,13 +225,13 @@ describe("conversational task ownership", () => {
       actionIndex: 1,
       status: "active",
     });
-    const second = owner.admit(subject(backgroundBranch), "test-progress");
+    const second = owner.admit(subject(backgroundBranch), "test-progress", 1);
     expect(second.actionIndex).toBe(2);
     expect(owner.snapshot().tasksCreated).toBe(1);
     expect(owner.snapshot().currentTask?.admissions).toBe(2);
     expect(owner.snapshot().currentTask?.taskRevision).toBe(1);
 
-    const unauthorized = owner.admit(subject(backgroundBranch), "not-registered");
+    const unauthorized = owner.admit(subject(backgroundBranch), "not-registered", 1);
     expect(unauthorized).toMatchObject({ allowed: false, reason: "capability is not authorized by the host", actionIndex: null });
     expect(owner.snapshot().currentTask?.admissions).toBe(2);
   });
@@ -248,7 +248,7 @@ describe("conversational task ownership", () => {
     expect(cancelled.cancelledAt).toBe(NOW);
     expect(owner.cancel(subject(branch)).status).toBe("cancelled");
 
-    const denied = owner.admit(subject(branch), "test-progress");
+    const denied = owner.admit(subject(branch), "test-progress", 1);
     expect(denied).toMatchObject({ allowed: false, reason: "task is cancelled", status: "cancelled", actionIndex: null });
     expect(owner.snapshot().currentTask?.admissions).toBe(0);
     expect(owner.snapshot().currentTask?.taskRevision).toBe(1);
@@ -266,7 +266,7 @@ describe("conversational task ownership", () => {
     expect(() => owner.inspect(subject(backgroundBranch, "other-session"))).toThrow(/different OMP session/);
     const unrelatedBranch = [base("leaf-9"), user("user-9", "leaf-9", "Unrelated.")];
     expect(() => owner.inspect(subject(unrelatedBranch))).toThrow(/anchor is not in the current conversation branch/);
-    expect(owner.admit(subject(unrelatedBranch), "test-progress")).toMatchObject({
+    expect(owner.admit(subject(unrelatedBranch), "test-progress", 1)).toMatchObject({
       allowed: false,
       reason: "Task anchor is not in the current conversation branch; B1 will not assume execution rights.",
     });
@@ -387,11 +387,11 @@ describe("conversational task ownership", () => {
     const branch = [base(), user("user-1", "leaf-1", "Please handle the managed task.")];
     observe(owner);
     const created = startFor(owner, branch);
-    expect(owner.admit(subject(branch), "test-progress").allowed).toBe(true);
+    expect(owner.admit(subject(branch), "test-progress", 1).allowed).toBe(true);
     observe(owner, { text: "Steering request." });
     expect(owner.snapshot().suspended?.reason).toBe("unsupported overlapping user turns");
 
-    const denied = owner.admit(subject(branch), "test-progress");
+    const denied = owner.admit(subject(branch), "test-progress", 1);
     expect(denied).toMatchObject({ allowed: false, reason: "task admissions are suspended: unsupported overlapping user turns", actionIndex: null });
     expect(owner.snapshot().currentTask?.admissions).toBe(1);
     expect(owner.inspect(subject(branch)).taskId).toBe(created.task.taskId);
@@ -434,7 +434,7 @@ describe("conversational task ownership", () => {
     expect(cancelled.anchor).toEqual(created.task.anchor);
     expect(cancelled.anchor.messageId).toBe("user-1");
 
-    const denied = owner.admit(subject(taskBranch), "test-progress");
+    const denied = owner.admit(subject(taskBranch), "test-progress", 1);
     expect(denied).toMatchObject({ allowed: false, reason: "task is cancelled", status: "cancelled", actionIndex: null });
     expect(owner.snapshot().currentTask?.admissions).toBe(0);
     expect(owner.snapshot().currentTask?.taskRevision).toBe(1);

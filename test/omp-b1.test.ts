@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { B1OmpSession, type B1RunOptions } from "./harness/b1-run.ts";
+import { classifyAdmissionReceipt } from "../src/task-requirements.ts";
 
 const integration = process.env.RUN_REAL_OMP_TEST === "1" ? test : test.skip;
 const TEST_TIMEOUT = 60_000;
@@ -303,6 +304,126 @@ integration("a second prompt has a separate lifecycle and cannot silently re-cre
   });
 }, TEST_TIMEOUT);
 
+integration("a real second prompt revises once and stale expected revisions are denied", async () => {
+  const firstPrompt = "Please own the release checklist.";
+  const amendment = "Please revise: prefer low latency over maximum precision.";
+  await withSession({ scenario: "revise" }, async (session) => {
+    await session.prompt(firstPrompt);
+    const first = await session.snapshot();
+    const created = expectOneTask(first);
+    const creationAnchor = created.anchor as Event;
+    expect(resultDetails(toolEnds(first, "b1-progress-before")[0])).toMatchObject({
+      allowed: true,
+      taskRevision: 1,
+      actionIndex: 1,
+    });
+
+    await session.prompt(amendment);
+    const snapshot = await session.snapshot();
+    const ownerState = state(snapshot);
+    const current = task(snapshot);
+    expect(ownerState.tasksCreated).toBe(1);
+    expect(current.taskId).toBe(created.taskId);
+    expect(current.taskRevision).toBe(2);
+    expect(current.rawRequest).toBe(firstPrompt);
+    expect(current.anchor).toEqual(creationAnchor);
+    expect(current.status).toBe("active");
+    expect(current.understanding).toBe("revised understanding");
+    expect(current.understandingRevision).toBe(2);
+    expect(current.understandingStale).toBe(false);
+
+    const sources = current.requirementSources as Event[];
+    expect(sources).toHaveLength(2);
+    expect(sources[0]).toMatchObject({ revision: 1, kind: "original", text: firstPrompt, previousRevision: null });
+    expect(sources[1]).toMatchObject({
+      revision: 2,
+      kind: "amendment",
+      previousRevision: 1,
+      text: amendment,
+      source: "rpc",
+    });
+    // The amendment source is the actual host message, not the creation one.
+    const reviseAttempt = attemptEvents(snapshot, "revise")[0];
+    const revUsers = (Array.isArray(reviseAttempt?.branch) ? reviseAttempt.branch as Event[] : [])
+      .filter((entry) => entry.role === "user");
+    expect(revUsers).toHaveLength(2);
+    expect(revUsers.at(-1)?.id).toBe(sources[1]?.messageId);
+    expect(sources[1]?.messageId).not.toBe(creationAnchor.messageId);
+
+    const firstRevision = resultDetails(toolEnds(snapshot, "b1-revise-1")[0]);
+    expect(firstRevision).toMatchObject({ revised: true, task: { taskRevision: 2 } });
+    const retry = resultDetails(toolEnds(snapshot, "b1-revise-2")[0]);
+    expect(retry).toMatchObject({ revised: false, task: { taskRevision: 2 } });
+    expect((retry.task as Event).requirementSources as Event[]).toHaveLength(2);
+    expect(events(snapshot, "audit", "task_revised")).toHaveLength(1);
+    expect(events(snapshot, "audit", "task_revision_duplicate")).toHaveLength(1);
+
+    const stale = toolEnds(snapshot, "b1-stale-progress");
+    expect(stale).toHaveLength(1);
+    expect((stale[0]?.result as Event).isError).toBe(true);
+    const staleDetails = resultDetails(stale[0]);
+    expect(String(staleDetails.reason)).toContain("stale expected taskRevision 1");
+    expect(staleDetails.actionIndex).toBeNull();
+    const accepted = resultDetails(toolEnds(snapshot, "b1-progress-after")[0]);
+    expect(accepted).toMatchObject({ allowed: true, taskRevision: 2, expectedTaskRevision: 2, actionIndex: 2, counter: 2 });
+    // Only the accepted revision-2 call moved the independent counter.
+    expect(snapshot.counter).toEqual({ count: 2 });
+    expect(task(snapshot).admissions).toBe(2);
+
+    // The original revision-1 receipt is immutable and now classifies stale;
+    // the revision-2 receipt is current. No result adoption is involved.
+    const oldReceipt = resultDetails(toolEnds(first, "b1-progress-before")[0]);
+    const receipt = {
+      taskId: String(oldReceipt.taskId),
+      ownerId: String(oldReceipt.ownerId),
+      taskRevision: Number(oldReceipt.taskRevision),
+      actionIndex: Number(oldReceipt.actionIndex),
+    };
+    expect(receipt).toMatchObject({ taskId: current.taskId, taskRevision: 1, actionIndex: 1 });
+    expect(classifyAdmissionReceipt(receipt, {
+      taskId: String(current.taskId),
+      ownerId: ownerState.ownerId as string,
+      taskRevision: Number(current.taskRevision),
+      detached: false,
+    })).toBe("stale-revision");
+    expect(classifyAdmissionReceipt({
+      taskId: String(accepted.taskId),
+      ownerId: String(accepted.ownerId),
+      taskRevision: Number(accepted.taskRevision),
+      actionIndex: Number(accepted.actionIndex),
+    }, {
+      taskId: String(current.taskId),
+      ownerId: ownerState.ownerId as string,
+      taskRevision: Number(current.taskRevision),
+      detached: false,
+    })).toBe("current");
+  });
+}, TEST_TIMEOUT);
+
+integration("a background revise attempt is denied while authorized background progress continues", async () => {
+  await withSession({ scenario: "background-revise" }, async (session) => {
+    await session.prompt("Please own the release checklist.");
+    const snapshot = await session.snapshot();
+    const current = expectOneTask(snapshot);
+    expect(events(snapshot, "fixtureAudit", "background_injected")).toHaveLength(1);
+    expect(events(snapshot, "fixtureAudit", "tool_call_emitted").some((event) => event.toolCallId === "b1-background-revise")).toBe(true);
+
+    const denied = toolEnds(snapshot, "b1-background-revise");
+    expect(denied).toHaveLength(1);
+    expect((denied[0]?.result as Event).isError).toBe(true);
+    expect(resultText(denied[0])).toContain("authority window was closed");
+    expect(current.taskRevision).toBe(1);
+    expect(current.requirementSources as Event[]).toHaveLength(1);
+
+    const progress = resultDetails(toolEnds(snapshot, "b1-background-progress")[0]);
+    expect(progress).toMatchObject({ allowed: true, taskRevision: 1, expectedTaskRevision: 1, actionIndex: 1 });
+    expect(snapshot.counter).toEqual({ count: 1 });
+    expect(events(snapshot, "audit", "task_revised")).toHaveLength(0);
+    expect(state(snapshot).tasksCreated).toBe(1);
+    expect(task(snapshot).taskRevision).toBe(1);
+  });
+}, TEST_TIMEOUT);
+
 integration("a legitimate later user prompt cancels the task and blocks later capabilities", async () => {
   await withSession({ scenario: "two-prompts-cancel" }, async (session) => {
     await session.prompt("Please own the release checklist.");
@@ -345,5 +466,158 @@ integration("a legitimate later user prompt cancels the task and blocks later ca
     expect(events(second, "audit", "capability_admission_denied").some((event) => event.reason === "task is cancelled")).toBe(true);
     expect(task(second).admissions).toBe(0);
     expect(second.counter).toBeUndefined();
+  });
+}, TEST_TIMEOUT);
+
+integration("native tree navigation to an older assistant detaches capability authority for a real later turn and a fresh session", async () => {
+  const firstPrompt = "OWN_TASK: please own the release checklist for the navigation test.";
+  const secondPrompt = "SECOND_OBSERVATION: record one more harmless follow-up on the same task.";
+  const navigationPrompt = "AFTER_NAVIGATION: report whether the capability is still authorized.";
+  const freshPrompt = "FRESH_SESSION: report whether the capability is still authorized here.";
+  await withSession({ scenario: "navigation-detach", persistSessions: true }, async (session) => {
+    await session.prompt(firstPrompt);
+    const first = await session.snapshot();
+    const created = expectOneTask(first);
+    const creationAnchor = created.anchor as Event;
+    expect(creationAnchor.messageId).toBeString();
+    const originalSessionId = creationAnchor.sessionId;
+    expect(originalSessionId).toBeString();
+
+    // Real same-branch later turn: the ordinary B1 positive still works, and
+    // one correct revision-1 capability is admitted before navigation.
+    await session.prompt(secondPrompt);
+    const second = await session.snapshot();
+    expect(state(second).tasksCreated).toBe(1);
+    expect(state(second).binding).toMatchObject({ state: "attached", sessionId: originalSessionId });
+    expect(task(second).taskId).toBe(created.taskId);
+    expect(task(second).rawRequest).toBe(firstPrompt);
+    expect(task(second).taskRevision).toBe(1);
+    expect((task(second).anchor as Event).messageId).toBe(creationAnchor.messageId);
+    expect(task(second).requirementSources as Event[]).toHaveLength(1);
+    const admitted = resultDetails(toolEnds(second, "b1-progress")[0]);
+    expect(admitted).toMatchObject({ allowed: true, taskId: created.taskId, taskRevision: 1, expectedTaskRevision: 1, actionIndex: 1, counter: 1 });
+    expect(second.counter).toEqual({ count: 1 });
+
+    // Choose the navigation target from the actual native branch snapshot:
+    // an assistant entry after the creation user anchor and before the leaf
+    // produced by the later turn. OMP navigates to an assistant entry itself
+    // (navigating to the original user entry would go BEFORE it).
+    const branchSnapshot = await session.waitForFixture("branch with the later turn", (value) => {
+      const branch = value.branch;
+      return value.label === "agent_end" && Array.isArray(branch)
+        && (branch as Event[]).some((entry) => entry.role === "user" && entry.text === secondPrompt);
+    });
+    expect(branchSnapshot.sessionId).toBe(originalSessionId);
+    const branch = branchSnapshot.branch as Event[];
+    const anchorIndex = branch.findIndex((entry) => entry.id === creationAnchor.messageId);
+    const laterUserIndex = branch.findIndex((entry) => entry.role === "user" && entry.text === secondPrompt);
+    expect(anchorIndex).toBeGreaterThanOrEqual(0);
+    expect(laterUserIndex).toBeGreaterThan(anchorIndex);
+    const targetIndex = branch.findIndex((entry, index) => index > anchorIndex && index < laterUserIndex
+      && entry.role === "assistant" && typeof entry.text === "string" && entry.text.startsWith("DONE: first prompt"));
+    expect(targetIndex).toBeGreaterThan(anchorIndex);
+    const targetId = branch[targetIndex]?.id;
+    expect(targetId).toBeString();
+    const oldLeafId = branchSnapshot.leafId;
+    expect(oldLeafId).toBeString();
+    expect(oldLeafId).not.toBe(targetId);
+    expect(branch.some((entry) => entry.id === oldLeafId)).toBe(true);
+
+    // Native command lifecycle through ExtensionCommandContext.navigateTree.
+    await session.command(`/b1navigate ${targetId}`);
+    const navigation = await session.waitForFixture("native navigation command", (value) => value.label === "after_navigation_command");
+    expect(navigation.sessionId).toBe(originalSessionId);
+    const navigationBranch = navigation.branch as Event[];
+    expect(navigationBranch.some((entry) => entry.id === creationAnchor.messageId)).toBe(true);
+    expect(navigationBranch.some((entry) => entry.id === targetId)).toBe(true);
+    expect(navigationBranch.some((entry) => entry.id === oldLeafId)).toBe(false);
+    expect(navigation.entryIds as string[]).toContain(oldLeafId as string);
+    const navigationOwner = navigation.owner as Event;
+    expect(navigationOwner.binding).toMatchObject({ state: "detached", event: "session_tree" });
+    expect((navigationOwner.currentTask as Event).taskId).toBe(created.taskId);
+
+    const afterNavigation = await session.snapshot();
+    const begin = events(afterNavigation, "fixtureAudit", "navigation_command_begin").find((event) => event.target === targetId);
+    const completed = events(afterNavigation, "fixtureAudit", "navigation_command_result").find((event) => event.target === targetId);
+    expect(begin).toBeDefined();
+    expect(completed).toBeDefined();
+    expect(begin?.sessionId).toBe(originalSessionId);
+    expect(completed?.sessionId).toBe(originalSessionId);
+    expect(events(afterNavigation, "fixtureAudit", "native_hook")
+      .some((event) => event.name === "session_tree" && event.sessionId === originalSessionId)).toBe(true);
+    expect(events(afterNavigation, "audit", "task_binding_detached")
+      .some((event) => event.event === "session_tree")).toBe(true);
+    expect(state(afterNavigation).binding).toMatchObject({ state: "detached", event: "session_tree" });
+    expect(state(afterNavigation).tasksCreated).toBe(1);
+    expect(task(afterNavigation).taskId).toBe(created.taskId);
+    expect(task(afterNavigation).rawRequest).toBe(firstPrompt);
+    expect(task(afterNavigation).taskRevision).toBe(1);
+    expect((task(afterNavigation).anchor as Event).messageId).toBe(creationAnchor.messageId);
+    expect(afterNavigation.counter).toEqual({ count: 1 });
+
+    // A real new user prompt still emits the actual tool call; the tool result
+    // proves a detached denial without moving the independent counter.
+    await session.prompt(navigationPrompt);
+    const afterDenial = await session.snapshot();
+    const emitted = events(afterDenial, "fixtureAudit", "tool_call_emitted").find((event) => event.toolCallId === "b1-detached-progress");
+    expect(emitted).toBeDefined();
+    expect(emitted?.tool).toBe("agent_test_capability");
+    expect(emitted?.arguments).toMatchObject({ action: "progress", expectedTaskRevision: 1 });
+    const deniedFrames = toolEnds(afterDenial, "b1-detached-progress");
+    expect(deniedFrames).toHaveLength(1);
+    expect((deniedFrames[0]?.result as Event).isError).toBe(true);
+    const denied = resultDetails(deniedFrames[0]);
+    expect(denied).toMatchObject({
+      allowed: false,
+      taskId: created.taskId,
+      taskRevision: 1,
+      expectedTaskRevision: 1,
+      actionIndex: null,
+      counter: null,
+    });
+    expect(String(denied.reason)).toContain("conversation binding is detached");
+    expect(events(afterDenial, "audit", "capability_admission_denied")
+      .some((event) => String(event.reason).includes("detached"))).toBe(true);
+    expect(afterDenial.counter).toEqual({ count: 1 });
+    expect(state(afterDenial).tasksCreated).toBe(1);
+    expect(state(afterDenial).binding).toMatchObject({ state: "detached" });
+    expect(task(afterDenial).taskId).toBe(created.taskId);
+    expect(task(afterDenial).rawRequest).toBe(firstPrompt);
+    expect(task(afterDenial).taskRevision).toBe(1);
+    expect(task(afterDenial).status).toBe("active");
+    expect((task(afterDenial).anchor as Event).messageId).toBe(creationAnchor.messageId);
+
+    // Native session replacement, then another real prompt in the new session.
+    const replacement = await session.newSession();
+    expect(replacement.success).toBe(true);
+    const switched = await session.waitForFixture("different native session", (value) => typeof value.sessionId === "string" && value.sessionId !== originalSessionId);
+    expect(switched.sessionId).not.toBe(originalSessionId);
+    expect(events(await session.snapshot(), "fixtureAudit", "native_hook")
+      .some((event) => (event.name === "session_switch" || event.name === "session_start") && event.sessionId === switched.sessionId)).toBe(true);
+
+    await session.prompt(freshPrompt);
+    const afterFresh = await session.snapshot();
+    const freshSnapshot = await session.fixtureSnapshot();
+    expect(freshSnapshot?.sessionId).toBe(switched.sessionId);
+    const freshEmitted = events(afterFresh, "fixtureAudit", "tool_call_emitted").find((event) => event.toolCallId === "b1-fresh-session-progress");
+    expect(freshEmitted).toBeDefined();
+    expect(freshEmitted?.tool).toBe("agent_test_capability");
+    const freshFrames = toolEnds(afterFresh, "b1-fresh-session-progress");
+    expect(freshFrames).toHaveLength(1);
+    expect((freshFrames[0]?.result as Event).isError).toBe(true);
+    const freshDenied = resultDetails(freshFrames[0]);
+    expect(freshDenied.allowed).toBe(false);
+    expect(String(freshDenied.reason)).toContain("conversation binding is detached");
+    expect(freshDenied.expectedTaskRevision).toBe(1);
+    expect(freshDenied.actionIndex).toBeNull();
+    expect(afterFresh.counter).toEqual({ count: 1 });
+    expect(state(afterFresh).tasksCreated).toBe(1);
+    expect(state(afterFresh).binding).toMatchObject({ state: "detached" });
+    expect(task(afterFresh).taskId).toBe(created.taskId);
+    expect(task(afterFresh).rawRequest).toBe(firstPrompt);
+    expect(task(afterFresh).taskRevision).toBe(1);
+    expect(task(afterFresh).status).toBe("active");
+    expect(events(afterFresh, "audit", "input_observed")
+      .filter((event) => event.accepted === true).length).toBeGreaterThanOrEqual(4);
   });
 }, TEST_TIMEOUT);
