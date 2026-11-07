@@ -79,6 +79,7 @@ async function fixture(options: {
   terminationGraceMs?: number;
   extraInputs?: Array<{ id: string; path: string }>;
   badInputs?: boolean;
+  launcherPath?: string;
   recordWriter?: (filePath: string, value: unknown) => void;
 } = {}): Promise<Fixture> {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "omp-agent-g2a1-unit-")));
@@ -122,6 +123,7 @@ async function fixture(options: {
     id: () => `run-${++sequence}`,
     ...(options.dispatchWallMs === undefined ? {} : { dispatchWallMs: options.dispatchWallMs }),
     ...(options.terminationGraceMs === undefined ? {} : { terminationGraceMs: options.terminationGraceMs }),
+    ...(options.launcherPath === undefined ? {} : { launcherPath: options.launcherPath }),
     ...(options.recordWriter === undefined ? {} : { recordWriter: options.recordWriter }),
   });
   return {
@@ -789,6 +791,42 @@ with open("fsize.json", "w", encoding="utf-8") as handle:
     }
   }, 20_000);
 
+  test("a final host record failure preserves executed facts and both cleanups", async () => {
+    let writes = 0;
+    const f = await fixture({
+      dispatchWallMs: 5000,
+      terminationGraceMs: 100,
+      recordWriter: (filePath, value) => {
+        writes += 1;
+        if (writes >= 3) throw new Error("injected final record fault");
+        writeFileSync(filePath, JSON.stringify(value));
+      },
+    });
+    try {
+      const result = await f.adapter.run(f.ctx, {
+        action: "run",
+        runtime: "python",
+        source: "open('done.txt', 'w').write('actual execution')\n",
+        inputIds: [],
+        expectedTaskRevision: 1,
+      });
+      const details = detailsOf(result);
+      expect(result.isError).toBe(true);
+      expect(writes).toBe(3);
+      expect(details.dispatch.spawned).toBe(true);
+      expect(details.dispatch.exitCode).toBe(0);
+      expect(details.dispatch.processGroupVerifiedGone).toBe(true);
+      expect(details.watchdog.armed).toBe(true);
+      expect(details.watchdog.watchdogTerminated).toBe(true);
+      expect(String(details.hostRecordErrors.finalRecord)).toContain("injected final record fault");
+      expect(details.artifacts.some((item: any) => item.relativePath === "done.txt")).toBe(true);
+      expect(() => process.kill(details.dispatch.pid, 0)).toThrow();
+      expect(() => process.kill(details.watchdog.watchdogPid, 0)).toThrow();
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
   test("artifact total byte cap rejects the next oversize file without reading it", async () => {
     const f = await fixture({ dispatchWallMs: 5000 });
     try {
@@ -1016,15 +1054,23 @@ with open(os.path.join(os.environ["OMP_WORK_DIR"], "fd-report.json"), "w", encod
 `);
       const interpreter = await realpath(PYTHON);
       const profile = path.join(root, "profile.sb");
+      const watchdogLog = path.join(root, "watchdog.jsonl");
       await writeFile(profile, sandboxProfile({ interpreterPath: interpreter, sourceRoot, inputRoot, workRoot }));
       const parentCode = `
 import os, sys
 os.dup2(0, 6000)
 os.set_inheritable(6000, True)
-os.execv(sys.executable, [sys.executable, "-I", "-B", sys.argv[1], "--profile", sys.argv[2], "--fsize", "262144", "--", sys.argv[3], sys.argv[4]])
+os.execv(sys.executable, [
+    sys.executable, "-I", "-B", sys.argv[1],
+    "--profile", sys.argv[2], "--fsize", "262144",
+    "--supervisor-pid", sys.argv[3], "--deadline-ms", "5000", "--grace-ms", "250",
+    "--control-fd", "3", "--ack-fd", "4",
+    "--watchdog-log", sys.argv[4], "--config-token", "fd-test-token", "--runtime", "python",
+    "--", sys.argv[5], sys.argv[6],
+])
 `;
       const child = spawn(PYTHON, [
-        "-I", "-B", "-c", parentCode, LAUNCHER, profile, interpreter, script,
+        "-I", "-B", "-c", parentCode, LAUNCHER, profile, String(process.pid), watchdogLog, interpreter, script,
       ], {
         detached: true,
         env: {
@@ -1032,14 +1078,531 @@ os.execv(sys.executable, [sys.executable, "-I", "-B", sys.argv[1], "--profile", 
           OMP_WORK_DIR: workRoot,
           OMP_INPUTS_MANIFEST: path.join(inputRoot, "manifest.json"),
         },
-        stdio: "ignore",
+        stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"],
       });
+      const control = child.stdio[3] as any;
+      const acknowledgement = child.stdio[4] as any;
+      let controlBuffer = "";
+      let acknowledged = false;
+      const armed = new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("launcher did not arm")), 5000);
+        control.on("data", (bytes: Buffer) => {
+          controlBuffer += bytes.toString("utf8");
+          while (controlBuffer.includes("\n")) {
+            const index = controlBuffer.indexOf("\n");
+            const line = controlBuffer.slice(0, index);
+            controlBuffer = controlBuffer.slice(index + 1);
+            if (!line) continue;
+            const message = JSON.parse(line);
+            if (message.type === "armed" && !acknowledged) {
+              acknowledged = true;
+              expect(message.scriptPid).toBe(child.pid);
+              acknowledgement.write(`${JSON.stringify({
+                type: "ack",
+                protocol: "g2a2-watchdog-v1",
+                configToken: "fd-test-token",
+                scriptPid: child.pid,
+                supervisorPid: process.pid,
+              })}\n`);
+              acknowledgement.end();
+              clearTimeout(timer);
+              resolve();
+            }
+          }
+        });
+      });
+      await armed;
       const exitCode = await new Promise<number | null>((resolve) => child.on("close", resolve));
       expect(exitCode).toBe(0);
       const report = JSON.parse(await readFile(path.join(workRoot, "fd-report.json"), "utf8"));
       expect(report.fd6000).not.toBe("open");
     } finally {
       await rm(root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  async function directLauncher(options: {
+    source: string;
+    runtime: "python" | "bun";
+    deadlineMs: number;
+    logPath: string;
+    configToken: string;
+    ack: boolean;
+    beforeAck?: (workRoot: string, armed: Record<string, any>) => void | Promise<void>;
+  }): Promise<{
+    root: string;
+    child: ReturnType<typeof spawn>;
+    workRoot: string;
+    control: any;
+    acknowledgement: any;
+    armed: Promise<Record<string, any>>;
+  }> {
+    const root = await realpath(await mkdtemp(path.join(tmpdir(), "omp-agent-g2a2-direct-")));
+    const sourceRoot = path.join(root, "source");
+    const inputRoot = path.join(root, "inputs");
+    const workRoot = path.join(root, "work");
+    await mkdir(sourceRoot);
+    await mkdir(inputRoot);
+    await mkdir(workRoot);
+    const extension = options.runtime === "python" ? "py" : "ts";
+    const script = path.join(sourceRoot, `script.${extension}`);
+    await writeFile(script, options.source);
+    const interpreter = await realpath(options.runtime === "python" ? PYTHON : BUN);
+    const profile = path.join(root, "profile.sb");
+    await writeFile(profile, sandboxProfile({ interpreterPath: interpreter, sourceRoot, inputRoot, workRoot }));
+    const child = spawn(PYTHON, [
+      "-I", "-B", LAUNCHER,
+      "--profile", profile, "--fsize", "262144",
+      "--supervisor-pid", String(process.pid),
+      "--deadline-ms", String(options.deadlineMs),
+      "--grace-ms", "100",
+      "--control-fd", "3", "--ack-fd", "4",
+      "--watchdog-log", options.logPath,
+      "--config-token", options.configToken,
+      "--runtime", options.runtime,
+      "--", interpreter,
+      ...(options.runtime === "python" ? ["-I", "-B", script] : ["--no-env-file", script]),
+    ], {
+      cwd: workRoot,
+      detached: true,
+      env: {
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        OMP_WORK_DIR: workRoot,
+        OMP_INPUTS_MANIFEST: path.join(inputRoot, "manifest.json"),
+      },
+      stdio: ["ignore", "ignore", "ignore", "pipe", "pipe"],
+    });
+    const control = child.stdio[3] as any;
+    const acknowledgement = child.stdio[4] as any;
+    const armed = new Promise<Record<string, any>>((resolve, reject) => {
+      let buffer = "";
+      const timer = setTimeout(() => reject(new Error("launcher did not arm")), 5000);
+      control.on("data", async (bytes: Buffer) => {
+        buffer += bytes.toString("utf8");
+        while (buffer.includes("\n")) {
+          const index = buffer.indexOf("\n");
+          const line = buffer.slice(0, index);
+          buffer = buffer.slice(index + 1);
+          if (!line) continue;
+          const message = JSON.parse(line);
+          if (message.type === "armed") {
+            clearTimeout(timer);
+            await options.beforeAck?.(workRoot, message);
+            if (options.ack) {
+              acknowledgement.write(`${JSON.stringify({
+                type: "ack",
+                protocol: "g2a2-watchdog-v1",
+                configToken: options.configToken,
+                scriptPid: child.pid,
+                supervisorPid: process.pid,
+              })}\n`);
+              acknowledgement.end();
+            }
+            resolve(message);
+          }
+        }
+      });
+    });
+    return { root, child, workRoot, control, acknowledgement, armed };
+  }
+
+  test("missing supervisor acknowledgement executes no untrusted code", async () => {
+    const logPath = path.join(await realpath(await mkdtemp(path.join(tmpdir(), "omp-agent-g2a2-nack-log-"))), "watchdog.jsonl");
+    const probe = await directLauncher({
+      source: "open('did-run.txt', 'w').write('must not run')\n",
+      runtime: "python",
+      deadlineMs: 5000,
+      logPath,
+      configToken: "missing-ack",
+      ack: false,
+    });
+    try {
+      const armed = await probe.armed;
+      expect(armed.armed).toBe(true);
+      probe.acknowledgement.destroy();
+      const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+        probe.child.on("close", (code, signal) => resolve({ code, signal }));
+      });
+      expect(result.code === 111 || result.signal !== null).toBe(true);
+      expect(await Bun.file(path.join(probe.workRoot, "did-run.txt")).exists()).toBe(false);
+    } finally {
+      try { process.kill(-probe.child.pid!, "SIGKILL"); } catch { /* gone */ }
+      await rm(path.dirname(logPath), { recursive: true, force: true });
+      await rm(probe.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("Python and Bun cannot signal the watchdog, write its control fd, or lose normal computation", async () => {
+    const pythonSource = `
+import json, os, signal
+watchdog = int(open("watchdog.pid", encoding="utf-8").read())
+report = {}
+for name, number in (("zero", 0), ("term", signal.SIGTERM)):
+    try:
+        os.kill(watchdog, number)
+        report[name] = "allowed"
+    except OSError as error:
+        report[name] = error.errno
+try:
+    os.write(3, b"forged")
+    report["fd3"] = "allowed"
+except OSError as error:
+    report["fd3"] = error.errno
+report["computed"] = sum(range(10000))
+with open("report.json", "w", encoding="utf-8") as handle:
+    json.dump(report, handle)
+`;
+    const bunSource = `
+import { readFileSync, writeFileSync, writeSync } from "node:fs";
+const watchdog = Number(readFileSync("watchdog.pid", "utf8"));
+const report = {};
+for (const [name, signal] of [["zero", 0], ["term", "SIGTERM"]]) {
+  try {
+    process.kill(watchdog, signal);
+    report[name] = "allowed";
+  } catch (error) {
+    report[name] = error.code;
+  }
+}
+try {
+  writeSync(3, Buffer.from("forged"));
+  report.fd3 = "allowed";
+} catch (error) {
+  report.fd3 = error.code;
+}
+let computed = 0;
+for (let value = 0; value < 10000; value += 1) computed += value;
+report.computed = computed;
+writeFileSync("report.json", JSON.stringify(report));
+`;
+    for (const runtime of ["python", "bun"] as const) {
+      const evidenceRoot = await realpath(await mkdtemp(path.join(tmpdir(), `omp-agent-g2a2-signal-${runtime}-`)));
+      const logPath = path.join(evidenceRoot, "watchdog.jsonl");
+      const probe = await directLauncher({
+        source: runtime === "python" ? pythonSource : bunSource,
+        runtime,
+        deadlineMs: 5000,
+        logPath,
+        configToken: `signal-${runtime}`,
+        ack: true,
+        beforeAck: async (workRoot, armed) => {
+          await writeFile(path.join(workRoot, "watchdog.pid"), String(armed.watchdogPid));
+        },
+      });
+      try {
+        await probe.armed;
+        const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+          probe.child.on("close", (code, signal) => resolve({ code, signal }));
+        });
+        expect(result.code).toBe(0);
+        const report = JSON.parse(await readFile(path.join(probe.workRoot, "report.json"), "utf8"));
+        if (runtime === "python") {
+          expect(report.zero).toBe(1);
+          expect(report.term).toBe(1);
+          expect(report.fd3).toBe(9);
+        } else {
+          expect(report.zero).toBe("EPERM");
+          expect(report.term).toBe("EPERM");
+          expect(["EBADF", "ENXIO"]).toContain(report.fd3);
+        }
+        expect(report.computed).toBe(49995000);
+      } finally {
+        try { process.kill(-probe.child.pid!, "SIGKILL"); } catch { /* gone */ }
+        await rm(evidenceRoot, { recursive: true, force: true });
+        await rm(probe.root, { recursive: true, force: true });
+      }
+    }
+  }, 30_000);
+
+  test("closed control stream and unwritable watchdog log do not prevent deadline kill", async () => {
+    const evidenceRoot = await realpath(await mkdtemp(path.join(tmpdir(), "omp-agent-g2a2-broken-control-")));
+    const logPath = path.join(evidenceRoot, "log-is-a-directory");
+    await mkdir(logPath);
+    const started = Date.now();
+    const probe = await directLauncher({
+      source: "import signal, time\nsignal.signal(signal.SIGTERM, lambda *args: None)\ntime.sleep(5)\nopen('finished.txt', 'w').write('late')\n",
+      runtime: "python",
+      deadlineMs: 600,
+      logPath,
+      configToken: "broken-control",
+      ack: true,
+    });
+    try {
+      await probe.armed;
+      probe.control.destroy();
+      const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+        probe.child.on("close", (code, signal) => resolve({ code, signal }));
+      });
+      expect(Date.now() - started).toBeLessThan(4000);
+      expect(result.code === 0 && result.signal === null).toBe(false);
+      expect(await Bun.file(path.join(probe.workRoot, "finished.txt")).exists()).toBe(false);
+      expect((await import("node:fs")).statSync(logPath).isDirectory()).toBe(true);
+    } finally {
+      try { process.kill(-probe.child.pid!, "SIGKILL"); } catch { /* gone */ }
+      await rm(evidenceRoot, { recursive: true, force: true });
+      await rm(probe.root, { recursive: true, force: true });
+    }
+  }, 20_000);
+});
+
+describe("bounded watchdog control protocol under host-selected launcher faults", () => {
+  const INJECTION_ANCHOR = "        armed_wfd = -1\n";
+  const EVENT_BASE = '{"protocol": CONTROL_PROTOCOL, "watchdogPid": os.getpid(), "scriptPid": script_pid, "supervisorPid": host_pid}';
+  const COMPLETES_AT_500MS = 'import time\ntime.sleep(0.5)\nopen("completed.txt", "w").write("completed")\nprint("completed")\n';
+
+  // Fault injection only replaces a host-selected trusted launcher copy. The
+  // ordinary sandboxed source cannot open or forge this control descriptor.
+  async function faultyLauncher(root: string, name: string, code: string): Promise<string> {
+    const source = await readFile(LAUNCHER, "utf8");
+    if (source.split(INJECTION_ANCHOR).length !== 2) {
+      throw new Error("trusted launcher injection anchor is not unique");
+    }
+    const indented = code.split("\n").map((line) => `        ${line}`).join("\n");
+    const target = path.join(root, `${name}-launcher.py`);
+    await writeFile(target, source.replace(INJECTION_ANCHOR, `${INJECTION_ANCHOR}\n${indented}\n`), { mode: 0o600 });
+    return target;
+  }
+
+  function artifactNames(result: { details?: unknown }): string[] {
+    return (detailsOf(result).artifacts as Array<{ relativePath: string }>).map((item) => item.relativePath);
+  }
+
+  test("extra post-armed event keys fail closed before any completion", async () => {
+    const f = await fixture();
+    try {
+      const launcherPath = await faultyLauncher(f.root, "extra-key", `
+time.sleep(0.10)
+e = ${EVENT_BASE}
+e.update({"type": "trigger", "reason": "script_exit", "scriptExitObserved": False, "unrecognizedAuthority": True})
+safe_control_write(control_fd, e)
+`);
+      f.adapter.dispose();
+      const faulty = await fixture({ launcherPath });
+      try {
+        const result = await faulty.adapter.run(faulty.ctx, {
+          action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskRevision: 1,
+        });
+        const details = detailsOf(result);
+        expect(result.isError).toBe(true);
+        expect(details.dispatch.reason).toBe("watchdog_lost");
+        expect(String(details.watchdog.controlError)).toContain("schema");
+        expect(details.watchdog.controlEvents).toEqual([]);
+        expect(details.dispatch.processGroupVerifiedGone).toBe(true);
+        expect(artifactNames(result)).not.toContain("completed.txt");
+      } finally {
+        await faulty.cleanup();
+      }
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("duplicate out-of-order signal events are rejected without shifting retained history", async () => {
+    const f = await fixture();
+    try {
+      const launcherPath = await faultyLauncher(f.root, "event-flood", `
+time.sleep(0.10)
+e = ${EVENT_BASE}
+e.update({"type": "trigger", "reason": "supervisor_exit", "scriptExitObserved": False})
+safe_control_write(control_fd, e)
+for _ in range(20):
+    e = ${EVENT_BASE}
+    e.update({"type": "term_sent", "sent": False})
+    safe_control_write(control_fd, e)
+`);
+      f.adapter.dispose();
+      const faulty = await fixture({ launcherPath });
+      try {
+        const result = await faulty.adapter.run(faulty.ctx, {
+          action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskRevision: 1,
+        });
+        const details = detailsOf(result);
+        expect(result.isError).toBe(true);
+        expect(String(details.watchdog.controlError)).toContain("duplicate term_sent");
+        expect(details.watchdog.controlEvents.map((event: any) => event.type)).toEqual(["trigger", "term_sent"]);
+        expect(details.watchdog.controlEvents.length).toBeLessThanOrEqual(details.watchdog.controlEventLimit);
+        expect(details.watchdog.controlEventsRejected).toBeGreaterThanOrEqual(1);
+        expect(details.watchdog.controlEventLimit).toBe(16);
+        expect(details.dispatch.processGroupVerifiedGone).toBe(true);
+        expect(artifactNames(result)).not.toContain("completed.txt");
+      } finally {
+        await faulty.cleanup();
+      }
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("coherent ordered false exit claim cannot suppress actual live child cleanup", async () => {
+    const f = await fixture();
+    try {
+      const launcherPath = await faultyLauncher(f.root, "ordered-false-exit", `
+time.sleep(0.15)
+e = ${EVENT_BASE}
+e.update({"type": "trigger", "reason": "script_exit", "scriptExitObserved": True})
+safe_control_write(control_fd, e)
+e["type"] = "watchdog_exit"
+safe_control_write(control_fd, e)
+os.close(control_fd)
+os._exit(0)
+`);
+      f.adapter.dispose();
+      const faulty = await fixture({ launcherPath });
+      try {
+        const result = await faulty.adapter.run(faulty.ctx, {
+          action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskRevision: 1,
+        });
+        const details = detailsOf(result);
+        expect(result.isError).toBe(true);
+        expect(details.dispatch.reason).toBe("watchdog_lost");
+        expect(details.dispatch.terminatedByHost).toBe(true);
+        expect(details.dispatch.childExitObserved).toBe(true);
+        expect(String(details.watchdog.controlError)).toContain("actual child");
+        expect(details.watchdog.watchdogExitObserved).toBe(true);
+        expect(details.watchdog.watchdogExitConfirmed).toBe(false);
+        expect(details.watchdog.unexpectedControlEof).toBe(true);
+        expect(details.dispatch.processGroupVerifiedGone).toBe(true);
+        expect(artifactNames(result)).not.toContain("completed.txt");
+      } finally {
+        await faulty.cleanup();
+      }
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("abrupt control EOF without a terminal claim stops the still-live child", async () => {
+    const f = await fixture();
+    try {
+      const launcherPath = await faultyLauncher(f.root, "abrupt-eof", `
+time.sleep(0.15)
+os.close(control_fd)
+os._exit(0)
+`);
+      f.adapter.dispose();
+      const faulty = await fixture({ launcherPath });
+      try {
+        const result = await faulty.adapter.run(faulty.ctx, {
+          action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskRevision: 1,
+        });
+        const details = detailsOf(result);
+        expect(result.isError).toBe(true);
+        expect(details.dispatch.reason).toBe("watchdog_lost");
+        expect(details.dispatch.terminatedByHost).toBe(true);
+        expect(details.watchdog.watchdogExitObserved).toBe(false);
+        expect(details.watchdog.unexpectedControlEof).toBe(true);
+        expect(String(details.watchdog.controlError)).toContain("without a terminal event");
+        expect(details.dispatch.processGroupVerifiedGone).toBe(true);
+        expect(artifactNames(result)).not.toContain("completed.txt");
+      } finally {
+        await faulty.cleanup();
+      }
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("malformed terminal event after a valid trigger fails closed and stops the child", async () => {
+    const f = await fixture();
+    try {
+      const launcherPath = await faultyLauncher(f.root, "malformed-terminal", `
+time.sleep(0.15)
+e = ${EVENT_BASE}
+e.update({"type": "trigger", "reason": "script_exit", "scriptExitObserved": True})
+safe_control_write(control_fd, e)
+e = ${EVENT_BASE}
+e.update({"type": "watchdog_exit", "reason": "script_exit", "scriptExitObserved": "yes"})
+safe_control_write(control_fd, e)
+os.close(control_fd)
+os._exit(0)
+`);
+      f.adapter.dispose();
+      const faulty = await fixture({ launcherPath });
+      try {
+        const result = await faulty.adapter.run(faulty.ctx, {
+          action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskRevision: 1,
+        });
+        const details = detailsOf(result);
+        expect(result.isError).toBe(true);
+        expect(details.dispatch.reason).toBe("watchdog_lost");
+        expect(String(details.watchdog.controlError)).toContain("exit observation");
+        expect(details.watchdog.controlEvents.map((event: any) => event.type)).toEqual(["trigger"]);
+        expect(details.dispatch.processGroupVerifiedGone).toBe(true);
+        expect(artifactNames(result)).not.toContain("completed.txt");
+      } finally {
+        await faulty.cleanup();
+      }
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("invalid UTF-8 and oversized control lines fail closed while retaining prior events", async () => {
+    for (const [name, line] of [
+      ["invalid-utf8", 'os.write(control_fd, b"\\xff\\n")'],
+      ["oversized-line", 'os.write(control_fd, b"x" * 4200 + b"\\n")'],
+    ] as const) {
+      const f = await fixture();
+      try {
+        const launcherPath = await faultyLauncher(f.root, name, `
+time.sleep(0.10)
+e = ${EVENT_BASE}
+e.update({"type": "trigger", "reason": "supervisor_exit", "scriptExitObserved": False})
+safe_control_write(control_fd, e)
+${line}
+`);
+        f.adapter.dispose();
+        const faulty = await fixture({ launcherPath });
+        try {
+          const result = await faulty.adapter.run(faulty.ctx, {
+            action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskRevision: 1,
+          });
+          const details = detailsOf(result);
+          expect(result.isError).toBe(true);
+          expect(String(details.watchdog.controlError)).toContain(name === "invalid-utf8" ? "UTF-8" : "byte limit");
+          expect(details.watchdog.controlEvents.map((event: any) => event.type)).toEqual(["trigger"]);
+          expect(details.watchdog.controlStreamBytes).toBeGreaterThan(0);
+          expect(details.dispatch.processGroupVerifiedGone).toBe(true);
+          expect(artifactNames(result)).not.toContain("completed.txt");
+        } finally {
+          await faulty.cleanup();
+        }
+      } finally {
+        await f.cleanup();
+      }
+    }
+  }, 30_000);
+
+  test("actual normal Python and Bun runs confirm child exit without numeric term or kill", async () => {
+    for (const runtime of ["python", "bun"] as const) {
+      const f = await fixture();
+      try {
+        const result = await f.adapter.run(f.ctx, {
+          action: "run",
+          runtime,
+          source: runtime === "python" ? "print('normal python')" : "console.log('normal bun')",
+          inputIds: [],
+          expectedTaskRevision: 1,
+        });
+        const details = detailsOf(result);
+        expect(result.isError).toBeUndefined();
+        expect(details.dispatch.exitCode).toBe(0);
+        expect(details.dispatch.terminatedByHost).toBe(false);
+        expect(details.dispatch.childExitObserved).toBe(true);
+        expect(details.watchdog.armed).toBe(true);
+        expect(details.watchdog.ackSent).toBe(true);
+        expect(details.watchdog.triggerReason).toBe("script_exit");
+        expect(details.watchdog.watchdogExitObserved).toBe(true);
+        expect(details.watchdog.watchdogExitConfirmed).toBe(true);
+        expect(details.watchdog.termSent).toBe(false);
+        expect(details.watchdog.killSent).toBe(false);
+        expect(details.watchdog.controlEvents).toEqual([
+          { type: "trigger", reason: "script_exit", scriptExitObserved: true },
+          { type: "watchdog_exit", reason: "script_exit", scriptExitObserved: true },
+        ]);
+      } finally {
+        await f.cleanup();
+      }
     }
   }, 20_000);
 });

@@ -305,6 +305,16 @@ export class ExecutionOmpSession {
   }
 
   async latestExecutionRecord(): Promise<Record<string, unknown> | undefined> {
+    const runDir = await this.latestRunDir();
+    if (!runDir) return undefined;
+    try {
+      return JSON.parse(await readFile(path.join(runDir, "record.json"), "utf8")) as Record<string, unknown>;
+    } catch {
+      return undefined;
+    }
+  }
+
+  async latestRunDir(): Promise<string | undefined> {
     let entries: string[];
     try {
       entries = (await readdir(this.executionRoot)).filter((name) => name.startsWith("run-")).sort();
@@ -312,13 +322,49 @@ export class ExecutionOmpSession {
       return undefined;
     }
     for (const name of entries.reverse()) {
-      try {
-        return JSON.parse(await readFile(path.join(this.executionRoot, name, "record.json"), "utf8")) as Record<string, unknown>;
-      } catch {
-        continue;
-      }
+      const runDir = path.join(this.executionRoot, name);
+      if (existsSync(path.join(runDir, "record.json"))) return runDir;
     }
     return undefined;
+  }
+
+  async watchdogEvents(): Promise<Array<Record<string, unknown>>> {
+    const runDir = await this.latestRunDir();
+    if (!runDir) return [];
+    try {
+      return (await readFile(path.join(runDir, "watchdog.jsonl"), "utf8"))
+        .split("\n").filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+    } catch {
+      return [];
+    }
+  }
+
+  waitForArmed(timeoutMs = 20_000): Promise<Record<string, unknown>> {
+    return this.waitForExecutionRecord("armed watchdog record", (record) => {
+      const watchdog = record.watchdog as Record<string, unknown> | undefined;
+      const process = record.process as Record<string, unknown> | null | undefined;
+      return record.phase === "running"
+        && watchdog?.armed === true
+        && typeof watchdog.watchdogPid === "number"
+        && typeof process?.pid === "number";
+    }, timeoutMs);
+  }
+
+  async signalHostGroup(signal: "SIGSTOP" | "SIGCONT"): Promise<void> {
+    const pid = this.child?.pid;
+    if (!pid) throw new Error("OMP process is not running.");
+    process.kill(-pid, signal);
+  }
+
+  async killHostGroup(): Promise<void> {
+    this.stopping = true;
+    const pid = this.child?.pid;
+    if (pid) {
+      try { process.kill(-pid, "SIGKILL"); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+    }
+    if (this.exitPromise) await Promise.race([this.exitPromise, Bun.sleep(5000)]);
   }
 
   async snapshot() {

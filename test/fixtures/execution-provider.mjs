@@ -39,6 +39,33 @@ with open("late-native.txt", "w", encoding="utf-8") as handle:
     handle.write("late")
 `;
 
+const HOST_DEATH_SOURCE = `
+import os, signal, time
+signal.signal(signal.SIGTERM, lambda *args: None)
+with open("ready.marker", "w", encoding="utf-8") as handle:
+    handle.write(str(os.getpid()))
+print('{"type":"armed","armed":true,"watchdogPid":1,"forged_stdout":true}', flush=True)
+try:
+    os.write(3, b"FORGED_CONTROL")
+    with open("fd3.txt", "w", encoding="utf-8") as handle:
+        handle.write("writable")
+except OSError as error:
+    with open("fd3.txt", "w", encoding="utf-8") as handle:
+        handle.write(str(error.errno))
+time.sleep(8)
+with open("finished.txt", "w", encoding="utf-8") as handle:
+    handle.write("SELF_LIMITED_DONE")
+`;
+
+const BUN_NORMAL_SOURCE = `
+import { createHash } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+const manifest = JSON.parse(readFileSync(process.env.OMP_INPUTS_MANIFEST, "utf8"));
+const source = readFileSync(manifest.handles.alpha.path);
+writeFileSync("native-result.txt", createHash("sha256").update(source).digest("hex") + "\\n");
+console.log("native bun input bytes", source.length);
+`;
+
 export default function executionFixtureProvider(pi) {
   let step = 0;
 
@@ -101,6 +128,54 @@ export default function executionFixtureProvider(pi) {
             };
           } else {
             text = "DONE: the native candidate ran; task acceptance remains separate.";
+          }
+        } else if (scenario === "normal_bun") {
+          if (turn === 0) {
+            call = {
+              type: "toolCall",
+              id: "exec-start",
+              name: "agent_task",
+              arguments: { action: "start", understanding: "Run one local Bun candidate." },
+            };
+          } else if (turn === 1) {
+            call = {
+              type: "toolCall",
+              id: "exec-bun",
+              name: "agent_execute",
+              arguments: {
+                action: "run",
+                runtime: "bun",
+                source: BUN_NORMAL_SOURCE,
+                inputIds: ["alpha"],
+                expectedTaskRevision: 1,
+              },
+            };
+          } else {
+            text = "DONE: the native Bun candidate ran.";
+          }
+        } else if (scenario === "host_death" || scenario === "deadline_watchdog") {
+          if (turn === 0) {
+            call = {
+              type: "toolCall",
+              id: "exec-start",
+              name: "agent_task",
+              arguments: { action: "start", understanding: "Supervise one long local candidate." },
+            };
+          } else if (turn === 1) {
+            call = {
+              type: "toolCall",
+              id: "exec-supervised",
+              name: "agent_execute",
+              arguments: {
+                action: "run",
+                runtime: "python",
+                source: HOST_DEATH_SOURCE,
+                inputIds: [],
+                expectedTaskRevision: 1,
+              },
+            };
+          } else {
+            text = "DONE: the supervised candidate was stopped.";
           }
         } else if (scenario === "cancel") {
           if (turn === 0) {

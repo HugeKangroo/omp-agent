@@ -1,6 +1,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { constants, existsSync, realpathSync } from "node:fs";
+import type { Duplex } from "node:stream";
 import {
   lstat,
   mkdir,
@@ -39,7 +40,7 @@ import type {
 
 export const EXECUTION_SCHEMA_VERSION = 1 as const;
 export const EXECUTION_TOOL = "agent_execute";
-export const EXECUTION_LIMITS_VERSION = "g2a1-v1" as const;
+export const EXECUTION_LIMITS_VERSION = "g2a2-v1" as const;
 export const EXECUTION_RUNTIMES = ["python", "bun"] as const;
 export type ExecutionRuntime = (typeof EXECUTION_RUNTIMES)[number];
 
@@ -62,12 +63,22 @@ export const EXECUTION_LIMITS = {
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 const RESPONSE_LOG_PREVIEW_BYTES = 4096;
 const MAX_SCAN_ENTRIES = 256;
+const WATCHDOG_PROTOCOL = "g2a2-watchdog-v1" as const;
+const WATCHDOG_CONTROL_MAX_LINE_BYTES = 4096;
+const WATCHDOG_CONTROL_MAX_TOTAL_BYTES = 64 * 1024;
+const WATCHDOG_CONTROL_MAX_EVENTS = 16;
+const WATCHDOG_SETTLE_MS = 2000;
+// A terminal control message is a claim, not proof that the direct child
+// exited. Allow only a small bounded window for the OS 'exit' event to be
+// delivered before treating the watchdog loss as real.
+const WATCHDOG_CHILD_EXIT_DRAIN_MS = 100;
 /**
- * Exit code 111 is also a legal untrusted-script exit. Without a separate
- * trusted pre-exec control channel, the numeric code alone cannot prove that
- * the launcher rejected the run or that no untrusted code executed.
+ * Exit code 111 is also a legal untrusted-script exit. The separate trusted
+ * control channel distinguishes a pre-exec handshake failure from a settled
+ * child; a numeric 111 after a validated acknowledgement still cannot prove
+ * that no untrusted code executed.
  */
-type LaunchStage = "spawn_failed" | "child_ran" | "unknown";
+type LaunchStage = "spawn_failed" | "handshake_failed" | "child_ran" | "unknown";
 const FORBIDDEN_RUN_KEYS = new Set([
   "command", "shell", "argv", "args", "path", "paths", "filePath", "inputPath",
   "cwd", "workDir", "home", "env", "environment", "endpoint", "url", "host",
@@ -150,6 +161,8 @@ interface PreparedRun {
   sourcePath: string;
   manifestPath: string;
   profilePath: string;
+  profileSha256: string;
+  watchdogLogPath: string;
   sourceBytes: number;
   sourceSha256: string;
   inputs: PreparedInput[];
@@ -166,7 +179,70 @@ type StopReason =
   | "task_revised"
   | "output_limit"
   | "host_record_failure"
+  | "watchdog_handshake_failed"
+  | "watchdog_lost"
   | "disposed";
+
+interface WatchdogArmedFacts {
+  protocol: string;
+  armed: true;
+  watchdogPid: number;
+  watchdogSid: number;
+  watchdogPgid: number;
+  scriptPid: number;
+  supervisorPid: number;
+  deadlineBasis: "python-monotonic";
+  durationMs: number;
+  graceMs: number;
+  armedAtMonotonic: number;
+  deadlineMonotonic: number;
+  configToken: string;
+  runtime: ExecutionRuntime;
+  profileSha256: string;
+  parentVerified: true;
+  scriptIsSessionLeader: true;
+  stdioClosed: true;
+  environmentKeys: string[];
+  signalsIgnored: true;
+}
+
+interface WatchdogOutcome {
+  protocol: string;
+  armed: boolean;
+  watchdogPid: number | null;
+  watchdogSid: number | null;
+  scriptPid: number | null;
+  supervisorPid: number;
+  deadlineBasis: string | null;
+  durationMs: number;
+  graceMs: number;
+  armedAtMonotonic: number | null;
+  deadlineMonotonic: number | null;
+  handshakeMs: number;
+  handshakeError: string | null;
+  ackAttempted: boolean;
+  ackSent: boolean;
+  triggerReason: string | null;
+  termSent: boolean;
+  killSent: boolean;
+  watchdogExitObserved: boolean;
+  watchdogExitConfirmed: boolean;
+  childExitObserved: boolean;
+  controlEnded: boolean;
+  controlError: string | null;
+  unexpectedControlEof: boolean;
+  controlEventLimit: number;
+  controlEventsRejected: number;
+  controlStreamBytes: number;
+  controlBytesDiscarded: number;
+  controlEvents: Array<Record<string, unknown>>;
+  logRef: string;
+  logAvailable: boolean;
+  pidGone: boolean | null;
+  watchdogTerminated: boolean | null;
+  watchdogKilledByHost: boolean;
+  pidReuseCaveat: string;
+}
 
 interface DispatchOutcome {
   spawned: boolean;
@@ -187,6 +263,8 @@ interface DispatchOutcome {
   groupCheckMs: number;
   launchStage: LaunchStage;
   hostRecordError: string | null;
+  childExitObserved: boolean;
+  watchdog: WatchdogOutcome;
 }
 
 interface RunBudget {
@@ -220,6 +298,10 @@ interface ArtifactRejection {
 
 function digest(bytes: Uint8Array | string): string {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function hexDigest(bytes: Uint8Array | string): string {
+  return createHash("sha256").update(bytes).digest("hex");
 }
 
 /**
@@ -475,6 +557,307 @@ function groupAlive(pgid: number): boolean {
   }
 }
 
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+function watchdogInteger(value: unknown, min: number, max: number): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= min && value <= max;
+}
+
+/**
+ * Bounded reader for the trusted launcher/watchdog event stream. Untrusted
+ * stdout/stderr are never consulted for readiness, identity or progress.
+ */
+class BoundedControlReader {
+  private buffer = Buffer.alloc(0);
+  private stopped = false;
+  totalBytes = 0;
+  discardedBytes = 0;
+
+  constructor(
+    private readonly onMessage: (message: Record<string, unknown>) => void,
+    private readonly onError: (message: string) => void,
+  ) {}
+
+  push(bytes: Buffer): void {
+    this.totalBytes += bytes.length;
+    if (this.stopped) {
+      this.discardedBytes += bytes.length;
+      return;
+    }
+    if (this.totalBytes > WATCHDOG_CONTROL_MAX_TOTAL_BYTES) {
+      this.stop("watchdog control stream exceeded its total byte limit");
+      return;
+    }
+    this.buffer = Buffer.concat([this.buffer, bytes]);
+    while (!this.stopped) {
+      const end = this.buffer.indexOf(10);
+      if (end < 0) break;
+      if (end > WATCHDOG_CONTROL_MAX_LINE_BYTES) {
+        this.stop("watchdog control line exceeded its byte limit");
+        return;
+      }
+      const line = this.buffer.subarray(0, end);
+      this.buffer = this.buffer.subarray(end + 1);
+      if (!line.length) continue;
+      let text: string;
+      try {
+        text = new TextDecoder("utf-8", { fatal: true }).decode(line);
+      } catch {
+        this.stop("watchdog control line is not valid UTF-8");
+        return;
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(text);
+      } catch {
+        this.stop("watchdog control line is not valid JSON");
+        return;
+      }
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        this.stop("watchdog control message is not an object");
+        return;
+      }
+      this.onMessage(parsed as Record<string, unknown>);
+    }
+    if (!this.stopped && this.buffer.length > WATCHDOG_CONTROL_MAX_LINE_BYTES) {
+      this.stop("watchdog control line exceeded its byte limit");
+    }
+  }
+
+  end(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    if (this.buffer.length > 0) this.onError("watchdog control stream ended with a partial line");
+  }
+
+  private stop(message: string): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.onError(message);
+  }
+}
+
+function validateArmedFacts(
+  message: Record<string, unknown>,
+  expected: {
+    supervisorPid: number;
+    scriptPid: number;
+    durationMs: number;
+    graceMs: number;
+    configToken: string;
+    runtime: ExecutionRuntime;
+    profileSha256: string;
+  },
+): WatchdogArmedFacts | string {
+  const keys = [
+    "type", "protocol", "armed", "watchdogPid", "watchdogSid", "watchdogPgid",
+    "scriptPid", "supervisorPid", "deadlineBasis", "durationMs", "graceMs",
+    "armedAtMonotonic", "deadlineMonotonic", "configToken", "runtime",
+    "profileSha256", "parentVerified", "scriptIsSessionLeader", "stdioClosed",
+    "environmentKeys", "signalsIgnored",
+  ].sort();
+  if (JSON.stringify(Object.keys(message).sort()) !== JSON.stringify(keys)) {
+    return "armed record does not match the expected schema";
+  }
+  if (message.type !== "armed" || message.protocol !== WATCHDOG_PROTOCOL || message.armed !== true) {
+    return "armed record has the wrong type or protocol";
+  }
+  if (!watchdogInteger(message.watchdogPid, 2, 2 ** 31 - 1)
+    || !watchdogInteger(message.watchdogSid, 2, 2 ** 31 - 1)
+    || !watchdogInteger(message.watchdogPgid, 2, 2 ** 31 - 1)) {
+    return "armed record has an invalid watchdog identity";
+  }
+  if (message.watchdogSid !== message.watchdogPid || message.watchdogPgid !== message.watchdogPid) {
+    return "watchdog is not an independent session and process-group leader";
+  }
+  if (message.scriptPid !== expected.scriptPid) return "armed record does not match the actual script PID";
+  if (message.supervisorPid !== expected.supervisorPid) return "armed record does not match the host supervisor PID";
+  if (message.watchdogPid === message.scriptPid || message.watchdogPid === message.supervisorPid) {
+    return "watchdog identity collides with a known process";
+  }
+  if (message.deadlineBasis !== "python-monotonic") return "deadline basis is not the shared Python monotonic clock";
+  if (message.durationMs !== expected.durationMs) return "independent deadline duration does not match the host configuration";
+  if (message.graceMs !== expected.graceMs) return "watchdog termination grace does not match the host configuration";
+  if (message.configToken !== expected.configToken) return "armed record does not match the per-run configuration token";
+  if (message.runtime !== expected.runtime) return "armed record runtime does not match the actual run";
+  if (message.profileSha256 !== expected.profileSha256) return "armed record does not match the actual sandbox profile";
+  if (message.parentVerified !== true || message.scriptIsSessionLeader !== true || message.stdioClosed !== true) {
+    return "launcher trust-boundary verification did not succeed";
+  }
+  if (message.signalsIgnored !== true) return "watchdog termination-signal isolation is absent";
+  const environmentKeys = message.environmentKeys;
+  if (!Array.isArray(environmentKeys)
+    || environmentKeys.length !== 2
+    || environmentKeys[0] !== "LC_ALL"
+    || environmentKeys[1] !== "PATH") {
+    return "watchdog retained an unexpected environment";
+  }
+  if (typeof message.armedAtMonotonic !== "number" || !Number.isFinite(message.armedAtMonotonic)
+    || typeof message.deadlineMonotonic !== "number" || !Number.isFinite(message.deadlineMonotonic)
+    || message.deadlineMonotonic <= message.armedAtMonotonic
+    || message.deadlineMonotonic - message.armedAtMonotonic > expected.durationMs / 1000 + 1) {
+    return "armed record has an inconsistent independent deadline";
+  }
+  return {
+    protocol: WATCHDOG_PROTOCOL,
+    armed: true,
+    watchdogPid: message.watchdogPid,
+    watchdogSid: message.watchdogSid,
+    watchdogPgid: message.watchdogPgid,
+    scriptPid: message.scriptPid,
+    supervisorPid: message.supervisorPid,
+    deadlineBasis: "python-monotonic",
+    durationMs: message.durationMs,
+    graceMs: message.graceMs,
+    armedAtMonotonic: message.armedAtMonotonic,
+    deadlineMonotonic: message.deadlineMonotonic,
+    configToken: message.configToken,
+    runtime: message.runtime as ExecutionRuntime,
+    profileSha256: message.profileSha256,
+    parentVerified: true,
+    scriptIsSessionLeader: true,
+    stdioClosed: true,
+    environmentKeys: ["LC_ALL", "PATH"],
+    signalsIgnored: true,
+  };
+}
+
+type WatchdogTriggerReason = "script_exit" | "supervisor_exit" | "absolute_deadline";
+
+interface ControlLifecycle {
+  triggerSeen: boolean;
+  triggerReason: WatchdogTriggerReason | null;
+  triggerScriptExitObserved: boolean;
+  termSeen: boolean;
+  killSeen: boolean;
+  exitSeen: boolean;
+  failureSeen: boolean;
+}
+
+const CONTROL_EVENT_IDENTITY_KEYS = ["type", "protocol", "watchdogPid", "scriptPid", "supervisorPid"] as const;
+
+function exactKeys(message: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(message).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function validateControlEvent(
+  message: Record<string, unknown>,
+  armed: WatchdogArmedFacts,
+  lifecycle: ControlLifecycle,
+): string | undefined {
+  if (message.protocol !== WATCHDOG_PROTOCOL) return "watchdog event protocol mismatch";
+  if (!watchdogInteger(message.watchdogPid, 2, 2 ** 31 - 1)
+    || !watchdogInteger(message.scriptPid, 2, 2 ** 31 - 1)
+    || !watchdogInteger(message.supervisorPid, 2, 2 ** 31 - 1)) {
+    return "watchdog event has an invalid process identity";
+  }
+  if (message.watchdogPid !== armed.watchdogPid
+    || message.scriptPid !== armed.scriptPid
+    || message.supervisorPid !== armed.supervisorPid) {
+    return "watchdog event identity mismatch";
+  }
+  if (message.type === "armed") return "duplicate watchdog armed record";
+  if (lifecycle.exitSeen) return "watchdog event arrived after the terminal exit record";
+  if (lifecycle.failureSeen) return "watchdog event arrived after a failure record";
+  switch (message.type) {
+    case "trigger": {
+      if (lifecycle.triggerSeen) return "duplicate watchdog trigger";
+      if (!exactKeys(message, [...CONTROL_EVENT_IDENTITY_KEYS, "reason", "scriptExitObserved"])) {
+        return "watchdog trigger event does not match the expected schema";
+      }
+      if (message.reason !== "script_exit"
+        && message.reason !== "supervisor_exit"
+        && message.reason !== "absolute_deadline") {
+        return "watchdog trigger reason is not recognized";
+      }
+      if (typeof message.scriptExitObserved !== "boolean") return "watchdog trigger is missing the exit observation";
+      if (message.reason === "script_exit" && message.scriptExitObserved !== true) {
+        return "script_exit trigger contradicts its exit observation";
+      }
+      if (message.reason !== "script_exit" && message.scriptExitObserved !== false) {
+        return "non-script trigger contradicts its exit observation";
+      }
+      return undefined;
+    }
+    case "term_sent": {
+      if (!lifecycle.triggerSeen) return "term_sent arrived before a trigger";
+      if (lifecycle.termSeen) return "duplicate term_sent";
+      if (lifecycle.triggerScriptExitObserved) return "term_sent contradicts an observed script exit";
+      if (!exactKeys(message, [...CONTROL_EVENT_IDENTITY_KEYS, "sent"])) {
+        return "watchdog term event does not match the expected schema";
+      }
+      if (typeof message.sent !== "boolean") return "watchdog signal event is missing its result";
+      return undefined;
+    }
+    case "kill_sent": {
+      if (!lifecycle.termSeen) return "kill_sent arrived before term_sent";
+      if (lifecycle.killSeen) return "duplicate kill_sent";
+      if (!exactKeys(message, [...CONTROL_EVENT_IDENTITY_KEYS, "sent"])) {
+        return "watchdog kill event does not match the expected schema";
+      }
+      if (typeof message.sent !== "boolean") return "watchdog signal event is missing its result";
+      return undefined;
+    }
+    case "watchdog_exit": {
+      if (!lifecycle.triggerSeen) return "watchdog_exit arrived before a trigger";
+      if (lifecycle.exitSeen) return "duplicate watchdog_exit";
+      if (!exactKeys(message, [...CONTROL_EVENT_IDENTITY_KEYS, "reason", "scriptExitObserved"])) {
+        return "watchdog exit event does not match the expected schema";
+      }
+      if (message.reason !== lifecycle.triggerReason) {
+        return "watchdog exit reason contradicts the trigger reason";
+      }
+      if (typeof message.scriptExitObserved !== "boolean") return "watchdog exit event is missing the exit observation";
+      if (message.reason === "script_exit" && message.scriptExitObserved !== true) {
+        return "script_exit terminal contradicts its exit observation";
+      }
+      return undefined;
+    }
+    case "watchdog_failure": {
+      if (lifecycle.failureSeen) return "duplicate watchdog_failure";
+      if (!exactKeys(message, [...CONTROL_EVENT_IDENTITY_KEYS, "error"])) {
+        return "watchdog failure event does not match the expected schema";
+      }
+      if (typeof message.error !== "string" || message.error.length < 1 || message.error.length > 200) {
+        return "watchdog failure event is malformed";
+      }
+      return undefined;
+    }
+    default:
+      return `unknown watchdog event: ${String(message.type)}`;
+  }
+}
+
+function watchdogSnapshot(
+  armed: WatchdogArmedFacts | null,
+  events: readonly Record<string, unknown>[],
+): Record<string, unknown> {
+  return {
+    protocol: WATCHDOG_PROTOCOL,
+    armed: armed !== null,
+    watchdogPid: armed?.watchdogPid ?? null,
+    watchdogSid: armed?.watchdogSid ?? null,
+    scriptPid: armed?.scriptPid ?? null,
+    supervisorPid: armed?.supervisorPid ?? null,
+    deadlineBasis: armed?.deadlineBasis ?? null,
+    durationMs: armed?.durationMs ?? null,
+    graceMs: armed?.graceMs ?? null,
+    armedAtMonotonic: armed?.armedAtMonotonic ?? null,
+    deadlineMonotonic: armed?.deadlineMonotonic ?? null,
+    controlEvents: [...events],
+    pidReuseCaveat: "numeric process-group/PID checks are bounded local facts; PID reuse is not proven and unrelated PIDs are never inspected",
+  };
+}
+
 function scalar(value: unknown, limit = 500): unknown {
   return typeof value === "string" && value.length > limit ? `${value.slice(0, limit)}…` : value;
 }
@@ -600,6 +983,7 @@ function boundedRunResponse(
     dispatch: dispatch === undefined
       ? undefined
       : Object.fromEntries(Object.entries(dispatch).map(([key, value]) => [key, scalar(value, 500)])),
+    watchdog: details.watchdog,
     output: {
       observedBytes: output.observedBytes,
       retainedBytes: output.retainedBytes,
@@ -852,12 +1236,22 @@ export class ExecutionAdapter {
             externalSignals: false,
             failureMode: "fail-closed; no unsandboxed fallback",
             metadataCaveat: "global file metadata reads are permitted; path metadata is not claimed secret",
-            hostLifetime: "deadline and process cleanup require a live host process; parent death is not independently enforced in A1",
+            hostLifetime: "a trusted separate-session watchdog independently terminates the script on supervisor death or its own absolute deadline; the TypeScript timer, abort and owner-cancel paths remain auxiliary",
+          },
+          supervision: {
+            protocol: WATCHDOG_PROTOCOL,
+            armedHandshake: "required before untrusted interpreter exec",
+            deadlineBasis: "trusted launcher Python monotonic clock, computed immediately before watchdog fork",
+            parentDeath: true,
+            termination: "SIGTERM then bounded grace then SIGKILL; queued script exit is drained first",
+            pidReuseCaveat: "bounded local prototype; numeric process-group reuse is not proven impossible and unrelated PIDs are never inspected",
+            guarantees: "no hard memory limit, aggregate disk quota or adversarial multi-tenant isolation is added",
           },
           notes: [
             "Inputs enter the child only after host authorization and a fresh read-only copy on an independent inode.",
-            "Artifacts are exported only after the process group is verified gone; exit code 0 is not task acceptance.",
+            "Artifacts are exported only after the process group and watchdog are verified settled; exit code 0 is not task acceptance.",
             "No hard memory limit or aggregate disk quota is claimed for this prototype.",
+            "The watchdog log and control pipe are evidence/control channels, never script-authored authority.",
           ],
         },
       };
@@ -1129,7 +1523,9 @@ export class ExecutionAdapter {
           spawnError: outcome.spawnError,
           launchStage: outcome.launchStage,
           hostRecordError: outcome.hostRecordError,
+          watchdog: outcome.watchdog,
         },
+        watchdog: outcome.watchdog,
         output: {
           observedBytes: outcome.observedBytes,
           retainedBytes: outcome.retainedBytes,
@@ -1185,11 +1581,19 @@ export class ExecutionAdapter {
           processGroupVerifiedGone: outcome.groupGone,
           spawnError: outcome.spawnError,
           launchStage: outcome.launchStage,
-          launchStageNote: outcome.launchStage === "unknown"
-            ? "exit code 111 alone is not proof of pre-exec launcher failure or that no untrusted code ran"
-            : null,
+          launchStageNote: outcome.watchdog.ackSent
+            ? "armed handshake acknowledged; user-code start is not independently proven, so exit/signal/artifacts are observations of the launched wrapper; exit code 111 alone is not proof of pre-exec launcher failure or that no untrusted code ran"
+            : outcome.launchStage === "handshake_failed"
+              ? "the trusted armed handshake did not complete; no acknowledgement was sent, so untrusted code was not started by a correctly handled launch"
+              : "the acknowledgement outcome is unproven; the wrapper exit and actual return code are reported as observed facts",
+          wrapperExitObserved: outcome.exitCode !== null || outcome.signal !== null,
+          userCodeStart: outcome.watchdog.ackSent ? "unproven" : "not_acknowledged",
+          watchdogArmed: outcome.watchdog.armed,
+          watchdogTerminated: outcome.watchdog.watchdogTerminated,
+          childExitObserved: outcome.childExitObserved,
           hostRecordError: outcome.hostRecordError,
         },
+        watchdog: outcome.watchdog,
         hostRecordErrors: {
           afterSpawn: outcome.hostRecordError,
           finalRecord: finalRecordError,
@@ -1231,7 +1635,13 @@ export class ExecutionAdapter {
         }],
         details,
         ...(outcome.spawnError
-          || outcome.launchStage === "unknown"
+          || outcome.launchStage === "handshake_failed"
+          || !outcome.watchdog.armed
+          || !outcome.watchdog.ackSent
+          || outcome.watchdog.watchdogTerminated !== true
+          || outcome.watchdog.controlError !== null
+          || outcome.watchdog.unexpectedControlEof
+          || outcome.watchdog.watchdogKilledByHost
           || outcome.hostRecordError
           || finalRecordError
           || artifactExportError
@@ -1257,6 +1667,10 @@ export class ExecutionAdapter {
         signal: outcome.signal,
         stopReason: outcome.stopReason,
         groupGone: outcome.groupGone,
+        watchdogArmed: outcome.watchdog.armed,
+        watchdogTerminated: outcome.watchdog.watchdogTerminated,
+        watchdogTriggerReason: outcome.watchdog.triggerReason,
+        watchdogControlError: outcome.watchdog.controlError,
         artifacts: artifacts.length,
         artifactRejections: rejections.length,
         visible,
@@ -1487,12 +1901,14 @@ export class ExecutionAdapter {
       ? ["-I", "-B", sourcePath]
       : ["run", "--no-env-file", "--no-install", sourcePath];
     const profilePath = path.join(runRoot, "profile.sb");
-    await writeFile(profilePath, sandboxProfile({
+    const profileBytes = Buffer.from(sandboxProfile({
       interpreterPath: realInterpreter,
       sourceRoot,
       inputRoot,
       workRoot,
-    }), { flag: "wx", mode: 0o600 });
+    }), "utf8");
+    const profileSha256 = hexDigest(profileBytes);
+    await writeFile(profilePath, profileBytes, { flag: "wx", mode: 0o600 });
     const childEnv: NodeJS.ProcessEnv = {
       PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
       LANG: "C.UTF-8",
@@ -1523,6 +1939,8 @@ export class ExecutionAdapter {
       sourcePath,
       manifestPath,
       profilePath,
+      profileSha256,
+      watchdogLogPath: path.join(runRoot, "watchdog.jsonl"),
       sourceBytes: sourceBytes.length,
       sourceSha256,
       inputs,
@@ -1543,6 +1961,8 @@ export class ExecutionAdapter {
     onSpawned: () => void,
   ): Promise<DispatchOutcome> {
     const startedAt = Date.now();
+    const configToken = randomUUID();
+    const watchdogLogRef = `${path.basename(prepared.runRoot)}/watchdog.jsonl`;
     let child: ChildProcess;
     try {
       child = spawn(
@@ -1551,6 +1971,14 @@ export class ExecutionAdapter {
           "-I", "-B", this.launcherPath,
           "--profile", prepared.profilePath,
           "--fsize", String(EXECUTION_LIMITS.maxFileSizeBytes),
+          "--supervisor-pid", String(process.pid),
+          "--deadline-ms", String(this.dispatchWallMs),
+          "--grace-ms", String(this.terminationGraceMs),
+          "--control-fd", "3",
+          "--ack-fd", "4",
+          "--watchdog-log", prepared.watchdogLogPath,
+          "--config-token", configToken,
+          "--runtime", runtime,
           "--",
           prepared.interpreter,
           ...prepared.interpreterArgs,
@@ -1559,7 +1987,7 @@ export class ExecutionAdapter {
           cwd: prepared.workRoot,
           env: prepared.childEnv,
           detached: true,
-          stdio: ["ignore", "pipe", "pipe"],
+          stdio: ["ignore", "pipe", "pipe", "pipe", "pipe"],
           windowsHide: true,
         },
       );
@@ -1583,6 +2011,44 @@ export class ExecutionAdapter {
         groupCheckMs: 0,
         launchStage: "spawn_failed",
         hostRecordError: null,
+        childExitObserved: false,
+        watchdog: {
+          protocol: WATCHDOG_PROTOCOL,
+          armed: false,
+          watchdogPid: null,
+          watchdogSid: null,
+          scriptPid: null,
+          supervisorPid: process.pid,
+          deadlineBasis: null,
+          durationMs: this.dispatchWallMs,
+          graceMs: this.terminationGraceMs,
+          armedAtMonotonic: null,
+          deadlineMonotonic: null,
+          handshakeMs: 0,
+          handshakeError: "no process was spawned",
+          ackAttempted: false,
+          ackSent: false,
+          triggerReason: null,
+          termSent: false,
+          killSent: false,
+          watchdogExitObserved: false,
+          watchdogExitConfirmed: false,
+          childExitObserved: false,
+          controlEnded: false,
+          controlError: null,
+          unexpectedControlEof: false,
+          controlEventLimit: WATCHDOG_CONTROL_MAX_EVENTS,
+          controlEventsRejected: 0,
+          controlStreamBytes: 0,
+          controlBytesDiscarded: 0,
+          controlEvents: [],
+          logRef: watchdogLogRef,
+          logAvailable: false,
+          pidGone: null,
+          watchdogTerminated: null,
+          watchdogKilledByHost: false,
+          pidReuseCaveat: "numeric process-group/PID checks are bounded local facts; PID reuse is not proven and unrelated PIDs are never inspected",
+        },
       };
     }
     // Ownership of the actual child starts here. Attach an error sink before
@@ -1607,6 +2073,7 @@ export class ExecutionAdapter {
     let terminatedByHost = false;
     let groupCheckMs = 0;
     let closed = false;
+    let childExitObserved = false;
     let exitCode: number | null = null;
     let exitSignal: NodeJS.Signals | null = null;
     let hostRecordError: string | null = null;
@@ -1635,6 +2102,179 @@ export class ExecutionAdapter {
       })();
     };
     registerStop(requestStop);
+    const controlStream = (child.stdio[3] ?? null) as unknown as Duplex | null;
+    const ackStream = (child.stdio[4] ?? null) as unknown as Duplex | null;
+    let armed: WatchdogArmedFacts | null = null;
+    let handshakeError: string | null = null;
+    let ackAttempted = false;
+    let ackSent = false;
+    let controlError: string | null = null;
+    let controlEnded = false;
+    let watchdogExitObserved = false;
+    let watchdogExitConfirmed = false;
+    let triggerReason: string | null = null;
+    let termSent = false;
+    let killSent = false;
+    let unexpectedControlEof = false;
+    let watchdogKilledByHost = false;
+    let handshakeMs = 0;
+    let controlEventsRejected = 0;
+    let controlLossTask: Promise<void> | undefined;
+    const controlEvents: Array<Record<string, unknown>> = [];
+    const lifecycle: ControlLifecycle = {
+      triggerSeen: false,
+      triggerReason: null,
+      triggerScriptExitObserved: false,
+      termSeen: false,
+      killSeen: false,
+      exitSeen: false,
+      failureSeen: false,
+    };
+    const recordControlRejection = (message: string): void => {
+      // The first protocol error is authoritative; later benign records must
+      // never replace it or become trusted history.
+      controlEventsRejected += 1;
+      if (controlError === null) controlError = message;
+      if (armed === null && handshakeError === null) handshakeError = message;
+      if (!closed && !stopReason) {
+        requestStop(armed === null ? "watchdog_handshake_failed" : "watchdog_lost");
+      }
+    };
+    const verifyControlLoss = (): void => {
+      if (controlLossTask) return;
+      controlLossTask = (async () => {
+        if (armed === null || !controlEnded || stopReason !== null) return;
+        if (!watchdogExitObserved) {
+          unexpectedControlEof = true;
+          if (controlError === null) {
+            controlError = "watchdog control stream ended without a terminal event";
+          }
+        } else if (childExitObserved) {
+          watchdogExitConfirmed = true;
+          return;
+        }
+        if (childExitObserved) return;
+        const drainDeadline = Date.now() + WATCHDOG_CHILD_EXIT_DRAIN_MS;
+        while (!childExitObserved && !closed && stopReason === null && Date.now() < drainDeadline) {
+          await delay(5);
+        }
+        if (childExitObserved) {
+          if (watchdogExitObserved) watchdogExitConfirmed = true;
+          return;
+        }
+        if (closed || stopReason !== null) return;
+        if (watchdogExitObserved && controlError === null) {
+          controlError = "watchdog terminal event claimed script exit while the actual child was still running";
+          unexpectedControlEof = true;
+        }
+        requestStop("watchdog_lost");
+      })();
+    };
+    const endControl = (): void => {
+      if (controlEnded) return;
+      controlEnded = true;
+      parser.end();
+      if (closed) {
+        if (armed !== null && watchdogExitObserved && childExitObserved) watchdogExitConfirmed = true;
+        return;
+      }
+      if (armed === null) {
+        if (!stopReason) requestStop("watchdog_handshake_failed");
+        return;
+      }
+      verifyControlLoss();
+    };
+    const handleControlError = (message: string): void => {
+      if (controlError === null) controlError = message;
+      if (armed === null && handshakeError === null) handshakeError = message;
+      if (!closed && !stopReason) {
+        requestStop(armed === null ? "watchdog_handshake_failed" : "watchdog_lost");
+      }
+    };
+    const handleControlMessage = (message: Record<string, unknown>): void => {
+      if (controlEnded || controlError !== null || handshakeError !== null) {
+        controlEventsRejected += 1;
+        return;
+      }
+      if (armed === null) {
+        const validated = validateArmedFacts(message, {
+          supervisorPid: process.pid,
+          scriptPid: pid,
+          durationMs: this.dispatchWallMs,
+          graceMs: this.terminationGraceMs,
+          configToken,
+          runtime,
+          profileSha256: prepared.profileSha256,
+        });
+        if (typeof validated === "string") {
+          recordControlRejection(validated);
+          return;
+        }
+        armed = validated;
+        handshakeMs = Date.now() - startedAt;
+        return;
+      }
+      const invalid = validateControlEvent(message, armed, lifecycle);
+      if (invalid !== undefined) {
+        recordControlRejection(invalid);
+        return;
+      }
+      if (controlEvents.length >= WATCHDOG_CONTROL_MAX_EVENTS) {
+        recordControlRejection(
+          `watchdog control event limit ${WATCHDOG_CONTROL_MAX_EVENTS} exceeded; retained ${controlEvents.length} earlier events`,
+        );
+        return;
+      }
+      controlEvents.push({
+        type: message.type,
+        ...(typeof message.reason === "string" ? { reason: message.reason } : {}),
+        ...(typeof message.sent === "boolean" ? { sent: message.sent } : {}),
+        ...(typeof message.scriptExitObserved === "boolean"
+          ? { scriptExitObserved: message.scriptExitObserved }
+          : {}),
+        ...(typeof message.error === "string" ? { error: message.error.slice(0, 200) } : {}),
+      });
+      switch (message.type) {
+        case "trigger":
+          lifecycle.triggerSeen = true;
+          lifecycle.triggerReason = message.reason as WatchdogTriggerReason;
+          lifecycle.triggerScriptExitObserved = message.scriptExitObserved as boolean;
+          triggerReason = message.reason as string;
+          break;
+        case "term_sent":
+          lifecycle.termSeen = true;
+          if (message.sent === true) termSent = true;
+          break;
+        case "kill_sent":
+          lifecycle.killSeen = true;
+          if (message.sent === true) killSent = true;
+          break;
+        case "watchdog_exit":
+          lifecycle.exitSeen = true;
+          watchdogExitObserved = true;
+          if (childExitObserved) watchdogExitConfirmed = true;
+          break;
+        case "watchdog_failure":
+          lifecycle.failureSeen = true;
+          controlError = `watchdog failure: ${String(message.error)}`;
+          if (!closed && !stopReason) requestStop("watchdog_lost");
+          break;
+      }
+    };
+    const parser = new BoundedControlReader(handleControlMessage, handleControlError);
+    controlStream?.on("data", (bytes: Buffer) => parser.push(bytes));
+    controlStream?.on("end", endControl);
+    controlStream?.on("close", endControl);
+    controlStream?.on("error", (error: Error) => {
+      handleControlError(`watchdog control channel error: ${errorMessage(error)}`);
+      endControl();
+    });
+    ackStream?.on("error", (error: Error) => {
+      if (!ackSent) {
+        handshakeError = `acknowledgement channel error: ${errorMessage(error)}`;
+        if (!closed && !stopReason) requestStop("watchdog_handshake_failed");
+      }
+    });
     const onChunk = (bytes: Buffer): void => {
       observedBytes += bytes.length;
       const remaining = EXECUTION_LIMITS.maxRetainedOutputBytes - retainedBytes;
@@ -1653,6 +2293,11 @@ export class ExecutionAdapter {
     };
     child.stdout!.on("data", onChunk);
     child.stderr!.on("data", onChunk);
+    // 'exit' proves the direct child exited. 'close' additionally waits for
+    // inherited stdio pipes, so it must never be used as that proof.
+    child.on("exit", () => {
+      childExitObserved = true;
+    });
     const closedPromise = new Promise<void>((resolve) => {
       child.on("close", (code, exit) => {
         closed = true;
@@ -1666,19 +2311,89 @@ export class ExecutionAdapter {
     const onAbort = (): void => requestStop("abort_signal");
     signal?.addEventListener("abort", onAbort, { once: true });
 
-    // Post-spawn host I/O may fail. It must not disable termination or turn a
-    // real child into an unmanaged process; any failure requests the same
-    // owned group stop and is reported as a host-record fault.
-    try {
-      onSpawned();
-      this.recordWriter(recordPath, {
-        ...baseRecord,
-        phase: "running",
-        process: { pid, pgid, detachedSessionLeader: true, startedAt: this.now() },
+    onSpawned();
+
+    // The host must see a validated, registered watchdog before the trusted
+    // launcher is allowed to exec the untrusted interpreter. A timeout, EOF,
+    // malformed record, identity/config mismatch or host-record fault means
+    // no acknowledgement and no untrusted execution.
+    const handshakeDeadline = Date.now() + Math.max(1000, Math.min(5000, this.dispatchWallMs));
+    while (armed === null && !closed && stopReason === null && handshakeError === null
+      && Date.now() < handshakeDeadline) {
+      await delay(5);
+    }
+    if (armed === null && handshakeError === null) {
+      handshakeError = closed
+        ? "launcher exited before the armed handshake"
+        : stopReason !== null
+          ? `armed handshake ended because ${stopReason}`
+          : "armed handshake timed out";
+    }
+    // The watchdog record is assigned from the control callback. Keep an
+    // explicitly typed snapshot so control-flow narrowing of the closure
+    // variable cannot erase the actual runtime state.
+    const observedArmed = armed as unknown as WatchdogArmedFacts | null;
+    if (observedArmed !== null) {
+      const runningWatchdog = watchdogSnapshot(observedArmed, controlEvents);
+      try {
+        this.recordWriter(recordPath, {
+          ...baseRecord,
+          phase: "running",
+          process: { pid, pgid, detachedSessionLeader: true, startedAt: this.now(), watchdog: runningWatchdog },
+          watchdog: runningWatchdog,
+        });
+      } catch (error) {
+        hostRecordError = `host record write failed after spawn: ${errorMessage(error)}`;
+        if (!stopReason) requestStop("host_record_failure");
+      }
+    }
+    if (observedArmed !== null && !closed && stopReason === null && controlError === null && hostRecordError === null) {
+      ackAttempted = true;
+      const acknowledgement = `${JSON.stringify({
+        type: "ack",
+        protocol: WATCHDOG_PROTOCOL,
+        configToken,
+        scriptPid: pid,
+        supervisorPid: process.pid,
+      })}\n`;
+      ackSent = await new Promise<boolean>((resolve) => {
+        if (!ackStream) {
+          handshakeError = "acknowledgement channel is unavailable";
+          resolve(false);
+          return;
+        }
+        let settled = false;
+        let ackTimer: ReturnType<typeof setTimeout>;
+        const finish = (ok: boolean, error?: string): void => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(ackTimer);
+          if (error !== undefined) handshakeError = error;
+          resolve(ok);
+        };
+        ackTimer = setTimeout(() => finish(false, "acknowledgement write timed out"), 1000);
+        try {
+          ackStream.write(acknowledgement, (error?: Error | null) => {
+            if (error) finish(false, `acknowledgement write failed: ${errorMessage(error)}`);
+            else finish(true);
+          });
+        } catch (error) {
+          finish(false, `acknowledgement write failed: ${errorMessage(error)}`);
+        }
       });
-    } catch (error) {
-      hostRecordError = `host record write failed after spawn: ${errorMessage(error)}`;
-      requestStop("host_record_failure");
+      if (ackSent) {
+        try { ackStream?.end(); } catch { /* channel already closing */ }
+      } else if (!stopReason) {
+        requestStop("watchdog_handshake_failed");
+      }
+    } else if (observedArmed !== null && !closed && !stopReason && !ackSent) {
+      requestStop(hostRecordError !== null ? "host_record_failure" : "watchdog_handshake_failed");
+    }
+    if (observedArmed === null && !closed && !stopReason) {
+      requestStop("watchdog_handshake_failed");
+    }
+    if (!ackSent) {
+      try { ackStream?.destroy(); } catch { /* channel already closed */ }
     }
 
     try {
@@ -1699,9 +2414,95 @@ export class ExecutionAdapter {
     while (groupAlive(pgid) && Date.now() - groupCheckStart < 2000) await delay(10);
     groupCheckMs = Date.now() - groupCheckStart;
     const groupGone = !groupAlive(pgid);
+
+    // Normal completion requires both the actual script group gone and the
+    // watchdog process gone. Control EOF alone only proves its writer closed;
+    // it is not a process-exit proof. The watchdog keeps the writer open until
+    // just before exit, so EOF plus a bounded known-PID check are combined.
+    let pidGone: boolean | null = null;
+    if (observedArmed === null) {
+      const settleDeadline = Date.now() + 500;
+      while (!controlEnded && Date.now() < settleDeadline) await delay(10);
+    } else {
+      if (!controlEnded) {
+        const settleDeadline = Date.now() + WATCHDOG_SETTLE_MS;
+        while (!controlEnded && Date.now() < settleDeadline) await delay(10);
+        if (!controlEnded && pidAlive(observedArmed.watchdogPid)) {
+          // The control writer is still open, so this known PID is the
+          // watchdog rather than a reused unrelated process. Kill it to avoid
+          // leaking a watchdog when the host must return.
+          watchdogKilledByHost = true;
+          try { process.kill(observedArmed.watchdogPid, "SIGKILL"); } catch { /* already gone */ }
+          const killDeadline = Date.now() + 500;
+          while (!controlEnded && Date.now() < killDeadline) await delay(10);
+        }
+      }
+      const pidDeadline = Date.now() + WATCHDOG_SETTLE_MS;
+      while (pidAlive(observedArmed.watchdogPid) && Date.now() < pidDeadline) await delay(10);
+      pidGone = !pidAlive(observedArmed.watchdogPid);
+      if (pidGone && !controlEnded) {
+        const controlDeadline = Date.now() + 500;
+        while (!controlEnded && Date.now() < controlDeadline) await delay(10);
+      }
+      if (!controlEnded && controlError === null) {
+        controlError = "watchdog did not close its control stream";
+      }
+    }
+    if (observedArmed !== null && controlEnded && !watchdogExitObserved && !watchdogKilledByHost) {
+      unexpectedControlEof = true;
+    }
+    if (!controlEnded) {
+      try { controlStream?.destroy(); } catch { /* channel already closed */ }
+    }
+    if (controlLossTask) await controlLossTask;
+    const watchdog: WatchdogOutcome = {
+      protocol: WATCHDOG_PROTOCOL,
+      armed: observedArmed !== null,
+      watchdogPid: observedArmed?.watchdogPid ?? null,
+      watchdogSid: observedArmed?.watchdogSid ?? null,
+      scriptPid: observedArmed?.scriptPid ?? null,
+      supervisorPid: process.pid,
+      deadlineBasis: observedArmed?.deadlineBasis ?? null,
+      durationMs: observedArmed?.durationMs ?? this.dispatchWallMs,
+      graceMs: observedArmed?.graceMs ?? this.terminationGraceMs,
+      armedAtMonotonic: observedArmed?.armedAtMonotonic ?? null,
+      deadlineMonotonic: observedArmed?.deadlineMonotonic ?? null,
+      handshakeMs,
+      handshakeError,
+      ackAttempted,
+      ackSent,
+      triggerReason,
+      termSent,
+      killSent,
+      watchdogExitObserved,
+      watchdogExitConfirmed,
+      childExitObserved,
+      controlEnded,
+      controlError: controlError ?? (observedArmed === null ? handshakeError : null),
+      unexpectedControlEof,
+      controlEventLimit: WATCHDOG_CONTROL_MAX_EVENTS,
+      controlEventsRejected,
+      controlStreamBytes: parser.totalBytes,
+      controlBytesDiscarded: parser.discardedBytes,
+      controlEvents: controlEvents.slice(-WATCHDOG_CONTROL_MAX_EVENTS),
+      logRef: watchdogLogRef,
+      logAvailable: existsSync(prepared.watchdogLogPath),
+      pidGone,
+      watchdogTerminated: observedArmed === null ? null : pidGone === true,
+      watchdogKilledByHost,
+      pidReuseCaveat: "numeric process-group/PID checks are bounded local facts; PID reuse is not proven and unrelated PIDs are never inspected",
+    };
+    // Acknowledging the armed record does not prove that the interpreter
+    // started, so launchStage stays unknown after ACK. Actual wrapper exit,
+    // signal, output and artifacts remain observed execution facts; only 111
+    // without host termination keeps the A1 ambiguity error.
+    const launchStage: LaunchStage = observedArmed === null
+      ? "handshake_failed"
+      : !ackSent
+        ? (ackAttempted ? "unknown" : "handshake_failed")
+        : "unknown";
     const durationMs = Date.now() - startedAt;
     const logText = Buffer.concat(chunks).toString("utf8");
-    const launchStage: LaunchStage = exitCode === 111 && !terminatedByHost ? "unknown" : "child_ran";
     safeAudit(this.audit, {
       type: "execution_process_settled",
       runId: prepared.runId,
@@ -1718,6 +2519,12 @@ export class ExecutionAdapter {
       retainedBytes,
       truncated,
       hostRecordError,
+      watchdogArmed: watchdog.armed,
+      watchdogPid: watchdog.watchdogPid,
+      watchdogTerminated: watchdog.watchdogTerminated,
+      watchdogTriggerReason: watchdog.triggerReason,
+      watchdogControlError: watchdog.controlError,
+      launchStage,
     });
     return {
       spawned: true,
@@ -1738,6 +2545,8 @@ export class ExecutionAdapter {
       groupCheckMs,
       launchStage,
       hostRecordError,
+      childExitObserved,
+      watchdog,
     };
   }
 

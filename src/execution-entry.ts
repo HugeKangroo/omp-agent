@@ -37,7 +37,7 @@ interface OmpApi {
   registerTool(tool: OmpTool): void;
 }
 
-export const EXECUTION_ENTRY_VERSION = "0.1.0-g2a1.0";
+export const EXECUTION_ENTRY_VERSION = "0.1.0-g2a2.0";
 
 const EXECUTION_PARAMETERS = {
   type: "object",
@@ -72,7 +72,7 @@ const EXECUTION_PARAMETERS = {
   required: ["action"],
 } as const;
 
-const DESCRIPTION = "Generic local candidate execution for the current managed task. describe reports actual host-selected Python/Bun versions, truthful limits, the current task revision and authorized input handles without creating authority. run executes one bounded task-local Python or Bun script in a fresh private work directory with read-only authorized inputs, no network, no subprocess creation, no hardlinks, bounded output and host-owned artifacts. Exit 0 is candidate generation only and is never task acceptance. The host chooses paths, runtime, environment and limits; paths, shell commands, environment variables, endpoints, identities, budgets and policies are not accepted from the model.";
+const DESCRIPTION = "Generic local candidate execution for the current managed task. describe reports actual host-selected Python/Bun versions, truthful limits, the current task revision and authorized input handles without creating authority. run executes one bounded task-local Python or Bun script in a fresh private work directory with read-only authorized inputs, no network, no subprocess creation, no hardlinks, bounded output and host-owned artifacts, supervised by an independently forked trusted watchdog that enforces parent death and the absolute deadline. Exit 0 is candidate generation only and is never task acceptance. The host chooses paths, runtime, environment and limits; paths, shell commands, environment variables, endpoints, identities, budgets and policies are not accepted from the model.";
 
 function stderr(message: string, details?: unknown): void {
   try {
