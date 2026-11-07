@@ -104,8 +104,25 @@ integration("native G2-A1: real OMP registers agent_task/agent_execute, describe
   expect(emitted).toContain("agent_task");
   expect(emitted.filter((name) => name === "agent_execute").length).toBe(2);
   const describeTurn = snapshot.fixtureAudit.find((event) =>
-    event.type === "model_turn" && String(event.lastToolResult).includes("local Python/Bun candidate execution is available"));
+    event.type === "model_turn" && String(event.lastToolResult).includes("action=describe"));
   expect(describeTurn).toBeTruthy();
+  expect(describeTurn!.modelViewMissing).toEqual([]);
+  const describeContent = String(describeTurn!.lastToolResult);
+  expect(describeContent).toContain("model-visible execution view g2a3-model-view-v1");
+  expect(describeContent).toContain("OMP_WORK_DIR");
+  expect(describeContent).toContain("OMP_INPUTS_MANIFEST");
+  expect(describeContent).toContain(`- id="alpha" name="${path.basename(session.inputPath)}" bytes=${inputBefore.length} sha256="sha256:${sha256(inputBefore)}" writable=false available=true`);
+  expect(describeContent).toContain("attempts: limit=8 attempted=0 dispatched=0 reserved=0 remaining=8");
+  const runTurn = snapshot.fixtureAudit.find((event) =>
+    event.type === "model_turn" && String(event.lastToolResult).includes("action=run"));
+  expect(runTurn).toBeTruthy();
+  expect(runTurn!.modelViewMissing).toEqual([]);
+  const runContent = String(runTurn!.lastToolResult);
+  expect(runContent).toContain(`- id="alpha" bytes=${inputBefore.length} sha256="sha256:${sha256(inputBefore)}" writable=false`);
+  expect(runContent).toContain('- artifactId="artifact-1" relativePath="native-result.txt"');
+  expect(runContent).toMatch(/archiveRef="run-[^"]+\/artifacts\/artifact-1\.bin"/);
+  expect(runContent).toContain("taskAccepted=false");
+  expect(runContent).toContain("attempts limit=8 attempted=1 dispatched=1 reserved=0 remaining=7");
   const toolsSeen = snapshot.fixtureAudit.find((event) => event.type === "model_turn" && Array.isArray(event.tools));
   expect((toolsSeen!.tools as string[]).sort()).toEqual(["agent_execute", "agent_task"]);
 
@@ -140,6 +157,10 @@ integration("native G2-A2: Bun candidate is verified and both script and watchdo
   expect(`sha256:${sha256(archived)}`).toBe(String(artifact!.sha256));
   expect(archived.toString("utf8")).toBe(`${sha256(inputBefore)}\n`);
   expect(await readFile(session.inputPath)).toEqual(inputBefore);
+  const checkedTurns = snapshot.fixtureAudit.filter((event) =>
+    event.type === "model_turn" && Array.isArray(event.modelViewMissing));
+  expect(checkedTurns.length).toBeGreaterThan(0);
+  expect(checkedTurns.every((event) => (event.modelViewMissing as string[]).length === 0)).toBe(true);
   expect(snapshot.executionAudit.some((event) => event.type === "execution_failed")).toBe(false);
 });
 

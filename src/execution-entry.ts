@@ -37,7 +37,7 @@ interface OmpApi {
   registerTool(tool: OmpTool): void;
 }
 
-export const EXECUTION_ENTRY_VERSION = "0.1.0-g2a2.0";
+export const EXECUTION_ENTRY_VERSION = "0.1.0-g2a3.0";
 
 const EXECUTION_PARAMETERS = {
   type: "object",
@@ -72,7 +72,7 @@ const EXECUTION_PARAMETERS = {
   required: ["action"],
 } as const;
 
-const DESCRIPTION = "Generic local candidate execution for the current managed task. describe reports actual host-selected Python/Bun versions, truthful limits, the current task revision and authorized input handles without creating authority. run executes one bounded task-local Python or Bun script in a fresh private work directory with read-only authorized inputs, no network, no subprocess creation, no hardlinks, bounded output and host-owned artifacts, supervised by an independently forked trusted watchdog that enforces parent death and the absolute deadline. Exit 0 is candidate generation only and is never task acceptance. The host chooses paths, runtime, environment and limits; paths, shell commands, environment variables, endpoints, identities, budgets and policies are not accepted from the model.";
+const DESCRIPTION = "Generic local candidate execution for the current managed task. describe reports the versioned model-visible execution view: actual host-selected Python/Bun versions, truthful limits, the current task identity/revision, authorized input handles (id, bytes, sha256, writable:false, availability) and remaining launch attempts without creating authority. run executes one bounded task-local Python or Bun script in a fresh private work directory. Inside the script, cwd is that writable workDir; OMP_WORK_DIR and OMP_INPUTS_MANIFEST are host-provided environment entries. Read OMP_INPUTS_MANIFEST as JSON; manifest.handles[inputId] is {path, bytes, sha256, writable:false} and the manifest also carries workDir, sourcePath and runtime. Pass inputIds to stage read-only copies, use only the current manifest paths, use only runtime stdlib/builtins (no installs, network or subprocess creation), and write intended candidate files as ordinary top-level files directly in the current cwd with relative paths so the host archives them; no copy-back to a host workspace is supported. Every run is fresh, and previous-run archives are not automatically readable or writable inputs. run returns the real runId/revision/runtime, observed process and watchdog facts, explicit output observed/retained/shown/omitted/truncated counts, candidate artifact rows with artifactId/relativePath/archiveRef/bytes/sha256, export rejections, host-record/control errors, taskAccepted:false and remaining attempts. Exit 0 is candidate generation only and is never task acceptance. The host chooses paths, runtime, environment and limits; paths, shell commands, environment variables, endpoints, identities, budgets and policies are not accepted from the model.";
 
 function stderr(message: string, details?: unknown): void {
   try {

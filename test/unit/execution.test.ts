@@ -147,6 +147,10 @@ function detailsOf(result: { details?: unknown }): Record<string, any> {
   return result.details as Record<string, any>;
 }
 
+function contentOf(result: { content: Array<{ type: "text"; text: string }> }): string {
+  return result.content.map((part) => part.text).join("\n");
+}
+
 const PYTHON_INPUT_ARTIFACT = `
 import hashlib, json, os
 manifest = json.load(open(os.environ["OMP_INPUTS_MANIFEST"], encoding="utf-8"))
@@ -275,12 +279,41 @@ describe("agent_execute describe", () => {
       });
       expect(result.isError).toBeUndefined();
       expect(detailsOf(result).runtimeVersion).toBe(original);
+      const runContent = contentOf(result);
+      expect(runContent).toContain(`version="${original}"`);
+      expect(runContent).not.toContain("FORGED-VERSION");
       const record = JSON.parse(await readFile(path.join(f.root, String(detailsOf(result).hostRecordRef)), "utf8"));
       expect(record.runtimeVersion).toBe(original);
     } finally {
       await f.cleanup();
     }
   }, 20_000);
+
+  test("describe content alone carries task, runtimes, authorized inputs, limits, attempts and the generic I/O guide", async () => {
+    const f = await fixture();
+    try {
+      const content = contentOf(await f.adapter.describe(f.ctx));
+      expect(content).toContain("model-visible execution view g2a3-model-view-v1");
+      expect(content).toContain("action=describe");
+      expect(content).toMatch(/task taskId="task-[^"]+" taskRevision=1 taskStatus="active"/);
+      expect(content).toMatch(/- name="python" version="\d+\.\d+\.\d+" hostSelected=true available=true/);
+      expect(content).toMatch(/- name="bun" version="\d+\.\d+\.\d+" hostSelected=true available=true/);
+      expect(content).toContain(`- id="alpha" name="alpha.txt" bytes=${f.alphaBytes.length} sha256="${sha256(f.alphaBytes)}" writable=false available=true`);
+      expect(content).toContain("limits: version=\"g2a2-v1\" maxInputs=8");
+      expect(content).toContain("attempts: limit=8 attempted=0 dispatched=0 reserved=0 remaining=8");
+      expect(content).toContain("authority candidateOnly=true taskAccepted=false");
+      expect(content).toContain("OMP_WORK_DIR");
+      expect(content).toContain("OMP_INPUTS_MANIFEST");
+      expect(content).toContain("manifest.handles[inputId] is {path, bytes, sha256, writable:false}");
+      expect(content).toContain("never guess a host workspace, private archive or previous-run directory");
+      expect(content).toContain("Write intended candidate files as ordinary top-level files");
+      expect(content).toContain("Previous-run artifacts/archives are not automatically readable or writable inputs");
+      expect(content).not.toContain(f.fixtures);
+      expect(content).not.toContain(f.root);
+    } finally {
+      await f.cleanup();
+    }
+  });
 
   test("describe withholds task and input metadata when the binding detaches during inspection", async () => {
     const f = await fixture();
@@ -346,6 +379,229 @@ describe("generic Python and Bun execution", () => {
       const cpus = details.artifacts.find((item: any) => item.relativePath === "cpus.txt");
       expect(cpus).toBeTruthy();
       expect(Number(await readFile(path.join(f.root, cpus.archiveRef), "utf8"))).toBeGreaterThan(0);
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+});
+
+describe("model-visible execution view", () => {
+  test("run content alone carries the I/O guide, actual input metadata, a sentinel beyond 500 bytes and returned artifact refs", async () => {
+    const f = await fixture();
+    try {
+      const source = `
+import hashlib, json, os
+manifest = json.load(open(os.environ["OMP_INPUTS_MANIFEST"], encoding="utf-8"))
+source = open(manifest["handles"]["alpha"]["path"], "rb").read()
+open("computed.txt", "w", encoding="utf-8").write(hashlib.sha256(source).hexdigest())
+print("A" * 600 + "SENTINEL_BEYOND_500")
+`;
+      const result = await f.adapter.run(f.ctx, {
+        action: "run",
+        runtime: "python",
+        source,
+        inputIds: ["alpha"],
+        expectedTaskRevision: 1,
+      });
+      const content = contentOf(result);
+      expect(content).toContain("model-visible execution view g2a3-model-view-v1");
+      expect(content).toContain("action=run");
+      expect(content).toMatch(/run runId="run-[^"]+" callId="call-[^"]+" taskId="task-[^"]+" taskRevision=1 ownerId="owner-g2a1-unit"/);
+      expect(content).toMatch(/runtime name="python" version="\d+\.\d+\.\d+"/);
+      expect(content).toMatch(/availableRuntimes: python="\d+\.\d+\.\d+" bun="\d+\.\d+\.\d+"/);
+      expect(content).toContain('limits: version="g2a2-v1" maxInputs=8');
+      expect(content).toContain(`- id="alpha" bytes=${f.alphaBytes.length} sha256="${sha256(f.alphaBytes)}" writable=false`);
+      expect(content).toContain("SENTINEL_BEYOND_500");
+      expect(content).toContain("outputPreviewBegin");
+      expect(content).toContain("outputPreviewEnd");
+      expect(content).toMatch(/output observedBytes=\d+ retainedBytes=\d+ decodedTextBytes=\d+ shownBytes=\d+ omittedBytes=0 truncated=false observedAfterRetentionBytes=0 previewTruncated=false droppedIncompleteBytes=0 invalidEncoding=false/);
+      expect(content).toContain("artifacts total=1 shown=1 omitted=0 withheld=false");
+      expect(content).toContain('- artifactId="artifact-1" relativePath="computed.txt"');
+      expect(content).toMatch(/archiveRef="run-[^"]+\/artifacts\/artifact-1\.bin"/);
+      expect(content).toMatch(/sha256="sha256:[0-9a-f]{64}" verified=true/);
+      expect(content).toContain("artifactRejections total=0 shown=0 omitted=0 withheld=false");
+      expect(content).toContain("attempts limit=8 attempted=1 dispatched=1 reserved=0 remaining=7");
+      expect(content).toContain("authority candidateOnly=true taskAccepted=false toolIsError=false");
+      expect(content).toContain("note: exit code 0 and exported artifacts are candidate generation only; the task is not accepted.");
+      expect(content).toContain("OMP_INPUTS_MANIFEST");
+      expect(content).not.toContain(f.fixtures);
+      expect(content).not.toContain(f.root);
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("run content truncates a preview on a UTF-8 boundary and counts actual emitted bytes", async () => {
+    const f = await fixture();
+    try {
+      const result = await f.adapter.run(f.ctx, {
+        action: "run",
+        runtime: "python",
+        source: "import sys\nsys.stdout.write(\"€\" * 2000 + \"TAIL_BEYOND_PREVIEW\")\n",
+        inputIds: [],
+        expectedTaskRevision: 1,
+      });
+      const content = contentOf(result);
+      expect(content).toContain("€");
+      expect(content).not.toContain("TAIL_BEYOND_PREVIEW");
+      expect(content).not.toContain("\uFFFD");
+      expect(content).toMatch(/shownBytes=4095 omittedBytes=\d+ truncated=false/);
+      expect(content).toMatch(/omittedBytes=(\d+)/);
+      expect(Number(/omittedBytes=(\d+)/.exec(content)?.[1])).toBeGreaterThan(0);
+      expect(content).toContain("previewTruncated=true");
+      const previewSection = content.split("outputPreviewBegin")[1]!.split("outputPreviewEnd")[0]!;
+      const preview = previewSection.slice(previewSection.indexOf("\n") + 1).replace(/\n$/, "");
+      expect(Buffer.byteLength(preview, "utf8")).toBe(4095);
+      expect(content).not.toContain("\uFFFD");
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("invalid UTF-8 keeps raw capture bytes and computes preview omission in the decoded text domain", async () => {
+    const f = await fixture();
+    try {
+      const result = await f.adapter.run(f.ctx, {
+        action: "run",
+        runtime: "python",
+        source: "import os\nos.write(1, b'\\xff' * 2000)\n",
+        inputIds: [],
+        expectedTaskRevision: 1,
+      });
+      const details = detailsOf(result);
+      expect(details.output.observedBytes).toBe(2000);
+      expect(details.output.retainedBytes).toBe(2000);
+      expect(details.output.decodedTextBytes).toBe(6000);
+      expect(details.output.droppedIncompleteBytes).toBe(0);
+      expect(details.output.invalidEncoding).toBe(true);
+      expect(details.output.shownBytes).toBe(4095);
+      expect(details.output.omittedBytes).toBe(1905);
+      expect(details.output.previewTruncated).toBe(true);
+      const content = contentOf(result);
+      expect(content).toContain("observedBytes=2000 retainedBytes=2000 decodedTextBytes=6000");
+      expect(content).toContain("shownBytes=4095 omittedBytes=1905");
+      expect(content).toContain("previewTruncated=true droppedIncompleteBytes=0 invalidEncoding=true");
+      expect(content).toContain('decodingPolicy="utf8-invalid-to-replacement; incomplete-trailing-capture-dropped"');
+      const previewSection = content.split("outputPreviewBegin")[1]!.split("outputPreviewEnd")[0]!;
+      const preview = previewSection.slice(previewSection.indexOf("\n") + 1).replace(/\n$/, "");
+      expect(Buffer.byteLength(preview, "utf8")).toBe(4095);
+      const record = JSON.parse(await readFile(path.join(f.root, String(details.hostRecordRef)), "utf8"));
+      expect(record.output.observedBytes).toBe(2000);
+      expect(record.output.retainedBytes).toBe(2000);
+      expect(record.output.decodedTextBytes).toBe(6000);
+      expect(record.output.droppedIncompleteBytes).toBe(0);
+      expect(record.output.invalidEncoding).toBe(true);
+      expect(Buffer.byteLength(record.output.text, "utf8")).toBe(6000);
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("a complete invalid trailing byte is replaced and flagged, not dropped as a cap split", async () => {
+    const f = await fixture();
+    try {
+      const result = await f.adapter.run(f.ctx, {
+        action: "run",
+        runtime: "python",
+        source: "import os\nos.write(1, b'\\xc0')\n",
+        inputIds: [],
+        expectedTaskRevision: 1,
+      });
+      const details = detailsOf(result);
+      expect(details.output.observedBytes).toBe(1);
+      expect(details.output.retainedBytes).toBe(1);
+      expect(details.output.decodedTextBytes).toBe(3);
+      expect(details.output.droppedIncompleteBytes).toBe(0);
+      expect(details.output.invalidEncoding).toBe(true);
+      expect(details.output.text).toBe("\uFFFD");
+      const record = JSON.parse(await readFile(path.join(f.root, String(details.hostRecordRef)), "utf8"));
+      expect(record.output.decodedTextBytes).toBe(3);
+      expect(record.output.droppedIncompleteBytes).toBe(0);
+      expect(record.output.invalidEncoding).toBe(true);
+      expect(record.output.text).toBe("\uFFFD");
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("literal U+FFFD in valid UTF-8 is not reported as invalid encoding", async () => {
+    const f = await fixture();
+    try {
+      const result = await f.adapter.run(f.ctx, {
+        action: "run",
+        runtime: "python",
+        source: "import sys\nsys.stdout.write('\\uFFFD' * 2000)\n",
+        inputIds: [],
+        expectedTaskRevision: 1,
+      });
+      const details = detailsOf(result);
+      expect(details.output.decodedTextBytes).toBe(6000);
+      expect(details.output.droppedIncompleteBytes).toBe(0);
+      expect(details.output.invalidEncoding).toBe(false);
+      expect(details.output.shownBytes).toBe(4095);
+      expect(details.output.omittedBytes).toBe(1905);
+      expect(details.output.previewTruncated).toBe(true);
+      const content = contentOf(result);
+      expect(content).toContain("decodedTextBytes=6000");
+      expect(content).toContain("droppedIncompleteBytes=0 invalidEncoding=false");
+      expect(content).toContain("\uFFFD");
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("a multi-byte code point split by the capture cap is counted, not replaced", async () => {
+    const f = await fixture({ dispatchWallMs: 5000 });
+    try {
+      const result = await f.adapter.run(f.ctx, {
+        action: "run",
+        runtime: "python",
+        source: "import sys\nsys.stdout.write('\\u20ac' * 30000)\n",
+        inputIds: [],
+        expectedTaskRevision: 1,
+      });
+      const details = detailsOf(result);
+      expect(details.output.truncated).toBe(true);
+      expect(details.output.retainedBytes).toBe(EXECUTION_LIMITS.maxRetainedOutputBytes);
+      expect(details.output.droppedIncompleteBytes).toBe(1);
+      expect(details.output.decodedTextBytes).toBe(EXECUTION_LIMITS.maxRetainedOutputBytes - 1);
+      expect(details.output.invalidEncoding).toBe(false);
+      expect(Buffer.byteLength(details.output.text, "utf8")).toBe(4095);
+      expect(contentOf(result)).not.toContain("\uFFFD");
+      const content = contentOf(result);
+      expect(content).toContain(`droppedIncompleteBytes=1 invalidEncoding=false`);
+      expect(content).toContain("previewTruncated=true");
+      const record = JSON.parse(await readFile(path.join(f.root, String(details.hostRecordRef)), "utf8"));
+      expect(record.output.retainedBytes).toBe(EXECUTION_LIMITS.maxRetainedOutputBytes);
+      expect(record.output.droppedIncompleteBytes).toBe(1);
+      expect(record.output.decodedTextBytes).toBe(EXECUTION_LIMITS.maxRetainedOutputBytes - 1);
+      expect(record.output.text).not.toContain("\uFFFD");
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("an invalid partial sequence at the capture cap is replaced, not dropped as valid pending UTF-8", async () => {
+    const f = await fixture({ dispatchWallMs: 5000 });
+    try {
+      const result = await f.adapter.run(f.ctx, {
+        action: "run",
+        runtime: "python",
+        source: "import os\nos.write(1, b'A' * 65534)\nos.write(1, b'\\xe0\\x80')\nos.write(1, b'TAIL')\n",
+        inputIds: [],
+        expectedTaskRevision: 1,
+      });
+      const details = detailsOf(result);
+      expect(details.output.truncated).toBe(true);
+      expect(details.output.retainedBytes).toBe(EXECUTION_LIMITS.maxRetainedOutputBytes);
+      expect(details.output.droppedIncompleteBytes).toBe(0);
+      expect(details.output.decodedTextBytes).toBe(EXECUTION_LIMITS.maxRetainedOutputBytes + 4);
+      expect(details.output.invalidEncoding).toBe(true);
+      const record = JSON.parse(await readFile(path.join(f.root, String(details.hostRecordRef)), "utf8"));
+      expect(record.output.droppedIncompleteBytes).toBe(0);
+      expect(record.output.decodedTextBytes).toBe(EXECUTION_LIMITS.maxRetainedOutputBytes + 4);
+      expect(record.output.invalidEncoding).toBe(true);
+      expect(record.output.text.endsWith("\uFFFD\uFFFD")).toBe(true);
     } finally {
       await f.cleanup();
     }
@@ -685,6 +941,11 @@ describe("limits, cancellation and evidence", () => {
       expect(details.dispatch.processGroupVerifiedGone).toBe(true);
       expect(details.output.text.length).toBeLessThanOrEqual(4096);
       expect(details.output.omittedFromResponseBytes).toBeGreaterThan(0);
+      const content = contentOf(result);
+      expect(content).toMatch(/shownBytes=\d+ omittedBytes=\d+ truncated=true/);
+      expect(content).toContain("previewTruncated=true");
+      expect(content).toContain("outputPreviewBegin");
+      expect(content).not.toContain("x".repeat(EXECUTION_LIMITS.maxRetainedOutputBytes));
     } finally {
       await f.cleanup();
     }
@@ -786,6 +1047,11 @@ with open("fsize.json", "w", encoding="utf-8") as handle:
       expect(String(details.hostRecordErrors.finalRecord)).toContain("injected record fault");
       expect(writes).toBe(3);
       expect(() => process.kill(details.dispatch.pid, 0)).toThrow();
+      const content = contentOf(result);
+      expect(content).toContain('stopReason="host_record_failure"');
+      expect(content).toContain('afterSpawn="host record write failed after spawn: injected record fault"');
+      expect(content).toContain('finalRecord="final host record write failed: injected record fault"');
+      expect(content).toContain("toolIsError=true");
     } finally {
       await f.cleanup();
     }
@@ -822,6 +1088,13 @@ with open("fsize.json", "w", encoding="utf-8") as handle:
       expect(details.artifacts.some((item: any) => item.relativePath === "done.txt")).toBe(true);
       expect(() => process.kill(details.dispatch.pid, 0)).toThrow();
       expect(() => process.kill(details.watchdog.watchdogPid, 0)).toThrow();
+      const content = contentOf(result);
+      expect(content).toContain('finalRecord="final host record write failed: injected final record fault"');
+      expect(content).toContain('artifactRejections total=0 shown=0 omitted=0 withheld=false');
+      expect(content).toContain('relativePath="done.txt"');
+      expect(content).toContain("archiveRef=");
+      expect(content).toContain("toolIsError=true");
+      expect(content).toContain("taskAccepted=false");
     } finally {
       await f.cleanup();
     }
@@ -905,6 +1178,11 @@ print("completed candidate artifacts")
       });
       const details = detailsOf(result);
       expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThanOrEqual(EXECUTION_LIMITS.maxToolResponseBytes);
+      const content = contentOf(result);
+      expect(content).toContain("artifacts total=8 shown=8 omitted=0 withheld=false");
+      expect(content).toMatch(/artifactRejections total=248 shown=8 omitted=240 withheld=false/);
+      expect(content).toContain("\\u0001\\u0001\\u0001");
+      expect(Buffer.byteLength(content, "utf8")).toBeLessThanOrEqual(EXECUTION_LIMITS.maxToolResponseBytes);
       expect(details.runId).toBeString();
       expect(details.dispatch.spawned).toBe(true);
       expect(details.dispatch.processGroupVerifiedGone).toBe(true);
@@ -915,9 +1193,13 @@ print("completed candidate artifacts")
       expect(details.artifactRejectionsOmitted).toBeGreaterThan(200);
       expect(details.artifactRejectionsRecordRef).toBe(details.hostRecordRef);
       expect(details.artifactRejections.every((item: any) => item.relativePath.startsWith("\u0001".repeat(200)))).toBe(true);
+      expect(details.output.shownBytes).toBe(Buffer.byteLength(details.output.text, "utf8"));
+      expect(details.output.omittedBytes).toBe(Math.max(0, details.output.decodedTextBytes - details.output.shownBytes));
 
       const record = JSON.parse(await readFile(path.join(f.root, String(details.hostRecordRef)), "utf8"));
       expect(record.phase).toBe("completed");
+      expect(record.output.decodedTextBytes).toBe(Buffer.byteLength(record.output.text, "utf8"));
+      expect(record.output.invalidEncoding).toBe(false);
       expect(record.artifactRejections.length).toBe(248);
       expect(details.artifactRejectionsShown + details.artifactRejectionsOmitted).toBe(record.artifactRejections.length);
       const rejected = record.artifactRejections.find((item: any) => item.reason === "artifact count limit");
@@ -999,6 +1281,14 @@ describe("owner authority changes during a run", () => {
       expect(details.dispatch.processGroupVerifiedGone).toBe(true);
       expect(details.artifactsWithheld).toBe(true);
       expect(details.artifacts).toEqual([]);
+      const content = contentOf(result);
+      expect(content).toContain("visible=false");
+      expect(content).toContain("outputPreviewWithheld=true");
+      expect(content).toMatch(/artifacts total=\d+ shown=0 omitted=\d+ withheld=true/);
+      expect(content).toMatch(/artifactRejections total=\d+ shown=0 omitted=\d+ withheld=true/);
+      expect(content).not.toContain("late.txt");
+      expect(content).not.toContain("late output");
+      expect(content).toContain("taskAccepted=false");
       expect(f.owner.snapshot().currentTask?.taskRevision).toBe(2);
     } finally {
       await f.cleanup();
@@ -1024,6 +1314,99 @@ describe("owner authority changes during a run", () => {
       expect(details.bindingAfter.state).toBe("detached");
       expect(details.artifactsWithheld).toBe(true);
       expect(details.withheldReason).toContain("host record");
+      const content = contentOf(result);
+      expect(content).toContain('bindingAfter="detached"');
+      expect(content).toContain("visible=false");
+      expect(content).toContain("outputPreviewWithheld=true");
+      expect(content).not.toContain("late.txt");
+      expect(content).not.toContain("late output");
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+  test("a final record callback that detaches the live binding conceals output and artifact paths while the raw record survives", async () => {
+    let writes = 0;
+    let f: Fixture;
+    f = await fixture({
+      dispatchWallMs: 5000,
+      recordWriter: (filePath, value) => {
+        writes += 1;
+        writeFileSync(filePath, JSON.stringify(value));
+        if (writes === 3) f.owner.navigate("session_tree", SESSION);
+      },
+    });
+    try {
+      const result = await f.adapter.run(f.ctx, {
+        action: "run",
+        runtime: "python",
+        source: "print('visible-before-detach')\nopen('secret.txt', 'w', encoding='utf-8').write('secret-output')\n",
+        inputIds: [],
+        expectedTaskRevision: 1,
+      });
+      expect(writes).toBe(3);
+      const content = contentOf(result);
+      expect(content).toContain('bindingAfter="detached"');
+      expect(content).toContain("visible=false");
+      expect(content).toContain("outputPreviewWithheld=true");
+      expect(content).toMatch(/artifacts total=1 shown=0 omitted=1 withheld=true/);
+      expect(content).not.toContain("visible-before-detach");
+      expect(content).not.toContain("secret.txt");
+      expect(content).not.toContain("secret-output");
+      const recordPath = path.join(f.root, (await f.runDirs())[0]!, "record.json");
+      const record = JSON.parse(await readFile(recordPath, "utf8"));
+      expect(record.output.text).toContain("visible-before-detach");
+      expect(record.artifacts.some((item: any) => item.relativePath === "secret.txt")).toBe(true);
+      expect(record.artifactRejections).toEqual([]);
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("an execution_completed audit callback that detaches conceals output and artifact paths after the final check", async () => {
+    const f = await fixture({ dispatchWallMs: 5000 });
+    const auditSeam = f.adapter as unknown as { audit: (event: Record<string, unknown>) => void };
+    const originalAudit = auditSeam.audit;
+    let detachedInAudit = false;
+    auditSeam.audit = (event) => {
+      originalAudit(event);
+      if (event.type === "execution_completed") {
+        detachedInAudit = true;
+        f.owner.navigate("session_tree", SESSION);
+      }
+    };
+    try {
+      const result = await f.adapter.run(f.ctx, {
+        action: "run",
+        runtime: "python",
+        source: "import os\nprint('AUDIT_PRIVATE_STDOUT')\nopen('audit-private-artifact.txt', 'w', encoding='utf-8').write('ok')\nos.mkdir('audit-private-rejection')\n",
+        inputIds: [],
+        expectedTaskRevision: 1,
+      });
+      expect(detachedInAudit).toBe(true);
+      expect(f.owner.bindingStatus().state).toBe("detached");
+      const details = detailsOf(result);
+      expect(details.bindingAfter.state).toBe("detached");
+      expect(details.visible).toBe(false);
+      expect(details.output.text).toBe("");
+      expect(details.artifacts).toEqual([]);
+      expect(details.artifactRejections).toEqual([]);
+      expect(details.artifactsWithheld).toBe(true);
+      expect(details.artifactRejectionsWithheld).toBe(true);
+      const content = contentOf(result);
+      expect(content).toContain('bindingAfter="detached"');
+      expect(content).toContain("visible=false");
+      expect(content).toContain("outputPreviewWithheld=true");
+      expect(content).toMatch(/artifacts total=1 shown=0 omitted=1 withheld=true/);
+      expect(content).toMatch(/artifactRejections total=1 shown=0 omitted=1 withheld=true/);
+      const serialized = JSON.stringify(result);
+      expect(serialized).not.toContain("AUDIT_PRIVATE_STDOUT");
+      expect(serialized).not.toContain("audit-private-artifact.txt");
+      expect(serialized).not.toContain("audit-private-rejection");
+      const recordPath = path.join(f.root, (await f.runDirs())[0]!, "record.json");
+      const record = JSON.parse(await readFile(recordPath, "utf8"));
+      expect(record.output.text).toContain("AUDIT_PRIVATE_STDOUT");
+      expect(record.artifacts.some((item: any) => item.relativePath === "audit-private-artifact.txt")).toBe(true);
+      expect(record.artifactRejections.some((item: any) => item.relativePath === "audit-private-rejection")).toBe(true);
     } finally {
       await f.cleanup();
     }

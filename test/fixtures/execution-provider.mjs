@@ -87,12 +87,40 @@ export default function executionFixtureProvider(pi) {
       queueMicrotask(() => {
         const turn = step++;
         const toolResults = context.messages.filter((message) => message.role === "toolResult");
+        const lastToolResult = textOf(toolResults.at(-1)?.content);
+        const requiredMarkers = scenario === "normal" && turn === 2
+          ? [
+            "model-visible execution view g2a3-model-view-v1",
+            "action=describe",
+            "OMP_WORK_DIR",
+            "OMP_INPUTS_MANIFEST",
+            "authorizedInputs",
+            'id="alpha"',
+            "writable=false",
+            "remaining=",
+            "taskAccepted=false",
+          ]
+          : (scenario === "normal" && turn === 3) || (scenario === "normal_bun" && turn === 2)
+            ? [
+              "model-visible execution view g2a3-model-view-v1",
+              "action=run",
+              'runId="run-',
+              'relativePath="native-result.txt"',
+              "artifactId=",
+              "archiveRef=",
+              "shownBytes=",
+              "taskAccepted=false",
+              "remaining=",
+            ]
+            : [];
         audit({
           type: "model_turn",
           step: turn,
           tools: context.tools.map((tool) => tool.name),
           toolResultCount: toolResults.length,
-          lastToolResult: textOf(toolResults.at(-1)?.content).slice(0, 3000),
+          lastToolResult: lastToolResult.slice(0, 12000),
+          lastToolResultBytes: Buffer.byteLength(lastToolResult, "utf8"),
+          modelViewMissing: requiredMarkers.filter((marker) => !lastToolResult.includes(marker)),
         });
 
         let call;

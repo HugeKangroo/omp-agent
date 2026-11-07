@@ -41,6 +41,12 @@ import type {
 export const EXECUTION_SCHEMA_VERSION = 1 as const;
 export const EXECUTION_TOOL = "agent_execute";
 export const EXECUTION_LIMITS_VERSION = "g2a2-v1" as const;
+/**
+ * The model-visible projection is versioned independently from host records.
+ * Only tool content text reaches an OpenAI-completions model; details are
+ * never serialized into the provider request.
+ */
+export const EXECUTION_MODEL_VIEW_VERSION = "g2a3-model-view-v1" as const;
 export const EXECUTION_RUNTIMES = ["python", "bun"] as const;
 export type ExecutionRuntime = (typeof EXECUTION_RUNTIMES)[number];
 
@@ -254,6 +260,9 @@ interface DispatchOutcome {
   durationMs: number;
   observedBytes: number;
   retainedBytes: number;
+  decodedTextBytes: number;
+  droppedIncompleteBytes: number;
+  invalidEncoding: boolean;
   truncated: boolean;
   observedAfterRetentionBytes: number;
   logText: string;
@@ -883,9 +892,86 @@ function responseByteLength(result: ExecutionToolResult): number {
   return Buffer.byteLength(JSON.stringify(result), "utf8");
 }
 
+/**
+ * Trim a UTF-8 preview without cutting a code point. The previous byte slice
+ * could end mid-sequence and decode a fabricated U+FFFD into model-visible
+ * content. shownBytes/omittedBytes are always measured on the emitted text.
+ */
 function utf8Window(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
   const bytes = Buffer.from(text, "utf8");
-  return bytes.length <= maxBytes ? text : bytes.subarray(0, maxBytes).toString("utf8");
+  if (bytes.length <= maxBytes) return text;
+  let end = maxBytes;
+  while (end > 0 && (bytes[end]! & 0xc0) === 0x80) end -= 1;
+  return bytes.subarray(0, end).toString("utf8");
+}
+
+const OUTPUT_DECODING_POLICY = "utf8-invalid-to-replacement; incomplete-trailing-capture-dropped";
+
+interface DecodedCapture {
+  text: string;
+  decodedTextBytes: number;
+  droppedIncompleteBytes: number;
+  invalidEncoding: boolean;
+}
+
+/**
+ * Decode a byte-bounded capture without fabricating a replacement code point
+ * for a code point split by the capture cap. Bytes actually decoded as invalid
+ * are replaced with U+FFFD; literal U+FFFD in valid UTF-8 remains distinct
+ * because invalidEncoding is false there.
+ */
+function utf8LeadLength(first: number): number {
+  if (first < 0x80) return 1;
+  if (first >= 0xc2 && first <= 0xdf) return 2;
+  if (first >= 0xe0 && first <= 0xef) return 3;
+  if (first >= 0xf0 && first <= 0xf4) return 4;
+  return 1;
+}
+
+/** True only when the bytes are a valid, still-pending UTF-8 prefix. */
+function isPendingUtf8Prefix(bytes: Buffer): boolean {
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(bytes, { stream: true });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function decodeCapturedOutput(bytes: Buffer, captureTruncated: boolean): DecodedCapture {
+  let end = bytes.length;
+  if (captureTruncated) {
+    // Only a cap split, never a complete stream, may end in a valid but
+    // incomplete UTF-8 prefix. Invalid leads (C0/C1/F5..F7/FF) are left for
+    // replacement decoding and invalidEncoding=true.
+    let lead = end - 1;
+    let continuations = 0;
+    while (lead >= 0 && (bytes[lead]! & 0xc0) === 0x80 && continuations < 3) {
+      lead -= 1;
+      continuations += 1;
+    }
+    if (lead >= 0) {
+      const expected = utf8LeadLength(bytes[lead]!);
+      if (expected > 1 && end - lead < expected && isPendingUtf8Prefix(bytes.subarray(lead, end))) {
+        end = lead;
+      }
+    }
+  }
+  const captured = bytes.subarray(0, end);
+  let invalidEncoding = false;
+  try {
+    new TextDecoder("utf-8", { fatal: true }).decode(captured);
+  } catch {
+    invalidEncoding = true;
+  }
+  const text = captured.toString("utf8");
+  return {
+    text,
+    decodedTextBytes: Buffer.byteLength(text, "utf8"),
+    droppedIncompleteBytes: bytes.length - end,
+    invalidEncoding,
+  };
 }
 
 function copiedRejection(item: ArtifactRejection): ArtifactRejection {
@@ -903,130 +989,346 @@ function copiedArtifact(item: ArtifactRecord): ArtifactRecord {
   };
 }
 
-/**
- * A completed local execution is already committed host evidence. Response
- * size pressure must trim only the display window (rejection names, artifact
- * rows, log preview), never replace the actual run/dispatch/record facts with
- * a generic preparation error. The full arrays remain in the host record.
- */
-function boundedRunResponse(
-  result: ExecutionToolResult,
-  facts: {
-    rejections: readonly ArtifactRejection[];
-    artifacts: readonly ArtifactRecord[];
+function copiedWatchdog(item: WatchdogOutcome): WatchdogOutcome {
+  return {
+    ...item,
+    controlEvents: item.controlEvents.map((event) => ({ ...event })),
+  };
+}
+
+const MODEL_VIEW_ARTIFACT_ROWS = EXECUTION_LIMITS.maxArtifacts;
+const MODEL_VIEW_REJECTION_ROWS = 8;
+const MODEL_VIEW_SCALAR_CHARS = 500;
+
+/** Quoted, escaped and bounded so control characters stay unambiguous. */
+function modelString(value: unknown, limit = MODEL_VIEW_SCALAR_CHARS): string {
+  if (value === null || value === undefined) return "null";
+  const text = typeof value === "string" ? value : String(value);
+  return JSON.stringify(text.length > limit ? `${text.slice(0, limit)}…` : text);
+}
+
+const MODEL_VIEW_IO_CONTRACT = [
+  "I/O contract (generic host API, not task-specific):",
+  "- Every run starts in a fresh writable workDir, and that directory is the script process cwd.",
+  "- The host sets OMP_WORK_DIR and OMP_INPUTS_MANIFEST in the script environment.",
+  "- Read OMP_INPUTS_MANIFEST as JSON. manifest.handles[inputId] is {path, bytes, sha256, writable:false}; the manifest also carries workDir, sourcePath and runtime.",
+  "- Pass inputIds to run so the host stages read-only copies. Use only the current manifest's paths; never guess a host workspace, private archive or previous-run directory.",
+  "- Use only runtime stdlib/builtins. Package installs, network access and process forking are unavailable.",
+  "- Write intended candidate files as ordinary top-level files directly in the current cwd, using relative paths. The host archives them automatically after the process group settles; no copy-back to a host workspace is needed or possible.",
+  "- Every run is fresh. Previous-run artifacts/archives are not automatically readable or writable inputs to a later run; re-importing an artifact as an input is not supported.",
+  "- Generic Python manifest read: import json, os; manifest = json.load(open(os.environ[\"OMP_INPUTS_MANIFEST\"], encoding=\"utf-8\")); path = manifest[\"handles\"][inputId][\"path\"]",
+].join("\n");
+
+interface ModelViewWindow {
+  artifactsShown: number;
+  rejectionsShown: number;
+  previewBytes: number;
+}
+
+const MODEL_VIEW_INITIAL_WINDOW: ModelViewWindow = {
+  artifactsShown: MODEL_VIEW_ARTIFACT_ROWS,
+  rejectionsShown: MODEL_VIEW_REJECTION_ROWS,
+  previewBytes: RESPONSE_LOG_PREVIEW_BYTES,
+};
+
+interface DescribeModelViewFacts {
+  taskId: string;
+  taskRevision: number;
+  taskStatus: string;
+  binding: BindingStatus;
+  runtimes: Record<ExecutionRuntime, ExecutionRuntimeInfo>;
+  limits: Record<string, number | string>;
+  authorizedInputs: Array<Record<string, unknown>>;
+  dispatchBudget: { limit: number; attempted: number; dispatched: number; reserved: number };
+}
+
+function renderDescribeModelView(facts: DescribeModelViewFacts): string {
+  const lines: string[] = [];
+  lines.push(`${EXECUTION_TOOL} model-visible execution view ${EXECUTION_MODEL_VIEW_VERSION}`);
+  lines.push("action=describe");
+  lines.push(`task taskId=${modelString(facts.taskId)} taskRevision=${facts.taskRevision} taskStatus=${modelString(facts.taskStatus)}`);
+  lines.push(`binding state=${modelString(facts.binding.state)} reason=${modelString(facts.binding.reason)}`);
+  lines.push("authority candidateOnly=true taskAccepted=false; describe grants no execution authority and tool success is not task acceptance.");
+  lines.push("runtimes:");
+  for (const runtime of EXECUTION_RUNTIMES) {
+    const info = facts.runtimes[runtime];
+    lines.push(`- name=${modelString(runtime)} version=${modelString(info.version)} hostSelected=true available=true`);
+  }
+  lines.push("authorizedInputs:");
+  if (facts.authorizedInputs.length === 0) {
+    lines.push("- none");
+  } else {
+    for (const input of facts.authorizedInputs) {
+      lines.push(`- id=${modelString(input.id)} name=${modelString(input.name)} bytes=${String(input.bytes ?? "unknown")} sha256=${modelString(input.sha256)} writable=false available=${String(input.available)} reason=${modelString(input.reason)}`);
+    }
+  }
+  lines.push(`limits: version=${modelString(facts.limits.version)} maxInputs=${String(facts.limits.maxInputs)} maxInputBytes=${String(facts.limits.maxInputBytes)} maxTotalInputBytes=${String(facts.limits.maxTotalInputBytes)} maxSourceBytes=${String(facts.limits.maxSourceBytes)} maxDispatches=${String(facts.limits.maxDispatches)} dispatchWallMs=${String(facts.limits.dispatchWallMs)} maxRetainedOutputBytes=${String(facts.limits.maxRetainedOutputBytes)} maxArtifacts=${String(facts.limits.maxArtifacts)} maxArtifactTotalBytes=${String(facts.limits.maxArtifactTotalBytes)} maxFileSizeBytes=${String(facts.limits.maxFileSizeBytes)} maxToolResponseBytes=${String(facts.limits.maxToolResponseBytes)}`);
+  lines.push(`attempts: limit=${facts.dispatchBudget.limit} attempted=${facts.dispatchBudget.attempted} dispatched=${facts.dispatchBudget.dispatched} reserved=${facts.dispatchBudget.reserved} remaining=${Math.max(0, facts.dispatchBudget.limit - facts.dispatchBudget.attempted - facts.dispatchBudget.reserved)}`);
+  lines.push(MODEL_VIEW_IO_CONTRACT);
+  return lines.join("\n");
+}
+
+interface RunModelViewFacts {
+  schemaVersion: number;
+  limitsVersion: string;
+  runId: string;
+  callId: string;
+  taskId: string;
+  ownerId: string;
+  taskRevision: number;
+  anchorMessageId: string | null;
+  runtime: ExecutionRuntime;
+  runtimeVersion: string;
+  availableRuntimes: Record<ExecutionRuntime, ExecutionRuntimeInfo>;
+  limits: Record<string, number | string>;
+  source: { bytes: number; sha256: string };
+  inputs: Array<{ id: string; bytes: number; sha256: string }>;
+  dispatch: {
+    spawned: boolean;
+    pid: number | null;
+    pgid: number | null;
+    exitCode: number | null;
+    signal: NodeJS.Signals | null;
+    reason: string;
+    durationMs: number;
+    terminatedByHost: boolean;
+    processGroupVerifiedGone: boolean;
+    spawnError: string | null;
+    launchStage: LaunchStage;
+    launchStageNote: string;
+    wrapperExitObserved: boolean;
+    userCodeStart: string;
+    watchdogArmed: boolean;
+    watchdogTerminated: boolean | null;
+    childExitObserved: boolean;
+    hostRecordError: string | null;
+  };
+  watchdog: WatchdogOutcome;
+  hostRecordErrors: { afterSpawn: string | null; finalRecord: string | null; artifactExport: string | null };
+  output: {
+    observedBytes: number;
     retainedBytes: number;
-    recordRef: string;
-  },
-): ExecutionToolResult {
-  if (responseByteLength(result) <= EXECUTION_LIMITS.maxToolResponseBytes) return result;
+    decodedTextBytes: number;
+    droppedIncompleteBytes: number;
+    invalidEncoding: boolean;
+    truncated: boolean;
+    observedAfterRetentionBytes: number;
+    text: string;
+  };
+  artifacts: readonly ArtifactRecord[];
+  artifactRejections: readonly ArtifactRejection[];
+  artifactTotalBytes: number;
+  artifactLimitReached: boolean;
+  bindingBefore: "attached";
+  bindingAfter: BindingStatus;
+  taskAfterStatus: string | null;
+  taskStillReachable: boolean;
+  visible: boolean;
+  withheldReason: string | null;
+  attemptBudget: { limit: number; attempted: number; dispatched: number; reserved: number };
+  hostRecordRef: string;
+  isError: boolean;
+}
 
-  const content = result.content.map((part) => ({ ...part }));
-  const details = { ...(result.details ?? {}) } as Record<string, unknown>;
-  const output = { ...((details.output as Record<string, unknown> | undefined) ?? {}) };
-  details.output = output;
-  const compose = (): ExecutionToolResult => ({
-    content: content.map((part) => ({ ...part })),
-    details: { ...details, output: { ...output } },
-    ...(result.isError === undefined ? {} : { isError: result.isError }),
-  });
-  const withinBound = (): boolean => responseByteLength(compose()) <= EXECUTION_LIMITS.maxToolResponseBytes;
-  const rejectionTotal = facts.rejections.length;
+function modelRows(facts: RunModelViewFacts, window: ModelViewWindow): {
+  artifacts: readonly ArtifactRecord[];
+  rejections: readonly ArtifactRejection[];
+  preview: string;
+  shownBytes: number;
+  omittedBytes: number;
+  previewTruncated: boolean;
+} {
+  const artifacts = facts.visible ? facts.artifacts.slice(0, window.artifactsShown) : [];
+  const rejections = facts.visible ? facts.artifactRejections.slice(0, window.rejectionsShown) : [];
+  const preview = facts.visible ? utf8Window(facts.output.text, window.previewBytes) : "";
+  const shownBytes = Buffer.byteLength(preview, "utf8");
+  return {
+    artifacts,
+    rejections,
+    preview,
+    shownBytes,
+    omittedBytes: Math.max(0, facts.output.decodedTextBytes - shownBytes),
+    previewTruncated: shownBytes < facts.output.decodedTextBytes,
+  };
+}
+
+function renderRunModelView(facts: RunModelViewFacts, window: ModelViewWindow): string {
+  const rows = modelRows(facts, window);
+  const lines: string[] = [];
+  lines.push(`${EXECUTION_TOOL} model-visible execution view ${EXECUTION_MODEL_VIEW_VERSION}`);
+  lines.push("action=run");
+  lines.push(`run runId=${modelString(facts.runId)} callId=${modelString(facts.callId)} taskId=${modelString(facts.taskId)} taskRevision=${facts.taskRevision} ownerId=${modelString(facts.ownerId)}`);
+  lines.push(`runtime name=${modelString(facts.runtime)} version=${modelString(facts.runtimeVersion)} sourceBytes=${facts.source.bytes} sourceSha256=${modelString(facts.source.sha256)}`);
+  lines.push(`availableRuntimes: python=${modelString(facts.availableRuntimes.python.version)} bun=${modelString(facts.availableRuntimes.bun.version)}`);
+  lines.push(`limits: version=${modelString(facts.limits.version)} maxInputs=${String(facts.limits.maxInputs)} maxInputBytes=${String(facts.limits.maxInputBytes)} maxTotalInputBytes=${String(facts.limits.maxTotalInputBytes)} maxSourceBytes=${String(facts.limits.maxSourceBytes)} maxDispatches=${String(facts.limits.maxDispatches)} dispatchWallMs=${String(facts.limits.dispatchWallMs)} maxRetainedOutputBytes=${String(facts.limits.maxRetainedOutputBytes)} maxArtifacts=${String(facts.limits.maxArtifacts)} maxArtifactTotalBytes=${String(facts.limits.maxArtifactTotalBytes)} maxFileSizeBytes=${String(facts.limits.maxFileSizeBytes)} maxToolResponseBytes=${String(facts.limits.maxToolResponseBytes)}`);
+  lines.push("inputs selected for this run:");
+  if (facts.inputs.length === 0) {
+    lines.push("- none");
+  } else {
+    for (const input of facts.inputs) {
+      lines.push(`- id=${modelString(input.id)} bytes=${input.bytes} sha256=${modelString(input.sha256)} writable=false`);
+    }
+  }
+  lines.push(`authority candidateOnly=true taskAccepted=false toolIsError=${facts.isError}`);
+  lines.push(`visibility visible=${facts.visible} bindingAfter=${modelString(facts.bindingAfter.state)} taskStillReachable=${facts.taskStillReachable} taskStatusAfter=${modelString(facts.taskAfterStatus)} withheldReason=${modelString(facts.withheldReason)}`);
+  const dispatch = facts.dispatch;
+  lines.push(`dispatch spawned=${dispatch.spawned} pid=${String(dispatch.pid)} pgid=${String(dispatch.pgid)} exitCode=${String(dispatch.exitCode)} signal=${modelString(dispatch.signal)} stopReason=${modelString(dispatch.reason)} durationMs=${dispatch.durationMs} terminatedByHost=${dispatch.terminatedByHost} processGroupVerifiedGone=${dispatch.processGroupVerifiedGone}`);
+  lines.push(`launch stage=${modelString(dispatch.launchStage)} userCodeStart=${modelString(dispatch.userCodeStart)} wrapperExitObserved=${dispatch.wrapperExitObserved} note=${modelString(dispatch.launchStageNote)} spawnError=${modelString(dispatch.spawnError)}`);
+  lines.push(`watchdog protocol=${modelString(facts.watchdog.protocol)} armed=${facts.watchdog.armed} ackSent=${facts.watchdog.ackSent} triggerReason=${modelString(facts.watchdog.triggerReason)} controlError=${modelString(facts.watchdog.controlError)} unexpectedControlEof=${facts.watchdog.unexpectedControlEof} watchdogTerminated=${String(facts.watchdog.watchdogTerminated)} killedByHost=${facts.watchdog.watchdogKilledByHost}`);
+  lines.push(`hostRecordErrors afterSpawn=${modelString(facts.hostRecordErrors.afterSpawn)} finalRecord=${modelString(facts.hostRecordErrors.finalRecord)} artifactExport=${modelString(facts.hostRecordErrors.artifactExport)} hostRecordError=${modelString(dispatch.hostRecordError)}`);
+  lines.push(`output observedBytes=${facts.output.observedBytes} retainedBytes=${facts.output.retainedBytes} decodedTextBytes=${facts.output.decodedTextBytes} shownBytes=${rows.shownBytes} omittedBytes=${rows.omittedBytes} truncated=${facts.output.truncated} observedAfterRetentionBytes=${facts.output.observedAfterRetentionBytes} previewTruncated=${rows.previewTruncated} droppedIncompleteBytes=${facts.output.droppedIncompleteBytes} invalidEncoding=${facts.output.invalidEncoding} decodingPolicy=${modelString(OUTPUT_DECODING_POLICY)}`);
+  if (facts.visible) {
+    lines.push("outputPreviewBegin (merged stdout+stderr; model-visible; an absent preview is empty)");
+    lines.push(rows.preview);
+    lines.push("outputPreviewEnd");
+  } else {
+    lines.push("outputPreviewWithheld=true (output remains only in the host record)");
+  }
   const artifactTotal = facts.artifacts.length;
+  lines.push(`artifacts total=${artifactTotal} shown=${rows.artifacts.length} omitted=${artifactTotal - rows.artifacts.length} withheld=${!facts.visible}`);
+  for (const artifact of rows.artifacts) {
+    lines.push(`- artifactId=${modelString(artifact.artifactId)} relativePath=${modelString(artifact.relativePath)} archiveRef=${modelString(artifact.archiveRef)} bytes=${artifact.bytes} sha256=${modelString(artifact.sha256)} verified=${artifact.verified} (host-side ref; not readable from the script)`);
+  }
+  const rejectionTotal = facts.artifactRejections.length;
+  lines.push(`artifactRejections total=${rejectionTotal} shown=${rows.rejections.length} omitted=${rejectionTotal - rows.rejections.length} withheld=${!facts.visible} artifactTotalBytes=${facts.artifactTotalBytes} artifactLimitReached=${facts.artifactLimitReached}`);
+  for (const rejection of rows.rejections) {
+    lines.push(`- relativePath=${modelString(rejection.relativePath)} reason=${modelString(rejection.reason)}`);
+  }
+  lines.push(`attempts limit=${facts.attemptBudget.limit} attempted=${facts.attemptBudget.attempted} dispatched=${facts.attemptBudget.dispatched} reserved=${facts.attemptBudget.reserved} remaining=${Math.max(0, facts.attemptBudget.limit - facts.attemptBudget.attempted - facts.attemptBudget.reserved)}`);
+  lines.push(`hostRecordRef=${modelString(facts.hostRecordRef)} hostOwned=true scriptReadable=false`);
+  lines.push("note: exit code 0 and exported artifacts are candidate generation only; the task is not accepted. No model claim is verification evidence.");
+  lines.push(MODEL_VIEW_IO_CONTRACT);
+  return lines.join("\n");
+}
 
-  for (const shown of [8, 4, 2, 1, 0]) {
-    details.artifactRejections = facts.rejections.slice(0, shown).map(copiedRejection);
-    details.artifactRejectionsShown = shown;
-    details.artifactRejectionsOmitted = rejectionTotal - shown;
-    details.artifactRejectionsRecordRef = facts.recordRef;
-    if (withinBound()) return compose();
-  }
-  for (const shown of [8, 4, 2, 1, 0]) {
-    details.artifacts = facts.artifacts.slice(0, shown).map(copiedArtifact);
-    details.artifactsShown = shown;
-    details.artifactsOmitted = artifactTotal - shown;
-    details.artifactsRecordRef = facts.recordRef;
-    if (withinBound()) return compose();
-  }
-  for (const shownBytes of [2048, 1024, 256, 0]) {
-    const text = utf8Window(String(output.text ?? ""), shownBytes);
-    const preview = Buffer.byteLength(text, "utf8");
-    output.text = text;
-    output.responsePreviewBytes = preview;
-    output.omittedFromResponseBytes = Math.max(0, facts.retainedBytes - preview);
-    details.outputShownBytes = preview;
-    details.outputOmittedBytes = output.omittedFromResponseBytes;
-    details.outputRecordRef = facts.recordRef;
-    if (withinBound()) return compose();
-  }
-  for (const shownBytes of [500, 200, 80]) {
-    const original = content[0]?.text ?? "";
-    const suffix = ` … [response window; actual completed run ${String(details.runId ?? "unknown")} is retained in ${facts.recordRef}]`;
-    const prefix = utf8Window(original, shownBytes);
-    content[0] = { type: "text", text: `${prefix}${suffix}` };
-    if (withinBound()) return compose();
-  }
-  // Last resort: retain only the committed process/record facts. This remains
-  // a completed-run response, not a preparation or unknown-run failure.
-  const dispatch = details.dispatch as Record<string, unknown> | undefined;
-  const essentials: Record<string, unknown> = {
+function assembleRunResponse(
+  facts: RunModelViewFacts,
+  window: ModelViewWindow,
+  compact = false,
+): ExecutionToolResult {
+  const rows = modelRows(facts, window);
+  const artifactTotal = facts.artifacts.length;
+  const rejectionTotal = facts.artifactRejections.length;
+  const watchdog = compact
+    ? {
+      protocol: facts.watchdog.protocol,
+      armed: facts.watchdog.armed,
+      ackSent: facts.watchdog.ackSent,
+      triggerReason: scalar(facts.watchdog.triggerReason, MODEL_VIEW_SCALAR_CHARS),
+      controlError: scalar(facts.watchdog.controlError, MODEL_VIEW_SCALAR_CHARS),
+      unexpectedControlEof: facts.watchdog.unexpectedControlEof,
+      watchdogTerminated: facts.watchdog.watchdogTerminated,
+      watchdogKilledByHost: facts.watchdog.watchdogKilledByHost,
+      controlEvents: [],
+      controlEventsShown: 0,
+      controlEventsOmitted: facts.watchdog.controlEvents.length,
+      logRef: facts.watchdog.logRef,
+    }
+    : copiedWatchdog(facts.watchdog);
+  const dispatch = compact
+    ? Object.fromEntries(Object.entries(facts.dispatch).map(([key, value]) => [key, scalar(value, MODEL_VIEW_SCALAR_CHARS)]))
+    : { ...facts.dispatch };
+  const details: Record<string, unknown> = {
     action: "run",
-    schemaVersion: details.schemaVersion,
-    limitsVersion: details.limitsVersion,
-    runId: details.runId,
-    callId: details.callId,
-    taskId: details.taskId,
-    ownerId: details.ownerId,
-    taskRevision: details.taskRevision,
-    anchorMessageId: details.anchorMessageId,
-    runtime: details.runtime,
-    runtimeVersion: details.runtimeVersion,
-    dispatch: dispatch === undefined
-      ? undefined
-      : Object.fromEntries(Object.entries(dispatch).map(([key, value]) => [key, scalar(value, 500)])),
-    watchdog: details.watchdog,
+    modelViewVersion: EXECUTION_MODEL_VIEW_VERSION,
+    schemaVersion: facts.schemaVersion,
+    limitsVersion: facts.limitsVersion,
+    runId: facts.runId,
+    callId: facts.callId,
+    taskId: facts.taskId,
+    ownerId: facts.ownerId,
+    taskRevision: facts.taskRevision,
+    anchorMessageId: facts.anchorMessageId,
+    runtime: facts.runtime,
+    runtimeVersion: facts.runtimeVersion,
+    source: { ...facts.source },
+    inputs: facts.inputs.map((input) => ({ ...input })),
+    dispatch,
+    watchdog,
+    hostRecordErrors: compact
+      ? Object.fromEntries(Object.entries(facts.hostRecordErrors)
+        .map(([key, value]) => [key, scalar(value, MODEL_VIEW_SCALAR_CHARS)]))
+      : { ...facts.hostRecordErrors },
     output: {
-      observedBytes: output.observedBytes,
-      retainedBytes: output.retainedBytes,
-      responsePreviewBytes: 0,
-      omittedFromResponseBytes: facts.retainedBytes,
-      truncated: output.truncated,
-      observedAfterRetentionBytes: output.observedAfterRetentionBytes,
-      text: "",
-      hostRecordRef: facts.recordRef,
+      observedBytes: facts.output.observedBytes,
+      retainedBytes: facts.output.retainedBytes,
+      decodedTextBytes: facts.output.decodedTextBytes,
+      droppedIncompleteBytes: facts.output.droppedIncompleteBytes,
+      invalidEncoding: facts.output.invalidEncoding,
+      decodingPolicy: OUTPUT_DECODING_POLICY,
+      shownBytes: rows.shownBytes,
+      omittedBytes: rows.omittedBytes,
+      responsePreviewBytes: rows.shownBytes,
+      omittedFromResponseBytes: rows.omittedBytes,
+      truncated: facts.output.truncated,
+      previewTruncated: rows.previewTruncated,
+      observedAfterRetentionBytes: facts.output.observedAfterRetentionBytes,
+      text: rows.preview,
+      hostRecordRef: facts.hostRecordRef,
     },
-    artifacts: [],
-    artifactsWithheld: details.artifactsWithheld,
-    artifactsShown: 0,
-    artifactsOmitted: artifactTotal,
-    artifactsRecordRef: facts.recordRef,
-    artifactRejections: [],
-    artifactRejectionsShown: 0,
-    artifactRejectionsOmitted: rejectionTotal,
-    artifactRejectionsRecordRef: facts.recordRef,
-    artifactTotalBytes: details.artifactTotalBytes,
-    artifactLimitReached: details.artifactLimitReached,
-    bindingBefore: details.bindingBefore,
-    bindingAfter: details.bindingAfter,
-    withheldReason: scalar(details.withheldReason, 500),
-    attemptBudget: details.attemptBudget,
-    hostRecordErrors: details.hostRecordErrors === undefined
-      ? undefined
-      : Object.fromEntries(Object.entries(details.hostRecordErrors as Record<string, unknown>)
-        .map(([key, value]) => [key, scalar(value, 500)])),
+    artifacts: rows.artifacts.map(copiedArtifact),
+    artifactsTotal: artifactTotal,
+    artifactsShown: rows.artifacts.length,
+    artifactsOmitted: artifactTotal - rows.artifacts.length,
+    artifactsWithheld: !facts.visible,
+    artifactsRecordRef: facts.hostRecordRef,
+    artifactRejections: rows.rejections.map(copiedRejection),
+    artifactRejectionsTotal: rejectionTotal,
+    artifactRejectionsShown: rows.rejections.length,
+    artifactRejectionsOmitted: rejectionTotal - rows.rejections.length,
+    artifactRejectionsWithheld: !facts.visible,
+    artifactRejectionsRecordRef: facts.hostRecordRef,
+    artifactTotalBytes: facts.artifactTotalBytes,
+    artifactLimitReached: facts.artifactLimitReached,
+    bindingBefore: facts.bindingBefore,
+    bindingAfter: { ...facts.bindingAfter },
+    taskAfterStatus: facts.taskAfterStatus,
+    taskStillReachable: facts.taskStillReachable,
+    visible: facts.visible,
+    withheldReason: facts.withheldReason,
+    attemptBudget: { ...facts.attemptBudget },
     candidateOnly: true,
     taskAccepted: false,
     note: "A zero exit code is candidate generation only, not task acceptance. No model claim is verification evidence.",
-    hostRecordRef: facts.recordRef,
+    hostRecordRef: facts.hostRecordRef,
   };
-  const minimal: ExecutionToolResult = {
-    content: [{
-      type: "text",
-      text: `${EXECUTION_TOOL}: run ${String(details.runId ?? "unknown")} finished with exit=${String(dispatch?.exitCode)} signal=${String(dispatch?.signal)}; candidate only, task not accepted. Full facts: ${facts.recordRef}.`,
-    }],
-    details: essentials,
-    ...(result.isError === undefined ? {} : { isError: result.isError }),
+  return {
+    content: [{ type: "text", text: renderRunModelView(facts, window) }],
+    details,
+    ...(facts.isError ? { isError: true } : {}),
   };
-  return minimal;
+}
+
+/**
+ * A completed local execution is already committed host evidence. Response
+ * size pressure trims only the projection window (artifact rows, rejection
+ * rows, model-visible output preview); the content view is rebuilt for every
+ * window so a full unbounded text copy never survives while details shrink.
+ * Full arrays/text remain in the host record.
+ */
+function boundedRunResponse(facts: RunModelViewFacts): ExecutionToolResult {
+  const windows: ModelViewWindow[] = [
+    MODEL_VIEW_INITIAL_WINDOW,
+    { artifactsShown: MODEL_VIEW_ARTIFACT_ROWS, rejectionsShown: 4, previewBytes: RESPONSE_LOG_PREVIEW_BYTES },
+    { artifactsShown: MODEL_VIEW_ARTIFACT_ROWS, rejectionsShown: 2, previewBytes: RESPONSE_LOG_PREVIEW_BYTES },
+    { artifactsShown: MODEL_VIEW_ARTIFACT_ROWS, rejectionsShown: 1, previewBytes: RESPONSE_LOG_PREVIEW_BYTES },
+    { artifactsShown: MODEL_VIEW_ARTIFACT_ROWS, rejectionsShown: 0, previewBytes: RESPONSE_LOG_PREVIEW_BYTES },
+    { artifactsShown: 4, rejectionsShown: 0, previewBytes: RESPONSE_LOG_PREVIEW_BYTES },
+    { artifactsShown: 2, rejectionsShown: 0, previewBytes: RESPONSE_LOG_PREVIEW_BYTES },
+    { artifactsShown: 1, rejectionsShown: 0, previewBytes: RESPONSE_LOG_PREVIEW_BYTES },
+    { artifactsShown: 0, rejectionsShown: 0, previewBytes: RESPONSE_LOG_PREVIEW_BYTES },
+    { artifactsShown: 0, rejectionsShown: 0, previewBytes: 2048 },
+    { artifactsShown: 0, rejectionsShown: 0, previewBytes: 1024 },
+    { artifactsShown: 0, rejectionsShown: 0, previewBytes: 256 },
+    { artifactsShown: 0, rejectionsShown: 0, previewBytes: 0 },
+  ];
+  for (const window of windows) {
+    const result = assembleRunResponse(facts, window);
+    if (responseByteLength(result) <= EXECUTION_LIMITS.maxToolResponseBytes) return result;
+  }
+  // The compact details drop only already-counted watchdog event rows and
+  // scalarize strings; run/process/record facts stay present.
+  return assembleRunResponse(facts, { artifactsShown: 0, rejectionsShown: 0, previewBytes: 0 }, true);
 }
 
 export class ExecutionAdapter {
@@ -1188,30 +1490,51 @@ export class ExecutionAdapter {
         return errorResult("describe was withheld: the conversation binding detached during input inspection.");
       }
       const budget = this.budgets.get(task.taskId);
+      const limits: Record<string, number | string> = {
+        ...EXECUTION_LIMITS,
+        dispatchWallMs: this.dispatchWallMs,
+        terminationGraceMs: this.terminationGraceMs,
+      };
+      const binding = this.owner.bindingStatus();
+      const dispatchBudget = {
+        limit: EXECUTION_LIMITS.maxDispatches,
+        attempted: budget?.attempted ?? 0,
+        dispatched: budget?.dispatched ?? 0,
+        reserved: budget?.reserved ?? 0,
+      };
       const response: ExecutionToolResult = {
         content: [{
           type: "text",
-          text: `${EXECUTION_TOOL}: local Python/Bun candidate execution is available for taskRevision ${task.taskRevision}; describe grants no execution authority and tool success is not task acceptance.`,
+          text: renderDescribeModelView({
+            taskId: task.taskId,
+            taskRevision: task.taskRevision,
+            taskStatus: task.status,
+            binding,
+            runtimes: {
+              python: runtimeSnapshot(this.runtimes.python),
+              bun: runtimeSnapshot(this.runtimes.bun),
+            },
+            limits,
+            authorizedInputs: inputs,
+            dispatchBudget,
+          }),
         }],
         details: {
           action: "describe",
+          modelViewVersion: EXECUTION_MODEL_VIEW_VERSION,
           schemaVersion: EXECUTION_SCHEMA_VERSION,
           limitsVersion: EXECUTION_LIMITS_VERSION,
           taskId: task.taskId,
           taskRevision: task.taskRevision,
           taskStatus: task.status,
-          binding: this.owner.bindingStatus(),
+          binding,
           candidateOnly: true,
           taskAccepted: false,
           runtimes: {
             python: runtimeSnapshot(this.runtimes.python),
             bun: runtimeSnapshot(this.runtimes.bun),
           },
-          limits: {
-            ...EXECUTION_LIMITS,
-            dispatchWallMs: this.dispatchWallMs,
-            terminationGraceMs: this.terminationGraceMs,
-          },
+          limits,
           artifactPolicy: {
             scope: "top-level ordinary files directly inside the writable work directory",
             subdirectories: "not exported",
@@ -1308,6 +1631,7 @@ export class ExecutionAdapter {
     budget.reserved += 1;
     let attemptedDispatch = false;
     let recordPersisted = false;
+    let finalAuditSent = false;
     let runId: string | undefined;
     let preparedRoot: string | undefined;
     try {
@@ -1485,25 +1809,20 @@ export class ExecutionAdapter {
       } else {
         rejections = [{ relativePath: ".", reason: "process group not verified gone; no artifact export" }];
       }
-      const bindingAfter = this.owner.bindingStatus();
-      let taskAfter: ManagedTask | undefined;
+      const bindingAtRecord = this.owner.bindingStatus();
+      let taskAtRecord: ManagedTask | undefined;
       try {
-        const liveAfterSubject = subjectFromContext(context, this.workspaceRoot);
-        taskAfter = this.owner.reachableTask(liveAfterSubject);
+        taskAtRecord = this.owner.reachableTask(subjectFromContext(context, this.workspaceRoot));
       } catch {
-        taskAfter = undefined;
+        taskAtRecord = undefined;
       }
-      const visible = bindingAfter.state === "attached"
-        && taskAfter !== undefined
-        && taskAfter.taskId === decision.taskId
-        && taskAfter.taskRevision === decision.taskRevision;
-      const withheldReason = visible
+      const visibleAtRecord = bindingAtRecord.state === "attached"
+        && taskAtRecord !== undefined
+        && taskAtRecord.taskId === decision.taskId
+        && taskAtRecord.taskRevision === decision.taskRevision;
+      const withheldReasonAtRecord = visibleAtRecord
         ? null
         : "conversation binding or task reachability changed after the run; output and artifact paths remain in the host record";
-      const logPreview = visible
-        ? Buffer.from(outcome.logText, "utf8").subarray(0, RESPONSE_LOG_PREVIEW_BYTES).toString("utf8")
-        : "";
-      const previewBytes = Buffer.byteLength(logPreview, "utf8");
       const dispatchBudget = this.budgetFor(decision.taskId);
       const record = {
         ...baseRecord,
@@ -1523,24 +1842,28 @@ export class ExecutionAdapter {
           spawnError: outcome.spawnError,
           launchStage: outcome.launchStage,
           hostRecordError: outcome.hostRecordError,
-          watchdog: outcome.watchdog,
+          watchdog: copiedWatchdog(outcome.watchdog),
         },
-        watchdog: outcome.watchdog,
+        watchdog: copiedWatchdog(outcome.watchdog),
         output: {
           observedBytes: outcome.observedBytes,
           retainedBytes: outcome.retainedBytes,
+          decodedTextBytes: outcome.decodedTextBytes,
+          droppedIncompleteBytes: outcome.droppedIncompleteBytes,
+          invalidEncoding: outcome.invalidEncoding,
+          decodingPolicy: OUTPUT_DECODING_POLICY,
           observedAfterRetentionBytes: outcome.observedAfterRetentionBytes,
           truncated: outcome.truncated,
           text: outcome.logText,
         },
-        artifacts,
-        artifactRejections: rejections,
+        artifacts: artifacts.map(copiedArtifact),
+        artifactRejections: rejections.map(copiedRejection),
         artifactTotalBytes,
         artifactLimitReached: stoppedAtLimit,
         artifactExportError,
         hostRecordError: outcome.hostRecordError,
-        bindingAfter,
-        withheldReason,
+        bindingAfter: { ...bindingAtRecord },
+        withheldReason: withheldReasonAtRecord,
         taskAccepted: false,
         candidateOnly: true,
       };
@@ -1551,12 +1874,46 @@ export class ExecutionAdapter {
         finalRecordError = `final host record write failed: ${errorMessage(error)}`;
         safeAudit(this.audit, { type: "execution_record_write_failed", runId, error: finalRecordError });
       }
+      // The final record callback is a trusted host callback. It may
+      // synchronously navigate, detach or revise the live task. Re-read the
+      // actual session/task immediately before projecting model-visible output;
+      // a snapshot taken before that callback is not sufficient.
+      let finalTask: ManagedTask | undefined;
+      try {
+        finalTask = this.owner.reachableTask(subjectFromContext(context, this.workspaceRoot));
+      } catch {
+        finalTask = undefined;
+      }
+      const finalBinding = this.owner.bindingStatus();
+      const visible = finalBinding.state === "attached"
+        && finalTask !== undefined
+        && finalTask.taskId === decision.taskId
+        && finalTask.taskRevision === decision.taskRevision;
+      const withheldReason = visible
+        ? null
+        : "conversation binding or task reachability changed after the run; output and artifact paths remain in the host record";
       const hostRecordRef = `${path.basename(prepared.runRoot)}/record.json`;
-      const displayedRejections = visible
-        ? rejections.map(copiedRejection)
-        : rejections.map((item) => ({ relativePath: item.relativePath, reason: "withheld" }));
-      const details: Record<string, unknown> = {
-        action: "run",
+      const attemptBudget = {
+        limit: EXECUTION_LIMITS.maxDispatches,
+        attempted: dispatchBudget.attempted,
+        dispatched: dispatchBudget.dispatched,
+        reserved: dispatchBudget.reserved,
+      };
+      const isError = outcome.spawnError !== null
+        || outcome.launchStage === "handshake_failed"
+        || !outcome.watchdog.armed
+        || !outcome.watchdog.ackSent
+        || outcome.watchdog.watchdogTerminated !== true
+        || outcome.watchdog.controlError !== null
+        || outcome.watchdog.unexpectedControlEof
+        || outcome.watchdog.watchdogKilledByHost
+        || outcome.hostRecordError !== null
+        || finalRecordError !== null
+        || artifactExportError !== null
+        || !outcome.groupGone
+        || outcome.stopReason === "timeout"
+        || (outcome.spawned && outcome.exitCode !== 0 && !outcome.terminatedByHost);
+      const facts: RunModelViewFacts = {
         schemaVersion: EXECUTION_SCHEMA_VERSION,
         limitsVersion: EXECUTION_LIMITS_VERSION,
         runId,
@@ -1567,6 +1924,15 @@ export class ExecutionAdapter {
         anchorMessageId: decision.anchorMessageId,
         runtime: args.runtime,
         runtimeVersion: runtimeInfo.version,
+        availableRuntimes: {
+          python: runtimeSnapshot(this.runtimes.python),
+          bun: runtimeSnapshot(this.runtimes.bun),
+        },
+        limits: {
+          ...EXECUTION_LIMITS,
+          dispatchWallMs: this.dispatchWallMs,
+          terminationGraceMs: this.terminationGraceMs,
+        },
         source: { bytes: prepared.sourceBytes, sha256: prepared.sourceSha256 },
         inputs: prepared.inputs.map((input) => ({ id: input.id, bytes: input.bytes, sha256: input.sha256 })),
         dispatch: {
@@ -1593,7 +1959,7 @@ export class ExecutionAdapter {
           childExitObserved: outcome.childExitObserved,
           hostRecordError: outcome.hostRecordError,
         },
-        watchdog: outcome.watchdog,
+        watchdog: copiedWatchdog(outcome.watchdog),
         hostRecordErrors: {
           afterSpawn: outcome.hostRecordError,
           finalRecord: finalRecordError,
@@ -1602,61 +1968,29 @@ export class ExecutionAdapter {
         output: {
           observedBytes: outcome.observedBytes,
           retainedBytes: outcome.retainedBytes,
-          responsePreviewBytes: previewBytes,
-          omittedFromResponseBytes: Math.max(0, outcome.retainedBytes - previewBytes),
+          decodedTextBytes: outcome.decodedTextBytes,
+          droppedIncompleteBytes: outcome.droppedIncompleteBytes,
+          invalidEncoding: outcome.invalidEncoding,
           truncated: outcome.truncated,
           observedAfterRetentionBytes: outcome.observedAfterRetentionBytes,
-          text: logPreview,
-          hostRecordRef,
+          text: outcome.logText,
         },
-        artifacts: visible ? artifacts.map(copiedArtifact) : [],
-        artifactsWithheld: !visible,
-        artifactRejections: displayedRejections,
+        artifacts: artifacts.map(copiedArtifact),
+        artifactRejections: rejections.map(copiedRejection),
         artifactTotalBytes,
         artifactLimitReached: stoppedAtLimit,
         bindingBefore: "attached",
-        bindingAfter: { ...bindingAfter },
+        bindingAfter: { ...finalBinding },
+        taskAfterStatus: finalTask?.status ?? null,
+        taskStillReachable: finalTask !== undefined,
+        visible,
         withheldReason,
-        attemptBudget: {
-          limit: EXECUTION_LIMITS.maxDispatches,
-          attempted: dispatchBudget.attempted,
-          dispatched: dispatchBudget.dispatched,
-          reserved: dispatchBudget.reserved,
-        },
-        candidateOnly: true,
-        taskAccepted: false,
-        note: "A zero exit code is candidate generation only, not task acceptance. No model claim is verification evidence.",
+        attemptBudget,
         hostRecordRef,
+        isError,
       };
-      const response: ExecutionToolResult = {
-        content: [{
-          type: "text",
-          text: `${EXECUTION_TOOL}: run ${runId} finished with exit=${String(outcome.exitCode)} signal=${String(outcome.signal)}; candidate only, task not accepted. Output: ${visible ? logPreview.slice(0, 500) : "[withheld: binding changed]"}`,
-        }],
-        details,
-        ...(outcome.spawnError
-          || outcome.launchStage === "handshake_failed"
-          || !outcome.watchdog.armed
-          || !outcome.watchdog.ackSent
-          || outcome.watchdog.watchdogTerminated !== true
-          || outcome.watchdog.controlError !== null
-          || outcome.watchdog.unexpectedControlEof
-          || outcome.watchdog.watchdogKilledByHost
-          || outcome.hostRecordError
-          || finalRecordError
-          || artifactExportError
-          || !outcome.groupGone
-          || outcome.stopReason === "timeout"
-          || (outcome.spawned && outcome.exitCode !== 0 && !outcome.terminatedByHost)
-          ? { isError: true }
-          : {}),
-      };
-      const bounded = boundedRunResponse(response, {
-        rejections: displayedRejections,
-        artifacts: visible ? artifacts : [],
-        retainedBytes: outcome.retainedBytes,
-        recordRef: hostRecordRef,
-      });
+      const initialProjection = assembleRunResponse(facts, MODEL_VIEW_INITIAL_WINDOW);
+      const boundedBeforeFinalCheck = boundedRunResponse(facts);
       safeAudit(this.audit, {
         type: "execution_completed",
         runId,
@@ -1674,17 +2008,45 @@ export class ExecutionAdapter {
         artifacts: artifacts.length,
         artifactRejections: rejections.length,
         visible,
-        responseBytes: responseByteLength(bounded),
-        responseWindowTrimmed: bounded !== response,
+        responseBytes: responseByteLength(boundedBeforeFinalCheck),
+        responseWindowTrimmed: responseByteLength(initialProjection) > responseByteLength(boundedBeforeFinalCheck),
       });
-      return bounded;
+      finalAuditSent = true;
+      // execution_completed is the final synchronous host callback. It may
+      // navigate, detach or revise the live task. Re-read the actual
+      // subject/binding after it and rebuild both content and details from
+      // the resulting visibility. No host callback runs after this point.
+      let finalTaskAfterAudit: ManagedTask | undefined;
+      try {
+        finalTaskAfterAudit = this.owner.reachableTask(subjectFromContext(context, this.workspaceRoot));
+      } catch {
+        finalTaskAfterAudit = undefined;
+      }
+      const finalBindingAfterAudit = this.owner.bindingStatus();
+      const finalVisible = finalBindingAfterAudit.state === "attached"
+        && finalTaskAfterAudit !== undefined
+        && finalTaskAfterAudit.taskId === decision.taskId
+        && finalTaskAfterAudit.taskRevision === decision.taskRevision;
+      const finalWithheldReason = finalVisible
+        ? null
+        : "conversation binding or task reachability changed after the run; output and artifact paths remain in the host record";
+      return boundedRunResponse({
+        ...facts,
+        bindingAfter: { ...finalBindingAfterAudit },
+        taskAfterStatus: finalTaskAfterAudit?.status ?? null,
+        taskStillReachable: finalTaskAfterAudit !== undefined,
+        visible: finalVisible,
+        withheldReason: finalWithheldReason,
+      });
     } catch (error) {
-      safeAudit(this.audit, {
-        type: "execution_failed",
-        runId: runId ?? null,
-        taskId: current.taskId,
-        error: errorMessage(error),
-      });
+      if (!finalAuditSent) {
+        safeAudit(this.audit, {
+          type: "execution_failed",
+          runId: runId ?? null,
+          taskId: current.taskId,
+          error: errorMessage(error),
+        });
+      }
       return errorResult(errorMessage(error));
     } finally {
       if (!attemptedDispatch) {
@@ -2002,6 +2364,9 @@ export class ExecutionAdapter {
         durationMs: Date.now() - startedAt,
         observedBytes: 0,
         retainedBytes: 0,
+        decodedTextBytes: 0,
+        droppedIncompleteBytes: 0,
+        invalidEncoding: false,
         truncated: false,
         observedAfterRetentionBytes: 0,
         logText: "",
@@ -2502,7 +2867,8 @@ export class ExecutionAdapter {
         ? (ackAttempted ? "unknown" : "handshake_failed")
         : "unknown";
     const durationMs = Date.now() - startedAt;
-    const logText = Buffer.concat(chunks).toString("utf8");
+    const decodedOutput = decodeCapturedOutput(Buffer.concat(chunks), truncated);
+    const logText = decodedOutput.text;
     safeAudit(this.audit, {
       type: "execution_process_settled",
       runId: prepared.runId,
@@ -2536,6 +2902,9 @@ export class ExecutionAdapter {
       durationMs,
       observedBytes,
       retainedBytes,
+      decodedTextBytes: decodedOutput.decodedTextBytes,
+      droppedIncompleteBytes: decodedOutput.droppedIncompleteBytes,
+      invalidEncoding: decodedOutput.invalidEncoding,
       truncated,
       observedAfterRetentionBytes: observedAfterRetention,
       logText,
