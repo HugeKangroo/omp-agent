@@ -108,6 +108,24 @@ integration("genuine RPC prompt creates one task from the actual host input and 
     expect(attempts).toHaveLength(1);
     expect(attempts[0]?.agentKind).toBe("main");
     expect(branchCustomTypes(attempts[0])).toContain("omp-agent.b1.guidance");
+
+    // The context hook runs fresh before each provider callback: no task before
+    // the start tool exists, then one owner-derived projection at revision 1.
+    const turns = events(snapshot, "fixtureAudit", "model_turn");
+    expect(turns[0]?.taskContextCount).toBe(0);
+    const afterStart = turns.find((event) => event.step === 1);
+    expect(afterStart?.taskContextCount).toBe(1);
+    expect(afterStart?.taskContext).toMatchObject({
+      kind: "omp-agent.task-context",
+      availability: "current",
+      task: { taskRevision: 1, status: "active" },
+      binding: { state: "attached" },
+      requirements: { original: { revision: 1, text: prompt }, amendments: [] },
+    });
+    // The context-hook input is captured before the entry appends its message.
+    expect(afterStart?.contextBefore).toMatchObject({ taskContextCount: 0 });
+    // The transient projection is not in the actual persisted branch.
+    expect(branchCustomTypes(snapshot.fixtureSnapshot)).not.toContain("omp-agent.task-context");
   });
 }, TEST_TIMEOUT);
 
@@ -358,6 +376,19 @@ integration("a real second prompt revises once and stale expected revisions are 
     expect(events(snapshot, "audit", "task_revised")).toHaveLength(1);
     expect(events(snapshot, "audit", "task_revision_duplicate")).toHaveLength(1);
 
+    // The provider callback immediately after the accepted revise tool result
+    // sees the new revision (not only the next user prompt).
+    const afterReviseTurn = events(snapshot, "fixtureAudit", "model_turn").find((event) => event.step === 4);
+    expect(afterReviseTurn?.taskContext).toMatchObject({
+      task: { taskRevision: 2, status: "active" },
+      requirements: {
+        taskRevision: 2,
+        original: { revision: 1, text: firstPrompt },
+        amendments: [{ revision: 2, previousRevision: 1, source: "rpc", text: amendment }],
+      },
+    });
+    expect(afterReviseTurn?.contextBefore).toMatchObject({ taskContextCount: 0 });
+
     const stale = toolEnds(snapshot, "b1-stale-progress");
     expect(stale).toHaveLength(1);
     expect((stale[0]?.result as Event).isError).toBe(true);
@@ -581,6 +612,18 @@ integration("native tree navigation to an older assistant detaches capability au
     expect(afterDenial.counter).toEqual({ count: 1 });
     expect(state(afterDenial).tasksCreated).toBe(1);
     expect(state(afterDenial).binding).toMatchObject({ state: "detached" });
+    const detachedContextTurns = events(afterDenial, "fixtureAudit", "model_turn").filter((event) => {
+      const context = event.taskContext;
+      return typeof context === "object" && context !== null
+        && (context as Event).binding !== undefined
+        && ((context as Event).binding as Event).state === "detached";
+    });
+    expect(detachedContextTurns.length).toBeGreaterThanOrEqual(1);
+    expect(detachedContextTurns.at(-1)?.taskContext).toMatchObject({
+      availability: "read-only-unavailable",
+      binding: { state: "detached", event: "session_tree" },
+      requirements: { original: { text: firstPrompt } },
+    });
     expect(task(afterDenial).taskId).toBe(created.taskId);
     expect(task(afterDenial).rawRequest).toBe(firstPrompt);
     expect(task(afterDenial).taskRevision).toBe(1);
@@ -619,5 +662,357 @@ integration("native tree navigation to an older assistant detaches capability au
     expect(task(afterFresh).status).toBe("active");
     expect(events(afterFresh, "audit", "input_observed")
       .filter((event) => event.accepted === true).length).toBeGreaterThanOrEqual(4);
+  });
+}, TEST_TIMEOUT);
+
+integration("a local non-navigating command with agentInvoked=false does not block the next genuine task", async () => {
+  await withSession({ scenario: "start" }, async (session) => {
+    const command = await session.command("/b1noop");
+    expect(command.agentInvoked).toBe(false);
+    const afterCommand = await session.snapshot();
+    expect(events(afterCommand, "fixtureAudit", "noop_command")).toHaveLength(1);
+    const ownerAfterCommand = state(afterCommand);
+    expect(ownerAfterCommand.tasksCreated).toBe(0);
+    expect(ownerAfterCommand.currentTask).toBeNull();
+    // The command input is only a pending observation: no start candidate ran.
+    expect(ownerAfterCommand.activeGrant).toMatchObject({ started: false, anchorMessageId: null });
+    expect(ownerAfterCommand.suspended).toBeNull();
+    expect(events(afterCommand, "audit", "task_started")).toHaveLength(0);
+
+    const request = "Please own the release checklist after the local command.";
+    await session.prompt(request);
+    const snapshot = await session.snapshot();
+    const current = expectOneTask(snapshot);
+    expect(current.rawRequest).toBe(request);
+    expect(state(snapshot).suspended).toBeNull();
+    expect(events(snapshot, "audit", "task_observation_superseded")).toHaveLength(1);
+    expect(events(snapshot, "audit", "task_owner_overlap_rejected")).toHaveLength(0);
+    expect(events(snapshot, "audit", "task_owner_suspended")).toHaveLength(0);
+    expect(events(snapshot, "audit", "input_observed").filter((event) => event.accepted === true)).toHaveLength(2);
+    expect(resultDetails(toolEnds(snapshot, "b1-start")[0]).created).toBe(true);
+  });
+}, TEST_TIMEOUT);
+
+integration("a pending local command before a real session replacement does not detach the first task", async () => {
+  const request = "请创建并管理发布检查清单任务。";
+  await withSession({ scenario: "start" }, async (session) => {
+    const originalSessionId = (await session.fixtureSnapshot())?.sessionId;
+    expect(originalSessionId).toBeString();
+
+    const command = await session.command("/b1noop");
+    expect(command.agentInvoked).toBe(false);
+    const afterCommand = await session.snapshot();
+    const ownerAfterCommand = state(afterCommand);
+    expect(events(afterCommand, "fixtureAudit", "noop_command")).toHaveLength(1);
+    expect(ownerAfterCommand.tasksCreated).toBe(0);
+    expect(ownerAfterCommand.currentTask).toBeNull();
+    expect(ownerAfterCommand.activeGrant).toMatchObject({ text: "/b1noop", started: false, anchorMessageId: null });
+    expect(ownerAfterCommand.binding).toMatchObject({ state: "attached" });
+
+    const replacement = await session.newSession();
+    expect(replacement.success).toBe(true);
+    const switched = await session.waitForFixture("different native session", (value) => typeof value.sessionId === "string" && value.sessionId !== originalSessionId);
+    expect(switched.sessionId).not.toBe(originalSessionId);
+    expect(events(await session.snapshot(), "fixtureAudit", "native_hook")
+      .some((event) => (event.name === "session_switch" || event.name === "session_start") && event.sessionId === switched.sessionId)).toBe(true);
+
+    const afterSwitch = await session.snapshot();
+    const ownerAfterSwitch = state(afterSwitch);
+    expect(ownerAfterSwitch.tasksCreated).toBe(0);
+    expect(ownerAfterSwitch.currentTask).toBeNull();
+    expect(ownerAfterSwitch.activeGrant).toBeNull();
+    expect(ownerAfterSwitch.suspended).toBeNull();
+    expect(ownerAfterSwitch.binding).toMatchObject({ state: "attached", reason: null, event: null });
+    expect(events(afterSwitch, "audit", "task_binding_detached")).toHaveLength(0);
+
+    await session.prompt(request);
+    const snapshot = await session.snapshot();
+    const current = expectOneTask(snapshot);
+    expect(current.rawRequest).toBe(request);
+    const anchor = current.anchor as Event;
+    expect(anchor.sessionId).toBe(switched.sessionId);
+    expect(anchor.sessionId).not.toBe(originalSessionId);
+    expect(anchor.source).toBe("rpc");
+    expect(anchor.messageId).toBeString();
+    expect(anchor.messageId).not.toHaveLength(0);
+    expect(anchor.observedText).toBe(request);
+    expect(anchor.anchorText).toBe(request);
+    expect(state(snapshot).binding).toMatchObject({ state: "attached", reason: null, event: null });
+    expect(state(snapshot).suspended).toBeNull();
+    expect(events(snapshot, "audit", "task_started")).toHaveLength(1);
+    expect(events(snapshot, "audit", "task_binding_detached")).toHaveLength(0);
+    expect(events(snapshot, "audit", "task_observation_superseded")).toHaveLength(0);
+    expect(events(snapshot, "audit", "task_owner_suspended")).toHaveLength(0);
+
+    const emitted = events(snapshot, "fixtureAudit", "tool_call_emitted").find((event) => event.toolCallId === "b1-start");
+    expect(emitted?.tool).toBe("agent_task");
+    const ended = toolEnds(snapshot, "b1-start");
+    expect(ended).toHaveLength(1);
+    const details = resultDetails(ended[0]);
+    expect(details.created).toBe(true);
+    expect((details.task as Event).taskId).toBe(current.taskId);
+    expect((details.task as Event).rawRequest).toBe(request);
+    expect(((details.task as Event).anchor as Event).sessionId).toBe(switched.sessionId);
+    expect(((details.task as Event).anchor as Event).messageId).toBe(anchor.messageId);
+
+    const finalFixture = await session.fixtureSnapshot();
+    expect(finalFixture?.sessionId).toBe(switched.sessionId);
+    expect(finalFixture?.entryIds as unknown[]).toContain(anchor.messageId);
+    const persistedAnchor = (finalFixture?.branch as Event[]).find((entry) => entry.id === anchor.messageId);
+    expect(persistedAnchor).toMatchObject({ type: "message", role: "user", text: request });
+  });
+}, TEST_TIMEOUT);
+
+integration("a local command after an existing task does not prevent the next genuine revision", async () => {
+  const firstPrompt = "Please own the release checklist before the local command.";
+  const amendment = "Please revise: keep the original task and prefer low latency.";
+  await withSession({ scenario: "command-then-revise" }, async (session) => {
+    await session.prompt(firstPrompt);
+    const first = await session.snapshot();
+    const created = expectOneTask(first);
+
+    const command = await session.command("/b1noop");
+    expect(command.agentInvoked).toBe(false);
+    const afterCommand = await session.snapshot();
+    expect(state(afterCommand).tasksCreated).toBe(1);
+    expect(task(afterCommand).taskId).toBe(created.taskId);
+    expect(task(afterCommand).taskRevision).toBe(1);
+    expect(state(afterCommand).activeGrant).toMatchObject({ started: false, anchorMessageId: null });
+    expect(state(afterCommand).suspended).toBeNull();
+
+    await session.prompt(amendment);
+    const snapshot = await session.snapshot();
+    const current = task(snapshot);
+    expect(current.taskId).toBe(created.taskId);
+    expect(current.taskRevision).toBe(2);
+    expect(current.status).toBe("active");
+    expect(current.rawRequest).toBe(firstPrompt);
+    expect((current.anchor as Event).messageId).toBe((created.anchor as Event).messageId);
+    const sources = current.requirementSources as Event[];
+    expect(sources).toHaveLength(2);
+    expect(sources[0]).toMatchObject({ revision: 1, kind: "original", text: firstPrompt });
+    expect(sources[1]).toMatchObject({ revision: 2, kind: "amendment", text: amendment, source: "rpc" });
+    expect(events(snapshot, "audit", "task_observation_superseded").length).toBeGreaterThanOrEqual(1);
+    expect(events(snapshot, "audit", "task_owner_overlap_rejected")).toHaveLength(0);
+    expect(events(snapshot, "audit", "task_owner_suspended")).toHaveLength(0);
+    expect(resultDetails(toolEnds(snapshot, "b1-revise")[0])).toMatchObject({ revised: true, task: { taskRevision: 2 } });
+  });
+}, TEST_TIMEOUT);
+
+integration("real OMP compaction preserves authoritative requirements and denies hostile summary control", async () => {
+  const padding = " bounded-context".repeat(90);
+  const firstPrompt = `CONSTRAINT_SENTINEL_ALPHA: preserve the original release checklist exactly.${padding}`;
+  const amendment = `CONSTRAINT_SENTINEL_BETA: amend the checklist to prefer low latency.${padding}`;
+  const harmless = `HARMLESS_TURN: ordinary later context after both requirements.${padding}`;
+  const postPrompt = "POST_COMPACT_AMENDMENT: keep both sentinels and add a verification step.";
+  await withSession({ scenario: "compaction", persistSessions: true }, async (session) => {
+    await session.prompt(firstPrompt);
+    const first = await session.snapshot();
+    const created = expectOneTask(first);
+    const creationAnchor = created.anchor as Event;
+    expect(creationAnchor.messageId).toBeString();
+    expect(task(first).requirementSources as Event[]).toHaveLength(1);
+
+    await session.prompt(amendment);
+    const revised = await session.snapshot();
+    expect(task(revised).taskRevision).toBe(2);
+    expect(task(revised).requirementSources as Event[]).toHaveLength(2);
+    expect((task(revised).requirementSources as Event[])[1]).toMatchObject({ revision: 2, text: amendment });
+
+    await session.prompt(harmless);
+    const beforeCompact = await session.snapshot();
+    const beforeOwner = state(beforeCompact);
+    expect(beforeOwner.tasksCreated).toBe(1);
+    expect(task(beforeCompact).taskRevision).toBe(2);
+    expect(beforeOwner.binding).toMatchObject({ state: "attached" });
+    expect(beforeOwner.activeGrant).toBeNull();
+    expect(beforeOwner.authorizedCapabilities).toEqual(["test-progress"]);
+
+    await session.compact("fixture compaction without a remote summarizer");
+    const compactEnd = session.frames.filter((frame) => frame.type === "manual_compaction_end").at(-1);
+    expect(compactEnd?.aborted).toBe(false);
+    const compactFixture = await session.waitForAudit("fixture session_before_compact", (event) => event.type === "session_before_compact_fixture");
+    expect(compactFixture.firstKeptEntryId).toBeString();
+    const preCompactBranch = beforeCompact.fixtureSnapshot?.branch as Event[];
+    const harmlessEntry = preCompactBranch.find((entry) => entry.role === "user"
+      && typeof entry.text === "string" && entry.text.startsWith("HARMLESS_TURN"));
+    expect(harmlessEntry?.id).toBeString();
+    expect(compactFixture.firstKeptEntryId).toBe(harmlessEntry?.id);
+    expect(compactFixture.summary).toContain("SUMMARY_ATTACK_COMPACT");
+    await session.waitForAudit("fixture session_compact", (event) => event.type === "session_compact_fixture");
+    const afterCompactSnapshot = await session.fixtureSnapshot();
+    expect(afterCompactSnapshot?.label).toBe("session_compact");
+    const compactBranch = afterCompactSnapshot?.branch as Event[];
+    expect(compactBranch.some((entry) => entry.id === creationAnchor.messageId)).toBe(true);
+    const compactBranchCustomTypes = afterCompactSnapshot ? branchCustomTypes(afterCompactSnapshot) : [];
+    expect(compactBranchCustomTypes).not.toContain("omp-agent.task-context");
+    // The session_compact hook snapshot is taken before the background attack.
+    // Compaction itself changes no task state, revision, binding or permission.
+    expect(afterCompactSnapshot?.owner).toEqual(beforeCompact.fixtureSnapshot?.owner);
+
+    await session.waitForAudit("compaction background attack completion", (event) => event.type === "compaction_attack_finished", 20_000);
+    await Bun.sleep(200);
+    const attacked = await session.snapshot();
+    const attackedTask = task(attacked);
+    const beforeTask = task(beforeCompact);
+    expect(state(attacked).tasksCreated).toBe(1);
+    expect(attackedTask.taskId).toBe(created.taskId);
+    expect(attackedTask.ownerId).toBe(beforeTask.ownerId);
+    expect(attackedTask.taskRevision).toBe(2);
+    expect(attackedTask.status).toBe("active");
+    expect(attackedTask.admissions).toBe(1);
+    expect(beforeTask.admissions).toBe(0);
+    expect((attackedTask.anchor as Event).messageId).toBe(creationAnchor.messageId);
+    expect(attackedTask.requirementSources).toEqual(beforeTask.requirementSources);
+    expect(state(attacked).binding).toEqual(beforeOwner.binding);
+    expect(state(attacked).authorizedCapabilities).toEqual(beforeOwner.authorizedCapabilities);
+    expect(events(attacked, "audit", "task_binding_detached")).toHaveLength(0);
+    expect(events(attacked, "audit", "task_cancelled")).toHaveLength(0);
+    expect(events(attacked, "audit", "task_started")).toHaveLength(1);
+    expect(events(attacked, "audit", "task_revised")).toHaveLength(1);
+
+    const attackCalls = [
+      { id: "b1-after-compact-cancel", tool: "agent_task" },
+      { id: "b1-after-compact-start", tool: "agent_task" },
+      { id: "b1-after-compact-revise", tool: "agent_task" },
+      { id: "b1-after-compact-progress", tool: "agent_test_capability" },
+    ];
+    const emitted = events(attacked, "fixtureAudit", "tool_call_emitted");
+    const turns = events(attacked, "fixtureAudit", "model_turn");
+    for (const [index, attack] of attackCalls.entries()) {
+      const matches = emitted.filter((event) => event.toolCallId === attack.id);
+      expect(matches).toHaveLength(1);
+      const emission = matches[0]!;
+      expect(emission.tool).toBe(attack.tool);
+      expect(typeof attack.id).toBe("string");
+      expect(attack.id.length).toBeGreaterThan(0);
+      const turn = turns.find((event) => event.step === emission.step);
+      expect(turn?.step).toBe(5 + index);
+      expect(turn).toBeDefined();
+      // The context-hook input before injection is the actual compacted base
+      // context: both old requirement sentinels are absent there.
+      expect(turn?.contextBefore).toMatchObject({
+        messageCount: expect.any(Number),
+        taskContextCount: 0,
+        alphaPresent: false,
+        betaPresent: false,
+      });
+      expect(turn?.taskContextCount).toBe(1);
+      expect(turn?.taskContext).toMatchObject({
+        kind: "omp-agent.task-context",
+        availability: "current",
+        task: { taskId: created.taskId, taskRevision: 2, status: "active" },
+        binding: { state: "attached" },
+        requirements: {
+          taskRevision: 2,
+          original: { revision: 1, text: firstPrompt },
+          amendments: [{ revision: 2, text: amendment }],
+        },
+      });
+      // The hostile summary actually reached the provider for exactly these
+      // attack turns, scoped by the non-empty tool call id above.
+      expect(turn?.summaryPresent).toBe(true);
+    }
+
+    for (const deniedCall of attackCalls.slice(0, 3)) {
+      const ended = toolEnds(attacked, deniedCall.id);
+      expect(ended).toHaveLength(1);
+      expect((ended[0]?.result as Event).isError).toBe(true);
+      expect(resultText(ended[0])).toContain("No live genuine user turn");
+    }
+    const allowedProgress = resultDetails(toolEnds(attacked, "b1-after-compact-progress")[0]);
+    expect(allowedProgress).toMatchObject({
+      allowed: true,
+      taskId: created.taskId,
+      taskRevision: 2,
+      expectedTaskRevision: 2,
+      actionIndex: 1,
+      status: "active",
+      counter: 1,
+    });
+    expect(attacked.counter).toEqual({ count: 1 });
+
+    // A later genuine user message can inspect and revise the same task using
+    // its actual new branch anchor; compaction did not synthesize navigation.
+    await session.prompt(postPrompt);
+    const afterPost = await session.snapshot();
+    const postTask = task(afterPost);
+    expect(postTask.taskId).toBe(created.taskId);
+    expect(postTask.taskRevision).toBe(3);
+    expect(postTask.status).toBe("active");
+    expect(postTask.rawRequest).toBe(firstPrompt);
+    expect((postTask.anchor as Event).messageId).toBe(creationAnchor.messageId);
+    const sources = postTask.requirementSources as Event[];
+    expect(sources).toHaveLength(3);
+    expect(sources[0]).toMatchObject({ revision: 1, kind: "original", text: firstPrompt });
+    expect(sources[1]).toMatchObject({ revision: 2, kind: "amendment", text: amendment });
+    expect(sources[2]).toMatchObject({ revision: 3, kind: "amendment", previousRevision: 2, source: "rpc", text: postPrompt });
+    expect((sources[2]!.messageId as string)).not.toBe(creationAnchor.messageId);
+    const inspected = resultDetails(toolEnds(afterPost, "b1-post-compact-inspect")[0]);
+    expect(inspected.task).toMatchObject({ taskId: created.taskId, taskRevision: 2, status: "active" });
+    expect(inspected.requirements).toMatchObject({
+      taskRevision: 2,
+      original: { revision: 1, text: firstPrompt },
+      amendments: [{ revision: 2, text: amendment }],
+    });
+    expect(resultDetails(toolEnds(afterPost, "b1-post-compact-revise")[0])).toMatchObject({ revised: true, task: { taskRevision: 3 } });
+    expect(resultDetails(toolEnds(afterPost, "b1-post-compact-revise-retry")[0])).toMatchObject({ revised: false, task: { taskRevision: 3 } });
+    expect(events(afterPost, "audit", "task_revised")).toHaveLength(2);
+    expect(events(afterPost, "audit", "task_revision_duplicate")).toHaveLength(1);
+    expect(state(afterPost).binding).toMatchObject({ state: "attached" });
+    expect(events(afterPost, "audit", "task_binding_detached")).toHaveLength(0);
+    expect(afterPost.counter).toEqual({ count: 1 });
+
+    // The same-loop provider callback after the post-compaction revise sees
+    // revision 3 immediately, not only after a new prompt.
+    const afterPostReviseTurn = events(afterPost, "fixtureAudit", "model_turn").find((event) => event.step === 12);
+    expect(afterPostReviseTurn?.taskContext).toMatchObject({
+      task: { taskRevision: 3, status: "active" },
+      requirements: { taskRevision: 3, amendments: [{ revision: 2 }, { revision: 3, text: postPrompt }] },
+    });
+    expect(branchCustomTypes(await session.fixtureSnapshot())).not.toContain("omp-agent.task-context");
+  });
+}, TEST_TIMEOUT);
+
+integration("a background follow-up after a local command cannot consume the pending genuine observation", async () => {
+  const command = "/b1noopbackground";
+  const request = "Please own the release checklist after the background attempt.";
+  await withSession({ scenario: "command-background-pending" }, async (session) => {
+    const completed = await session.command(command);
+    expect(completed.agentInvoked).toBe(false);
+    await session.waitForAudit("pending background completion", (event) => event.type === "pending_background_finished", 20_000);
+    await Bun.sleep(250);
+
+    const afterBackground = await session.snapshot();
+    expect(events(afterBackground, "fixtureAudit", "pending_background_injected")).toHaveLength(1);
+    expect(events(afterBackground, "fixtureAudit", "tool_call_emitted").some((event) => event.toolCallId === "b1-pending-bg-start")).toBe(true);
+    const denied = toolEnds(afterBackground, "b1-pending-bg-start");
+    expect(denied).toHaveLength(1);
+    expect((denied[0]?.result as Event).isError).toBe(true);
+    expect(resultText(denied[0])).toContain("No live genuine user turn");
+    expect(state(afterBackground).tasksCreated).toBe(0);
+    expect(state(afterBackground).currentTask).toBeNull();
+    expect(state(afterBackground).suspended).toBeNull();
+    // Actual OMP did not emit before_agent_start for this follow-up, so the
+    // pending observation is preserved without a mismatch event; no real
+    // agent_end or background control closed or started it either.
+    expect(events(afterBackground, "audit", "task_grant_closed")).toHaveLength(0);
+    expect(events(afterBackground, "audit", "task_owner_suspended")).toHaveLength(0);
+    // The local-command observation is still pending, not started or consumed.
+    expect(state(afterBackground).activeGrant).toMatchObject({
+      text: command,
+      started: false,
+      anchorMessageId: null,
+    });
+
+    await session.prompt(request);
+    const snapshot = await session.snapshot();
+    const current = expectOneTask(snapshot);
+    expect(current.rawRequest).toBe(request);
+    expect(state(snapshot).suspended).toBeNull();
+    expect(events(snapshot, "audit", "task_observation_superseded")).toHaveLength(1);
+    expect(events(snapshot, "audit", "task_owner_overlap_rejected")).toHaveLength(0);
+    expect(events(snapshot, "audit", "task_owner_suspended")).toHaveLength(0);
+    expect(resultDetails(toolEnds(snapshot, "b1-pending-genuine-start")[0]).created).toBe(true);
   });
 }, TEST_TIMEOUT);

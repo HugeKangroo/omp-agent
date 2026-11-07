@@ -19,7 +19,13 @@ import {
 import {
   assertTaskControlResponseBound,
   requirementProjection,
+  RequirementBoundsError,
 } from "./task-requirements.ts";
+import {
+  TASK_CONTEXT_TYPE,
+  buildTaskContextMessage,
+  buildUnavailableTaskContextMessage,
+} from "./task-context.ts";
 
 /**
  * Experimental G1-B1 entry. It is loaded explicitly, is separate from the
@@ -38,6 +44,10 @@ interface BeforeAgentStartEvent {
 }
 
 interface AgentEndEvent {
+  messages?: unknown;
+}
+
+interface ContextEvent {
   messages?: unknown;
 }
 
@@ -61,6 +71,7 @@ interface OmpApi {
   on(event: "input", handler: (event: InputEvent, context: OmpToolContext) => unknown): void;
   on(event: "before_agent_start", handler: (event: BeforeAgentStartEvent, context: OmpToolContext) => unknown): void;
   on(event: "agent_end", handler: (event: AgentEndEvent, context: OmpToolContext) => unknown): void;
+  on(event: "context", handler: (event: ContextEvent, context: OmpToolContext) => unknown): void;
   on(event: "session_start" | "session_switch" | "session_branch" | "session_tree" | "session_shutdown",
     handler: (event: unknown, context: OmpToolContext) => unknown): void;
   registerTool(tool: OmpTool): void;
@@ -109,6 +120,38 @@ function safeAudit(audit: AuditSink, event: AuditEvent): void {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function contentText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((part): part is { type: "text"; text: string } =>
+      typeof part === "object" && part !== null
+      && (part as { type?: unknown }).type === "text"
+      && typeof (part as { text?: unknown }).text === "string")
+    .map((part) => part.text)
+    .join("\n");
+}
+
+/**
+ * Identify only this extension's reserved ephemeral context message so a
+ * reentrant context input cannot accumulate stale projections. Matching is
+ * for removal/refresh only; no message content becomes authority.
+ */
+function isOwnedTaskContextMessage(value: unknown): boolean {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const message = value as Record<string, unknown>;
+  if (message.customType === TASK_CONTEXT_TYPE) return true;
+  if (message.attribution !== "agent") return false;
+  const text = contentText(message.content);
+  if (!text.includes(`"kind":"${TASK_CONTEXT_TYPE}"`)) return false;
+  try {
+    const parsed = JSON.parse(text) as { kind?: unknown };
+    return parsed.kind === TASK_CONTEXT_TYPE;
+  } catch {
+    return false;
+  }
 }
 
 function optionalEnv(env: NodeJS.ProcessEnv, name: string): string | undefined {
@@ -173,10 +216,81 @@ function buildControlResponse(
 }
 
 /**
+ * Read-only inspection may legitimately need a different shape from a
+ * mutation result: the full task record plus the complete requirement
+ * projection repeat large source text and can exceed the response bound even
+ * though each record is individually bounded. This fallback keeps the complete
+ * projection and reduces the task record to identity/status/binding facts; the
+ * host owner retains every original source record unchanged.
+ */
+function buildCompactInspectionResponse(
+  task: ManagedTask,
+  binding: ReturnType<TaskOwner["bindingStatus"]>,
+): ControlResponse {
+  const taskSnapshot = structuredClone(task);
+  const requirements = requirementProjection({
+    taskId: taskSnapshot.taskId,
+    ownerId: taskSnapshot.ownerId,
+    taskRevision: taskSnapshot.taskRevision,
+    sources: taskSnapshot.requirementSources,
+    understanding: taskSnapshot.understanding === null
+      ? null
+      : {
+        text: taskSnapshot.understanding,
+        revision: taskSnapshot.understandingRevision,
+        stale: taskSnapshot.understandingStale,
+      },
+  });
+  const details: Record<string, unknown> = {
+    action: "inspect",
+    compact: true,
+    binding,
+    task: {
+      schemaVersion: taskSnapshot.schemaVersion,
+      taskId: taskSnapshot.taskId,
+      ownerId: taskSnapshot.ownerId,
+      taskRevision: taskSnapshot.taskRevision,
+      status: taskSnapshot.status,
+      createdAt: taskSnapshot.createdAt,
+      cancelledAt: taskSnapshot.cancelledAt,
+      admissions: taskSnapshot.admissions,
+      anchor: {
+        messageId: taskSnapshot.anchor.messageId,
+        sessionId: taskSnapshot.anchor.sessionId,
+        source: taskSnapshot.anchor.source,
+        observedAt: taskSnapshot.anchor.observedAt,
+      },
+      sourceCount: taskSnapshot.requirementSources.length,
+      amendmentCount: taskSnapshot.requirementSources.filter((source) => source.kind === "amendment").length,
+    },
+    requirements,
+  };
+  const response: ControlResponse = {
+    content: [{ type: "text", text: JSON.stringify(details) }],
+    details,
+  };
+  assertTaskControlResponseBound(response);
+  return response;
+}
+
+function buildInspectionResponse(
+  task: ManagedTask,
+  binding: ReturnType<TaskOwner["bindingStatus"]>,
+): ControlResponse {
+  try {
+    return buildControlResponse("inspect", task, { binding });
+  } catch (error) {
+    if (!(error instanceof RequirementBoundsError)) throw error;
+    return buildCompactInspectionResponse(task, binding);
+  }
+}
+
+/**
  * Cancellation already committed before this response exists, so the response
  * must not be able to fail only because the accepted task's original request
- * is large. The compact view is fixed-size host facts; the authoritative
- * ledger remains available through inspect.
+ * is large. The compact cancellation view is fixed-size host facts; the
+ * authoritative ledger remains in owner state, and inspection returns the
+ * complete bounded projection when the full redundant envelope does not fit.
  */
 function buildCompactCancellationResponse(
   task: ManagedTask,
@@ -378,6 +492,73 @@ export function createTaskEntry(pi: OmpApi, options: TaskEntryOptions): { owner:
     return undefined;
   });
 
+  /**
+   * Fresh read-only task context before every model call. It is rebuilt from
+   * owner state each time, appended after the event's messages without
+   * mutating them, and never persisted by this extension. A model summary or
+   * previous context message contributes nothing to the projection.
+   */
+  pi.on("context", (event, context) => {
+    if (context.agent?.kind === "sub") return undefined;
+    const prior = Array.isArray(event.messages) ? event.messages : [];
+    // Always remove this extension's reserved transient projection, even when
+    // no current task exists. That keeps zero tasks at zero owned projections
+    // and avoids reusing stale/forged context from a prior invocation.
+    const preserved = prior.filter((message) => !isOwnedTaskContextMessage(message));
+    const snapshot = owner.snapshot();
+    const task = snapshot.currentTask;
+    if (!task) {
+      safeAudit(audit, { type: "task_context_skipped", reason: "no current task" });
+      return preserved.length === prior.length ? undefined : { messages: preserved };
+    }
+    let contextMessage;
+    try {
+      const projection = owner.requirements();
+      const built = buildTaskContextMessage({
+        task: {
+          taskId: task.taskId,
+          taskRevision: task.taskRevision,
+          status: task.status,
+          createdAt: task.createdAt,
+          cancelledAt: task.cancelledAt,
+          anchor: {
+            messageId: task.anchor.messageId,
+            sessionId: task.anchor.sessionId,
+          },
+        },
+        binding: snapshot.binding,
+        requirements: projection,
+        authorizedCapabilities: snapshot.authorizedCapabilities,
+      }, Date.now());
+      contextMessage = built.message;
+      safeAudit(audit, {
+        type: "task_context_projected",
+        taskId: task.taskId,
+        taskRevision: task.taskRevision,
+        status: task.status,
+        binding: snapshot.binding.state,
+        fallback: built.fallback,
+        bytes: built.bytes,
+        priorMessages: Array.isArray(event.messages) ? event.messages.length : 0,
+      });
+    } catch (error) {
+      safeAudit(audit, { type: "task_context_projection_failed", taskId: task.taskId, error: errorMessage(error) });
+      contextMessage = buildUnavailableTaskContextMessage({
+        reason: "The current task-context projection failed; the host owner remains authoritative and no constraints are restated here.",
+        task: {
+          taskId: task.taskId,
+          taskRevision: task.taskRevision,
+          status: task.status,
+        },
+        binding: {
+          state: snapshot.binding.state,
+          reason: snapshot.binding.reason,
+        },
+      }, Date.now()).message;
+    }
+    return { messages: [...preserved, contextMessage] };
+  });
+
   pi.on("session_start", (_event, context) => {
     try {
       owner.sessionStarted(context.sessionManager?.getSessionId());
@@ -404,7 +585,7 @@ export function createTaskEntry(pi: OmpApi, options: TaskEntryOptions): { owner:
   pi.registerTool({
     name: TASK_CONTROL_TOOL,
     label: "Managed task control",
-    description: "Start, inspect or cancel this conversation's managed task. Start is accepted only from a live genuine user turn and uses the host-observed request, source, session and message anchor. Model arguments cannot supply identity, permissions, budgets or authoritative requirements.",
+    description: "Start, inspect, revise or cancel this conversation's managed task. Start and revise require a live genuine user turn; the host-observed user message supplies the authoritative text, source, session and branch anchor. Revise appends an amendment without changing task identity, the original request or the creation anchor. Inspect is read-only, including detached history. Model arguments cannot supply identity, permissions, budgets or authoritative requirements.",
     parameters: TASK_PARAMETERS,
     approval: "write",
     loadMode: "essential",
@@ -442,7 +623,7 @@ export function createTaskEntry(pi: OmpApi, options: TaskEntryOptions): { owner:
         }
         if (parsed.action === "inspect") {
           const task = owner.inspect(subject);
-          return buildControlResponse("inspect", task, { binding: owner.bindingStatus() });
+          return buildInspectionResponse(task, owner.bindingStatus());
         }
         if (signal?.aborted) {
           safeAudit(audit, { type: "task_tool_aborted", action: parsed.action, phase: parsed.action });

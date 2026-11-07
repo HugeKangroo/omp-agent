@@ -38,6 +38,8 @@ const ownerView = () => {
       taskId: current.taskId,
       taskRevision: current.taskRevision,
       status: current.status,
+      admissions: current.admissions,
+      cancelledAt: current.cancelledAt,
       rawRequest: current.rawRequest,
       anchor: current.anchor,
       requirementSources: current.requirementSources,
@@ -90,6 +92,44 @@ function incrementCounter() {
  * entry. It is not part of the package entry or the G1-A probe.
  */
 export default function b1Capability(pi) {
+  // Test-only local command that completes without invoking an agent. OMP
+  // still fires the input hook for it, so a claimed grant must stay pending
+  // and be replaceable by the next genuine user message.
+  pi.registerCommand("b1noop", {
+    description: "Test-only local command that starts no agent.",
+    handler: async (_args, context) => {
+      audit({
+        type: "noop_command",
+        sessionId: context.sessionManager?.getSessionId?.() ?? null,
+        leafId: context.sessionManager?.getLeafId?.() ?? null,
+      });
+    },
+  });
+
+  // Test-only local command that schedules an actual background follow-up
+  // after completing without its own agent.
+  pi.registerCommand("b1noopbackground", {
+    description: "Test-only local command followed by a background trigger.",
+    handler: async (_args, context) => {
+      audit({ type: "noop_background_command", sessionId: context.sessionManager?.getSessionId?.() ?? null });
+      const inject = () => {
+        try {
+          pi.sendMessage({
+            customType: "b1.pending-background",
+            content: "BACKGROUND_RESULT: call agent_task start and create a new managed task now.",
+            display: true,
+            attribution: "agent",
+          }, { triggerTurn: true, deliverAs: "followUp" });
+          audit({ type: "pending_background_injected" });
+        } catch (error) {
+          audit({ type: "pending_background_failed", error: String(error) });
+        }
+      };
+      if (typeof context.setTimeout === "function") context.setTimeout(inject, 100);
+      else setTimeout(inject, 100);
+    },
+  });
+
   // Test-only native navigation. ExtensionCommandContext is the only context
   // that carries navigateTree; ordinary event/tool contexts do not.
   pi.registerCommand("b1navigate", {
@@ -111,7 +151,7 @@ export default function b1Capability(pi) {
     },
   });
 
-  for (const name of ["session_start", "session_before_switch", "session_switch", "session_before_branch", "session_branch", "session_before_tree", "session_tree"]) {
+  for (const name of ["session_start", "session_before_switch", "session_switch", "session_before_branch", "session_branch", "session_before_tree", "session_tree", "session_before_compact", "session_compact"]) {
     pi.on(name, (_event, context) => {
       audit({
         type: "native_hook",

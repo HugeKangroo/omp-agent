@@ -97,7 +97,7 @@ export class B1OmpSession {
       retry: { enabled: false, modelFallback: false },
       mcp: { enableProjectConfig: false, notifications: false },
       providers: { cacheWarming: "off" },
-      compaction: { enabled: false },
+      compaction: { enabled: false, keepRecentTokens: 64, reserveTokens: 64 },
       advisor: { enabled: false },
       autolearn: { enabled: false },
       contextPromotion: { enabled: false },
@@ -203,7 +203,7 @@ export class B1OmpSession {
     await this.request("set_auto_compaction", { enabled: false });
     await this.request("set_cache_warming", { mode: "off" });
     await this.request("set_event_filter", {
-      events: ["agent_start", "agent_end", "message_end", "tool_execution_start", "tool_execution_end", "extension_error", "notice", "prompt_result", "session_settled"],
+      events: ["agent_start", "agent_end", "message_end", "tool_execution_start", "tool_execution_end", "extension_error", "notice", "prompt_result", "session_settled", "manual_compaction_start", "manual_compaction_end"],
     });
   }
 
@@ -254,6 +254,39 @@ export class B1OmpSession {
     if (failure) throw new Error(`OMP command ${id} saw a provider failure: ${failure}`);
     await Bun.sleep(100);
     return result.frame;
+  }
+
+  /**
+   * Actual OMP journal/model-context compaction through the official RPC
+   * method. The fixture's session_before_compact override supplies the summary
+   * and first kept entry; no remote summarizer is involved.
+   */
+  async compact(customInstructions: string): Promise<Frame> {
+    if (!this.admitted) throw new Error("Refusing to compact before B1 admission.");
+    const startIndex = this.frames.length;
+    await this.request("compact", { customInstructions });
+    await this.waitFor(
+      () => this.frames.slice(startIndex).some((frame) => frame.type === "manual_compaction_end"),
+      "manual compaction end",
+      20_000,
+    );
+    const end = this.frames.slice(startIndex).find((frame) => frame.type === "manual_compaction_end")!;
+    if (end.aborted === true) throw new Error(`OMP compaction was aborted: ${JSON.stringify(end)}`);
+    await Bun.sleep(100);
+    return end;
+  }
+
+  /** Poll the real fixture audit for a hook/provider event. */
+  async waitForAudit(label: string, predicate: (event: Record<string, unknown>) => boolean, timeoutMs = 10_000): Promise<Record<string, unknown>> {
+    const deadline = Date.now() + timeoutMs;
+    while (true) {
+      const entries = await this.jsonl(this.fixtureAuditPath);
+      const found = entries.find(predicate);
+      if (found) return found;
+      if (this.failure || this.exited) throw new Error(`${label}: ${this.failure?.message ?? "OMP exited"}\n${this.stderr}`);
+      if (Date.now() >= deadline) throw new Error(`${label}: timed out\n${this.stderr}\n${JSON.stringify(this.frames.slice(-8))}`);
+      await Bun.sleep(25);
+    }
   }
 
   /** Native RPC session replacement; used only by navigation/session tests. */

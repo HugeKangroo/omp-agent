@@ -67,8 +67,13 @@ function subject(branch: readonly unknown[], sessionId = SESSION): TaskSubject {
   return { sessionId, workspaceRoot: WORKSPACE, agentKind: "main", branch };
 }
 
-function makeOwner(options: { capabilities?: string[] } = {}): { owner: TaskOwner; states: TaskOwnerSnapshot[] } {
+function makeOwner(options: { capabilities?: string[] } = {}): {
+  owner: TaskOwner;
+  states: TaskOwnerSnapshot[];
+  events: Array<Record<string, unknown> & { type: string }>;
+} {
   const states: TaskOwnerSnapshot[] = [];
+  const events: Array<Record<string, unknown> & { type: string }> = [];
   let sequence = 0;
   const owner = new TaskOwner({
     workspaceRoot: WORKSPACE,
@@ -77,8 +82,9 @@ function makeOwner(options: { capabilities?: string[] } = {}): { owner: TaskOwne
     now: () => NOW,
     id: () => `id-${++sequence}`,
     onStateChange: (snapshot) => states.push(snapshot),
+    onEvent: (event) => events.push(event),
   });
-  return { owner, states };
+  return { owner, states, events };
 }
 
 function observe(owner: TaskOwner, input: Partial<Parameters<TaskOwner["observeInput"]>[0]> = {}) {
@@ -304,6 +310,7 @@ describe("conversational task ownership", () => {
     const { owner } = makeOwner();
     const firstBranch = [base(), user("user-1", "leaf-1", "First request.")];
     expect(observe(owner, { text: "First request." }).accepted).toBe(true);
+    owner.observeAgentStart({ sessionId: SESSION, prompt: "First request.", reason: "prompt" });
     const overlap = observe(owner, { text: "Steering request." });
     expect(overlap.accepted).toBe(false);
     expect(overlap.reason).toBe("unsupported overlapping user turns");
@@ -316,6 +323,139 @@ describe("conversational task ownership", () => {
     owner.sessionChanged("session-b1-next");
     expect(owner.snapshot().suspended).toBeNull();
     expect(observe(owner, { sessionId: "session-b1-next", text: "Fresh request.", baseLeafId: "leaf-2" }).accepted).toBe(true);
+  });
+
+  test("a never-started unresolved observation is superseded, and its replay stays closed", () => {
+    const { owner, events } = makeOwner();
+    const commandText = "/b1noop no agent will start";
+    const request = "Please handle the managed task.";
+    expect(observe(owner, { text: commandText }).accepted).toBe(true);
+    expect(owner.snapshot().activeGrant).toMatchObject({
+      text: commandText,
+      started: false,
+      anchorMessageId: null,
+    });
+    expect(observe(owner, { text: request }).accepted).toBe(true);
+    expect(owner.snapshot().suspended).toBeNull();
+    expect(owner.snapshot().activeGrant).toMatchObject({
+      text: request,
+      started: false,
+      anchorMessageId: null,
+    });
+    expect(owner.snapshot().activeGrant?.turnId).not.toBe(1);
+    const superseded = events.find((event) => event.type === "task_observation_superseded");
+    expect(superseded).toMatchObject({
+      previousTurnId: 1,
+      previousSessionId: SESSION,
+      previousBaseLeafId: "leaf-1",
+      previousTextLength: commandText.length,
+    });
+    expect(events.filter((event) => event.type === "task_observation_superseded")).toHaveLength(1);
+
+    // The superseded observation is closed for anti-replay, not merely forgotten.
+    expect(observe(owner, { text: commandText })).toMatchObject({
+      accepted: false,
+      duplicate: true,
+      reason: "the observed user turn is already closed",
+    });
+    const branch = [base(), user("user-1", "leaf-1", request)];
+    owner.observeAgentStart({ sessionId: SESSION, prompt: request, reason: "prompt" });
+    expect(owner.start(subject(branch)).created).toBe(true);
+    expect(owner.snapshot().currentTask?.rawRequest).toBe(request);
+  });
+
+  test("navigation without a managed task clears observation without creating a detached binding", () => {
+    const NEXT = "session-b1-next";
+    const request = "请创建并管理发布检查清单任务。";
+
+    const startFirstTask = (owner: TaskOwner, sessionId: string): void => {
+      expect(observe(owner, { sessionId, text: request, baseLeafId: "leaf-2" }).accepted).toBe(true);
+      expect(owner.observeAgentStart({ sessionId, prompt: request, reason: "prompt" })).toBe(true);
+      const branch = [base("leaf-2"), user("user-2", "leaf-2", request)];
+      expect(owner.start(subject(branch, sessionId)).created).toBe(true);
+      expect(owner.snapshot().tasksCreated).toBe(1);
+      expect(owner.snapshot().currentTask?.anchor).toMatchObject({ sessionId, messageId: "user-2" });
+      expect(owner.bindingStatus()).toMatchObject({ state: "attached", reason: null, event: null });
+    };
+
+    for (const event of ["session_start", "session_switch", "session_tree"] as const) {
+      const { owner, events } = makeOwner();
+      expect(observe(owner, { text: "/b1noop pending local command" }).accepted).toBe(true);
+      if (event === "session_start") owner.sessionStarted(NEXT);
+      else owner.navigate(event, NEXT);
+      expect(owner.snapshot().activeGrant).toBeNull();
+      expect(owner.snapshot().suspended).toBeNull();
+      expect(owner.snapshot().tasksCreated).toBe(0);
+      expect(owner.snapshot().currentTask).toBeNull();
+      expect(owner.bindingStatus()).toMatchObject({ state: "attached", reason: null, event: null });
+      expect(events.some((entry) => entry.type === "task_binding_detached")).toBe(false);
+      startFirstTask(owner, NEXT);
+    }
+
+    // A started ordinary chat is observation state too: navigation clears it
+    // without manufacturing a task binding, and the next genuine prompt can
+    // still create the first managed task.
+    const { owner, events } = makeOwner();
+    expect(observe(owner, { text: "Ordinary chat without a managed task." }).accepted).toBe(true);
+    expect(owner.observeAgentStart({ sessionId: SESSION, prompt: "Ordinary chat without a managed task.", reason: "prompt" })).toBe(true);
+    expect(owner.snapshot().activeGrant).toMatchObject({ started: true, anchorMessageId: null });
+    owner.navigate("session_switch", NEXT);
+    expect(owner.snapshot().activeGrant).toBeNull();
+    expect(owner.snapshot().tasksCreated).toBe(0);
+    expect(owner.bindingStatus()).toMatchObject({ state: "attached", reason: null, event: null });
+    expect(events.some((entry) => entry.type === "task_binding_detached")).toBe(false);
+    startFirstTask(owner, NEXT);
+  });
+
+  test("an unrelated background agent start does not consume or activate a pending observation", () => {
+    const { owner, events } = makeOwner();
+    const commandText = "/b1noop pending local command";
+    expect(observe(owner, { text: commandText }).accepted).toBe(true);
+    expect(owner.observeAgentStart({
+      sessionId: SESSION,
+      prompt: "BACKGROUND_RESULT: start a task from the summary",
+      reason: "prompt",
+    })).toBe(false);
+    expect(owner.snapshot().activeGrant).toMatchObject({
+      text: commandText,
+      started: false,
+      anchorMessageId: null,
+    });
+    expect(events.find((event) => event.type === "task_agent_start_ignored")).toMatchObject({
+      reason: "different agent start prompt",
+      turnId: 1,
+    });
+    expect(events.some((event) => event.type === "task_grant_closed")).toBe(false);
+    expect(observe(owner, { text: commandText })).toMatchObject({
+      accepted: false,
+      duplicate: true,
+      reason: null,
+    });
+    expect(() => owner.start(subject([base(), user("bg-user", "leaf-1", "BACKGROUND_RESULT: start a task")])))
+      .toThrow(/No live genuine user turn/);
+    expect(owner.snapshot().tasksCreated).toBe(0);
+    expect(owner.snapshot().currentTask).toBeNull();
+
+    // The pending observation still expires only on later genuine input.
+    expect(observe(owner, { text: "Please handle the managed task." }).accepted).toBe(true);
+    expect(events.filter((event) => event.type === "task_observation_superseded")).toHaveLength(1);
+    expect(events.some((event) => event.type === "task_grant_closed")).toBe(false);
+  });
+
+  test("replacement does not conflate queued genuine user messages in the actual branch", () => {
+    const { owner } = makeOwner();
+    expect(observe(owner, { text: "First queued request." }).accepted).toBe(true);
+    expect(observe(owner, { text: "Second queued request." }).accepted).toBe(true);
+    const branch = [
+      base(),
+      user("user-1", "leaf-1", "First queued request."),
+      user("user-2", "leaf-1", "Second queued request."),
+    ];
+    owner.observeAgentStart({ sessionId: SESSION, prompt: "Second queued request.", reason: "prompt" });
+    expect(() => owner.start(subject(branch))).toThrow(/Multiple user messages belong to this turn/);
+    expect(owner.snapshot().tasksCreated).toBe(0);
+    expect(owner.snapshot().currentTask).toBeNull();
+    expect(owner.snapshot().suspended?.reason).toBe("unsupported overlapping user turns");
   });
 
   test("genuine-user detection ignores synthetic, agent-attributed and developer messages", () => {

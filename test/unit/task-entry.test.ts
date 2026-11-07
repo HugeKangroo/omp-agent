@@ -43,6 +43,8 @@ async function setup(): Promise<{
   input(text: string): void;
   beforeStart(text: string): void;
   closeTurn(text?: string): void;
+  projectContext(messages: unknown[]): unknown;
+  navigate(): void;
   taskCount(): number;
   status(): string | null;
   snapshot(): TaskOwnerSnapshot;
@@ -102,6 +104,12 @@ async function setup(): Promise<{
       handlers.get("agent_end")!({
         messages: [{ role: "user", content: [{ type: "text", text }], attribution: "user", id: currentUserId }],
       }, context);
+    },
+    projectContext(messages: unknown[]) {
+      return handlers.get("context")!({ messages }, context);
+    },
+    navigate() {
+      handlers.get("session_tree")!({}, context);
     },
     taskCount: () => owner.snapshot().tasksCreated,
     status: () => owner.snapshot().currentTask?.status ?? null,
@@ -297,4 +305,281 @@ describe("B1 entry control boundaries", () => {
     expect(JSON.stringify(started)).toBe(startJson);
     expect((started.details as { task: Record<string, unknown> }).task.status).toBe("active");
     expect((JSON.parse(started.content![0]!.text) as { task: Record<string, unknown> }).task.status).toBe("active");
+
+    // A maximum accepted task must stay inspectable after cancellation. The
+    // redundant full task+projection envelope no longer fits, so inspect
+    // returns compact task facts plus the complete requirement projection
+    // instead of truncating constraints or rejecting a valid historical read.
+    const ownerBeforeInspect = JSON.stringify(harness.snapshot());
+    const inspected = await harness.tool.execute("call-inspect", { action: "inspect" }, undefined, undefined, harness.context);
+    expect(inspected.isError).toBeUndefined();
+    const inspectBytes = new TextEncoder().encode(JSON.stringify(inspected)).byteLength;
+    expect(inspectBytes).toBeLessThanOrEqual(MAX_TASK_CONTROL_RESPONSE_BYTES);
+    const inspectedDetails = inspected.details as { compact?: boolean; task: Record<string, unknown>; requirements: Record<string, unknown> };
+    expect(inspectedDetails.compact).toBe(true);
+    expect(inspectedDetails.task).toMatchObject({
+      taskId: created.taskId,
+      ownerId: created.ownerId,
+      taskRevision: 1,
+      status: "cancelled",
+      sourceCount: 1,
+      amendmentCount: 0,
+    });
+    const inspectedRequirements = inspectedDetails.requirements as {
+      original: { revision: number; text: string };
+      amendments: Array<Record<string, unknown>>;
+      taskRevision: number;
+    };
+    expect(inspectedRequirements.taskRevision).toBe(1);
+    expect(inspectedRequirements.original).toMatchObject({ revision: 1, text: request });
+    expect(inspectedRequirements.amendments).toHaveLength(0);
+    expect(JSON.parse(inspected.content![0]!.text)).toEqual(inspectedDetails);
+    expect(JSON.stringify(harness.snapshot())).toBe(ownerBeforeInspect);
+
+    // Returned details are a detached snapshot: mutating them cannot change
+    // the owner, and a fresh inspection still restates the complete source.
+    inspectedRequirements.original.text = "FORGED";
+    inspectedDetails.task.taskRevision = 99;
+    inspectedDetails.task.status = "active";
+    expect(harness.snapshot().currentTask!.requirementSources[0]!.text).toBe(request);
+    expect(harness.snapshot().currentTask!.taskRevision).toBe(1);
+    expect(harness.status()).toBe("cancelled");
+    const reinspected = await harness.tool.execute("call-inspect-2", { action: "inspect" }, undefined, undefined, harness.context);
+    expect(reinspected.isError).toBeUndefined();
+    expect((reinspected.details as typeof inspectedDetails).requirements).toMatchObject({
+      original: { revision: 1, text: request },
+      taskRevision: 1,
+    });
+    expect((reinspected.details as typeof inspectedDetails).task).toMatchObject({ taskRevision: 1, status: "cancelled" });
+  });
+
+  test("a maximum accepted revision stays inspectable after cancellation with both source texts", async () => {
+    const original = "o".repeat(1024);
+    const attemptRevise = async (length: number): Promise<number | undefined> => {
+      const probe = await setup();
+      probe.input(original);
+      probe.beforeStart(original);
+      const started = await probe.tool.execute("call-start", { action: "start" }, undefined, undefined, probe.context);
+      if (started.isError) throw new Error("test setup: near-limit original request did not start");
+      probe.closeTurn(original);
+      const amendment = "a".repeat(length);
+      probe.input(amendment);
+      probe.beforeStart(amendment);
+      const revised = await probe.tool.execute("call-revise", { action: "revise" }, undefined, undefined, probe.context);
+      return revised.isError ? undefined : new TextEncoder().encode(JSON.stringify(revised)).byteLength;
+    };
+    let low = 0;
+    let high = 70_000;
+    while (low < high) {
+      const mid = Math.ceil((low + high) / 2);
+      if ((await attemptRevise(mid)) === undefined) high = mid - 1;
+      else low = mid;
+    }
+    const maximumAmendment = low;
+    expect(maximumAmendment).toBeGreaterThan(20_000);
+
+    const harness = await setup();
+    harness.input(original);
+    harness.beforeStart(original);
+    const started = await harness.tool.execute("call-start", { action: "start" }, undefined, undefined, harness.context);
+    expect(started.isError).toBeUndefined();
+    const created = harness.snapshot().currentTask!;
+    harness.closeTurn(original);
+
+    const amendment = "a".repeat(maximumAmendment);
+    harness.input(amendment);
+    harness.beforeStart(amendment);
+    const revised = await harness.tool.execute("call-revise", { action: "revise" }, undefined, undefined, harness.context);
+    expect(revised.isError).toBeUndefined();
+    const reviseBytes = new TextEncoder().encode(JSON.stringify(revised)).byteLength;
+    expect(reviseBytes).toBeLessThanOrEqual(MAX_TASK_CONTROL_RESPONSE_BYTES);
+    expect(reviseBytes).toBeGreaterThan(MAX_TASK_CONTROL_RESPONSE_BYTES - 512);
+    expect(harness.snapshot().currentTask!.taskRevision).toBe(2);
+    harness.closeTurn(amendment);
+
+    const cancellation = "Please cancel the revised managed task.";
+    harness.input(cancellation);
+    harness.beforeStart(cancellation);
+    const cancelled = await harness.tool.execute("call-cancel", { action: "cancel" }, undefined, undefined, harness.context);
+    expect(cancelled.isError).toBeUndefined();
+    expect(harness.status()).toBe("cancelled");
+    expect(harness.snapshot().currentTask!.taskRevision).toBe(2);
+
+    const ownerBeforeInspect = JSON.stringify(harness.snapshot());
+    const inspected = await harness.tool.execute("call-inspect", { action: "inspect" }, undefined, undefined, harness.context);
+    expect(inspected.isError).toBeUndefined();
+    const inspectBytes = new TextEncoder().encode(JSON.stringify(inspected)).byteLength;
+    expect(inspectBytes).toBeLessThanOrEqual(MAX_TASK_CONTROL_RESPONSE_BYTES);
+    const details = inspected.details as {
+      compact?: boolean;
+      task: Record<string, unknown>;
+      requirements: {
+        taskRevision: number;
+        original: { revision: number; text: string };
+        amendments: Array<{ revision: number; previousRevision: number; source: string; text: string }>;
+      };
+    };
+    expect(details.compact).toBe(true);
+    expect(details.task).toMatchObject({
+      taskId: created.taskId,
+      taskRevision: 2,
+      status: "cancelled",
+      sourceCount: 2,
+      amendmentCount: 1,
+    });
+    expect(details.requirements.taskRevision).toBe(2);
+    expect(details.requirements.original).toMatchObject({ revision: 1, text: original });
+    expect(details.requirements.amendments).toHaveLength(1);
+    expect(details.requirements.amendments[0]).toMatchObject({
+      revision: 2,
+      previousRevision: 1,
+      source: "rpc",
+      text: amendment,
+    });
+    expect(JSON.parse(inspected.content![0]!.text)).toEqual(details);
+    expect(JSON.stringify(harness.snapshot())).toBe(ownerBeforeInspect);
+
+    details.requirements.original.text = "FORGED ORIGINAL";
+    details.requirements.amendments[0]!.text = "FORGED AMENDMENT";
+    details.task.taskRevision = 99;
+    expect(harness.snapshot().currentTask!.requirementSources.map((source) => source.text)).toEqual([original, amendment]);
+    expect(harness.snapshot().currentTask!.taskRevision).toBe(2);
+    expect(harness.status()).toBe("cancelled");
+    const reinspected = await harness.tool.execute("call-inspect-2", { action: "inspect" }, undefined, undefined, harness.context);
+    expect(reinspected.isError).toBeUndefined();
+    expect((reinspected.details as typeof details).requirements.original.text).toBe(original);
+    expect((reinspected.details as typeof details).requirements.amendments[0]!.text).toBe(amendment);
+    expect((reinspected.details as typeof details).task).toMatchObject({ taskRevision: 2, status: "cancelled" });
+  });
+
+  test("context hook projects fresh owner state without mutating the event messages", async () => {
+    const harness = await setup();
+    const prior: unknown[] = [{ role: "user", content: [{ type: "text", text: "Hello." }] }];
+    expect(harness.projectContext(prior)).toBeUndefined();
+    expect(prior).toHaveLength(1);
+
+    const request = "Please own the release checklist.";
+    harness.input(request);
+    harness.beforeStart(request);
+    const started = await harness.tool.execute("call-start", { action: "start" }, undefined, undefined, harness.context);
+    expect(started.isError).toBeUndefined();
+
+    const projected = harness.projectContext(prior) as { messages: unknown[] };
+    expect(prior).toHaveLength(1);
+    expect(projected.messages).toHaveLength(2);
+    expect(projected.messages[0]).toBe(prior[0]);
+    const injected = projected.messages[1] as {
+      role: string;
+      customType: string;
+      content: string;
+      display: boolean;
+      attribution: string;
+      timestamp: number;
+    };
+    expect(injected).toMatchObject({
+      role: "custom",
+      customType: "omp-agent.task-context",
+      display: false,
+      attribution: "agent",
+    });
+    expect(typeof injected.timestamp).toBe("number");
+    const view = JSON.parse(injected.content) as {
+      availability: string;
+      task: { taskId: string; taskRevision: number; status: string };
+      binding: { state: string };
+      requirements: { original: { revision: number; text: string }; amendments: unknown[] };
+      authorizedCapabilities: string[];
+      provenance: Record<string, string>;
+    };
+    expect(view).toMatchObject({
+      availability: "current",
+      task: { taskRevision: 1, status: "active" },
+      binding: { state: "attached" },
+      requirements: { original: { revision: 1, text: request }, amendments: [] },
+      authorizedCapabilities: ["test-progress"],
+      provenance: {
+        requirements: "host-observed-sources",
+        understanding: "non-authoritative-model-note",
+      },
+    });
+    expect(new TextEncoder().encode(JSON.stringify(injected)).byteLength).toBeLessThanOrEqual(128 * 1024);
+
+    const amendment = "Please prefer low latency.";
+    harness.closeTurn(request);
+    harness.input(amendment);
+    harness.beforeStart(amendment);
+    const revised = await harness.tool.execute("call-revise", { action: "revise" }, undefined, undefined, harness.context);
+    expect(revised.isError).toBeUndefined();
+    const nextView = JSON.parse((harness.projectContext(prior) as { messages: Array<{ content: string }> }).messages[1]!.content) as typeof view & {
+      requirements: { amendments: Array<{ revision: number; source: string; text: string }> };
+    };
+    expect(nextView.task.taskRevision).toBe(2);
+    expect(nextView.requirements.amendments).toHaveLength(1);
+    expect(nextView.requirements.amendments[0]).toMatchObject({ revision: 2, source: "rpc", text: amendment });
+
+    harness.navigate();
+    const detachedView = JSON.parse((harness.projectContext(prior) as { messages: Array<{ content: string }> }).messages[1]!.content) as typeof view & {
+      binding: { state: string; reason: string; event: string };
+    };
+    expect(detachedView.availability).toBe("read-only-unavailable");
+    expect(detachedView.binding).toMatchObject({ state: "detached", event: "session_tree" });
+    expect(detachedView.binding.reason).toContain("navigation");
+    expect(detachedView.requirements.original.text).toBe(request);
+  });
+
+  test("reentrant context input is replaced with one fresh projection at the latest revision", async () => {
+    const harness = await setup();
+    const prior: unknown[] = [{ role: "user", content: [{ type: "text", text: "Hello." }] }];
+    const request = "Please own the original checklist.";
+    harness.input(request);
+    harness.beforeStart(request);
+    const started = await harness.tool.execute("call-start", { action: "start" }, undefined, undefined, harness.context);
+    expect(started.isError).toBeUndefined();
+    const first = harness.projectContext(prior) as { messages: Array<Record<string, unknown>> };
+    expect(first.messages).toHaveLength(2);
+    expect(first.messages.filter((message) => message.customType === "omp-agent.task-context")).toHaveLength(1);
+
+    const amendment = "Please amend with low latency.";
+    harness.closeTurn(request);
+    harness.input(amendment);
+    harness.beforeStart(amendment);
+    const revised = await harness.tool.execute("call-revise", { action: "revise" }, undefined, undefined, harness.context);
+    expect(revised.isError).toBeUndefined();
+
+    const second = harness.projectContext(first.messages) as { messages: Array<Record<string, unknown>> };
+    expect(second.messages).toHaveLength(2);
+    expect(second.messages[0] === prior[0]).toBe(true);
+    const owned = second.messages.filter((message) => message.customType === "omp-agent.task-context");
+    expect(owned).toHaveLength(1);
+    const view = JSON.parse(String(owned[0]!.content)) as {
+      task: { taskRevision: number };
+      requirements: { amendments: Array<{ revision: number; text: string }> };
+    };
+    expect(view.task.taskRevision).toBe(2);
+    expect(view.requirements.amendments).toEqual([expect.objectContaining({ revision: 2, text: amendment })]);
+    // The earlier projection object was not mutated in place.
+    expect(JSON.parse(String(first.messages[1]!.content))).toMatchObject({ task: { taskRevision: 1 } });
+  });
+
+  test("no-task context removes stale reserved projections and preserves unrelated messages", async () => {
+    const harness = await setup();
+    const stale = {
+      role: "custom",
+      customType: "omp-agent.task-context",
+      content: JSON.stringify({ kind: "omp-agent.task-context", state: "unavailable" }),
+      display: false,
+      attribution: "agent",
+      timestamp: 1,
+    };
+    const user = { role: "user", content: [{ type: "text", text: "Ordinary chat." }] };
+    const result = harness.projectContext([user, stale]) as { messages: unknown[] };
+    expect(result.messages).toHaveLength(1);
+    expect(result.messages[0]).toBe(user);
+    expect(JSON.stringify(result.messages)).not.toContain("omp-agent.task-context");
+
+    const onlyStale = harness.projectContext([stale]) as { messages: unknown[] };
+    expect(onlyStale.messages).toHaveLength(0);
+    // With no reserved projection present, normal no-task behavior is unchanged.
+    expect(harness.projectContext([user])).toBeUndefined();
+    expect(harness.taskCount()).toBe(0);
   });

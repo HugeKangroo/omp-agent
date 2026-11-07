@@ -219,6 +219,15 @@ function copyGrant(grant: UserTurnGrant): UserTurnGrant {
 }
 
 /**
+ * A pending observation has never started an agent and never resolved a
+ * branch anchor. Only this state may be expired/replaced by later genuine
+ * input, and an unrelated agent start must not consume it.
+ */
+function isUnresolvedPendingObservation(grant: UserTurnGrant): boolean {
+  return !grant.started && grant.anchorMessageId === null && !grant.authorityClosed;
+}
+
+/**
  * Strict model-facing argument parser. Identity, permissions, source and
  * anchor fields are rejected explicitly even though the tool schema also
  * filters unknown properties before execution.
@@ -376,16 +385,36 @@ export class TaskOwner {
     if (this.suspended) {
       return { accepted: false, duplicate: false, reason: this.suspended.reason };
     }
+    let superseded: UserTurnGrant | undefined;
     if (this.grant) {
       if (this.grant.sessionId === sessionId && this.grant.baseLeafId === baseLeafId && this.grant.text === raw) {
         return { accepted: false, duplicate: true, reason: null };
       }
-      this.suspend("unsupported overlapping user turns", {
-        type: "task_owner_overlap_rejected",
+      // OMP fires input for local extension commands that can finish with
+      // prompt_result.agentInvoked=false and no before_agent_start/agent_end.
+      // Such an observation is only pending: it never started an agent and
+      // never resolved an anchor, so a later genuine input may expire it.
+      // The pending-start state is matched before any authority/anchor path;
+      // a started grant or any resolved anchor is never overwritten here.
+      if (!isUnresolvedPendingObservation(this.grant)) {
+        this.suspend("unsupported overlapping user turns", {
+          type: "task_owner_overlap_rejected",
+          sessionId,
+          previousTurnId: this.grant.turnId,
+        });
+        return { accepted: false, duplicate: false, reason: "unsupported overlapping user turns" };
+      }
+      superseded = this.grant;
+      this.rememberClosedInput(this.inputKey(superseded.sessionId, superseded.baseLeafId, superseded.text));
+      this.changed({
+        type: "task_observation_superseded",
+        previousTurnId: superseded.turnId,
+        previousSessionId: superseded.sessionId,
+        previousBaseLeafId: superseded.baseLeafId,
+        previousTextLength: superseded.text.length,
         sessionId,
-        previousTurnId: this.grant.turnId,
+        baseLeafId,
       });
-      return { accepted: false, duplicate: false, reason: "unsupported overlapping user turns" };
     }
     this.lastSessionId = sessionId;
     this.grant = {
@@ -409,6 +438,7 @@ export class TaskOwner {
       baseLeafId,
       baselineTaskRevision: this.grant.baselineTaskRevision,
       textLength: raw.length,
+      ...(superseded === undefined ? {} : { supersededTurnId: superseded.turnId }),
     });
     return { accepted: true, duplicate: false, reason: null };
   }
@@ -427,6 +457,20 @@ export class TaskOwner {
       return false;
     }
     if (input.reason !== "prompt" || input.prompt.trim() !== grant.text.trim()) {
+      // A background or unmatched agent start is not identity evidence for
+      // this observation. An unresolved pending observation (e.g. a local
+      // command that invoked no agent) stays pending and replaceable; it is
+      // not started, closed, or converted into authority. Started grants and
+      // anchored observations keep the strict close behavior.
+      if (isUnresolvedPendingObservation(grant)) {
+        this.changed({
+          type: "task_agent_start_ignored",
+          reason: input.reason !== "prompt" ? "background agent start" : "different agent start prompt",
+          turnId: grant.turnId,
+          sessionId: input.sessionId,
+        });
+        return false;
+      }
       this.rememberClosedInput(this.inputKey(grant.sessionId, grant.baseLeafId, grant.text));
       this.grant = undefined;
       this.changed({ type: "task_grant_closed", reason: "different agent start" });
@@ -522,15 +566,17 @@ export class TaskOwner {
 
   /**
    * Real session_start. Same-session startup only resets turn state; a start
-   * bound to a different session detaches mutations and admissions. A fresh
-   * owner with no task or grant remains usable.
+   * bound to a different session detaches mutations and admissions when an
+   * established managed task exists. A turn grant is observation state, not
+   * an execution binding: without a managed task it is cleared and the fresh
+   * owner remains able to create its first task.
    */
   sessionStarted(sessionId?: string): void {
     const previous = this.grant?.sessionId ?? this.task?.anchor.sessionId ?? this.lastSessionId;
-    const hadBinding = this.task !== undefined || this.grant !== undefined;
+    const hadManagedTask = this.task !== undefined;
     const changedSession = sessionId !== undefined && previous !== undefined && sessionId !== previous;
     this.resetTurnState(sessionId);
-    if (changedSession && hadBinding) {
+    if (changedSession && hadManagedTask) {
       this.detachBinding("session_start selected a different session", "session_start", sessionId ?? null);
       return;
     }
@@ -540,12 +586,14 @@ export class TaskOwner {
   /**
    * Actual session_switch/session_branch/session_tree navigation invalidates
    * the execution binding and clears live grants. No text, summary or
-   * navigation back restores it; there is no transfer/recovery API.
+   * navigation back restores it; there is no transfer/recovery API. Only an
+   * established managed task has a binding to detach; a pending or started
+   * turn observation belongs to no task and is merely reset.
    */
   navigate(event: "session_switch" | "session_branch" | "session_tree", sessionId?: string): void {
-    const hadBinding = this.task !== undefined || this.grant !== undefined;
+    const hadManagedTask = this.task !== undefined;
     this.resetTurnState(sessionId);
-    if (hadBinding) {
+    if (hadManagedTask) {
       this.detachBinding(
         `conversation navigation (${event}) invalidated the execution binding`,
         event,
