@@ -11,14 +11,21 @@ const jobs = new Map();
 const config = {
   dropSubmitAck: false,
   holdCancel: false,
+  holdCancelResponse: false,
   holdSubmitAccept: false,
+  holdSubmitAck: false,
   delayedQueryMs: 0,
+  delayedCancelMs: 0,
   corruptResponse: null,
   submitHttpError: null,
 };
 const CORRUPTIONS = new Set(["operationId", "digest", "jobId", "missingDigest", "overlongJobId"]);
 /** operationId -> { operationId, digest, payload, requests: [{req,res}] } */
 const pendingSubmits = new Map();
+/** Held cancellation HTTP responses; the service state mutation already happened. */
+const pendingCancelResponses = [];
+/** Held submit acknowledgements created only after the actual job exists. */
+const pendingSubmitAcks = [];
 const counters = {
   submitRequests: 0,
   queryRequests: 0,
@@ -73,12 +80,14 @@ const server = createServer(async (req, res) => {
     const parts = url.pathname.split("/").filter(Boolean).map(decodeURIComponent);
     if (req.method === "POST" && url.pathname === "/_control/config") {
       const body = await readJson(req);
-      for (const key of ["dropSubmitAck", "holdCancel", "holdSubmitAccept"]) {
+      for (const key of ["dropSubmitAck", "holdCancel", "holdCancelResponse", "holdSubmitAccept", "holdSubmitAck"]) {
         if (typeof body[key] === "boolean") config[key] = body[key];
       }
-      if (typeof body.delayedQueryMs === "number" && Number.isSafeInteger(body.delayedQueryMs)
-        && body.delayedQueryMs >= 0 && body.delayedQueryMs <= 10_000) {
-        config.delayedQueryMs = body.delayedQueryMs;
+      for (const key of ["delayedQueryMs", "delayedCancelMs"]) {
+        if (typeof body[key] === "number" && Number.isSafeInteger(body[key])
+          && body[key] >= 0 && body[key] <= 10_000) {
+          config[key] = body[key];
+        }
       }
       if (body.corruptResponse === null || (typeof body.corruptResponse === "string" && CORRUPTIONS.has(body.corruptResponse))) {
         config.corruptResponse = body.corruptResponse;
@@ -165,6 +174,37 @@ const server = createServer(async (req, res) => {
       send(res, 200, { ok: true, released: Boolean(entry) });
       return;
     }
+    if (req.method === "POST" && url.pathname === "/_control/release-submit-ack") {
+      const pending = pendingSubmitAcks.shift();
+      if (pending) {
+        send(pending.res, 201, withCorruptedIdentity({
+          accepted: true,
+          jobId: pending.job.jobId,
+          operationId: pending.job.operationId,
+          state: pending.job.state,
+          digest: pending.job.digest,
+          replayed: false,
+        }));
+      }
+      send(res, 200, { ok: true, released: Boolean(pending) });
+      return;
+    }
+    if (req.method === "POST" && url.pathname === "/_control/release-cancel-response") {
+      const pending = pendingCancelResponses.shift();
+      if (pending) {
+        send(pending.res, 200, withCorruptedIdentity({
+          jobId: pending.job.jobId,
+          operationId: pending.job.operationId,
+          state: pending.job.state,
+          digest: pending.job.digest,
+          cancelRequested: true,
+          cancelConfirmed: pending.job.state === "cancelled",
+          cancelIntentId: pending.job.cancelIntentId,
+        }));
+      }
+      send(res, 200, { ok: true, released: Boolean(pending) });
+      return;
+    }
     if (req.method === "POST" && url.pathname === "/_control/shutdown") {
       send(res, 200, { ok: true });
       setTimeout(() => server.close(() => process.exit(0)), 10).unref();
@@ -231,6 +271,11 @@ const server = createServer(async (req, res) => {
         req.socket.destroy();
         return;
       }
+      if (config.holdSubmitAck) {
+        // The actual job exists; only the acknowledgement is withheld.
+        pendingSubmitAcks.push({ req, res, job });
+        return;
+      }
       return send(res, 201, withCorruptedIdentity({
         accepted: true,
         jobId: job.jobId,
@@ -273,8 +318,9 @@ const server = createServer(async (req, res) => {
         counters.actualCancels += 1;
       }
       // Cancellation intent mutation is real; only the echoed identity can be
-      // corrupted by the adversarial test control.
-      return send(res, 200, withCorruptedIdentity({
+      // corrupted by the adversarial test control. A held/delayed response
+      // never changes whether the service committed the intent.
+      const reply = () => send(res, 200, withCorruptedIdentity({
         jobId: job.jobId,
         operationId: job.operationId,
         state: job.state,
@@ -283,6 +329,13 @@ const server = createServer(async (req, res) => {
         cancelConfirmed: job.state === "cancelled",
         cancelIntentId: job.cancelIntentId,
       }));
+      if (config.holdCancelResponse) {
+        pendingCancelResponses.push({ req, res, job });
+        return;
+      }
+      if (config.delayedCancelMs > 0) setTimeout(reply, config.delayedCancelMs);
+      else reply();
+      return;
     }
 
     send(res, 404, { error: "not_found" });

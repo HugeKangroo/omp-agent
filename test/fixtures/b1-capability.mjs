@@ -66,6 +66,9 @@ const writeSnapshot = (label, context) => {
       owner: ownerView(),
     };
     writeFileSync(snapshotPath, JSON.stringify(value));
+    // Append-only history avoids losing a label when a later hook overwrites
+    // the single latest snapshot before a test reads it.
+    appendFileSync(`${snapshotPath}.history`, `${JSON.stringify(value)}\n`);
   } catch (error) {
     audit({ type: "fixture_snapshot_failed", label, error: String(error) });
   }

@@ -153,6 +153,7 @@ export default function b1FixtureProvider(pi) {
         });
 
         let call;
+        let calls = [];
         let text;
         if (scenario === "start") {
           if (turn === 0) {
@@ -460,6 +461,80 @@ export default function b1FixtureProvider(pi) {
           } else {
             text = "DONE: completion won cancellation and the task was not accepted.";
           }
+        } else if (scenario === "job-abort-query") {
+          if (turn === 0) {
+            call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
+          } else if (turn === 1) {
+            call = { type: "toolCall", id: "job-submit-abort", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+          } else if (turn === 2) {
+            text = "DONE: submitted the job before the delayed query.";
+          } else if (turn === 3) {
+            call = { type: "toolCall", id: "job-query-aborted", name: "agent_job", arguments: { action: "query" } };
+          } else if (turn === 4) {
+            call = { type: "toolCall", id: "job-query-after-abort", name: "agent_job", arguments: { action: "query" } };
+          } else {
+            text = "DONE: the interrupted query did not change the task or remote job.";
+          }
+        } else if (scenario === "job-abort-submit") {
+          if (turn === 0) {
+            call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
+          } else if (turn === 1) {
+            call = { type: "toolCall", id: "job-submit-held", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+          } else if (turn === 2) {
+            call = { type: "toolCall", id: "job-query-after-submit-abort", name: "agent_job", arguments: { action: "query" } };
+          } else {
+            text = "DONE: the original operation reconciled after the interrupted submit.";
+          }
+        } else if (scenario === "job-kill") {
+          if (turn === 0) {
+            call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
+          } else if (turn === 1) {
+            call = { type: "toolCall", id: "job-submit-kill", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+          } else {
+            text = "DONE: job running before the host kills OMP.";
+          }
+        } else if (scenario === "job-parallel-cancel") {
+          if (turn === 0) {
+            call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
+          } else if (turn === 1) {
+            calls = [
+              { type: "toolCall", id: "job-submit-raced", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } },
+              { type: "toolCall", id: "job-task-cancel-raced", name: "agent_task", arguments: { action: "cancel" } },
+            ];
+          } else {
+            text = "DONE: concurrent submit and task cancellation settled on one intent.";
+          }
+        } else if (scenario === "job-revise-replace") {
+          // The fixture may be reinstantiated on a new OMP session; the
+          // genuine prompt text keeps the post-replacement calls deterministic.
+          const lastUser = [...context.messages].reverse().find((message) => message.role === "user");
+          const promptText = textOf(lastUser?.content);
+          const replacementToolsDone = context.messages.some((message) => message.role === "toolResult"
+            && (message.toolCallId === "job-query-new-session" || message.toolCallId === "job-submit-new-session"));
+          if (promptText.includes("NEW_SESSION_JOB") && !replacementToolsDone) {
+            calls = [
+              { type: "toolCall", id: "job-query-new-session", name: "agent_job", arguments: { action: "query" } },
+              { type: "toolCall", id: "job-submit-new-session", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } },
+            ];
+          } else if (promptText.includes("NEW_SESSION_JOB") && replacementToolsDone) {
+            text = "DONE: the replacement session was denied before any external request.";
+          } else if (turn === 0) {
+            call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
+          } else if (turn === 1) {
+            call = { type: "toolCall", id: "job-submit-revise", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+          } else if (turn === 2) {
+            text = "DONE: first prompt submitted revision 1.";
+          } else if (turn === 3) {
+            call = { type: "toolCall", id: "job-revise-2", name: "agent_task", arguments: { action: "revise", understanding: "second genuine requirement" } };
+          } else if (turn === 4) {
+            call = { type: "toolCall", id: "job-query-after-revise", name: "agent_job", arguments: { action: "query" } };
+          } else if (turn === 5) {
+            text = "DONE: late job receipt remains bound to revision 1 while the task is revision 2.";
+          } else if (turn === 6) {
+            call = { type: "toolCall", id: "job-task-cancel-held", name: "agent_task", arguments: { action: "cancel" } };
+          } else {
+            text = "DONE: cancellation committed before session replacement.";
+          }
         } else if (scenario === "background-revise") {
           if (turn === 0) {
             call = { type: "toolCall", id: "b1-start", name: "agent_task", arguments: { action: "start", understanding: "authorized task" } };
@@ -477,10 +552,13 @@ export default function b1FixtureProvider(pi) {
           text = `UNEXPECTED_SCENARIO: ${scenario}`;
         }
 
-        if (call) audit({ type: "tool_call_emitted", step: turn, tool: call.name, arguments: call.arguments, toolCallId: call.id });
+        const toolCalls = calls.length ? calls : call ? [call] : [];
+        for (const emitted of toolCalls) {
+          audit({ type: "tool_call_emitted", step: turn, tool: emitted.name, arguments: emitted.arguments, toolCallId: emitted.id });
+        }
         if (scenario === "compaction" && turn === 9) audit({ type: "compaction_attack_finished", step: turn });
         if (scenario === "compaction" && turn === 13) audit({ type: "compaction_post_revision_finished", step: turn });
-        const content = call ? [call] : [{ type: "text", text }];
+        const content = toolCalls.length ? toolCalls : [{ type: "text", text }];
         const message = {
           role: "assistant",
           content,
@@ -495,12 +573,20 @@ export default function b1FixtureProvider(pi) {
             totalTokens: 15,
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
           },
-          stopReason: call ? "toolUse" : "stop",
+          stopReason: toolCalls.length ? "toolUse" : "stop",
           timestamp: Date.now(),
         };
         stream.push({ type: "start", partial: message });
-        if (call) stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: call, partial: message });
-        else stream.push({ type: "text_end", contentIndex: 0, content: text, partial: message });
+        if (toolCalls.length) {
+          toolCalls.forEach((emitted, index) => stream.push({
+            type: "toolcall_end",
+            contentIndex: index,
+            toolCall: emitted,
+            partial: message,
+          }));
+        } else {
+          stream.push({ type: "text_end", contentIndex: 0, content: text, partial: message });
+        }
         stream.push({ type: "done", reason: message.stopReason, message });
         stream.end();
       });

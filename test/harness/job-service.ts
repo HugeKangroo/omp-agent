@@ -91,8 +91,11 @@ export class MockJobService {
   configure(config: {
     dropSubmitAck?: boolean;
     holdCancel?: boolean;
+    holdCancelResponse?: boolean;
     holdSubmitAccept?: boolean;
+    holdSubmitAck?: boolean;
     delayedQueryMs?: number;
+    delayedCancelMs?: number;
     corruptResponse?: "operationId" | "digest" | "jobId" | "missingDigest" | "overlongJobId" | null;
     submitHttpError?: number | null;
   }): Promise<{ ok: boolean; config: Record<string, unknown> }> {
@@ -117,6 +120,14 @@ export class MockJobService {
 
   releaseSubmit(): Promise<{ ok: boolean; released: boolean }> {
     return this.control("/_control/release-submit", {});
+  }
+
+  releaseSubmitAck(): Promise<{ ok: boolean; released: boolean }> {
+    return this.control("/_control/release-submit-ack", {});
+  }
+
+  releaseCancelResponse(): Promise<{ ok: boolean; released: boolean }> {
+    return this.control("/_control/release-cancel-response", {});
   }
 
   async cleanup(): Promise<void> {

@@ -17,6 +17,7 @@ const PROVIDER_PATH = path.join(REPO_ROOT, "test/fixtures/b1-provider.mjs");
 const CAPABILITY_PATH = path.join(REPO_ROOT, "test/fixtures/b1-capability.mjs");
 const ENTRY_PATH = path.join(REPO_ROOT, "src/task-entry.ts");
 const JOB_ENTRY_PATH = path.join(REPO_ROOT, "src/job-entry.ts");
+const OBSERVED_JOB_ENTRY_PATH = path.join(REPO_ROOT, "test/fixtures/observe-job-tool.mjs");
 const B1_PROVIDER = "g1b-fixture";
 const B1_MODEL = "scripted";
 const B1_API = "g1b-fixture-api";
@@ -35,6 +36,8 @@ export interface B1RunOptions {
     endpoint: string;
     capabilityId?: string;
     timeoutMs?: number;
+    /** Test-only transparent observer of the actual third-argument signal. */
+    observeToolSignal?: boolean;
   };
 }
 
@@ -49,9 +52,11 @@ export class B1OmpSession {
   readonly sessionDir: string | undefined;
   readonly jobRecordPath: string | undefined;
   readonly jobAuditPath: string | undefined;
+  readonly jobToolTracePath: string | undefined;
   private readonly jobEndpoint: string | undefined;
   private readonly jobCapabilityId: string | undefined;
   private readonly jobTimeoutMs: number | undefined;
+  private readonly observeJobTool: boolean | undefined;
   readonly frames: Frame[] = [];
   readonly scenario: string;
   promptSent = false;
@@ -78,9 +83,11 @@ export class B1OmpSession {
     sessionDir: string | undefined;
     jobRecordPath: string | undefined;
     jobAuditPath: string | undefined;
+    jobToolTracePath: string | undefined;
     jobEndpoint: string | undefined;
     jobCapabilityId: string | undefined;
     jobTimeoutMs: number | undefined;
+    observeJobTool: boolean | undefined;
   }, scenario: string) {
     this.root = values.root;
     this.workspace = values.workspace;
@@ -92,9 +99,11 @@ export class B1OmpSession {
     this.sessionDir = values.sessionDir;
     this.jobRecordPath = values.jobRecordPath;
     this.jobAuditPath = values.jobAuditPath;
+    this.jobToolTracePath = values.jobToolTracePath;
     this.jobEndpoint = values.jobEndpoint;
     this.jobCapabilityId = values.jobCapabilityId;
     this.jobTimeoutMs = values.jobTimeoutMs;
+    this.observeJobTool = values.observeJobTool;
     this.scenario = scenario;
   }
 
@@ -137,7 +146,11 @@ export class B1OmpSession {
     await writeFile(fixtureSnapshotPath, "", { mode: 0o600 });
     const jobRecordPath = options.jobs ? path.join(root, "job-record.json") : undefined;
     const jobAuditPath = options.jobs ? path.join(root, "job-audit.jsonl") : undefined;
+    const jobToolTracePath = options.jobs && options.jobs.observeToolSignal
+      ? path.join(root, "job-tool-trace.jsonl")
+      : undefined;
     if (jobAuditPath) await writeFile(jobAuditPath, "", { mode: 0o600 });
+    if (jobToolTracePath) await writeFile(jobToolTracePath, "", { mode: 0o600 });
     const session = new B1OmpSession({
       root,
       workspace,
@@ -149,9 +162,11 @@ export class B1OmpSession {
       sessionDir,
       jobRecordPath,
       jobAuditPath,
+      jobToolTracePath,
       jobEndpoint: options.jobs?.endpoint,
       jobCapabilityId: options.jobs?.capabilityId,
       jobTimeoutMs: options.jobs?.timeoutMs,
+      observeJobTool: options.jobs?.observeToolSignal,
     }, options.scenario);
     return session;
   }
@@ -186,6 +201,7 @@ export class B1OmpSession {
       env.OMP_AGENT_JOB_AUDIT_PATH = this.jobAuditPath!;
       env.OMP_AGENT_JOB_CAPABILITY = this.jobCapabilityId ?? "job-submit";
       if (this.jobTimeoutMs !== undefined) env.OMP_AGENT_JOB_TIMEOUT_MS = String(this.jobTimeoutMs);
+      if (this.jobToolTracePath) env.B3_TOOL_TRACE = this.jobToolTracePath;
     }
     return env;
   }
@@ -204,7 +220,7 @@ export class B1OmpSession {
       "--extension", PROVIDER_PATH,
       "--extension", ENTRY_PATH,
       "--extension", CAPABILITY_PATH,
-      ...(this.jobEndpoint ? ["--extension", JOB_ENTRY_PATH] : []),
+      ...(this.jobEndpoint ? ["--extension", this.observeJobTool ? OBSERVED_JOB_ENTRY_PATH : JOB_ENTRY_PATH] : []),
     ];
   }
 
@@ -280,6 +296,65 @@ export class B1OmpSession {
   }
 
   /**
+   * Send a genuine user prompt whose agent run is expected to be host-aborted.
+   * Completion is still the correlated prompt_result (aborted) plus
+   * session_settled; an RPC acknowledgement alone is insufficient.
+   */
+  async promptAborted(message: string): Promise<Frame> {
+    if (!this.admitted) throw new Error("Refusing to send a business prompt before B1 admission.");
+    const id = `b1-prompt-${++this.sequence}`;
+    const startIndex = this.frames.length;
+    this.promptSent = true;
+    this.send({ type: "prompt", id, message });
+    await this.waitFor(() => this.frames.some((frame) => frame.type === "response" && frame.id === id), "prompt acknowledgement", 10_000);
+    const acknowledgement = this.frames.find((frame) => frame.type === "response" && frame.id === id)!;
+    if (acknowledgement.success !== true) throw new Error(`OMP rejected prompt: ${String(acknowledgement.error)}`);
+    const deadline = Date.now() + 25_000;
+    await this.waitFor(() => this.result(id, startIndex) !== undefined, `prompt_result ${id}`, Math.max(1, deadline - Date.now()));
+    const result = this.result(id, startIndex)!;
+    if (result.frame.status !== "aborted") {
+      throw new Error(`OMP prompt ${id} was expected to abort but ended ${String(result.frame.status)}.`);
+    }
+    await this.waitFor(
+      () => result.frame.sessionSettled === true
+        || this.frames.some((frame, index) => index > result.index && frame.type === "session_settled"),
+      `session_settled after aborted ${id}`,
+      Math.max(1, deadline - Date.now()),
+    );
+    await Bun.sleep(100);
+    return result.frame;
+  }
+
+  /** Host-requested abort. The ACK is not completion; callers wait for prompt_result. */
+  abort(): Promise<Frame> {
+    return this.request("abort");
+  }
+
+  get processId(): number | undefined {
+    return this.child?.pid;
+  }
+
+  /**
+   * Actual process-group death for disconnect evidence. This is not remote
+   * cancellation and not restart recovery; the independent service is owned by
+   * the test host and must be checked separately.
+   */
+  async killProcessGroup(signal: NodeJS.Signals = "SIGKILL"): Promise<void> {
+    const child = this.child;
+    if (!child?.pid) throw new Error("OMP process is not running.");
+    if (this.exited) return;
+    // A deliberate kill is not a harness failure.
+    this.stopping = true;
+    try { process.kill(-child.pid, signal); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
+    if (this.exitPromise) await Promise.race([this.exitPromise, Bun.sleep(5_000)]);
+    const deadline = Date.now() + 5_000;
+    while (this.groupExists() && Date.now() < deadline) await Bun.sleep(20);
+    if (this.groupExists()) throw new Error(`OMP process group survived ${signal}.`);
+  }
+
+  /**
    * Drive a local extension command. A slash command does not invoke an agent,
    * so completion is the matching prompt_result with agentInvoked=false; an
    * ACK or a guessed sleep is not completion.
@@ -343,6 +418,12 @@ export class B1OmpSession {
     return this.request("new_session");
   }
 
+  /** Append-only fixture snapshot history; labels are never lost to a later hook. */
+  async fixtureSnapshotHistory(): Promise<Frame[]> {
+    return (await this.jsonl(`${this.fixtureSnapshotPath}.history`))
+      .filter((value): value is Frame => typeof value === "object" && value !== null && !Array.isArray(value));
+  }
+
   async fixtureSnapshot(): Promise<Frame | undefined> {
     const value = await this.json(this.fixtureSnapshotPath);
     return typeof value === "object" && value !== null && !Array.isArray(value) ? value as Frame : undefined;
@@ -394,6 +475,7 @@ export class B1OmpSession {
       counter: await this.json(path.join(this.root, "capability-counter.json")),
       jobRecord: this.jobRecordPath ? await this.json(this.jobRecordPath) : undefined,
       jobAudit: this.jobAuditPath ? await this.jsonl(this.jobAuditPath) : [],
+      jobToolTrace: this.jobToolTracePath ? await this.jsonl(this.jobToolTracePath) : [],
       stderr: this.stderr,
       workspaceEntries: (await readdir(this.workspace)).sort(),
     };

@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { createServer, type Server } from "node:http";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -741,5 +742,270 @@ describe("JobAdapter failure visibility", () => {
     expect(failed.isError).toBeFalsy();
     expect(typeof operation.lastError).toBe("string");
     expect(() => new JobAdapterError("visible")).toThrow("visible");
+  });
+});
+
+async function listen(server: Server): Promise<string> {
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => resolve());
+  });
+  const address = server.address();
+  if (typeof address !== "object" || address === null) throw new Error("test server has no port");
+  return `http://127.0.0.1:${address.port}`;
+}
+
+async function adapterForEndpoint(endpoint: string, timeoutMs = 1_000): Promise<{
+  adapter: JobAdapter;
+  owner: TaskOwner;
+  branch: Entry[];
+  root: string;
+  recordPath: string;
+}> {
+  const root = await mkdtemp(path.join(tmpdir(), "omp-agent-b3b-transport-"));
+  const recordPath = path.join(root, "record.json");
+  const owner = newOwner();
+  const { branch } = startTask(owner);
+  const adapter = new JobAdapter(owner, {
+    endpoint,
+    recordPath,
+    capabilityId: "job-submit",
+    timeoutMs,
+    now: () => NOW,
+    id: (() => { let n = 0; return () => `transport-${++n}`; })(),
+  });
+  cleanups.push(async () => {
+    adapter.dispose();
+    await rm(root, { recursive: true, force: true });
+  });
+  return { adapter, owner, branch, root, recordPath };
+}
+
+describe("B3b model-call abort and local wait lifecycle", () => {
+  test("an already-aborted signal rejects before admission, record or POST", async () => {
+    const { service, owner, adapter, branch } = await setup();
+    const controller = new AbortController();
+    controller.abort("user interrupt");
+    await expect(adapter.submit(contextFor(branch), {
+      expectedTaskRevision: 1,
+      payload: "alpha-prototype-payload",
+    }, controller.signal)).rejects.toThrow(/aborted before admission/);
+    expect(adapter.operationIds).toHaveLength(0);
+    expect(owner.snapshot().currentTask?.admissions).toBe(0);
+    const stats = await service.stats();
+    expect(stats.counters.submitRequests).toBe(0);
+    expect(stats.counters.actualCreates).toBe(0);
+  });
+
+  test("in-flight query abort ends the local wait and keeps the prior running fact", async () => {
+    const { service, adapter, branch } = await setup();
+    const submitted = await adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    const operationId = (submitted.details?.operation as Record<string, unknown>).operationId as string;
+    await service.configure({ delayedQueryMs: 800 });
+
+    const controller = new AbortController();
+    const pending = adapter.query(contextFor(branch), controller.signal);
+    await waitFor("query reached service", async () => (await service.stats()).counters.queryRequests === 1 ? true : undefined);
+    const abortedAt = Date.now();
+    controller.abort("Interrupted by user");
+    const result = await pending;
+    expect(Date.now() - abortedAt).toBeLessThan(500);
+    expect(result.isError).toBe(true);
+    expect(result.details?.aborted).toBe(true);
+    expect((result.details?.query as Record<string, unknown>).outcome).toBe("aborted");
+    const operation = result.details?.operation as Record<string, unknown>;
+    expect(operation.externalState).toBe("running");
+    expect((result.details?.task as Record<string, unknown>).status).toBe("active");
+    const observations = operation.observations as Array<Record<string, unknown>>;
+    expect(observations.some((observation) => observation.source === "query_aborted")).toBe(true);
+    expect(observations.filter((observation) => observation.source === "query")).toHaveLength(0);
+    const calls = operation.calls as Array<Record<string, unknown>>;
+    expect(calls.at(-1)?.outcome).toBe("aborted");
+    const stats = await service.stats();
+    expect(stats.counters.cancelRequests).toBe(0);
+    expect(stats.counters.actualCreates).toBe(1);
+
+    await service.configure({ delayedQueryMs: 0 });
+    const queried = await adapter.query(contextFor(branch));
+    expect(queried.isError).toBeFalsy();
+    expect((queried.details?.operation as Record<string, unknown>).operationId).toBe(operationId);
+    expect((queried.details?.operation as Record<string, unknown>).externalState).toBe("running");
+  });
+
+  test("submit abort after dispatch retains unknown under the original operation and reconciles later", async () => {
+    const { service, adapter, branch } = await setup();
+    await service.configure({ holdSubmitAccept: true });
+    const controller = new AbortController();
+    const pending = adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" }, controller.signal);
+    await waitFor("held submit reached service", async () => (await service.stats()).counters.submitRequests === 1 ? true : undefined);
+    controller.abort("Interrupted by user");
+    const aborted = await pending;
+    expect(aborted.isError).toBe(true);
+    const abortedOperation = aborted.details?.operation as Record<string, unknown>;
+    expect(abortedOperation.externalState).toBe("unknown");
+    expect(abortedOperation.externalJobId).toBeNull();
+    expect(abortedOperation.dispatch).toBe("sent");
+    expect(abortedOperation.taskRevision).toBe(1);
+    const operationId = abortedOperation.operationId as string;
+    const digest = abortedOperation.payloadDigest as string;
+    const observations = abortedOperation.observations as Array<Record<string, unknown>>;
+    expect(observations.some((observation) => observation.source === "submit_aborted")).toBe(true);
+    expect((aborted.details?.query as Record<string, unknown> | undefined)?.outcome).toBeUndefined();
+    expect((await service.stats()).counters.actualCreates).toBe(0);
+
+    await service.releaseSubmit();
+    const afterRelease = await service.stats();
+    expect(afterRelease.counters.actualCreates).toBe(1);
+    expect(afterRelease.counters.submitRequests).toBe(1);
+
+    const reconciled = await adapter.query(contextFor(branch));
+    expect(reconciled.isError).toBeFalsy();
+    const operation = reconciled.details?.operation as Record<string, unknown>;
+    expect(operation.operationId).toBe(operationId);
+    expect(operation.payloadDigest).toBe(digest);
+    expect(operation.externalState).toBe("running");
+    expect((reconciled.details?.task as Record<string, unknown>).status).toBe("active");
+    expect((await service.stats()).counters.actualCreates).toBe(1);
+  });
+
+  test("host cleanup does not inherit an aborted model query signal", async () => {
+    const { service, owner, adapter, branch } = await setup();
+    await adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    await service.configure({ delayedCancelMs: 500, delayedQueryMs: 700 });
+    const cancelledBranch = cancelTask(owner, branch);
+    const queryController = new AbortController();
+    const querying = adapter.query(contextFor(cancelledBranch), queryController.signal);
+    await waitFor("model query reached service", async () => (await service.stats()).counters.queryRequests === 1 ? true : undefined);
+    queryController.abort("user interrupt during query");
+    const aborted = await querying;
+    expect(aborted.isError).toBe(true);
+    expect((aborted.details?.query as Record<string, unknown>).outcome).toBe("aborted");
+
+    const settled = await waitFor("same-intent cleanup", async () => {
+      const operation = adapter.operationIds[0] ? adapter.snapshot(adapter.operationIds[0]) : undefined;
+      return operation?.cancelIntent?.state === "confirmed" ? operation : undefined;
+    });
+    expect(settled.externalState).toBe("cancelled");
+    const stats = await service.stats();
+    expect(stats.counters.cancelRequests).toBe(1);
+    expect(stats.counters.actualCreates).toBe(1);
+    expect(owner.snapshot().currentTask?.status).toBe("cancelled");
+  });
+
+  test("dispose aborts model waits but lets an already-issued cleanup settle within its deadline", async () => {
+    const { service, owner, adapter, branch } = await setup();
+    await adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    await service.configure({ holdCancelResponse: true });
+    cancelTask(owner, branch);
+    await waitFor("held cleanup request", async () => (await service.stats()).counters.cancelRequests === 1 ? true : undefined);
+    adapter.dispose();
+    await service.releaseCancelResponse();
+    const settled = await waitFor("cleanup settles after dispose", async () => {
+      const operation = adapter.snapshot(adapter.operationIds[0]!);
+      return operation?.cancelIntent?.state === "confirmed" ? operation : undefined;
+    });
+    expect(settled.externalState).toBe("cancelled");
+    expect(settled.cancelIntent).not.toBeNull();
+    expect((await service.stats()).counters.cancelRequests).toBe(1);
+    expect((await service.stats()).counters.actualCancels).toBe(1);
+  });
+
+  test("dispose aborts the local wait without claiming the remote job stopped", async () => {
+    const { service, adapter, branch } = await setup();
+    const submitted = await adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    const operationId = (submitted.details?.operation as Record<string, unknown>).operationId as string;
+    await service.configure({ delayedQueryMs: 1_000 });
+    const pending = adapter.query(contextFor(branch));
+    await waitFor("query reached service", async () => (await service.stats()).counters.queryRequests === 1 ? true : undefined);
+    adapter.dispose();
+    const result = await pending;
+    expect(result.isError).toBe(true);
+    expect((result.details?.query as Record<string, unknown>).outcome).toBe("aborted");
+    const operation = adapter.snapshot(operationId)!;
+    expect(operation.externalState).toBe("running");
+    expect(operation.lastError).toContain("disposed");
+    expect(operation.externalJobId).not.toBeNull();
+    await expect(adapter.query(contextFor(branch))).rejects.toThrow(/disposed/);
+    const stats = await service.stats();
+    expect(stats.counters.cancelRequests).toBe(0);
+    expect(stats.counters.actualCreates).toBe(1);
+  });
+
+  test("a result is withheld after the conversation binding detaches during the await", async () => {
+    const { service, owner, adapter, branch } = await setup();
+    await adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    await service.configure({ delayedQueryMs: 400 });
+    const pending = adapter.query(contextFor(branch));
+    await waitFor("query reached service", async () => (await service.stats()).counters.queryRequests === 1 ? true : undefined);
+    owner.navigate("session_switch", "replacement-session");
+    await expect(pending).rejects.toThrow(/result withheld/);
+    expect(adapter.snapshot(adapter.operationIds[0]!)?.observations.length).toBeGreaterThan(0);
+    expect((await service.stats()).counters.queryRequests).toBe(1);
+  });
+
+  test("withheld disclosure after a valid 201 is not mislabelled as a transport failure", async () => {
+    const { service, owner, adapter, branch, recordPath } = await setup();
+    await service.configure({ holdSubmitAccept: true });
+    const pending = adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    await waitFor("held submit reached service", async () => (await service.stats()).counters.submitRequests === 1 ? true : undefined);
+    owner.navigate("session_switch", "replacement-session");
+    await service.releaseSubmit();
+    await expect(pending).rejects.toThrow(/result withheld/);
+    expect((await service.stats()).counters.actualCreates).toBe(1);
+    const record = JSON.parse(await readFile(recordPath, "utf8")) as {
+      operations: Array<Record<string, unknown>>;
+    };
+    const operation = record.operations[0]!;
+    expect(operation.externalState).toBe("running");
+    expect(operation.accepted).toBe(true);
+    expect(operation.externalJobId).toBe("job-1");
+    const calls = operation.calls as Array<Record<string, unknown>>;
+    expect(calls.at(-1)?.outcome).toBe("ok");
+    const observations = operation.observations as Array<Record<string, unknown>>;
+    expect(observations.some((observation) => observation.source === "submit_response")).toBe(true);
+    expect(observations.filter((observation) => observation.source === "submit_transport_error")).toHaveLength(0);
+    expect(observations.filter((observation) => observation.source === "submit_protocol_error")).toHaveLength(0);
+  });
+
+  test("redirect responses are refused without a second request", async () => {
+    let requests = 0;
+    const server = createServer((_req, res) => {
+      requests += 1;
+      res.writeHead(302, { location: "/jobs/elsewhere" });
+      res.end();
+    });
+    const endpoint = await listen(server);
+    cleanups.push(async () => { await new Promise<void>((resolve) => server.close(() => resolve())); });
+    const { adapter, branch } = await adapterForEndpoint(endpoint);
+    const result = await adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha" });
+    expect(result.isError).toBe(true);
+    const operation = result.details?.operation as Record<string, unknown>;
+    expect(operation.externalState).toBe("unknown");
+    expect(operation.externalJobId).toBeNull();
+    expect(String(operation.lastError)).toContain("redirect");
+    expect(requests).toBe(1);
+  });
+
+  test("chunked oversize responses are cut at the 16 KiB bound and cancelled", async () => {
+    let requests = 0;
+    let responseClosed = false;
+    const server = createServer((_req, res) => {
+      requests += 1;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.on("close", () => { responseClosed = true; });
+      const chunk = "x".repeat(4 * 1024);
+      for (let index = 0; index < 6 && !res.destroyed; index += 1) res.write(chunk);
+      res.end();
+    });
+    const endpoint = await listen(server);
+    cleanups.push(async () => { await new Promise<void>((resolve) => server.close(() => resolve())); });
+    const { adapter, branch } = await adapterForEndpoint(endpoint);
+    const result = await adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha" });
+    expect(result.isError).toBe(true);
+    const operation = result.details?.operation as Record<string, unknown>;
+    expect(operation.externalState).toBe("unknown");
+    expect(String(operation.lastError)).toMatch(/exceeds 16384 bytes/);
+    await waitFor("oversize stream cancellation", async () => responseClosed ? true : undefined);
+    expect(requests).toBe(1);
   });
 });

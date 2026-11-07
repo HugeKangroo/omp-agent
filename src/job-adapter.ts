@@ -41,7 +41,8 @@ export interface JobCall {
   action: "submit" | "query";
   startedAt: string;
   finishedAt: string | null;
-  outcome: "ok" | "error" | "unknown";
+  /** A host abort only ends the local wait; it never changes task/remote state. */
+  outcome: "ok" | "error" | "unknown" | "aborted";
   detail: string | null;
 }
 
@@ -115,6 +116,43 @@ export class JobAdapterError extends Error {
   override name = "JobAdapterError";
 }
 
+/**
+ * Local wait termination. This is not a remote-job failure and never means the
+ * external effect did not occur.
+ */
+class JobRequestAborted extends JobAdapterError {
+  override name = "JobRequestAborted";
+
+  constructor(
+    readonly reason: "caller" | "timeout" | "disposed",
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+/** Local transport/protocol refusal; never evidence of a remote job outcome. */
+class JobProtocolError extends JobAdapterError {
+  override name = "JobProtocolError";
+}
+
+/** The call completed but disclosure is no longer reachable. Not a transport outcome. */
+class JobResultWithheld extends JobAdapterError {
+  override name = "JobResultWithheld";
+}
+
+function protocolError(error: unknown): error is JobProtocolError {
+  return error instanceof JobProtocolError;
+}
+
+function requestAborted(error: unknown): error is JobRequestAborted {
+  return error instanceof JobRequestAborted;
+}
+
+function abortedBefore(phase: string): JobAdapterError {
+  return new JobAdapterError(`agent_job was aborted ${phase}; no admission or transport was performed.`);
+}
+
 interface JobRecord {
   schemaVersion: typeof JOB_SCHEMA_VERSION;
   adapterId: string;
@@ -133,6 +171,7 @@ interface RemoteResponse {
 interface QueryRemoteOutcome {
   ok: boolean;
   fresh: boolean;
+  aborted: boolean;
   callOutcome: JobCall["outcome"];
   remoteState: RemoteResponse["state"] | null;
   error: string | null;
@@ -140,7 +179,8 @@ interface QueryRemoteOutcome {
 
 function querySummary(outcome: QueryRemoteOutcome): Record<string, unknown> {
   return {
-    outcome: outcome.ok ? "ok" : outcome.fresh ? "stale" : "unverified",
+    outcome: outcome.aborted ? "aborted" : outcome.ok ? "ok" : outcome.fresh ? "stale" : "unverified",
+    aborted: outcome.aborted,
     fresh: outcome.fresh,
     remoteState: outcome.remoteState,
     error: outcome.error,
@@ -285,6 +325,12 @@ export class JobAdapter {
   private readonly cleanupDirty = new Set<string>();
   private cleanupRunning = false;
   private disposed = false;
+  /**
+   * Local HTTP waits. Model-owned waits are aborted on dispose; an
+   * already-issued host cleanup is allowed to settle within its fixed request
+   * deadline, while no new cleanup attempt starts after disposal.
+   */
+  private readonly activeRequests = new Map<AbortController, "model" | "cleanup">();
   private readonly unsubscribe: () => void;
 
   constructor(owner: TaskOwner, config: HostJobConfig) {
@@ -437,23 +483,83 @@ export class JobAdapter {
     return operation ? freeze(copy(operation)) : undefined;
   }
 
+  /**
+   * One caller-owned local wait. The model call signal and the host timeout
+   * both end only this wait. Redirects are never followed: the endpoint is the
+   * authority boundary, so a 3xx is a protocol error, not a job outcome.
+   */
   private async request(
     method: "GET" | "POST",
     requestPath: string,
-    body?: unknown,
+    body: unknown,
+    signal: AbortSignal | undefined,
+    kind: "model" | "cleanup",
   ): Promise<{ status: number; value: Record<string, unknown> | undefined }> {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    let abortReason: JobRequestAborted["reason"] | null = null;
+    const stop = (reason: JobRequestAborted["reason"]): void => {
+      if (controller.signal.aborted) return;
+      abortReason = reason;
+      const abort = new Error(reason === "caller"
+        ? "model call signal aborted"
+        : reason === "timeout" ? `request timed out after ${this.timeoutMs}ms` : "adapter disposed");
+      controller.abort(abort);
+    };
+    const onCallerAbort = (): void => stop("caller");
+    if (signal?.aborted) stop("caller");
+    else signal?.addEventListener("abort", onCallerAbort, { once: true });
+    const timer = setTimeout(() => stop("timeout"), this.timeoutMs);
+    this.activeRequests.set(controller, kind);
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
     try {
+      if (controller.signal.aborted) throw this.abortedError(abortReason ?? "disposed");
       const response = await fetch(`${this.endpoint}${requestPath}`, {
         method,
         headers: body === undefined ? {} : { "content-type": "application/json" },
         ...(body === undefined ? {} : { body: JSON.stringify(body) }),
         signal: controller.signal,
+        redirect: "manual",
       });
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      if (bytes.byteLength > MAX_RESPONSE_BYTES) {
-        throw new JobAdapterError(`Job service response exceeds ${MAX_RESPONSE_BYTES} bytes.`);
+      if (response.status >= 300 && response.status < 400) {
+        await response.body?.cancel().catch(() => {});
+        throw new JobProtocolError(
+          `Job service returned redirect HTTP ${response.status}; redirects are refused because the loopback endpoint is the authority boundary.`,
+        );
+      }
+      const declared = Number(response.headers.get("content-length"));
+      if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+        await response.body?.cancel().catch(() => {});
+        throw new JobProtocolError(`Job service response exceeds ${MAX_RESPONSE_BYTES} bytes.`);
+      }
+      const chunks: Uint8Array[] = [];
+      let total = 0;
+      if (response.body) {
+        reader = response.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          total += value.byteLength;
+          if (total > MAX_RESPONSE_BYTES) {
+            await reader.cancel().catch(() => {});
+            reader = undefined;
+            throw new JobProtocolError(`Job service response exceeds ${MAX_RESPONSE_BYTES} bytes.`);
+          }
+          chunks.push(value);
+        }
+        reader.releaseLock();
+        reader = undefined;
+      }
+      // An abort that raced with the final read wins: a late reply is not
+      // converted into a fresh observation for an interrupted call.
+      if (abortReason !== null || controller.signal.aborted
+        || (kind === "model" && (this.disposed || signal?.aborted))) {
+        throw this.abortedError(abortReason ?? (this.disposed ? "disposed" : "caller"));
+      }
+      const bytes = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
       }
       let value: Record<string, unknown> | undefined;
       if (bytes.byteLength) {
@@ -462,17 +568,36 @@ export class JobAdapter {
           if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) {
             value = parsed as Record<string, unknown>;
           } else {
-            throw new JobAdapterError("Job service returned a non-object JSON response.");
+            throw new JobProtocolError("Job service returned a non-object JSON response.");
           }
         } catch (error) {
           if (error instanceof JobAdapterError) throw error;
-          throw new JobAdapterError(`Job service returned invalid JSON: ${errorMessage(error)}`);
+          throw new JobProtocolError(`Job service returned invalid JSON: ${errorMessage(error)}`);
         }
       }
       return { status: response.status, value };
+    } catch (error) {
+      if (reader) await reader.cancel().catch(() => {});
+      if (error instanceof JobRequestAborted) throw error;
+      if (protocolError(error)) throw error;
+      if (abortReason !== null) throw this.abortedError(abortReason);
+      if (kind === "model" && this.disposed) throw this.abortedError("disposed");
+      throw error;
     } finally {
       clearTimeout(timer);
+      signal?.removeEventListener("abort", onCallerAbort);
+      this.activeRequests.delete(controller);
     }
+  }
+
+  private abortedError(reason: JobRequestAborted["reason"]): JobRequestAborted {
+    if (reason === "timeout") {
+      return new JobRequestAborted("timeout", `Job request timed out after ${this.timeoutMs}ms; the external effect may be unknown.`);
+    }
+    if (reason === "disposed") {
+      return new JobRequestAborted("disposed", "Job request was aborted locally because the adapter was disposed; the remote effect is not claimed stopped.");
+    }
+    return new JobRequestAborted("caller", "Job request was aborted by the model call signal; prior verified external facts are retained and the remote effect is not claimed stopped.");
   }
 
   /**
@@ -539,10 +664,16 @@ export class JobAdapter {
     }
   }
 
-  async submit(context: JobToolContext, args: { expectedTaskRevision: number; payload: string }): Promise<JobToolResult> {
+  async submit(
+    context: JobToolContext,
+    args: { expectedTaskRevision: number; payload: string },
+    signal?: AbortSignal,
+  ): Promise<JobToolResult> {
     if (this.disposed) throw new JobAdapterError("Job adapter is disposed.");
+    if (signal?.aborted) throw abortedBefore("before admission");
     const traceId = `job-trace-${this.newId()}`;
     const scope = this.taskContext(context);
+    if (signal?.aborted) throw abortedBefore("before admission");
     const payload = boundedPayload(args.payload);
     const digest = digestOf(payload);
     const existingId = this.byTask.get(scope.taskId);
@@ -573,17 +704,18 @@ export class JobAdapter {
         );
       }
       const call = this.startCall(existing, "submit", traceId);
-      const outcome = await this.queryRemote(existing, "submit_reconcile");
+      const outcome = await this.queryRemote(existing, "submit_reconcile", signal, "model");
       this.finishCall(existing, call, outcome.callOutcome, outcome.error);
       this.persist();
-      return this.result(
-        "submit",
-        existing,
-        { reconciled: true, traceId, reconciliation: querySummary(outcome) },
-        !outcome.ok,
-      );
+      return this.resultFor(context, "submit", existing, {
+        reconciled: true,
+        traceId,
+        ...(outcome.aborted ? { aborted: true } : {}),
+        reconciliation: querySummary(outcome),
+      }, !outcome.ok);
     }
 
+    if (signal?.aborted) throw abortedBefore("before admission");
     const decision = this.owner.admit(scope.subject, this.capabilityId, args.expectedTaskRevision);
     if (!decision.allowed) {
       this.safeAudit({ type: "job_submit_denied", traceId, reason: decision.reason });
@@ -659,7 +791,34 @@ export class JobAdapter {
       });
       this.finishCall(operation, call, "error", operation.lastError);
       this.persist();
-      return this.result("submit", operation, { reconciled: false }, true);
+      return this.resultFor(context, "submit", operation, { reconciled: false }, true);
+    }
+
+    if (signal?.aborted) {
+      operation.lastError = "model call aborted after admission and before first transport; nothing was dispatched";
+      this.observe(operation, {
+        source: "submit_aborted_before_dispatch",
+        remoteState: null,
+        externalJobId: null,
+        detail: operation.lastError,
+        cancelIntentId: operation.cancelIntent?.cancelIntentId ?? null,
+      });
+      this.finishCall(operation, call, "aborted", operation.lastError);
+      this.persist();
+      this.safeAudit({
+        type: "job_call_aborted",
+        action: "submit",
+        reason: "caller_before_dispatch",
+        traceId,
+        operationId: operation.operationId,
+        taskRevision: operation.taskRevision,
+        externalState: operation.externalState,
+      });
+      return this.resultFor(context, "submit", operation, {
+        reconciled: false,
+        aborted: true,
+        abortReason: "caller_before_dispatch",
+      }, true);
     }
 
     operation.dispatch = "sent";
@@ -670,7 +829,7 @@ export class JobAdapter {
         operationId: operation.operationId,
         digest: operation.payloadDigest,
         payload: operation.payload,
-      });
+      }, signal, "model");
       if (response.status >= 400) {
         // A dispatched submit can have created the job before any 4xx/5xx,
         // proxy error or conflict response. HTTP status alone is not
@@ -689,7 +848,7 @@ export class JobAdapter {
         });
         this.finishCall(operation, call, "unknown", operation.lastError);
         this.persist();
-        return this.result("submit", operation, { reconciled: false }, true);
+        return this.resultFor(context, "submit", operation, { reconciled: false }, true);
       }
       // Full operationId + digest + stable jobId + actual state are validated
       // here, before any accepted/jobId/state field changes.
@@ -707,31 +866,55 @@ export class JobAdapter {
       this.finishCall(operation, call, "ok", null);
       this.persist();
       if (operation.cancelIntent) this.scheduleCleanup(operation.operationId);
-      return this.result("submit", operation, { reconciled: remote.replayed, traceId }, false);
+      return this.resultFor(context, "submit", operation, { reconciled: remote.replayed, traceId }, false);
     } catch (error) {
+      // A successful response whose disclosure was withheld after a binding
+      // change is not a transport failure. Preserve the committed outcome.
+      if (error instanceof JobResultWithheld) throw error;
       // Accepted-then-lost-ack is indistinguishable here from a transport
       // failure before acceptance. Never mint a new id or claim zero effect,
       // and never downgrade a verified remote fact on a late invalid response.
+      const aborted = requestAborted(error);
+      const protocol = protocolError(error);
       this.markSubmitUnverified(operation, "unknown");
       operation.lastError = errorMessage(error);
       this.observe(operation, {
-        source: "submit_transport_error",
+        source: aborted ? "submit_aborted" : protocol ? "submit_protocol_error" : "submit_transport_error",
         remoteState: null,
         externalJobId: operation.externalJobId,
-        detail: operation.lastError,
+        detail: aborted
+          ? `${(error as JobRequestAborted).reason}: submit was interrupted after dispatch; the original operation id and digest are retained, external state is unknown, and no replay is attempted`
+          : protocol
+            ? `local transport protocol refusal after dispatch: ${operation.lastError}; this is not a remote job failure or a no-effect claim`
+            : operation.lastError,
         cancelIntentId: operation.cancelIntent?.cancelIntentId ?? null,
       });
-      this.finishCall(operation, call, "unknown", operation.lastError);
+      this.finishCall(operation, call, aborted ? "aborted" : protocol ? "error" : "unknown", operation.lastError);
       this.persist();
+      if (aborted) {
+        this.safeAudit({
+          type: "job_call_aborted",
+          action: "submit",
+          reason: (error as JobRequestAborted).reason,
+          traceId,
+          operationId: operation.operationId,
+          taskRevision: operation.taskRevision,
+          externalState: operation.externalState,
+        });
+      }
       if (operation.cancelIntent) this.scheduleCleanup(operation.operationId);
-      return this.result("submit", operation, { reconciled: false }, false);
+      return this.resultFor(context, "submit", operation, aborted
+        ? { reconciled: false, aborted: true, abortReason: (error as JobRequestAborted).reason }
+        : protocol ? { reconciled: false, protocolError: true } : { reconciled: false }, aborted || protocol);
     }
   }
 
-  async query(context: JobToolContext): Promise<JobToolResult> {
+  async query(context: JobToolContext, signal?: AbortSignal): Promise<JobToolResult> {
     if (this.disposed) throw new JobAdapterError("Job adapter is disposed.");
+    if (signal?.aborted) throw abortedBefore("before query");
     const traceId = `job-trace-${this.newId()}`;
     const scope = this.taskContext(context);
+    if (signal?.aborted) throw abortedBefore("before query");
     const operationId = this.byTask.get(scope.taskId);
     if (!operationId) throw new JobAdapterError("No job operation is registered for this task.");
     const operation = this.operations.get(operationId)!;
@@ -739,20 +922,36 @@ export class JobAdapter {
     if (operation.dispatch === "not_started") {
       this.finishCall(operation, call, "ok", "operation was never dispatched");
       this.persist();
-      return this.result("query", operation, {
+      return this.resultFor(context, "query", operation, {
         traceId,
-        query: { outcome: "ok", fresh: false, remoteState: "not_dispatched", error: null },
+        query: { outcome: "ok", aborted: false, fresh: false, remoteState: "not_dispatched", error: null },
       }, false);
     }
-    const outcome = await this.queryRemote(operation, "query");
+    const outcome = await this.queryRemote(operation, "query", signal, "model");
     this.finishCall(operation, call, outcome.callOutcome, outcome.error);
     this.persist();
+    if (outcome.aborted) {
+      this.safeAudit({
+        type: "job_call_aborted",
+        action: "query",
+        reason: (outcome.error ?? "aborted").slice(0, 200),
+        traceId,
+        operationId: operation.operationId,
+        taskRevision: operation.taskRevision,
+        externalState: operation.externalState,
+      });
+    }
     if (operation.cancelIntent && operation.cancelIntent.state === "requested_unconfirmed"
       && (operation.externalState === "running" || operation.externalState === "unknown")) {
-      // Reconcile/retry the SAME intent, not a new cancellation.
+      // Reconcile/retry the SAME intent, not a new cancellation. Cleanup owns
+      // its own waits and never inherits the model call's abort signal.
       this.scheduleCleanup(operation.operationId);
     }
-    return this.result("query", operation, { traceId, query: querySummary(outcome) }, !outcome.ok);
+    return this.resultFor(context, "query", operation, {
+      traceId,
+      query: querySummary(outcome),
+      ...(outcome.aborted ? { aborted: true } : {}),
+    }, !outcome.ok);
   }
 
   private startCall(operation: JobOperationSnapshot, action: "submit" | "query", traceId: string): JobCall {
@@ -775,9 +974,14 @@ export class JobAdapter {
     operation.updatedAt = this.now();
   }
 
-  private async queryRemote(operation: JobOperationSnapshot, source: string): Promise<QueryRemoteOutcome> {
+  private async queryRemote(
+    operation: JobOperationSnapshot,
+    source: string,
+    signal?: AbortSignal,
+    kind: "model" | "cleanup" = "model",
+  ): Promise<QueryRemoteOutcome> {
     try {
-      const response = await this.request("GET", `/jobs/${encodeURIComponent(operation.operationId)}`);
+      const response = await this.request("GET", `/jobs/${encodeURIComponent(operation.operationId)}`, undefined, signal, kind);
       if (response.status === 404) {
         // Not found is not proof that no job will appear: an accepted submit
         // may still be in flight. Preserve any verified state, but this
@@ -794,7 +998,7 @@ export class JobAdapter {
           detail,
           cancelIntentId: operation.cancelIntent?.cancelIntentId ?? null,
         });
-        return { ok: false, fresh: false, callOutcome: "unknown", remoteState: null, error: detail };
+        return { ok: false, fresh: false, aborted: false, callOutcome: "unknown", remoteState: null, error: detail };
       }
       if (response.status >= 400) throw new JobAdapterError(`job query failed with HTTP ${response.status}`);
       const remote = this.responseState(response.value, operation);
@@ -813,17 +1017,30 @@ export class JobAdapter {
         operation.cancelIntent.lastAttemptAt = this.now();
       }
       operation.lastError = null;
-      return { ok: true, fresh: true, callOutcome: "ok", remoteState: remote.state, error: null };
+      return { ok: true, fresh: true, aborted: false, callOutcome: "ok", remoteState: remote.state, error: null };
     } catch (error) {
+      const aborted = requestAborted(error);
+      const protocol = protocolError(error);
       operation.lastError = errorMessage(error);
       this.observe(operation, {
-        source: `${source}_transport_error`,
+        source: aborted ? `${source}_aborted` : protocol ? `${source}_protocol_error` : `${source}_transport_error`,
         remoteState: null,
         externalJobId: operation.externalJobId,
-        detail: operation.lastError,
+        detail: aborted
+          ? `${(error as JobRequestAborted).reason}: local wait ended; prior verified external facts are retained and no fresh state was observed`
+          : protocol
+            ? `local transport protocol refusal: ${operation.lastError}; this is not a remote job failure or a no-effect claim`
+            : operation.lastError,
         cancelIntentId: operation.cancelIntent?.cancelIntentId ?? null,
       });
-      return { ok: false, fresh: false, callOutcome: "unknown", remoteState: null, error: operation.lastError };
+      return {
+        ok: false,
+        fresh: false,
+        aborted,
+        callOutcome: aborted ? "aborted" : protocol ? "error" : "unknown",
+        remoteState: null,
+        error: operation.lastError,
+      };
     }
   }
 
@@ -854,7 +1071,7 @@ export class JobAdapter {
     try {
       const response = await this.request("POST", `/jobs/${encodeURIComponent(operation.operationId)}/cancel`, {
         cancelIntentId: operation.cancelIntent.cancelIntentId,
-      });
+      }, undefined, "cleanup");
       if (response.status === 404) {
         // The possibly in-flight submit may not be visible yet. Keep the same
         // intent unconfirmed and try to reconcile by operation id.
@@ -865,7 +1082,11 @@ export class JobAdapter {
           detail: "cancel target not yet observed; absence is not proof",
           cancelIntentId: operation.cancelIntent.cancelIntentId,
         });
-        await this.queryRemote(operation, "cancel_not_found_query");
+        // Disposal stops new attempts. An already-issued not-found response may
+        // still settle, but it must not start a fresh reconciliation query.
+        if (!this.disposed) {
+          await this.queryRemote(operation, "cancel_not_found_query", undefined, "cleanup");
+        }
         this.persist();
         this.safeAudit({
           type: "job_cancel_observed",
@@ -921,6 +1142,39 @@ export class JobAdapter {
         error: operation.lastError,
       });
     }
+  }
+
+  /**
+   * After any awaited model job call, re-check the actual conversation/task
+   * binding before exposing job details. A replaced/detached conversation gets
+   * an error, not the old operation payload. A revision change is not a
+   * replacement: the old revision receipt is returned and can be reported as
+   * stale without retagging.
+   */
+  private resultFor(
+    context: JobToolContext,
+    action: "submit" | "query",
+    operation: JobOperationSnapshot,
+    extra: Record<string, unknown>,
+    isError: boolean,
+  ): JobToolResult {
+    try {
+      const scope = this.taskContext(context);
+      if (scope.taskId !== operation.taskId) {
+        throw new JobAdapterError("the current conversation reaches a different task");
+      }
+    } catch (error) {
+      this.safeAudit({
+        type: "job_result_withheld",
+        action,
+        operationId: operation.operationId,
+        reason: errorMessage(error),
+      });
+      throw new JobResultWithheld(
+        `agent_job result withheld: the conversation/task binding is no longer reachable (${errorMessage(error)}). Original operation observations remain in the host record.`,
+      );
+    }
+    return this.result(action, operation, extra, isError);
   }
 
   private result(
@@ -1009,7 +1263,21 @@ export class JobAdapter {
     if (this.disposed) return;
     this.disposed = true;
     this.unsubscribe();
-    this.safeAudit({ type: "job_adapter_disposed", adapterId: this.adapterId, unresolved: this.unresolvedOperationIds() });
+    let drainingCleanup = 0;
+    for (const [controller, kind] of this.activeRequests) {
+      if (kind === "cleanup") {
+        drainingCleanup += 1;
+        continue;
+      }
+      if (!controller.signal.aborted) controller.abort(new Error("job adapter disposed"));
+    }
+    this.safeAudit({
+      type: "job_adapter_disposed",
+      adapterId: this.adapterId,
+      unresolved: this.unresolvedOperationIds(),
+      /** Already-issued cleanup may settle within its fixed deadline; no new attempt starts. */
+      drainingCleanup,
+    });
   }
 
   unresolvedOperationIds(): string[] {

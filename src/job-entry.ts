@@ -48,7 +48,7 @@ interface OmpApi {
   registerTool(tool: OmpTool): void;
 }
 
-export const JOB_ENTRY_VERSION = "0.1.0-g1b3a.0";
+export const JOB_ENTRY_VERSION = "0.1.0-g1b3b.0";
 
 const JOB_PARAMETERS = {
   type: "object",
@@ -151,9 +151,9 @@ export function createJobEntry(pi: OmpApi, options: {
           return await adapter.submit(context, {
             expectedTaskRevision: parsed.expectedTaskRevision!,
             payload: parsed.payload!,
-          });
+          }, signal);
         }
-        return await adapter.query(context);
+        return await adapter.query(context, signal);
       } catch (error) {
         safeAudit(audit, { type: "job_tool_rejected", error: errorMessage(error) });
         return errorResult(errorMessage(error));

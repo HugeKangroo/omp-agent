@@ -840,7 +840,8 @@ integration("real OMP compaction preserves authoritative requirements and denies
     expect(compactFixture.firstKeptEntryId).toBe(harmlessEntry?.id);
     expect(compactFixture.summary).toContain("SUMMARY_ATTACK_COMPACT");
     await session.waitForAudit("fixture session_compact", (event) => event.type === "session_compact_fixture");
-    const afterCompactSnapshot = await session.fixtureSnapshot();
+    const afterCompactSnapshot = (await session.fixtureSnapshotHistory())
+      .filter((snapshot) => snapshot.label === "session_compact").at(-1);
     expect(afterCompactSnapshot?.label).toBe("session_compact");
     const compactBranch = afterCompactSnapshot?.branch as Event[];
     expect(compactBranch.some((entry) => entry.id === creationAnchor.messageId)).toBe(true);
