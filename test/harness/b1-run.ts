@@ -16,10 +16,11 @@ const REPO_ROOT = path.resolve(import.meta.dir, "../..");
 const PROVIDER_PATH = path.join(REPO_ROOT, "test/fixtures/b1-provider.mjs");
 const CAPABILITY_PATH = path.join(REPO_ROOT, "test/fixtures/b1-capability.mjs");
 const ENTRY_PATH = path.join(REPO_ROOT, "src/task-entry.ts");
+const JOB_ENTRY_PATH = path.join(REPO_ROOT, "src/job-entry.ts");
 const B1_PROVIDER = "g1b-fixture";
 const B1_MODEL = "scripted";
 const B1_API = "g1b-fixture-api";
-const EXPECTED_TOOLS = ["agent_task", "agent_test_capability", "agent_untrusted_echo"];
+const BASE_TOOLS = ["agent_task", "agent_test_capability", "agent_untrusted_echo"];
 
 export interface B1RunOptions {
   scenario: string;
@@ -29,6 +30,12 @@ export interface B1RunOptions {
    * --no-session; when enabled, journals live only under the private temp root.
    */
   persistSessions?: boolean;
+  /** Explicit G1-B3a experimental job entry. Endpoint is host-chosen. */
+  jobs?: {
+    endpoint: string;
+    capabilityId?: string;
+    timeoutMs?: number;
+  };
 }
 
 export class B1OmpSession {
@@ -40,6 +47,11 @@ export class B1OmpSession {
   readonly fixtureSnapshotPath: string;
   readonly configPath: string;
   readonly sessionDir: string | undefined;
+  readonly jobRecordPath: string | undefined;
+  readonly jobAuditPath: string | undefined;
+  private readonly jobEndpoint: string | undefined;
+  private readonly jobCapabilityId: string | undefined;
+  private readonly jobTimeoutMs: number | undefined;
   readonly frames: Frame[] = [];
   readonly scenario: string;
   promptSent = false;
@@ -64,6 +76,11 @@ export class B1OmpSession {
     fixtureSnapshotPath: string;
     configPath: string;
     sessionDir: string | undefined;
+    jobRecordPath: string | undefined;
+    jobAuditPath: string | undefined;
+    jobEndpoint: string | undefined;
+    jobCapabilityId: string | undefined;
+    jobTimeoutMs: number | undefined;
   }, scenario: string) {
     this.root = values.root;
     this.workspace = values.workspace;
@@ -73,6 +90,11 @@ export class B1OmpSession {
     this.fixtureSnapshotPath = values.fixtureSnapshotPath;
     this.configPath = values.configPath;
     this.sessionDir = values.sessionDir;
+    this.jobRecordPath = values.jobRecordPath;
+    this.jobAuditPath = values.jobAuditPath;
+    this.jobEndpoint = values.jobEndpoint;
+    this.jobCapabilityId = values.jobCapabilityId;
+    this.jobTimeoutMs = values.jobTimeoutMs;
     this.scenario = scenario;
   }
 
@@ -113,7 +135,24 @@ export class B1OmpSession {
     await writeFile(auditPath, "", { mode: 0o600 });
     await writeFile(fixtureAuditPath, "", { mode: 0o600 });
     await writeFile(fixtureSnapshotPath, "", { mode: 0o600 });
-    const session = new B1OmpSession({ root, workspace, statePath, auditPath, fixtureAuditPath, fixtureSnapshotPath, configPath, sessionDir }, options.scenario);
+    const jobRecordPath = options.jobs ? path.join(root, "job-record.json") : undefined;
+    const jobAuditPath = options.jobs ? path.join(root, "job-audit.jsonl") : undefined;
+    if (jobAuditPath) await writeFile(jobAuditPath, "", { mode: 0o600 });
+    const session = new B1OmpSession({
+      root,
+      workspace,
+      statePath,
+      auditPath,
+      fixtureAuditPath,
+      fixtureSnapshotPath,
+      configPath,
+      sessionDir,
+      jobRecordPath,
+      jobAuditPath,
+      jobEndpoint: options.jobs?.endpoint,
+      jobCapabilityId: options.jobs?.capabilityId,
+      jobTimeoutMs: options.jobs?.timeoutMs,
+    }, options.scenario);
     return session;
   }
 
@@ -139,8 +178,15 @@ export class B1OmpSession {
     env.OMP_AGENT_B1_STATE_PATH = this.statePath;
     env.OMP_AGENT_B1_WORKSPACE_ROOT = this.workspace;
     env.OMP_AGENT_B1_AUDIT_PATH = this.auditPath;
-    env.OMP_AGENT_B1_CAPABILITIES = "test-progress";
+    env.OMP_AGENT_B1_CAPABILITIES = this.jobEndpoint ? "test-progress,job-submit" : "test-progress";
     env.B1_CAPABILITY_COUNTER = path.join(this.root, "capability-counter.json");
+    if (this.jobEndpoint && this.jobRecordPath) {
+      env.OMP_AGENT_JOB_ENDPOINT = this.jobEndpoint;
+      env.OMP_AGENT_JOB_RECORD_PATH = this.jobRecordPath;
+      env.OMP_AGENT_JOB_AUDIT_PATH = this.jobAuditPath!;
+      env.OMP_AGENT_JOB_CAPABILITY = this.jobCapabilityId ?? "job-submit";
+      if (this.jobTimeoutMs !== undefined) env.OMP_AGENT_JOB_TIMEOUT_MS = String(this.jobTimeoutMs);
+    }
     return env;
   }
 
@@ -158,6 +204,7 @@ export class B1OmpSession {
       "--extension", PROVIDER_PATH,
       "--extension", ENTRY_PATH,
       "--extension", CAPABILITY_PATH,
+      ...(this.jobEndpoint ? ["--extension", JOB_ENTRY_PATH] : []),
     ];
   }
 
@@ -192,8 +239,9 @@ export class B1OmpSession {
     }
     const dumpTools = Array.isArray(state.dumpTools) ? state.dumpTools as Array<{ name?: unknown }> : [];
     const names = dumpTools.map((tool) => typeof tool.name === "string" ? tool.name : "").sort();
-    if (JSON.stringify(names) !== JSON.stringify([...EXPECTED_TOOLS].sort())) {
-      throw new Error(`B1 admission failed: tools=${names.join(",")} expected=${EXPECTED_TOOLS.join(",")}`);
+    const expectedTools = [...BASE_TOOLS, ...(this.jobEndpoint ? ["agent_job"] : [])];
+    if (JSON.stringify(names) !== JSON.stringify([...expectedTools].sort())) {
+      throw new Error(`B1 admission failed: tools=${names.join(",")} expected=${expectedTools.join(",")}`);
     }
     const prePromptAudit = existsSync(this.auditPath) ? (await readFile(this.auditPath, "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line) as Event) : [];
     const business = prePromptAudit.filter((event) => ["input_observed", "task_started", "task_tool_attempt", "capability_admission_allowed"].includes(String(event.type)));
@@ -344,6 +392,8 @@ export class B1OmpSession {
       fixtureAudit: await this.jsonl(this.fixtureAuditPath),
       fixtureSnapshot: await this.fixtureSnapshot(),
       counter: await this.json(path.join(this.root, "capability-counter.json")),
+      jobRecord: this.jobRecordPath ? await this.json(this.jobRecordPath) : undefined,
+      jobAudit: this.jobAuditPath ? await this.jsonl(this.jobAuditPath) : [],
       stderr: this.stderr,
       workspaceEntries: (await readdir(this.workspace)).sort(),
     };

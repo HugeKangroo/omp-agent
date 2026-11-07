@@ -12,6 +12,7 @@
     "test": "bun test test/unit",
     "test:omp": "bun run scripts/test-omp.ts",
     "test:entry": "bun run scripts/test-entry.ts",
+    "test:jobs": "bun run scripts/test-jobs.ts",
     "typecheck": "bun x tsc --noEmit"
   },
   "devDependencies": {

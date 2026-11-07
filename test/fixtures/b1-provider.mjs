@@ -398,6 +398,68 @@ export default function b1FixtureProvider(pi) {
           } else {
             text = `UNEXPECTED_COMMAND_REVISE_TURN ${turn}`;
           }
+        } else if (scenario === "job-normal") {
+          if (turn === 0) {
+            call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
+          } else if (turn === 1) {
+            call = { type: "toolCall", id: "job-submit-1", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+          } else if (turn === 2) {
+            call = { type: "toolCall", id: "job-query-running", name: "agent_job", arguments: { action: "query" } };
+          } else if (turn === 3) {
+            text = "DONE: submitted one job and observed it running.";
+          } else if (turn === 4) {
+            call = { type: "toolCall", id: "job-query-succeeded", name: "agent_job", arguments: { action: "query" } };
+          } else {
+            text = "DONE: the host completed the job; the task remains active.";
+          }
+        } else if (scenario === "job-lost-ack") {
+          if (turn === 0) {
+            call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
+          } else if (turn === 1) {
+            call = { type: "toolCall", id: "job-submit-lost", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+          } else if (turn === 2) {
+            call = { type: "toolCall", id: "job-submit-reconcile", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+          } else if (turn === 3) {
+            call = { type: "toolCall", id: "job-submit-conflict", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "changed-payload-must-conflict" } };
+          } else if (turn === 4) {
+            call = { type: "toolCall", id: "job-query-after-lost", name: "agent_job", arguments: { action: "query" } };
+          } else {
+            text = "DONE: the lost acknowledgement was reconciled by the original operation id.";
+          }
+        } else if (scenario === "job-cancel") {
+          if (turn === 0) {
+            call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
+          } else if (turn === 1) {
+            call = { type: "toolCall", id: "job-submit-cancel", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+          } else if (turn === 2) {
+            text = "DONE: first prompt submitted the job.";
+          } else if (turn === 3) {
+            call = { type: "toolCall", id: "job-task-cancel", name: "agent_task", arguments: { action: "cancel" } };
+          } else if (turn === 4) {
+            text = "DONE: the genuine user cancelled the task; no model job cancel was called.";
+          } else if (turn === 5) {
+            call = { type: "toolCall", id: "job-query-after-cancel", name: "agent_job", arguments: { action: "query" } };
+          } else if (turn === 6) {
+            call = { type: "toolCall", id: "job-submit-after-cancel", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+          } else {
+            text = "DONE: host cleanup was observed and new submission was denied.";
+          }
+        } else if (scenario === "job-complete-cancel") {
+          if (turn === 0) {
+            call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
+          } else if (turn === 1) {
+            call = { type: "toolCall", id: "job-submit-complete", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+          } else if (turn === 2) {
+            text = "DONE: first prompt submitted the job.";
+          } else if (turn === 3) {
+            call = { type: "toolCall", id: "job-task-cancel-complete", name: "agent_task", arguments: { action: "cancel" } };
+          } else if (turn === 4) {
+            call = { type: "toolCall", id: "job-query-complete", name: "agent_job", arguments: { action: "query" } };
+          } else if (turn === 5) {
+            call = { type: "toolCall", id: "job-submit-complete-denied", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+          } else {
+            text = "DONE: completion won cancellation and the task was not accepted.";
+          }
         } else if (scenario === "background-revise") {
           if (turn === 0) {
             call = { type: "toolCall", id: "b1-start", name: "agent_task", arguments: { action: "start", understanding: "authorized task" } };

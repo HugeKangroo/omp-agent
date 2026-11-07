@@ -218,6 +218,32 @@ function copyGrant(grant: UserTurnGrant): UserTurnGrant {
   return { ...grant };
 }
 
+/** Defensive copy for listener facts: primitives, arrays and plain records. */
+function copyFacts(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => copyFacts(item));
+  if (typeof value === "object" && value !== null) {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype === Object.prototype || prototype === null) {
+      const copy: Record<string, unknown> = {};
+      for (const [key, item] of Object.entries(value as Record<string, unknown>)) copy[key] = copyFacts(item);
+      return copy;
+    }
+  }
+  return value;
+}
+
+function freezeFacts<T>(value: T): T {
+  if (Array.isArray(value)) {
+    for (const item of value) freezeFacts(item);
+    return Object.freeze(value);
+  }
+  if (typeof value === "object" && value !== null) {
+    for (const item of Object.values(value)) freezeFacts(item);
+    return Object.freeze(value);
+  }
+  return value;
+}
+
 /**
  * A pending observation has never started an agent and never resolved a
  * branch anchor. Only this state may be expired/replaced by later genuine
@@ -255,6 +281,16 @@ export function parseTaskControlArguments(value: unknown): TaskControlArguments 
   return { action: action as TaskControlAction, understanding };
 }
 
+export type TaskOwnerEvent = Readonly<Record<string, unknown> & { type: string; ownerId: string }>;
+export type TaskOwnerListener = (event: TaskOwnerEvent) => void | Promise<void>;
+
+export interface TaskOwnerListenerFailure {
+  /** `sync` while the listener call threw; `async` for a rejected promise. */
+  mode: "sync" | "async";
+  eventType: string;
+  error: string;
+}
+
 export interface TaskOwnerOptions {
   workspaceRoot: string;
   authorizedCapabilities?: readonly string[];
@@ -265,6 +301,11 @@ export interface TaskOwnerOptions {
   id?: () => string;
   onStateChange?: (snapshot: TaskOwnerSnapshot) => void;
   onEvent?: (event: Record<string, unknown> & { type: string }) => void;
+  /**
+   * Host-only diagnostic. Listener failures never roll back a committed owner
+   * event and never recursively notify subscribers.
+   */
+  onListenerFailure?: (failure: TaskOwnerListenerFailure) => void;
 }
 
 /**
@@ -281,6 +322,9 @@ export class TaskOwner {
   private readonly newId: () => string;
   private readonly onStateChange: ((snapshot: TaskOwnerSnapshot) => void) | undefined;
   private readonly onEvent: ((event: Record<string, unknown> & { type: string }) => void) | undefined;
+  private readonly onListenerFailure: ((failure: TaskOwnerListenerFailure) => void) | undefined;
+  private readonly listeners = new Map<number, TaskOwnerListener>();
+  private listenerSequence = 0;
   private tasksCreated = 0;
   private task: ManagedTask | undefined;
   private grant: UserTurnGrant | undefined;
@@ -314,6 +358,24 @@ export class TaskOwner {
     this.newId = options.id ?? (() => randomUUID());
     this.onStateChange = options.onStateChange;
     this.onEvent = options.onEvent;
+    this.onListenerFailure = options.onListenerFailure;
+  }
+
+  /**
+   * Host-only read subscription. Listeners receive immutable facts after the
+   * owner has already committed the change. The returned function is the only
+   * capability; no listener receives an owner handle or authority.
+   */
+  subscribe(listener: TaskOwnerListener): () => void {
+    if (typeof listener !== "function") throw new TaskOwnerError("Task owner listener must be a function.");
+    const id = ++this.listenerSequence;
+    this.listeners.set(id, listener);
+    let active = true;
+    return () => {
+      if (!active) return;
+      active = false;
+      this.listeners.delete(id);
+    };
   }
 
   snapshot(): TaskOwnerSnapshot {
@@ -328,6 +390,24 @@ export class TaskOwner {
       binding: this.bindingStatus(),
       authorizedCapabilities: [...this.capabilities].sort(),
     };
+  }
+
+  /**
+   * Read-only capability-facing check. It verifies the subject's actual branch
+   * still reaches the task's creation anchor; it emits no event and grants no
+   * mutation or admission authority.
+   */
+  reachableTask(subject: TaskSubject): ManagedTask {
+    this.assertSubject(subject);
+    if (!this.detached) {
+      if (!this.task) throw new TaskOwnerError("No managed task exists for this owner.");
+      this.assertTaskReachable(subject, this.task);
+      return copyTask(this.task);
+    }
+    if (!this.task) throw new TaskOwnerError("No managed task exists for this owner.");
+    throw new TaskOwnerError(
+      `Task history is detached (${this.detached.reason}); no active capability binding is available.`,
+    );
   }
 
   /** Read-only navigation binding status. It never reattaches authority. */
@@ -351,9 +431,98 @@ export class TaskOwner {
     }
   }
 
+  private reportHostCallbackFailure(callback: "onEvent" | "onStateChange", eventType: string, error: unknown): void {
+    try {
+      process.stderr.write(`${JSON.stringify({
+        type: "omp_agent_task_owner",
+        message: "host_callback_failed",
+        callback,
+        eventType,
+        error: error instanceof Error ? error.message : String(error),
+      })}\n`);
+    } catch {
+      // A diagnostic channel is not guaranteed.
+    }
+  }
+
+  private reportListenerFailure(failure: TaskOwnerListenerFailure): void {
+    try {
+      this.onListenerFailure?.(failure);
+    } catch {
+      // Diagnostics can never affect owner state.
+    }
+    try {
+      this.onEvent?.({ type: "task_listener_failed", ...failure });
+    } catch {
+      // The audit channel is host-owned and may also fail.
+    }
+    try {
+      process.stderr.write(`${JSON.stringify({ type: "omp_agent_task_owner", message: "listener_failed", ...failure })}\n`);
+    } catch {
+      // A diagnostic channel is not guaranteed.
+    }
+  }
+
   private changed(event?: Record<string, unknown> & { type: string }): void {
-    if (event && this.onEvent) this.onEvent({ ...event, ownerId: this.ownerId });
-    this.onStateChange?.(this.snapshot());
+    const facts: TaskOwnerEvent | undefined = event
+      ? freezeFacts({ ...(copyFacts(event) as Record<string, unknown>), type: event.type, ownerId: this.ownerId })
+      : undefined;
+    // Existing host callbacks remain authoritative and fail-closed: their
+    // first error is remembered, later host callbacks stop in baseline order,
+    // but post-commit subscribers still observe the committed event before the
+    // error is propagated to the caller.
+    let hostFailed = false;
+    let hostError: unknown;
+    if (facts && this.onEvent) {
+      try {
+        this.onEvent(facts as Record<string, unknown> & { type: string });
+      } catch (error) {
+        hostFailed = true;
+        hostError = error;
+        this.reportHostCallbackFailure("onEvent", facts.type, error);
+      }
+    }
+    if (!hostFailed) {
+      try {
+        this.onStateChange?.(this.snapshot());
+      } catch (error) {
+        hostFailed = true;
+        hostError = error;
+        this.reportHostCallbackFailure("onStateChange", facts?.type ?? "state_change", error);
+      }
+    }
+    if (facts) {
+      // Snapshot registrations: an unsubscribe during dispatch only affects
+      // later events. Each listener gets its own frozen copy.
+      const listeners = [...this.listeners.values()];
+      for (const listener of listeners) {
+        const delivered = freezeFacts(copyFacts(facts)) as TaskOwnerEvent;
+        try {
+          const result = listener(delivered);
+          if (result && typeof (result as PromiseLike<void>).then === "function") {
+            Promise.resolve(result).catch((error: unknown) => {
+              this.reportListenerFailure({
+                mode: "async",
+                eventType: facts.type,
+                error: error instanceof Error ? error.message : String(error),
+              });
+            });
+          }
+        } catch (error) {
+          this.reportListenerFailure({
+            mode: "sync",
+            eventType: facts.type,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
+    if (hostFailed) {
+      // Preserve baseline propagation identity: the original host error is
+      // rethrown even when it is `undefined`; optional listener failures never
+      // reach this path.
+      throw hostError;
+    }
   }
 
   private suspend(reason: string, event?: Record<string, unknown> & { type: string }): void {
@@ -730,7 +899,12 @@ export class TaskOwner {
     const anchor = this.resolveAuthority(subject, grant);
     if (this.task) {
       if (this.task.anchor.messageId === anchor.messageId) {
-        this.changed({ type: "task_duplicate_start", taskId: this.task.taskId, messageId: anchor.messageId });
+        this.changed({
+          type: "task_duplicate_start",
+          taskId: this.task.taskId,
+          taskRevision: this.task.taskRevision,
+          messageId: anchor.messageId,
+        });
         return { created: false, task: copyTask(this.task) };
       }
       throw new TaskOwnerError("A task already belongs to a different user message; B1 does not merge or rebind tasks.");
@@ -785,6 +959,7 @@ export class TaskOwner {
       type: "task_started",
       taskId: task.taskId,
       ownerId: task.ownerId,
+      taskRevision: task.taskRevision,
       messageId: task.anchor.messageId,
       sessionId: task.anchor.sessionId,
       source: task.anchor.source,
@@ -910,6 +1085,7 @@ export class TaskOwner {
     this.changed({
       type: "task_inspected",
       taskId: this.task.taskId,
+      taskRevision: this.task.taskRevision,
       binding: this.detached ? "detached" : "attached",
     });
     return copyTask(this.task);
@@ -933,7 +1109,7 @@ export class TaskOwner {
     // or custom messages after the current grant anchor still close the window.
     this.resolveAuthority(subject, grant);
     if (this.task.status === "cancelled") {
-      this.changed({ type: "task_cancel_duplicate", taskId: this.task.taskId });
+      this.changed({ type: "task_cancel_duplicate", taskId: this.task.taskId, taskRevision: this.task.taskRevision });
       return copyTask(this.task);
     }
     this.task.status = "cancelled";
