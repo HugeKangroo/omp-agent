@@ -16,6 +16,14 @@ import {
 } from "./harness/daily-run.ts";
 
 const TEST_TIMEOUT = 180_000;
+const EVIDENCE_GUIDANCE =
+  "For evidence-based work, before finalizing, check important conclusions, summaries, questions and proposed next steps for unstated premises: whether the sources establish the claimed event, entity, time, scope, certainty and links between them. " +
+  "Distinguish what sources directly establish from instructions, timestamps and assumptions; do not fill missing events, sequence or causal links from those alone. " +
+  "Check that citations support the claims they accompany, not just that the references exist; remove or narrow unsupported claims, make unresolved premises explicit, and keep questions conditional where needed. " +
+  "Check consistency across the document and final response. " +
+  "Describe checks only within their actual coverage: execution, structure, bytes and reference checks do not establish semantic correctness; self-review and model review are fallible advice, not host acceptance. " +
+  "Fixing a checker does not establish that unchanged content is correct. " +
+  "Keep this check proportional and report material limitations and revisions without private reasoning or a mandatory long review table.";
 const integration: (name: string, fn: () => Promise<unknown>, timeout?: number) => void =
   process.env.RUN_REAL_OMP_TEST === "1"
     ? (name, fn, timeout) => test(name, fn, timeout ?? TEST_TIMEOUT)
@@ -160,6 +168,8 @@ function currentGuidance(turn: Event): { daily: Event; task: Event } {
   expect(String(daily[0]!.content)).toContain("agent_verify");
   expect(String(daily[0]!.content)).toContain("agent_deliver");
   expect(String(daily[0]!.content)).toContain("Native workspace writes and shell self-tests do not create managed candidates or receipts");
+  expect(String(daily[0]!.content)).toContain(EVIDENCE_GUIDANCE);
+  expect(String(daily[0]!.content).split(EVIDENCE_GUIDANCE)).toHaveLength(2);
   expect(String(task[0]!.content)).toContain("agent_task");
   return { daily: daily[0]!, task: task[0]! };
 }

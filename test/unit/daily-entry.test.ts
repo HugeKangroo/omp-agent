@@ -43,6 +43,14 @@ import { VERIFICATION_TOOL } from "../../src/verification-entry.ts";
 const PYTHON = "/Library/Developer/CommandLineTools/usr/bin/python3";
 const BUN = process.execPath;
 const OWNER_ID = "owner-daily-fixture";
+const EVIDENCE_GUIDANCE =
+  "For evidence-based work, before finalizing, check important conclusions, summaries, questions and proposed next steps for unstated premises: whether the sources establish the claimed event, entity, time, scope, certainty and links between them. " +
+  "Distinguish what sources directly establish from instructions, timestamps and assumptions; do not fill missing events, sequence or causal links from those alone. " +
+  "Check that citations support the claims they accompany, not just that the references exist; remove or narrow unsupported claims, make unresolved premises explicit, and keep questions conditional where needed. " +
+  "Check consistency across the document and final response. " +
+  "Describe checks only within their actual coverage: execution, structure, bytes and reference checks do not establish semantic correctness; self-review and model review are fallible advice, not host acceptance. " +
+  "Fixing a checker does not establish that unchanged content is correct. " +
+  "Keep this check proportional and report material limitations and revisions without private reasoning or a mandatory long review table.";
 
 interface ToolResult {
   content: Array<{ type: string; text: string }>;
@@ -464,6 +472,8 @@ describe("daily composition", () => {
     expect(content).toContain(VERIFICATION_TOOL);
     expect(content).toContain(DELIVERY_TOOL);
     expect(content).toContain("Native workspace writes and shell self-tests do not create managed candidates or receipts");
+    expect(content).toContain(EVIDENCE_GUIDANCE);
+    expect(String(content).split(EVIDENCE_GUIDANCE)).toHaveLength(2);
     expect(messages.filter((message) => message.customType === B1_GUIDANCE_TYPE)).toHaveLength(1);
   });
 
