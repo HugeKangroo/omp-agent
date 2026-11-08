@@ -51,6 +51,11 @@ const EVIDENCE_GUIDANCE =
   "Describe checks only within their actual coverage: execution, structure, bytes and reference checks do not establish semantic correctness; self-review and model review are fallible advice, not host acceptance. " +
   "Fixing a checker does not establish that unchanged content is correct. " +
   "Keep this check proportional and report material limitations and revisions without private reasoning or a mandatory long review table.";
+const CAPABILITY_ADVISORY =
+  "Before choosing an execution route, compare the operations and constraints the task requires with the capability and limits the current host exposes; a tool or runtime being available does not establish support for every required operation. " +
+  "If an operation is explicitly unavailable or prohibited, do not dispatch a trial run or switch tools or languages to evade that limit. " +
+  "Investigate unknown facts only proportionally, through means already authorized and supported. " +
+  "If no compliant route exists, report what was not performed and remains unverified, with a scoped limitation, without inventing observations or success; an honest zero-tool answer remains valid.";
 
 interface ToolResult {
   content: Array<{ type: string; text: string }>;
@@ -468,6 +473,13 @@ describe("daily composition", () => {
     expect(daily[0]).toMatchObject({ display: false, attribution: "agent" });
     const content = daily[0]!.content;
     expect(typeof content).toBe("string");
+    expect(String(content).split(CAPABILITY_ADVISORY)).toHaveLength(2);
+    const taskFirst = "When the current genuine request should be managed, establish its task first";
+    expect(String(content).indexOf(CAPABILITY_ADVISORY)).toBeLessThan(String(content).indexOf(taskFirst));
+    expect(String(content)).toContain("does not establish support for every required operation");
+    expect(String(content)).toContain("If an operation is explicitly unavailable or prohibited");
+    expect(String(content)).toContain("Investigate unknown facts only proportionally, through means already authorized and supported");
+    expect(String(content)).toContain("zero-tool answer remains valid");
     expect(content).toContain(EXECUTION_TOOL);
     expect(content).toContain(VERIFICATION_TOOL);
     expect(content).toContain(DELIVERY_TOOL);
@@ -485,13 +497,18 @@ describe("daily composition", () => {
     const main = context(fx.workspace, []);
     const hasDailyGuidance = (ctx: OmpToolContext): boolean =>
       startMessages(fake, ctx).some((message) => message.customType === DAILY_GUIDANCE_TYPE);
+    const hasAdvisory = (ctx: OmpToolContext): boolean =>
+      startMessages(fake, ctx).some((message) => String(message.content).includes(CAPABILITY_ADVISORY));
     expect(hasDailyGuidance(main)).toBe(true);
+    expect(hasAdvisory(main)).toBe(true);
 
     const sub = { ...main, agent: { kind: "sub" as const } };
     expect(hasDailyGuidance(sub)).toBe(false);
+    expect(hasAdvisory(sub)).toBe(false);
 
     entry.dispose();
     expect(hasDailyGuidance(main)).toBe(false);
+    expect(hasAdvisory(main)).toBe(false);
   });
 
   test("successive startups create fresh instances and preserve previous files", async () => {

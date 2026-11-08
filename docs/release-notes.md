@@ -1,5 +1,11 @@
 # Release notes
 
+## Operation-level capability guidance
+
+Daily guidance now asks the model to check whether the operations required by a task are supported before choosing an execution route. An available runtime does not imply that every operation is available. Known restrictions should not trigger trial runs or tool switching to evade them; unknown facts may be investigated through authorized, supported means. If no compliant route exists, an honest response explaining non-execution remains valid.
+
+This is an advisory correction following a retained real-model failure. It changes no executor policy, schema, permissions, model selection or acceptance behavior. Type checking, 38 focused tests and three real OMP cases passed; those checks establish guidance delivery, not guaranteed model compliance.
+
 ## Advisory daily workflow guidance
 
 The real daily composition now adds one fixed, model-visible advisory message during ordinary main-agent prompt preparation. It describes the existing workflow: establish a managed task before dependent calls, generate deliverable files through `agent_execute` as registered candidates (including prose written by a task-local Python or Bun script), use only authorized input handles, verify the exact returned selection, preview delivery for a readable path, and report generated, verified and accepted coverage honestly. Native workspace writes and shell self-tests are stated not to be managed candidates or receipts.

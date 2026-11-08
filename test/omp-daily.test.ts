@@ -24,6 +24,11 @@ const EVIDENCE_GUIDANCE =
   "Describe checks only within their actual coverage: execution, structure, bytes and reference checks do not establish semantic correctness; self-review and model review are fallible advice, not host acceptance. " +
   "Fixing a checker does not establish that unchanged content is correct. " +
   "Keep this check proportional and report material limitations and revisions without private reasoning or a mandatory long review table.";
+const CAPABILITY_ADVISORY =
+  "Before choosing an execution route, compare the operations and constraints the task requires with the capability and limits the current host exposes; a tool or runtime being available does not establish support for every required operation. " +
+  "If an operation is explicitly unavailable or prohibited, do not dispatch a trial run or switch tools or languages to evade that limit. " +
+  "Investigate unknown facts only proportionally, through means already authorized and supported. " +
+  "If no compliant route exists, report what was not performed and remains unverified, with a scoped limitation, without inventing observations or success; an honest zero-tool answer remains valid.";
 const integration: (name: string, fn: () => Promise<unknown>, timeout?: number) => void =
   process.env.RUN_REAL_OMP_TEST === "1"
     ? (name, fn, timeout) => test(name, fn, timeout ?? TEST_TIMEOUT)
@@ -170,6 +175,15 @@ function currentGuidance(turn: Event): { daily: Event; task: Event } {
   expect(String(daily[0]!.content)).toContain("Native workspace writes and shell self-tests do not create managed candidates or receipts");
   expect(String(daily[0]!.content)).toContain(EVIDENCE_GUIDANCE);
   expect(String(daily[0]!.content).split(EVIDENCE_GUIDANCE)).toHaveLength(2);
+  const dailyContent = String(daily[0]!.content);
+  expect(dailyContent.split(CAPABILITY_ADVISORY)).toHaveLength(2);
+  expect(dailyContent.indexOf(CAPABILITY_ADVISORY)).toBeLessThan(
+    dailyContent.indexOf("When the current genuine request should be managed"),
+  );
+  expect(dailyContent).toContain("does not establish support for every required operation");
+  expect(dailyContent).toContain("If an operation is explicitly unavailable or prohibited");
+  expect(dailyContent).toContain("Investigate unknown facts only proportionally");
+  expect(dailyContent).toContain("zero-tool answer remains valid");
   expect(String(task[0]!.content)).toContain("agent_task");
   return { daily: daily[0]!, task: task[0]! };
 }
