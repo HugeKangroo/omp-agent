@@ -82,6 +82,8 @@ export interface DailyRunOptions {
   productDirectory?: string;
   /** Absolute observer fixture path; defaults to the checkout daily observer. */
   observerPath?: string;
+  /** Absolute provider fixture path; defaults to the checkout daily provider. */
+  providerPath?: string;
   /** Absolute selected-product task-entry-port.ts imported by the observer. */
   observerPortPath?: string;
   /** Isolated OMP profile name; defaults to "default" for legacy suites. */
@@ -277,6 +279,9 @@ export class DailyOmpSession {
   }
 
   static async create(options: DailyRunOptions): Promise<DailyOmpSession> {
+    if (options.providerPath !== undefined && !path.isAbsolute(options.providerPath)) {
+      throw new Error("providerPath must be an absolute path.");
+    }
     const created = await mkdtemp(path.join(tmpdir(), "omp-agent-daily-"));
     try {
       return await DailyOmpSession.createAt(await realpath(created), options);
@@ -524,7 +529,7 @@ export class DailyOmpSession {
       "--max-time", "120",
       "--max-cost", "0.1",
       "--cwd", this.workspace,
-      "--extension", PROVIDER_PATH,
+      "--extension", this.options.providerPath ?? PROVIDER_PATH,
     ];
     if (this.mode !== "baseline") {
       args.push("--extension", this.options.entryDirectory ?? ENTRY_PATH);
@@ -706,6 +711,7 @@ export class DailyOmpSession {
       mode: this.mode,
       profile: this.options.profile ?? "default",
       entryDirectory: this.options.entryDirectory ?? ENTRY_PATH,
+      providerPath: this.options.providerPath ?? PROVIDER_PATH,
       observerPath: this.options.observerPath ?? OBSERVER_PATH,
       observerPortPath: this.options.observerPortPath ?? null,
       productDirectory: this.options.productDirectory ?? null,
@@ -1106,6 +1112,7 @@ export class DailyOmpSession {
         argv: this.args(),
         cwd: this.launchDir,
         environmentKeys: Object.keys(this.env()).sort(),
+        providerPath: this.options.providerPath ?? PROVIDER_PATH,
         isolation: {
           home: this.values.homeDir,
           agentDir: this.values.agentDir,

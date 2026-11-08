@@ -41,6 +41,8 @@ A requirement amendment increments the task revision. Capabilities check that th
 
 Local execution uses host-selected paths, runtimes, input handles, time limits, and output limits. Candidates retain the source, input, and output identities needed for later checks. A process exit code alone does not establish that a task meets its requirements.
 
+`agent_execute describe` reads the current visible task without creating execution authority. It optionally accepts both `expectedTaskId` and `expectedTaskRevision`; the pair constrains that current query and cannot select retained history. Half-pairs, invalid values, mismatches and unknown fields are rejected. The adapter copies the guard before input inspection and rechecks live visibility and internal task facts afterward; the entry also rechecks disposal and the published owner after awaiting the adapter. Current terminal tasks keep their existing read-only view. OMP 18.18 may remove optional null or string-null placeholders before plugin dispatch: if both fields disappear, the plugin performs an unguarded query and does not claim the original pair was validated. Required guards for `run` are unchanged.
+
 ## Fixed composite-backend source
 
 `vendor/harness2/index.ts` exposes a host-only `HarnessController` library entry and its supporting types. The package includes an explicit 30-file set: the entry, portable provenance, 26 backend modules and the original MIT license and notice. `vendor/harness2/SOURCE.json` identifies the upstream baseline and the actual derived content independently; its content digest excludes the provenance file itself to avoid self-reference. The package has no runtime dependency on a local upstream checkout.

@@ -1123,4 +1123,246 @@ describe("daily composition", () => {
       status: "active",
     });
   });
+
+  test("guarded describe withholds metadata when the published owner is replaced during input await", async () => {
+    const fx = await fixture();
+    const inputPath = path.join(fx.root, "describe-input.txt");
+    await writeFile(inputPath, "describe input\n", { mode: 0o600 });
+    await writeConfig(fx, {
+      ...baseConfig(fx),
+      inputs: [{ id: "alpha", path: inputPath }],
+    });
+    const fake = fakeHost();
+    const entry = createDailyEntry(fake.pi, { env: fx.env, launchWorkspace: fx.workspace });
+    entries.push(entry);
+    const branch: Array<Record<string, unknown>> = [
+      { id: "leaf-1", parentId: null, type: "custom", customType: "fixture-base", data: {} },
+    ];
+    const ctx: OmpToolContext = {
+      cwd: fx.workspace,
+      agent: { kind: "main" },
+      sessionManager: {
+        getSessionId: () => "daily-describe-race",
+        getLeafId: () => "leaf-1",
+        getBranch: () => branch.slice(),
+      },
+    };
+    branch.push(userEntry("user-1", "leaf-1", "Describe only."));
+    fake.handlers.get("input")![0]!({ text: "Describe only.", source: "rpc" }, ctx);
+    startMessages(fake, ctx, "Describe only.");
+    const started = await fake.tools.get(TASK_CONTROL_TOOL)!.execute(
+      "call-start",
+      { action: "start" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(started.isError, JSON.stringify(started.details)).toBeUndefined();
+    const task = entry.owner.snapshot().currentTask!;
+    const valid = await fake.tools.get(EXECUTION_TOOL)!.execute(
+      "call-describe-valid",
+      { action: "describe", expectedTaskId: task.taskId, expectedTaskRevision: 1 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(valid.isError).toBeUndefined();
+    expect(valid.details).toMatchObject({ action: "describe", taskId: task.taskId, taskRevision: 1 });
+    expect(valid.content[0]!.text).toContain("describe-input.txt");
+    const wrong = await fake.tools.get(EXECUTION_TOOL)!.execute(
+      "call-describe-wrong",
+      { action: "describe", expectedTaskId: task.taskId, expectedTaskRevision: 2 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(wrong.isError).toBe(true);
+    expect((wrong.details as Record<string, unknown>).authorizedInputs).toBeUndefined();
+    expect(JSON.stringify(wrong)).not.toContain("describe-input.txt");
+    const pending = fake.tools.get(EXECUTION_TOOL)!.execute(
+      "call-describe",
+      { action: "describe", expectedTaskId: task.taskId, expectedTaskRevision: 1 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    // The entry parsed and began input inspection; the old owner stays
+    // attached and unchanged. Replacing the published owner must refuse the
+    // already-running describe before it can return input metadata.
+    const foreign = new TaskOwner({ workspaceRoot: fx.workspace, ownerId: "owner-daily-foreign" });
+    publishTaskOwner(foreign);
+    try {
+      const result = await pending;
+      expect(result.isError).toBe(true);
+      expect(result.content[0]!.text).toContain("owner");
+      expect((result.details as Record<string, unknown>).authorizedInputs).toBeUndefined();
+      expect(JSON.stringify(result)).not.toContain("describe-input.txt");
+      expect(currentTaskOwner()).toBe(foreign);
+      expect(entry.owner.bindingStatus().state).toBe("attached");
+      expect(entry.owner.snapshot().currentTask).toMatchObject({
+        taskId: task.taskId,
+        taskRevision: 1,
+        status: "active",
+        admissions: 0,
+        acceptance: null,
+      });
+    } finally {
+      clearPublishedTaskOwner(foreign);
+    }
+  });
+
+  test("guarded describe rechecks a foreign publish at the entry microtask boundary", async () => {
+    const fx = await fixture();
+    const inputPath = path.join(fx.root, "describe-boundary-input.txt");
+    await writeFile(inputPath, "boundary input\n", { mode: 0o600 });
+    await writeConfig(fx, {
+      ...baseConfig(fx),
+      inputs: [{ id: "alpha", path: inputPath }],
+    });
+    const fake = fakeHost();
+    const entry = createDailyEntry(fake.pi, { env: fx.env, launchWorkspace: fx.workspace });
+    entries.push(entry);
+    const branch: Array<Record<string, unknown>> = [
+      { id: "leaf-1", parentId: null, type: "custom", customType: "fixture-base", data: {} },
+    ];
+    const foreign = new TaskOwner({ workspaceRoot: fx.workspace, ownerId: "owner-daily-boundary" });
+    let branchReads = 0;
+    let armed = false;
+    let publishedByGetter = false;
+    const ctx: OmpToolContext = {
+      cwd: fx.workspace,
+      agent: { kind: "main" },
+      sessionManager: {
+        getSessionId: () => "daily-describe-boundary",
+        getLeafId: () => "leaf-1",
+        getBranch: () => {
+          branchReads += 1;
+          if (armed && branchReads === 2) {
+            // Queue after the adapter's final context inspection and internal
+            // seal but before the entry's continuation of
+            // `await adapter.describe` runs.
+            queueMicrotask(() => {
+              publishTaskOwner(foreign);
+              publishedByGetter = true;
+            });
+          }
+          return branch.slice();
+        },
+      },
+    };
+    branch.push(userEntry("user-1", "leaf-1", "Describe only."));
+    fake.handlers.get("input")![0]!({ text: "Describe only.", source: "rpc" }, ctx);
+    startMessages(fake, ctx, "Describe only.");
+    const started = await fake.tools.get(TASK_CONTROL_TOOL)!.execute(
+      "call-start",
+      { action: "start" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(started.isError, JSON.stringify(started.details)).toBeUndefined();
+    // Start's branch reads happen while the getter is unarmed, so no foreign
+    // publish may occur before this describe is armed.
+    expect(currentTaskOwner()).toBe(entry.owner);
+    expect(publishedByGetter).toBe(false);
+    const task = entry.owner.snapshot().currentTask!;
+    // Count only this describe's reads. The second read is the adapter's final
+    // context inspection after the real input await.
+    branchReads = 0;
+    armed = true;
+    try {
+      const result = await fake.tools.get(EXECUTION_TOOL)!.execute(
+        "call-describe-boundary",
+        { action: "describe", expectedTaskId: task.taskId, expectedTaskRevision: 1 },
+        undefined,
+        undefined,
+        ctx,
+      );
+      expect(publishedByGetter).toBe(true);
+      expect(branchReads).toBe(2);
+      expect(result.isError).toBe(true);
+      expect(result.content[0]!.text).toContain("owner");
+      expect(result.content[0]!.text).toContain("this entry can no longer act for the current task");
+      expect((result.details as Record<string, unknown>).authorizedInputs).toBeUndefined();
+      expect(JSON.stringify(result)).not.toContain("boundary-input.txt");
+      expect(currentTaskOwner()).toBe(foreign);
+      expect(entry.owner.bindingStatus().state).toBe("attached");
+      expect(entry.owner.snapshot().currentTask).toMatchObject({
+        taskId: task.taskId,
+        taskRevision: 1,
+        status: "active",
+      });
+      const audit = await readFile(entry.instance.auditPath, "utf8");
+      expect(audit).toContain('"type":"execution_tool_rejected"');
+      expect(audit).not.toContain('"type":"execution_describe_withheld"');
+    } finally {
+      clearPublishedTaskOwner(foreign);
+    }
+  });
+
+  test("guarded describe withholds metadata when the published owner is cleared during input await", async () => {
+    const fx = await fixture();
+    const inputPath = path.join(fx.root, "describe-clear-input.txt");
+    await writeFile(inputPath, "clear input\n", { mode: 0o600 });
+    await writeConfig(fx, {
+      ...baseConfig(fx),
+      inputs: [{ id: "alpha", path: inputPath }],
+    });
+    const fake = fakeHost();
+    const entry = createDailyEntry(fake.pi, { env: fx.env, launchWorkspace: fx.workspace });
+    entries.push(entry);
+    const branch: Array<Record<string, unknown>> = [
+      { id: "leaf-1", parentId: null, type: "custom", customType: "fixture-base", data: {} },
+    ];
+    const ctx: OmpToolContext = {
+      cwd: fx.workspace,
+      agent: { kind: "main" },
+      sessionManager: {
+        getSessionId: () => "daily-describe-clear",
+        getLeafId: () => "leaf-1",
+        getBranch: () => branch.slice(),
+      },
+    };
+    branch.push(userEntry("user-1", "leaf-1", "Describe only."));
+    fake.handlers.get("input")![0]!({ text: "Describe only.", source: "rpc" }, ctx);
+    startMessages(fake, ctx, "Describe only.");
+    const started = await fake.tools.get(TASK_CONTROL_TOOL)!.execute(
+      "call-start",
+      { action: "start" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(started.isError, JSON.stringify(started.details)).toBeUndefined();
+    const task = entry.owner.snapshot().currentTask!;
+    try {
+      const pending = fake.tools.get(EXECUTION_TOOL)!.execute(
+        "call-describe-clear",
+        { action: "describe", expectedTaskId: task.taskId, expectedTaskRevision: 1 },
+        undefined,
+        undefined,
+        ctx,
+      );
+      clearPublishedTaskOwner();
+      const result = await pending;
+      expect(result.isError).toBe(true);
+      expect(result.content[0]!.text).toContain("owner");
+      expect((result.details as Record<string, unknown>).authorizedInputs).toBeUndefined();
+      expect(JSON.stringify(result)).not.toContain("clear-input.txt");
+      expect(currentTaskOwner()).toBeUndefined();
+      expect(entry.owner.bindingStatus().state).toBe("attached");
+      expect(entry.owner.snapshot().currentTask).toMatchObject({
+        taskId: task.taskId,
+        taskRevision: 1,
+        status: "active",
+        admissions: 0,
+        acceptance: null,
+      });
+      const audit = await readFile(entry.instance.auditPath, "utf8");
+      expect(audit).toContain('"type":"execution_tool_rejected"');
+      expect(audit).not.toContain('"type":"execution_describe_withheld"');
+    } finally {
+      clearPublishedTaskOwner();
+    }
+  });
 });

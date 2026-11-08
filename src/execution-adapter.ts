@@ -32,6 +32,7 @@ import type {
   ManagedTask,
   TaskOwner,
   TaskOwnerEvent,
+  TaskOwnerSnapshot,
   TaskSubject,
 } from "./task-owner.ts";
 
@@ -149,6 +150,11 @@ export interface ExecutionToolResult {
 
 export type ExecutionArguments =
   | { action: "describe" }
+  /**
+   * Actual parsed pair constraining describe to the currently visible task.
+   * It never selects a retained task or grants authority.
+   */
+  | { action: "describe"; expectedTaskId: string; expectedTaskRevision: number }
   | {
     action: "run";
     runtime: ExecutionRuntime;
@@ -542,9 +548,21 @@ export function parseExecutionArguments(value: unknown, limits = EXECUTION_LIMIT
     throw new ExecutionAdapterError("agent_execute action must be describe or run.");
   }
   if (action === "describe") {
-    const unknown = keys.filter((key) => key !== "action");
+    const unknown = keys.filter((key) => !["action", "expectedTaskId", "expectedTaskRevision"].includes(key));
     if (unknown.length) throw new ExecutionAdapterError(`agent_execute describe has unsupported field(s): ${unknown.join(", ")}.`);
-    return { action };
+    const hasTaskId = Object.hasOwn(args, "expectedTaskId");
+    const hasRevision = Object.hasOwn(args, "expectedTaskRevision");
+    // OMP 18.18 may remove optional null placeholders before execute. Both
+    // removed is an actual unguarded query; any remaining single field rejects.
+    if (!hasTaskId && !hasRevision) return { action: "describe" };
+    if (hasTaskId !== hasRevision) {
+      throw new ExecutionAdapterError("agent_execute describe requires both expectedTaskId and expectedTaskRevision, or neither.");
+    }
+    return {
+      action: "describe",
+      expectedTaskId: identifier(args.expectedTaskId, "expectedTaskId"),
+      expectedTaskRevision: positiveInteger(args.expectedTaskRevision, "expectedTaskRevision"),
+    };
   }
   const unknown = keys.filter((key) => !["action", "runtime", "source", "inputIds", "expectedTaskId", "expectedTaskRevision"].includes(key));
   if (unknown.length) throw new ExecutionAdapterError(`agent_execute run has unsupported field(s): ${unknown.join(", ")}.`);
@@ -1815,6 +1833,62 @@ export class ExecutionAdapter {
     this.runReferenceBytes += bytes;
   }
 
+  private publishedOwnerReplaced(): boolean {
+    const published = currentTaskOwner();
+    // Direct host/test construction may leave the adapter unpublished; only a
+    // different live published owner proves a replacement.
+    return published !== undefined && published !== this.owner;
+  }
+
+  /**
+   * Resolve and seal the currently visible describe target. Every host context
+   * getter runs before the internal snapshot; the snapshot is then rechecked
+   * for disposal, published-owner replacement, owner identity, binding, task
+   * identity/revision/status and the optional parsed guard. No input metadata
+   * is read before this returns.
+   */
+  private describeCurrent(
+    context: OmpToolContext,
+    guard: { expectedTaskId: string; expectedTaskRevision: number } | undefined,
+  ): TaskOwnerSnapshot {
+    if (this.disposed) throw new ExecutionAdapterError("the execution adapter is disposed.");
+    if (this.publishedOwnerReplaced()) {
+      throw new ExecutionAdapterError("the managed task owner changed.");
+    }
+    const observed = this.owner.reachableTask(subjectFromContext(context, this.workspaceRoot));
+    // Last host getter has run. The remaining reads are internal; use the
+    // fresh snapshot for every returned fact and rejection decision.
+    const snapshot = this.owner.snapshot();
+    if (this.disposed) throw new ExecutionAdapterError("the execution adapter is disposed.");
+    if (this.publishedOwnerReplaced()) {
+      throw new ExecutionAdapterError("the managed task owner changed.");
+    }
+    if (snapshot.ownerId !== this.ownerId) {
+      throw new ExecutionAdapterError("the task owner identity changed.");
+    }
+    if (snapshot.binding.state !== "attached") {
+      throw new ExecutionAdapterError("the conversation binding detached during describe.");
+    }
+    const task = snapshot.currentTask;
+    if (task === null
+      || task.taskId !== observed.taskId
+      || task.taskRevision !== observed.taskRevision
+      || task.status !== observed.status) {
+      throw new ExecutionAdapterError("the current task changed while describe observed it.");
+    }
+    if (guard !== undefined) {
+      if (task.taskId !== guard.expectedTaskId) {
+        throw new ExecutionAdapterError("expectedTaskId does not match the currently visible task.");
+      }
+      if (task.taskRevision !== guard.expectedTaskRevision) {
+        throw new ExecutionAdapterError(
+          `expectedTaskRevision does not match the currently visible task revision ${task.taskRevision}.`,
+        );
+      }
+    }
+    return snapshot;
+  }
+
   /**
    * Actual visible terminal facts for a rejection. A tool that did not perform
    * acceptance never proves the current task is unaccepted: visible accepted
@@ -1901,11 +1975,18 @@ export class ExecutionAdapter {
     });
   }
 
-  async describe(context: ExecutionToolContext): Promise<ExecutionToolResult> {
+  async describe(
+    context: ExecutionToolContext,
+    args?: Extract<ExecutionArguments, { action: "describe" }>,
+  ): Promise<ExecutionToolResult> {
     if (this.disposed) return this.rejectionResult("the execution adapter is disposed.", context);
+    // Copy the parsed guard into stable primitives before any await. Later
+    // caller mutation cannot retarget the query or select retained history.
+    const guard = args !== undefined && "expectedTaskId" in args
+      ? { expectedTaskId: args.expectedTaskId, expectedTaskRevision: args.expectedTaskRevision }
+      : undefined;
     try {
-      const subject = subjectFromContext(context, this.workspaceRoot);
-      this.owner.reachableTask(subject);
+      this.describeCurrent(context, guard);
       const inputs: Array<Record<string, unknown>> = [];
       for (const input of this.configInputs) {
         try {
@@ -1931,27 +2012,23 @@ export class ExecutionAdapter {
         }
       }
       // Input inspection awaited host filesystem work. Rebuild the subject from
-      // the actual live context; never expose metadata derived from a captured
-      // branch or a binding that detached during inspection.
-      if (this.disposed) return this.rejectionResult("the execution adapter is disposed.", context);
-      let task: ManagedTask;
+      // the actual live context and re-seal disposition, published owner,
+      // binding and task revision before any input metadata can be returned.
+      let snapshot: TaskOwnerSnapshot;
       try {
-        task = this.owner.reachableTask(subjectFromContext(context, this.workspaceRoot));
+        snapshot = this.describeCurrent(context, guard);
       } catch (error) {
         safeAudit(this.audit, { type: "execution_describe_withheld", error: errorMessage(error) });
         return this.rejectionResult(`describe was withheld: ${errorMessage(error)}`, context);
       }
-      if (this.owner.bindingStatus().state !== "attached") {
-        safeAudit(this.audit, { type: "execution_describe_withheld", error: "binding detached during describe" });
-        return this.rejectionResult("describe was withheld: the conversation binding detached during input inspection.", context);
-      }
+      const task = snapshot.currentTask!;
       const budget = this.budgets.get(task.taskId);
       const limits: Record<string, number | string> = {
         ...EXECUTION_LIMITS,
         dispatchWallMs: this.dispatchWallMs,
         terminationGraceMs: this.terminationGraceMs,
       };
-      const binding = this.owner.bindingStatus();
+      const binding = snapshot.binding;
       const dispatchBudget = {
         limit: EXECUTION_LIMITS.maxDispatches,
         attempted: budget?.attempted ?? 0,
@@ -1960,7 +2037,7 @@ export class ExecutionAdapter {
       };
       const taskAccepted = task.status === "accepted"
         ? true
-        : this.owner.snapshot().acceptanceHazard !== null
+        : snapshot.acceptanceHazard !== null
           ? null
           : false;
       const response: ExecutionToolResult = {

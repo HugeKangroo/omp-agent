@@ -43,6 +43,18 @@ function user(id: string, parentId: string, text: string): Entry {
   };
 }
 
+function assistant(id: string, parentId: string): Entry {
+  return {
+    id,
+    parentId,
+    type: "message",
+    message: {
+      role: "assistant",
+      content: [{ type: "text", text: "working" }],
+    },
+  };
+}
+
 function subject(branch: readonly unknown[]): TaskSubject {
   return { sessionId: SESSION, workspaceRoot: WORKSPACE, agentKind: "main", branch };
 }
@@ -228,6 +240,37 @@ describe("agent_execute argument parsing", () => {
     })).toMatchObject({ action: "run", runtime: "python", inputIds: ["alpha"], expectedTaskId: "task-1", expectedTaskRevision: 1 });
   });
 
+  test("describe accepts either no guard or one complete positive pair", () => {
+    expect(parseExecutionArguments({ action: "describe" })).toEqual({ action: "describe" });
+    expect(parseExecutionArguments({
+      action: "describe",
+      expectedTaskId: "task-1",
+      expectedTaskRevision: 2,
+    })).toEqual({ action: "describe", expectedTaskId: "task-1", expectedTaskRevision: 2 });
+  });
+
+  test("describe rejects half pairs, nulls, invalid guards and authority fields", () => {
+    const invalid = [
+      { action: "describe", expectedTaskId: "task-1" },
+      { action: "describe", expectedTaskRevision: 1 },
+      { action: "describe", expectedTaskId: null, expectedTaskRevision: 1 },
+      { action: "describe", expectedTaskId: "task-1", expectedTaskRevision: null },
+      { action: "describe", expectedTaskId: null, expectedTaskRevision: null },
+      { action: "describe", expectedTaskId: 42, expectedTaskRevision: 1 },
+      { action: "describe", expectedTaskId: "task-1", expectedTaskRevision: "1" },
+      { action: "describe", expectedTaskId: "", expectedTaskRevision: 1 },
+      { action: "describe", expectedTaskId: "../task", expectedTaskRevision: 1 },
+      { action: "describe", expectedTaskId: "task-1", expectedTaskRevision: 0 },
+      { action: "describe", expectedTaskId: "task-1", expectedTaskRevision: -1 },
+      { action: "describe", expectedTaskId: "task-1", expectedTaskRevision: 1.5 },
+      { action: "describe", expectedTaskId: "task-1", expectedTaskRevision: Number.MAX_SAFE_INTEGER + 1 },
+      { action: "describe", expectedTaskId: "task-1", expectedTaskRevision: 1, taskId: "task-1" },
+      { action: "describe", expectedTaskId: "task-1", expectedTaskRevision: 1, revision: 1 },
+      { action: "describe", expectedTaskId: "task-1", expectedTaskRevision: 1, path: "/etc/passwd" },
+    ];
+    for (const value of invalid) expect(() => parseExecutionArguments(value)).toThrow();
+  });
+
   test("rejects host authority, paths, environment and duplicate handles", () => {
     const forbidden = [
       { action: "run", runtime: "python", source: "x", expectedTaskRevision: 1 },
@@ -357,6 +400,310 @@ describe("agent_execute describe", () => {
       expect(result.isError === true || (detailsOf(result).authorizedInputs === undefined)).toBe(true);
       expect(JSON.stringify(result)).not.toContain(f.fixtures);
       expect(JSON.stringify(result)).not.toContain("alpha.txt");
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("unguarded describe and a valid current pair return the same facts without attempts, admissions or runs", async () => {
+    const f = await fixture();
+    try {
+      const unguarded = await f.adapter.describe(f.ctx);
+      const task = f.owner.snapshot().currentTask!;
+      const args = {
+        action: "describe" as const,
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: task.taskRevision,
+      };
+      const pending = f.adapter.describe(f.ctx, args);
+      // Caller mutation after the call must not retarget the copied primitives.
+      args.expectedTaskId = "forged-task";
+      args.expectedTaskRevision = 99;
+      const paired = await pending;
+      expect(paired.isError).toBeUndefined();
+      expect(detailsOf(paired)).toEqual(detailsOf(unguarded));
+      expect(contentOf(paired)).toBe(contentOf(unguarded));
+      expect(detailsOf(paired).dispatchBudget).toEqual({ limit: 8, attempted: 0, dispatched: 0, reserved: 0 });
+      expect(f.owner.snapshot().currentTask).toMatchObject({ admissions: 0, acceptance: null, status: "active" });
+      expect(await f.runDirs()).toEqual([]);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("wrong task id and future revision reject before input metadata without effects", async () => {
+    const f = await fixture();
+    try {
+      const task = f.owner.snapshot().currentTask!;
+      for (const args of [
+        { action: "describe" as const, expectedTaskId: "task-other", expectedTaskRevision: task.taskRevision },
+        { action: "describe" as const, expectedTaskId: task.taskId, expectedTaskRevision: task.taskRevision + 1 },
+      ]) {
+        const result = await f.adapter.describe(f.ctx, args);
+        expect(result.isError).toBe(true);
+        expect((result.details as Record<string, unknown>).authorizedInputs).toBeUndefined();
+        expect(JSON.stringify(result)).not.toContain("alpha.txt");
+        expect(JSON.stringify(result)).not.toContain(f.fixtures);
+      }
+      const after = await f.adapter.describe(f.ctx);
+      expect(detailsOf(after).dispatchBudget).toEqual({ limit: 8, attempted: 0, dispatched: 0, reserved: 0 });
+      expect(f.owner.snapshot().currentTask).toMatchObject({ admissions: 0, acceptance: null, taskRevision: 1 });
+      expect(await f.runDirs()).toEqual([]);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("a stale revision rejects after a genuine revision while the current pair succeeds", async () => {
+    const f = await fixture();
+    try {
+      const amended = "Amend the current task requirements.";
+      f.owner.sessionChanged();
+      expect(f.owner.observeInput({
+        sessionId: SESSION,
+        workspaceRoot: WORKSPACE,
+        source: "rpc",
+        text: amended,
+        observedAt: NOW,
+        baseLeafId: "user-1",
+      }).accepted).toBe(true);
+      f.owner.observeAgentStart({ sessionId: SESSION, prompt: amended, reason: "prompt" });
+      const branch2 = [...f.branch, user("user-2", "user-1", amended)];
+      expect(f.owner.revise(subject(branch2), guard(f.owner), "amended").revised).toBe(true);
+      const task = f.owner.snapshot().currentTask!;
+      expect(task.taskRevision).toBe(2);
+
+      const stale = await f.adapter.describe(f.ctx, {
+        action: "describe",
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: 1,
+      });
+      expect(stale.isError).toBe(true);
+      expect((stale.details as Record<string, unknown>).authorizedInputs).toBeUndefined();
+      expect(JSON.stringify(stale)).not.toContain("alpha.txt");
+
+      const current = await f.adapter.describe(f.ctx, {
+        action: "describe",
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: 2,
+      });
+      expect(current.isError).toBeUndefined();
+      expect(detailsOf(current)).toMatchObject({ taskId: task.taskId, taskRevision: 2, taskStatus: "active" });
+      expect(f.owner.snapshot().currentTask).toMatchObject({ admissions: 0, acceptance: null, taskRevision: 2 });
+      expect(await f.runDirs()).toEqual([]);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("a cancelled current task remains visible to unguarded and matching-pair describe", async () => {
+    const f = await fixture();
+    try {
+      const task = f.owner.snapshot().currentTask!;
+      f.owner.cancel(subject(f.branch), guard(f.owner));
+      const unguarded = await f.adapter.describe(f.ctx);
+      const paired = await f.adapter.describe(f.ctx, {
+        action: "describe",
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: task.taskRevision,
+      });
+      expect(unguarded.isError).toBeUndefined();
+      expect(paired.isError).toBeUndefined();
+      expect(detailsOf(unguarded)).toMatchObject({ taskId: task.taskId, taskStatus: "cancelled", taskAccepted: false });
+      expect(contentOf(paired)).toContain('taskStatus="cancelled"');
+      expect(detailsOf(paired)).toEqual(detailsOf(unguarded));
+      const wrong = await f.adapter.describe(f.ctx, {
+        action: "describe",
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: task.taskRevision + 1,
+      });
+      expect(wrong.isError).toBe(true);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("a retained old task pair cannot select history after a new task starts", async () => {
+    const f = await fixture();
+    try {
+      const taskA = f.owner.snapshot().currentTask!;
+      const cancelText = "Cancel task A.";
+      const cancelBranch = [...f.branch, assistant("assistant-1", "user-1"), user("user-2", "assistant-1", cancelText)];
+      f.owner.sessionChanged();
+      f.owner.observeInput({
+        sessionId: SESSION,
+        workspaceRoot: WORKSPACE,
+        source: "rpc",
+        text: cancelText,
+        observedAt: NOW,
+        baseLeafId: "assistant-1",
+      });
+      f.owner.observeAgentStart({ sessionId: SESSION, prompt: cancelText, reason: "prompt" });
+      expect(f.owner.cancel(subject(cancelBranch), { taskId: taskA.taskId, taskRevision: taskA.taskRevision }).status)
+        .toBe("cancelled");
+
+      const startText = "Start task B.";
+      const branchB = [...cancelBranch, assistant("assistant-2", "user-2"), user("user-3", "assistant-2", startText)];
+      f.owner.sessionChanged();
+      f.owner.observeInput({
+        sessionId: SESSION,
+        workspaceRoot: WORKSPACE,
+        source: "rpc",
+        text: startText,
+        observedAt: NOW,
+        baseLeafId: "assistant-2",
+      });
+      f.owner.observeAgentStart({ sessionId: SESSION, prompt: startText, reason: "prompt" });
+      const started = f.owner.start(subject(branchB), "task B");
+      expect(started.created).toBe(true);
+      const ctxB = context(branchB, "user-3");
+      const taskB = f.owner.snapshot().currentTask!;
+      expect(taskB.taskId).not.toBe(taskA.taskId);
+
+      const old = await f.adapter.describe(ctxB, {
+        action: "describe",
+        expectedTaskId: taskA.taskId,
+        expectedTaskRevision: taskA.taskRevision,
+      });
+      expect(old.isError).toBe(true);
+      expect((old.details as Record<string, unknown>).authorizedInputs).toBeUndefined();
+      expect(JSON.stringify(old)).not.toContain("alpha.txt");
+
+      const current = await f.adapter.describe(ctxB, {
+        action: "describe",
+        expectedTaskId: taskB.taskId,
+        expectedTaskRevision: taskB.taskRevision,
+      });
+      expect(current.isError).toBeUndefined();
+      expect(detailsOf(current)).toMatchObject({ taskId: taskB.taskId, taskRevision: 1, taskStatus: "active" });
+      expect(f.owner.snapshot().currentTask).toMatchObject({ taskId: taskB.taskId, admissions: 0, acceptance: null });
+      expect(await f.runDirs()).toEqual([]);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("a real revision during the input await rejects the copied pair even after caller mutation", async () => {
+    const f = await fixture();
+    try {
+      const task = f.owner.snapshot().currentTask!;
+      const amended = "Revise while describe is awaiting input inspection.";
+      f.owner.sessionChanged();
+      f.owner.observeInput({
+        sessionId: SESSION,
+        workspaceRoot: WORKSPACE,
+        source: "rpc",
+        text: amended,
+        observedAt: NOW,
+        baseLeafId: "user-1",
+      });
+      f.owner.observeAgentStart({ sessionId: SESSION, prompt: amended, reason: "prompt" });
+      const branch2 = [...f.branch, user("user-2", "user-1", amended)];
+
+      const args = {
+        action: "describe" as const,
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: task.taskRevision,
+      };
+      const pending = f.adapter.describe(f.ctx, args);
+      // The caller's revision and the actual task revision both move to 2. A
+      // post-await reread of the caller object would falsely match; only the
+      // copied parsed pair can prove the stale revision still rejects.
+      args.expectedTaskRevision = 2;
+      const revised = f.owner.revise(subject(branch2), guard(f.owner), "revised during describe");
+      expect(revised.revised).toBe(true);
+
+      const result = await pending;
+      expect(result.isError).toBe(true);
+      expect((result.details as Record<string, unknown>).authorizedInputs).toBeUndefined();
+      expect(JSON.stringify(result)).not.toContain("alpha.txt");
+      expect(f.owner.snapshot().currentTask).toMatchObject({ taskId: task.taskId, taskRevision: 2, admissions: 0 });
+      expect(await f.runDirs()).toEqual([]);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("disposal during the input await withholds describe", async () => {
+    const f = await fixture();
+    try {
+      const task = f.owner.snapshot().currentTask!;
+      const pending = f.adapter.describe(f.ctx, {
+        action: "describe",
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: task.taskRevision,
+      });
+      f.adapter.dispose();
+      const result = await pending;
+      expect(result.isError).toBe(true);
+      expect((result.details as Record<string, unknown>).authorizedInputs).toBeUndefined();
+      expect(JSON.stringify(result)).not.toContain("alpha.txt");
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("a final getBranch disposal withholds stale describe metadata", async () => {
+    const f = await fixture();
+    let reads = 0;
+    let disposedByGetter = false;
+    const racingContext: ExecutionToolContext = {
+      cwd: WORKSPACE,
+      agent: { kind: "main" },
+      sessionManager: {
+        getSessionId: () => SESSION,
+        getLeafId: () => "user-1",
+        getBranch: () => {
+          reads += 1;
+          if (reads === 2) {
+            disposedByGetter = true;
+            f.adapter.dispose();
+          }
+          return f.branch;
+        },
+      },
+    };
+    try {
+      const result = await f.adapter.describe(racingContext);
+      expect(disposedByGetter).toBe(true);
+      expect(reads).toBeGreaterThanOrEqual(2);
+      expect(result.isError).toBe(true);
+      expect((result.details as Record<string, unknown>).authorizedInputs).toBeUndefined();
+      expect(JSON.stringify(result)).not.toContain("alpha.txt");
+      expect(result.details).toMatchObject({ taskAccepted: null, currentTaskStatus: null });
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("a final getBranch cancellation is reported from the fresh snapshot", async () => {
+    const f = await fixture();
+    let reads = 0;
+    let cancelledByGetter = 0;
+    const racingContext: ExecutionToolContext = {
+      cwd: WORKSPACE,
+      agent: { kind: "main" },
+      sessionManager: {
+        getSessionId: () => SESSION,
+        getLeafId: () => "user-1",
+        getBranch: () => {
+          reads += 1;
+          if (reads === 2) {
+            f.owner.cancel(subject(f.branch), guard(f.owner));
+            cancelledByGetter += 1;
+          }
+          return f.branch;
+        },
+      },
+    };
+    try {
+      const result = await f.adapter.describe(racingContext);
+      expect(cancelledByGetter).toBe(1);
+      expect(reads).toBeGreaterThanOrEqual(2);
+      expect(result.isError).toBeUndefined();
+      expect(detailsOf(result)).toMatchObject({ taskStatus: "cancelled", taskAccepted: false, taskRevision: 1 });
+      expect(contentOf(result)).toContain('taskStatus="cancelled"');
+      expect(f.owner.snapshot().currentTask?.status).toBe("cancelled");
     } finally {
       await f.cleanup();
     }

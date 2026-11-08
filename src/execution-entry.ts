@@ -57,7 +57,7 @@ const EXECUTION_PARAMETERS = {
     action: {
       type: "string",
       enum: ["describe", "run"],
-      description: "Describe host-selected runtimes and authorized input handles, or run one bounded task-local script.",
+      description: "Describe the current visible task's runtimes, limits and authorized input handles, or run one bounded task-local script.",
     },
     runtime: {
       type: "string",
@@ -76,12 +76,12 @@ const EXECUTION_PARAMETERS = {
     },
     expectedTaskId: {
       type: "string",
-      description: "Required for run. Optimistic identity guard copied from the current host task view. The owner checks it at admission and again immediately before spawn; it is never authority.",
+      description: "Required for run. Optional for describe only together with expectedTaskRevision: the pair must match the currently visible task, never a retained task, and is never authority.",
     },
     expectedTaskRevision: {
       type: "integer",
       minimum: 1,
-      description: "Required for run. Optimistic guard for run. The owner checks it at admission and again immediately before spawn.",
+      description: "Required for run. Optional for describe only together with expectedTaskId: the pair must match the currently visible task revision and never selects history.",
     },
   },
   // OMP 18.18 repairs a closed object schema by deleting unknown keys before
@@ -91,7 +91,7 @@ const EXECUTION_PARAMETERS = {
   required: ["action"],
 } as const;
 
-const DESCRIPTION = "Generic local candidate execution for the current managed task. describe reports the versioned model-visible execution view: actual host-selected Python/Bun versions, truthful limits, the current task identity/revision, authorized input handles (id, bytes, sha256, writable:false, availability) and remaining launch attempts without creating authority. run executes one bounded task-local Python or Bun script in a fresh private work directory. run requires expectedTaskId and expectedTaskRevision from the current host task view; both are optimistic guards, never authority, and a missing or wrong value is rejected before admission, launch budget, staging or spawn. Inside the script, cwd is that writable workDir; OMP_WORK_DIR and OMP_INPUTS_MANIFEST are host-provided environment entries. Read OMP_INPUTS_MANIFEST as JSON; manifest.handles[inputId] is {path, bytes, sha256, writable:false} and the manifest also carries workDir, sourcePath and runtime. Pass inputIds to stage read-only copies, use only the current manifest paths, use only runtime stdlib/builtins (no installs, network or subprocess creation), and write intended candidate files as ordinary top-level files directly in the current cwd with relative paths so the host archives them; no copy-back to a host workspace is supported. Every run is fresh, and previous-run archives are not automatically readable or writable inputs. run returns the real runId/revision/runtime, observed process and watchdog facts, explicit output observed/retained/shown/omitted/truncated counts, candidate artifact rows with artifactId/relativePath/archiveRef/bytes/sha256, export rejections, host-record/control errors, taskAccepted:false and remaining attempts. Exit 0 is candidate generation only and is never task acceptance. Delivery policy: after producing the registered artifacts intended for the final candidate report, use agent_verify on that current task/revision/run/artifact selection before the final report; intermediate exploration outputs need not be verified. Script self-tests are supplementary and do not replace host-configured verification. Verification is distinct from owner acceptance, so an unavailable task-acceptance operation is not a reason to skip verification. Report the actual host outcome, coverage and remaining gaps: on fail, use feedback to repair and submit a new candidate if justified; on insufficient coverage, explain missing checks or review and never repeatedly verify the same unchanged candidate merely to seek a pass. Do not imply verified or accepted beyond evidence. If no current registered candidate exists or verification cannot act due to cancellation or unavailability, report that limitation and never invent selectors or receipts. The host chooses paths, runtime, environment and limits; paths, shell commands, environment variables, endpoints, identities, budgets and policies are not accepted from the model; unknown or host-authority fields are refused by the plugin.";
+const DESCRIPTION = "Generic local candidate execution for the current managed task. describe reports the versioned model-visible execution view: actual host-selected Python/Bun versions, truthful limits, the current task identity/revision, authorized input handles (id, bytes, sha256, writable:false, availability) and remaining launch attempts without creating authority. describe optionally accepts BOTH expectedTaskId and expectedTaskRevision from the current host task view; when present they must match the currently visible task and never select retained history, and when absent describe remains an unguarded read of that current visible view. run executes one bounded task-local Python or Bun script in a fresh private work directory. run requires expectedTaskId and expectedTaskRevision from the current host task view; both are optimistic guards, never authority, and a missing or wrong value is rejected before admission, launch budget, staging or spawn. Inside the script, cwd is that writable workDir; OMP_WORK_DIR and OMP_INPUTS_MANIFEST are host-provided environment entries. Read OMP_INPUTS_MANIFEST as JSON; manifest.handles[inputId] is {path, bytes, sha256, writable:false} and the manifest also carries workDir, sourcePath and runtime. Pass inputIds to stage read-only copies, use only the current manifest paths, use only runtime stdlib/builtins (no installs, network or subprocess creation), and write intended candidate files as ordinary top-level files directly in the current cwd with relative paths so the host archives them; no copy-back to a host workspace is supported. Every run is fresh, and previous-run archives are not automatically readable or writable inputs. run returns the real runId/revision/runtime, observed process and watchdog facts, explicit output observed/retained/shown/omitted/truncated counts, candidate artifact rows with artifactId/relativePath/archiveRef/bytes/sha256, export rejections, host-record/control errors, taskAccepted:false and remaining attempts. Exit 0 is candidate generation only and is never task acceptance. Delivery policy: after producing the registered artifacts intended for the final candidate report, use agent_verify on that current task/revision/run/artifact selection before the final report; intermediate exploration outputs need not be verified. Script self-tests are supplementary and do not replace host-configured verification. Verification is distinct from owner acceptance, so an unavailable task-acceptance operation is not a reason to skip verification. Report the actual host outcome, coverage and remaining gaps: on fail, use feedback to repair and submit a new candidate if justified; on insufficient coverage, explain missing checks or review and never repeatedly verify the same unchanged candidate merely to seek a pass. Do not imply verified or accepted beyond evidence. If no current registered candidate exists or verification cannot act due to cancellation or unavailability, report that limitation and never invent selectors or receipts. The host chooses paths, runtime, environment and limits; paths, shell commands, environment variables, endpoints, identities, budgets and policies are not accepted from the model; unknown or host-authority fields are refused by the plugin.";
 
 function stderr(message: string, details?: unknown): void {
   try {
@@ -332,7 +332,20 @@ export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions)
           // The audit sink is a host callback and may replace the published
           // owner. Never rebind this already-created adapter to another owner.
           if (!ownerStillCurrent()) return ownerChangedResult();
-          if (parsed.action === "describe") return await adapter.describe(context);
+          if (parsed.action === "describe") {
+            const described = await adapter.describe(context, parsed);
+            // The adapter's own await may cross a microtask boundary after a
+            // host callback changes the published owner or the entry disposes.
+            // Re-seal at the entry before any describe metadata is returned.
+            if (disposed) {
+              return executionErrorResult(
+                "the execution entry is disposed; no effect occurred.",
+                { taskAccepted: null, currentTaskStatus: null },
+              );
+            }
+            if (!ownerStillCurrent()) return ownerChangedResult();
+            return described;
+          }
           return await adapter.run(context, parsed, signal);
         } catch (error) {
           safeAudit(audit, { type: "execution_tool_rejected", error: errorMessage(error) });

@@ -139,6 +139,14 @@ A subsequent backend compatibility check used the published source at `d3d17ca`,
 
 The first attempt failed before backend startup because Bun required a writable package manifest. Its failure is retained; the corrected fixture copies pinned inputs into its own pack directory and checks original and copied bytes before and after packing. The provider is deterministic and local: its reported $0.00204 total usage cost is synthetic, not a paid-model bill or quality measurement. These checks do not establish managed delegation, task authority recovery, cancellation races, semantic quality or a benefit from changing the default strategy.
 
+## Current-task execution descriptions
+
+Optional paired task guards on `agent_execute describe` passed type checking and 103 focused execution/daily-entry tests with 870 assertions. Independent review then found that one new microtask test triggered its owner replacement during setup. The test was corrected to arm only after task creation; type checking and the corrected case passed again with 15 assertions. Product code and the other tests were unchanged. Coverage includes stale or wrong guards, caller argument mutation, input-inspection races, terminal queries, disposal, owner replacement and unchanged execution authority.
+
+One real OMP session executed two genuine prompts, 15 local provider requests and 13 calls with the default 16-tool catalog. Independent inspection confirmed all call chains: five intended guard rejections, a real revision from R1 to R2, both null-placeholder forms becoming unguarded queries upstream, and unchanged owner state for all ten descriptions. Both prompts completed and settled; no execution, delivery or acceptance occurred.
+
+The original automatic result remains failed: its private grader treated custom-message text as an array, and its 8 MiB evidence export omitted the local native library. A separate offline correction changed only assistant-message extraction and passed all 132 retained-protocol checks. A new explicit 128 MiB export copied and verified all 50 retained files; the original failure, incomplete export and runtime directory remain intact. OMP exited normally without fallback signals. This was a review of the same captured execution, not another runtime pass or real-model quality sample.
+
 ## Bounded real-model journey
 
 A separate DeepSeek Flash sample used three genuine messages in one OMP session: produce a file, cancel that task while preserving its files, then produce a different file under a new task identity. Independent reads confirmed both selected artifacts, their actual delivery paths, preserved prior bytes, and the reported active/cancelled states. Both verification calls returned no-contract `insufficient`; those receipts contain no candidate-byte or semantic validation. File correctness came from independent physical checks. No task was accepted.
