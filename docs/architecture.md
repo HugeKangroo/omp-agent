@@ -1,6 +1,6 @@
 # Architecture
 
-`omp-agent` extends OMP with explicit task ownership, bounded execution, verification, and artifact delivery. OMP retains the model and tool invocation loop.
+`omp-agent` is an OMP plugin for individual workflows. It adds explicit task ownership, bounded execution, verification, and artifact delivery while OMP retains the model and tool invocation loop.
 
 ## Components
 
@@ -13,6 +13,7 @@
 | Verification service | Applies host-configured contracts and trusted checks to registered candidates |
 | Delivery service | Creates read-only artifact copies, requirement records, and a manifest; checks files before returning a preview |
 | Acceptance service and record store | Rechecks complete host evidence, reserves task acceptance, installs a record once, and separates commit facts from current visibility and file integrity |
+| Local review adapter and component | Displays frozen requirements and selected text files in the main-agent TUI, with default rejection and complete paint coverage before an explicit decision |
 | Job adapter | Exercises submission, reconciliation, and cancellation semantics against an explicitly configured service |
 
 The default package entry is a managed integration probe. The task, execution, and job entries are loaded explicitly in isolated test environments.
@@ -45,7 +46,11 @@ The host mechanism for human review is default-off and uses the same task owner,
 
 Human and hybrid records use an explicit v2 schema. Automatic acceptance continues to write v1 records. A valid partial automatic check retains its original insufficient outcome; a human decision may supplement uncovered semantics, but cannot override a failed or invalid configured check. Private verification issuance facts distinguish valid partial evidence from malformed verifier results without changing the historical receipt or model-visible verification result.
 
-The production review adapter is currently unavailable. No model approval flag, approval callback option, or usable review UI is provided. Isolated tests substitute only the review transport to exercise the real evidence and record-installation chain; those tests do not establish actual user approval.
+The fixed local adapter uses OMP public custom UI and terminal helpers. The experimental entry enables it only with the exact `OMP_AGENT_HUMAN_REVIEW=local-main-tui-v1` setting and configured delivery and acceptance directories. The model can request review of an existing delivery with exact task guards; it cannot approve. Only the current main-agent TUI context can display a review.
+
+The component defaults to Reject and counts matching completed paints rather than render calls alone. Resizing resets page coverage and selection; pasted input cannot approve. Task or context changes, cancellation, the fixed five-minute deadline, and disposal invalidate a pending review. TAB and control characters are escaped for display while original file bytes remain independently bound.
+
+The documented native integration scenarios passed using automated terminal input, including the actual fixed deadline. Genuine human review is pending. Simulated transport and automated terminal input are engineering evidence, not a human decision.
 
 ## Current limits
 

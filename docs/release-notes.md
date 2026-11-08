@@ -1,10 +1,18 @@
 # Release notes
 
+## Experimental local review component
+
+Added a default-off main-agent TUI review component and `agent_deliver request_review`. The exact `OMP_AGENT_HUMAN_REVIEW=local-main-tui-v1` setting enables the experimental path when delivery and acceptance are configured. Requests select an existing delivery and task revision; the model cannot approve.
+
+The component displays complete frozen requirements and selected text files, defaults to rejection, and requires matching completed paints before a separate selection and confirmation. Resizing resets coverage; pasted input cannot approve. Context changes, cancellation and the fixed five-minute deadline invalidate pending reviews. Display escaping includes TAB; original bytes and hashes stay separately bound.
+
+Host, component, and eight native integration scenarios have passed, including real deadline expiry and late-input rejection. Original fixture failures were retained and the affected cases rerun after targeted repairs. Genuine human review remains pending. Automatic acceptance keeps its v1 evidence rules, and partial automatic coverage keeps its original insufficient outcome. The default package entry and daily-use installation status are unchanged.
+
 ## Human review host mechanism
 
 Added a default-off host mechanism that binds a review to exact requirements, selected delivery bytes, and a fixed deadline. Human/hybrid v2 records preserve the original automatic receipt; automatic acceptance continues to use v1. Invalid or failed configured checks cannot be bypassed by a review decision.
 
-The production review adapter remains unavailable, and no model review action or environment activation is enabled. Positive approval tests use an isolated simulated transport over the real execution and acceptance chain. A usable review UI and genuine user acceptance remain pending.
+This earlier host-only increment used an isolated simulated review transport over the real execution and acceptance chain. The local UI and model request action were added in the newer increment above. Simulated approvals do not establish a human decision.
 
 ## Experimental model submission and inspection
 
@@ -12,7 +20,7 @@ Added `agent_deliver submit` and `inspect` to the opt-in delivery interface. The
 
 The acceptance service now uses the immutable store port captured from the actual owner, including when OMP loads the task entry separately from the execution composition. Late actions preserve accepted terminal state. Late abort, context loss, or entry disposal withholds unavailable paths without reversing a completed commit.
 
-Added `bun run test:delivery` for actual OMP integration using a local deterministic provider. Human review, continuous-task operation, durable recovery, and a daily-use installation profile remain pending. The default package entry is unchanged.
+Added `bun run test:delivery` for actual OMP integration using a local deterministic provider. At this increment, human review, continuous-task operation, durable recovery, and a daily-use installation profile were pending. See newer entries above for subsequent review work. The default package entry was unchanged.
 
 ## Experimental host acceptance
 

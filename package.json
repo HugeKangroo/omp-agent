@@ -15,6 +15,7 @@
     "test:jobs": "bun run scripts/test-jobs.ts",
     "test:delivery": "bun run scripts/test-delivery.ts",
     "test:human-review": "bun test test/human-review",
+    "test:human-review-native": "bun run scripts/test-human-review-native.ts",
     "typecheck": "bun x tsc --noEmit"
   },
   "devDependencies": {

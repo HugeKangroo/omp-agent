@@ -4,6 +4,7 @@ import type {
   AcceptanceContractEvidence,
 } from "./delivery-service.ts";
 import type { FrozenTaskRef } from "./execution-candidates.ts";
+import type { OmpToolContext } from "./task-entry-port.ts";
 import type { RequirementSource } from "./task-requirements.ts";
 import type {
   VerificationReceipt,
@@ -20,8 +21,8 @@ import type {
 
 export const HUMAN_REVIEW_POLICY_VERSION = "human-review-policy-v1";
 export const HUMAN_REVIEW_RECORD_VERSION = "acceptance-record-v2";
-export const HUMAN_REVIEW_DISPLAY_VERSION = "human-review-display-v1";
-export const HUMAN_REVIEW_ESCAPE_VERSION = "human-review-safe-text-v1";
+export const HUMAN_REVIEW_DISPLAY_VERSION = "human-review-display-v2";
+export const HUMAN_REVIEW_ESCAPE_VERSION = "human-review-safe-text-v2";
 export const HUMAN_REVIEW_INTERACTION_SOURCE = "local-main-tui-component";
 export const HUMAN_REVIEW_DECISION = "approve";
 
@@ -68,6 +69,14 @@ export interface HumanReviewTransportInput {
   issuedAt: string;
   expiresAt: string;
   signal: AbortSignal;
+  /** The live OMP context from the same acceptance-service call. */
+  context: OmpToolContext;
+  /**
+   * Read-only presentation veto created inside this call. The fixed adapter
+   * must invoke it after lazy module loads and immediately before mounting;
+   * it can only reject a stale surface and never approves or installs.
+   */
+  displayGuard: () => boolean;
 }
 
 export type HumanReviewTransportResult =
@@ -281,21 +290,23 @@ export interface AcceptanceRecordV2 {
 }
 
 /**
- * Documented unambiguous display transform (`human-review-safe-text-v1`).
+ * Documented unambiguous display transform (`human-review-safe-text-v2`).
  *
- * Newline and tab are preserved. Other C0/C1 controls, DEL, bidi/invisible
- * format controls and the escape marker itself are replaced by
- * `⟦U+XXXX⟧`/`⟦U+XXXXXX⟧`; every other character, including a literal
- * backslash or the literal text `\u202e`, is emitted unchanged. Because a real
- * marker is itself escaped, the output distinguishes a control character from
- * look-alike plain text. The original bytes and hashes are always bound
- * separately and this transform never mutates them.
+ * Newline is preserved as the only literal line separator. TAB, other C0/C1
+ * controls, DEL, bidi/invisible format controls and the escape marker itself
+ * are replaced by `⟦U+XXXX⟧`/`⟦U+XXXXXX⟧`; every other character, including a
+ * literal backslash or the literal text `\u202e`, is emitted unchanged.
+ * Because a real marker is itself escaped, the output distinguishes a control
+ * character from look-alike plain text. The original bytes and hashes are
+ * always bound separately and this transform never mutates them. Escaping TAB
+ * removes an ambiguous terminal-cell width from the display model while
+ * preserving the original file/requirement bytes and their digests.
  */
 export function humanReviewSafeText(text: string): string {
   let result = "";
   for (const character of text) {
     const code = character.codePointAt(0)!;
-    if (character === "\n" || character === "\t") {
+    if (character === "\n") {
       result += character;
       continue;
     }

@@ -34,9 +34,10 @@ mock.module(uiPath, () => ({
   },
 }));
 
-const { createHumanFixture } = await import("../harness/human-review-fixture.ts");
+const { createHumanFixture, textOf } = await import("../harness/human-review-fixture.ts");
 const { partialSpec } = await import("../harness/human-review-fixture.ts");
 const { AcceptanceService } = await import("../../src/acceptance-service.ts");
+const { DELIVERY_TOOL } = await import("../../src/delivery-entry.ts");
 const { createHash } = await import("node:crypto");
 
 function approve(input: HumanReviewTransportInput): HumanReviewTransportResult {
@@ -465,6 +466,174 @@ describe("G2-B2-C1 simulated human/hybrid transport", () => {
       });
     } finally {
       second.dispose();
+      await f.cleanup();
+    }
+  });
+
+  test("request_review action reports bounded review facts and idempotent replay", async () => {
+    clearTransport();
+    const f = await createHumanFixture({ humanReview: { kind: "local-main-tui", policyVersion: 1 } });
+    try {
+      const run = await f.run();
+      const preview = await f.preview(run.runId, run.artifactIds);
+      const tool = f.tools.get(DELIVERY_TOOL)!;
+      const parameters = tool.parameters as {
+        properties: { action: { enum: string[] } };
+      };
+      expect(parameters.properties.action.enum).toContain("request_review");
+      const task = f.owner.snapshot().currentTask!;
+      const selector = {
+        action: "request_review",
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: task.taskRevision,
+        deliveryId: preview.deliveryId,
+      };
+      scripts.push(approve);
+      const first = await tool.execute("call-review", selector, undefined, undefined, f.ctx);
+      expect(first.isError).toBeUndefined();
+      const text = textOf(first);
+      const facts = JSON.parse(text) as Record<string, any>;
+      expect(first.details as Record<string, any>).toEqual(facts);
+      expect(facts.format).toBe("agent-deliver-result-v1");
+      expect(facts.action).toBe("request_review");
+      expect(facts.humanReviewConfigured).toBe(true);
+      expect(facts.operation.outcome).toBe("committed");
+      expect(facts.operation.operationCommitted).toBe(true);
+      expect(facts.operation.idempotent).toBe(false);
+      expect(facts.operation.newCommit).toBe(true);
+      expect(facts.review.state).toBe("committed");
+      expect(facts.review.reviewId).toMatch(/^review-/);
+      expect(facts.review.reason).toBeNull();
+      expect(facts.taskAccepted).toBe(true);
+      expect(facts.currentTaskStatus).toBe("accepted");
+      expect(facts.files).toHaveLength(1);
+      expect(facts.files[0].relativePath).toBe("answer.txt");
+      expect(facts.paths.available).toBe(true);
+      expect(facts.integrity.record.state).toBe("intact");
+      expect(facts.acceptance.acceptanceId).toBe(f.owner.snapshot().currentTask!.acceptance!.acceptanceId);
+      expect(text).not.toContain("capability");
+      expect(text).not.toContain("presentation");
+      expect(text).not.toContain("humanReviewReceipt");
+      expect(text).not.toContain("token");
+
+      const record = recordOf(f.acceptanceRoot);
+      expect(record.value.schemaVersion).toBe(2);
+      const callsBeforeReplay = calls;
+      const replay = await tool.execute("call-review-replay", selector, undefined, undefined, f.ctx);
+      const replayFacts = JSON.parse(textOf(replay)) as Record<string, any>;
+      expect(replayFacts.operation.outcome).toBe("committed");
+      expect(replayFacts.operation.idempotent).toBe(true);
+      expect(replayFacts.operation.newCommit).toBe(false);
+      expect(replayFacts.review.state).toBe("committed");
+      expect(replayFacts.review.reviewId).toBeNull();
+      expect(calls).toBe(callsBeforeReplay);
+      expect(readdirSync(f.acceptanceRoot).filter((name) => name.startsWith("record-"))).toHaveLength(1);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("request_review rejection is honest and installs no record", async () => {
+    clearTransport();
+    const f = await createHumanFixture({ humanReview: { kind: "local-main-tui", policyVersion: 1 } });
+    try {
+      const run = await f.run();
+      const preview = await f.preview(run.runId, run.artifactIds);
+      const task = f.owner.snapshot().currentTask!;
+      scripts.push(() => ({ kind: "reject", reason: "fixture explicit rejection" }));
+      const result = await f.tools.get(DELIVERY_TOOL)!.execute("call-review-reject", {
+        action: "request_review",
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: task.taskRevision,
+        deliveryId: preview.deliveryId,
+      }, undefined, undefined, f.ctx);
+      expect(result.isError).toBe(true);
+      const facts = JSON.parse(textOf(result)) as Record<string, any>;
+      expect(facts.action).toBe("request_review");
+      expect(facts.review.state).toBe("rejected");
+      expect(facts.review.reason).toBe("fixture explicit rejection");
+      expect(facts.operation.outcome).toBe("not_committed");
+      expect(facts.operation.operationCommitted).toBe(false);
+      expect(facts.taskAccepted).toBe(false);
+      expect(facts.currentTaskStatus).toBe("active");
+      expect(facts.files).toBeNull();
+      expect(facts.retryable).toBe(false);
+      expect(readdirSync(f.acceptanceRoot).filter((name) => name.startsWith("record-"))).toHaveLength(0);
+      expect(f.owner.snapshot().currentTask!.status).toBe("active");
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("a committed review with detached final visibility withholds the review id", async () => {
+    clearTransport();
+    const f = await createHumanFixture({ humanReview: { kind: "local-main-tui", policyVersion: 1 } });
+    try {
+      const run = await f.run();
+      const preview = await f.preview(run.runId, run.artifactIds);
+      const service = f.entry.acceptance!;
+      const original = service.inspect.bind(service);
+      service.inspect = async (...args: Parameters<typeof service.inspect>) => {
+        const inspection = await original(...args);
+        // Navigation after the awaited inspection but before the entry's final
+        // current projection. The original commit fact must survive.
+        f.owner.navigate("session_switch");
+        return inspection;
+      };
+      scripts.push(approve);
+      const task = f.owner.snapshot().currentTask!;
+      const result = await f.tools.get(DELIVERY_TOOL)!.execute("call-review-detach", {
+        action: "request_review",
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: task.taskRevision,
+        deliveryId: preview.deliveryId,
+      }, undefined, undefined, f.ctx);
+      const facts = JSON.parse(textOf(result)) as Record<string, any>;
+      expect(facts.operation.outcome).toBe("committed");
+      expect(facts.operation.operationCommitted).toBe(true);
+      expect(facts.review.state).toBe("committed");
+      expect(facts.review.reviewId).toBeNull();
+      expect(facts.acceptance.acceptanceId).toMatch(/^acceptance-/);
+      expect(facts.visibility.state).not.toBe("visible");
+      expect(facts.files).toBeNull();
+      expect(facts.paths.available).toBe(false);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("disabled host omits request_review and reports configured:false for manual calls", async () => {
+    clearTransport();
+    const f = await createHumanFixture();
+    try {
+      const tool = f.tools.get(DELIVERY_TOOL)!;
+      const parameters = tool.parameters as {
+        properties: { action: { enum: string[] } };
+      };
+      expect(parameters.properties.action.enum).not.toContain("request_review");
+      const described = await tool.execute("call-describe", { action: "describe" }, undefined, undefined, f.ctx);
+      expect(described.details).toMatchObject({
+        humanReviewConfigured: false,
+        humanReviewMode: "unconfigured",
+      });
+      expect(textOf(described)).toContain("humanReviewConfigured: false");
+
+      const task = f.owner.snapshot().currentTask!;
+      const manual = await tool.execute("call-manual-review", {
+        action: "request_review",
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: task.taskRevision,
+        deliveryId: "delivery-fixture",
+      }, undefined, undefined, f.ctx);
+      expect(manual.isError).toBe(true);
+      const facts = JSON.parse(textOf(manual)) as Record<string, any>;
+      expect(facts.action).toBe("request_review");
+      expect(facts.humanReviewConfigured).toBe(false);
+      expect(facts.review.state).toBe("unavailable");
+      expect(facts.operation.outcome).toBe("not_committed");
+      expect(calls).toBe(0);
+      expect(f.owner.snapshot().currentTask!.status).toBe("active");
+    } finally {
       await f.cleanup();
     }
   });

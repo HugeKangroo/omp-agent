@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { readdirSync } from "node:fs";
 import {
   REVIEW_DEADLINE_MS,
@@ -7,6 +8,8 @@ import {
   REVIEW_MAX_FILE_BYTES,
   REVIEW_MAX_REQUIREMENT_BYTES,
   REVIEW_MAX_TOTAL_FILE_BYTES,
+  HUMAN_REVIEW_DISPLAY_VERSION,
+  HUMAN_REVIEW_ESCAPE_VERSION,
   humanReviewDeadlineAt,
   humanReviewDeadlineReached,
   humanReviewSafeText,
@@ -51,6 +54,8 @@ describe("G2-B2-C1 host human-review evidence", () => {
     expect(REVIEW_MAX_TOTAL_FILE_BYTES).toBe(24_576);
     expect(REVIEW_MAX_REQUIREMENT_BYTES).toBe(8_192);
     expect(REVIEW_MAX_DISPLAY_BYTES).toBe(65_536);
+    expect(HUMAN_REVIEW_DISPLAY_VERSION).toBe("human-review-display-v2");
+    expect(HUMAN_REVIEW_ESCAPE_VERSION).toBe("human-review-safe-text-v2");
     expect(humanReviewDeadlineReached(100, 300_099)).toBe(false);
     expect(humanReviewDeadlineReached(100, 300_100)).toBe(true);
     expect(humanReviewDeadlineAt("2026-11-08T00:00:00.000Z")).toBe("2026-11-08T00:05:00.000Z");
@@ -64,7 +69,31 @@ describe("G2-B2-C1 host human-review evidence", () => {
     expect(safeReal).not.toBe(safeLiteral);
     expect(humanReviewSafeText("x\u001b[31my")).toBe("x⟦U+001B⟧[31my");
     expect(humanReviewSafeText("⟦U+202E⟧")).toBe("⟦U+27E6⟧U+202E⟧");
-    expect(humanReviewSafeText("line\nnext\tcol")).toBe("line\nnext\tcol");
+    expect(humanReviewSafeText("line\nnext\tcol")).toBe("line\nnext⟦U+0009⟧col");
+    expect(humanReviewSafeText("tap⟦U+0009⟧marker")).toBe("tap⟦U+27E6⟧U+0009⟧marker");
+  });
+
+  test("TAB is escaped in the display model while original bytes and digest are unchanged", async () => {
+    const original = Buffer.from("A\tB\nC\n", "utf8");
+    const f = await createHumanFixture({
+      source: 'from pathlib import Path\nPath("answer.txt").write_bytes(b"A\\tB\\nC\\n")\nprint("tab artifact")\n',
+    });
+    try {
+      const run = await f.run();
+      const preview = await f.preview(run.runId, run.artifactIds);
+      const read = await f.readReview(preview.deliveryId);
+      const file = read.presentation.model.delivery.files[0]!;
+      const evidenceFile = read.evidence.files[0]!;
+      expect(file.text).toBe("A⟦U+0009⟧B\nC\n");
+      expect(file.text).not.toContain("\t");
+      expect(file.bytes).toBe(original.length);
+      expect(file.sha256).toBe(`sha256:${createHash("sha256").update(original).digest("hex")}`);
+      expect(evidenceFile.bytes).toBe(original.length);
+      expect(evidenceFile.sha256).toBe(file.sha256);
+      expect(read.presentation.requirementRevisions).toEqual([1]);
+    } finally {
+      await f.cleanup();
+    }
   });
 
   test("no-contract actual delivery is human-eligible and displays full bytes", async () => {

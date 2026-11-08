@@ -6,6 +6,7 @@ import type {
   AcceptanceVisibility,
   AcceptedInspectionResult,
   AcceptanceService,
+  HumanReviewOperationResult,
 } from "./acceptance-service.ts";
 import {
   DELIVERY_BUNDLE_VERSION,
@@ -39,10 +40,15 @@ const FORBIDDEN_DELIVERY_KEYS = new Set([
   "coverage", "receipt", "receiptId", "archiveRef", "archivePath", "path",
   "filePath", "manifest", "confirmed", "taskAccepted", "parameters", "config",
   "hostConfig", "deliveryRoot", "root", "bytes", "sha256", "verdict", "accepted",
-  "owners", "sessionId", "branch",
+  "owners", "sessionId", "branch", "approve", "approved", "reviewer", "decision",
+  "token", "capability", "nonce", "humanReceipt", "humanReview", "content",
+  "timeout", "limits",
 ]);
 
-const ACCEPTANCE_ACTIONS = new Set(["submit", "inspect"]);
+const ACCEPTANCE_ACTIONS = new Set(["submit", "inspect", "request_review"]);
+
+type DeliveryAction = "describe" | "preview" | "submit" | "inspect" | "request_review";
+type AcceptanceAction = "submit" | "inspect" | "request_review";
 
 export class DeliveryEntryError extends Error {
   override name = "DeliveryEntryError";
@@ -72,7 +78,8 @@ export type DeliveryArguments =
   | { action: "describe" }
   | { action: "preview"; request: DeliveryPreviewRequest }
   | { action: "submit"; request: AcceptanceSelector }
-  | { action: "inspect"; request: AcceptanceSelector };
+  | { action: "inspect"; request: AcceptanceSelector }
+  | { action: "request_review"; request: AcceptanceSelector };
 
 export interface DeliveryEntryOptions {
   owner: TaskOwner;
@@ -85,7 +92,7 @@ export interface DeliveryEntryControls {
   dispose(): void;
 }
 
-const DELIVERY_PARAMETERS = {
+const BASE_DELIVERY_PARAMETERS = {
   type: "object",
   properties: {
     action: {
@@ -129,7 +136,33 @@ const DELIVERY_PARAMETERS = {
   required: ["action"],
 } as const;
 
+function deliveryParameters(humanReviewConfigured: boolean): Record<string, unknown> {
+  return {
+    ...BASE_DELIVERY_PARAMETERS,
+    properties: {
+      ...BASE_DELIVERY_PARAMETERS.properties,
+      action: {
+        type: "string",
+        enum: humanReviewConfigured
+          ? ["describe", "preview", "submit", "inspect", "request_review"]
+          : ["describe", "preview", "submit", "inspect"],
+        description: humanReviewConfigured
+          ? "Describe delivery/acceptance coverage, preview a candidate selection, submit one existing delivery, inspect accepted history, or request an explicit local human review when the host and evidence admit it."
+          : "Describe delivery/acceptance coverage, preview a candidate selection, submit one existing delivery, or inspect accepted history.",
+      },
+    },
+  };
+}
+
 const DESCRIPTION = "Host-configured candidate delivery and guarded acceptance bridge for the current managed task. describe reports the current visible task identity/revision/status, the configured delivery root, host contract coverage, activity blockers, whether acceptance is implemented and host-configured, and the fixed limits. describe never reads delivery candidates and never promises that any delivery can be accepted; candidate eligibility is always not_checked until submit rechecks live state. preview requires expectedTaskId, expectedTaskRevision, runId and 1-8 unique artifactIds from that run; it writes private read-only copies, verifies actual bytes and returns real paths/names/sizes/sha256 plus a bounded UTF-8 preview. submit requires expectedTaskId, expectedTaskRevision and an existing deliveryId; these are optimistic selectors, never authority. The host calls the same-process acceptance coordinator, which rechecks the live contract, current verification receipt, frozen candidate set, delivered bytes, reservation and final evidence seal. A committed result reports the original operation and committed acceptance identity independently of later task navigation, appends checked file integrity when the accepted history is still visible, and an exact same-selector retry is idempotent: it installs no record and keeps the same acceptance identity. inspect is read-only: it reports the accepted record and integrity plus real checked file paths/names/bytes/sha256 when available, or explicitly reports no acceptance record, changed/missing files, detached visibility or unknown installation. Inspect never performs a new commit. No receipt, contract, verdict, path, digest, acceptance flag or confirmation is accepted from the model; unknown or host-authority fields are refused. Partial or incomplete semantic coverage, a fail/insufficient receipt and missing contracts are reported and are never converted into acceptance by retrying or fabricating evidence. Completion policy: when an intended final candidate has a current host verification receipt with complete usable semantic coverage and delivery/acceptance are configured, preview that exact run/artifact selection with its real receipt, submit the returned deliveryId, then inspect and report the actual checked files, integrity and acceptance/current result. Missing, partial or failing evidence remains honestly unaccepted; do not reverify unchanged candidates to seek a different result. If delivery or acceptance is not configured, state that boundary and do not imply acceptance. This is one generic lifecycle; acceptance remains optional host configuration.";
+
+const REVIEW_DESCRIPTION = " Local human review is configured only for the actual main agent in the local TUI with a UI installed. request_review requires expectedTaskId, expectedTaskRevision and an existing deliveryId, and only asks the local user to inspect the exact frozen requirements and delivered file bytes. It is an explicit user-review request, not a fallback from a failed automatic submit, and it never accepts model-provided approval, verdict, confirmation, receipt, token, capability, path, digest or content. The model cannot approve or decide; a rejection or cancellation leaves the task otherwise unchanged, and the same rejected request must not be repeated merely to seek a different answer. A committed request_review result is the same owner acceptance and reports the actual review state, current visibility and checked file integrity.";
+
+const REVIEW_UNCONFIGURED_DESCRIPTION = " Local human review is not configured for this host: request_review is not available and no model action can enable it.";
+
+function deliveryDescription(humanReviewConfigured: boolean): string {
+  return `${DESCRIPTION}${humanReviewConfigured ? REVIEW_DESCRIPTION : REVIEW_UNCONFIGURED_DESCRIPTION}`;
+}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -220,7 +253,7 @@ function parseAcceptanceSelector(args: Record<string, unknown>): AcceptanceSelec
   if (typeof args.expectedTaskRevision !== "number"
     || !Number.isSafeInteger(args.expectedTaskRevision)
     || args.expectedTaskRevision <= 0) {
-    throw new DeliveryEntryError("expectedTaskRevision must be a positive integer required by submit/inspect.");
+    throw new DeliveryEntryError("expectedTaskRevision must be a positive integer required by this action.");
   }
   const deliveryId = identifier(args.deliveryId, "deliveryId");
   return { expectedTaskId, expectedTaskRevision: args.expectedTaskRevision, deliveryId };
@@ -243,7 +276,7 @@ export function parseDeliveryArguments(value: unknown): DeliveryArguments {
     return { action: "describe" };
   }
   if (ACCEPTANCE_ACTIONS.has(String(args.action))) {
-    const action = args.action as "submit" | "inspect";
+    const action = args.action as AcceptanceAction;
     const allowed = new Set(["action", "expectedTaskId", "expectedTaskRevision", "deliveryId"]);
     const unknown = keys.filter((key) => !allowed.has(key));
     if (unknown.length) {
@@ -252,7 +285,7 @@ export function parseDeliveryArguments(value: unknown): DeliveryArguments {
     return { action, request: parseAcceptanceSelector(args) };
   }
   if (args.action !== "preview") {
-    throw new DeliveryEntryError("agent_deliver action must be describe, preview, submit or inspect.");
+    throw new DeliveryEntryError("agent_deliver action must be describe, preview, submit, inspect or request_review.");
   }
   const allowed = new Set([
     "action", "expectedTaskId", "expectedTaskRevision", "runId", "artifactIds", "verificationReceiptId",
@@ -335,6 +368,35 @@ function visibilityFacts(current: AcceptanceVisibility | null): {
   return {
     state: current.state,
     reason: safeNullable(current.reason, 1024),
+  };
+}
+
+/**
+ * Add only the host-configured human-review capability facts to describe.
+ * Submit/inspect result envelopes are deliberately unchanged.
+ */
+function withHumanReviewDescribe(
+  result: DeliveryToolResult,
+  configured: boolean,
+): DeliveryToolResult {
+  if (typeof result.details !== "object" || result.details === null || Array.isArray(result.details)) {
+    return result;
+  }
+  const details = result.details as Record<string, unknown>;
+  if (details.action !== "describe") return result;
+  const text = result.content.map((part) => part.text).join("\n");
+  const suffix = `\nhumanReviewImplemented: true\nhumanReviewConfigured: ${configured}\nhumanReviewMode: ${configured ? "local-main-tui" : "unconfigured"}`;
+  const nextText = `${text}${suffix}`;
+  const boundedText = Buffer.byteLength(nextText, "utf8") <= MAX_DELIVERY_CONTENT_BYTES ? nextText : text;
+  return {
+    ...result,
+    content: [{ type: "text", text: boundedText }],
+    details: {
+      ...details,
+      humanReviewImplemented: true,
+      humanReviewConfigured: configured,
+      humanReviewMode: configured ? "local-main-tui" : "unconfigured",
+    },
   };
 }
 
@@ -545,11 +607,12 @@ function fallbackSubmitFacts(
 function withheldAcceptanceResult(
   owner: TaskOwner,
   context: OmpToolContext,
-  action: "describe" | "preview" | "submit" | "inspect",
+  action: DeliveryAction,
   selector: AcceptanceSelector | null,
   acceptanceConfigured: boolean,
   reason: string,
   currentOverride?: AcceptanceVisibility | null,
+  humanReviewConfigured = false,
 ): DeliveryToolResult {
   const visible = currentOverride === undefined ? visibleTaskFacts(owner, context) : null;
   const current: AcceptanceVisibility | null = currentOverride !== undefined
@@ -571,25 +634,39 @@ function withheldAcceptanceResult(
         idempotent: false,
         newCommit: false,
       }
-    : action === "inspect"
-      ? { performed: false, readOnly: true, newCommit: false }
-      : action === "preview"
-        ? { performed: false, readOnly: false, newCommit: false }
-        : { performed: false, readOnly: true, newCommit: false };
+    : action === "request_review"
+      ? {
+          performed: false,
+          outcome: "not_committed",
+          operationCommitted: false,
+          idempotent: false,
+          newCommit: false,
+        }
+      : action === "inspect"
+        ? { performed: false, readOnly: true, newCommit: false }
+        : action === "preview"
+          ? { performed: false, readOnly: false, newCommit: false }
+          : { performed: false, readOnly: true, newCommit: false };
   const facts = {
     format: DELIVERY_RESULT_FORMAT,
     action,
     acceptanceImplemented: true,
     acceptanceConfigured,
+    ...(action === "request_review"
+      ? { humanReviewConfigured }
+      : {}),
     selectors: selector === null ? null : { ...selector },
     operation,
-    outcome: action === "submit"
+    outcome: action === "submit" || action === "request_review"
       ? "not_committed"
       : action === "inspect"
         ? "not_inspected"
         : action === "preview"
           ? "not_previewed"
           : "not_described",
+    ...(action === "request_review"
+      ? { review: { state: "unavailable", reviewId: null, reason: safeText(reason, 1024) } }
+      : {}),
     taskAccepted: topTaskAccepted(current),
     currentTaskId: topCurrentTaskId(current),
     currentTaskStatus: topCurrentTaskStatus(current),
@@ -637,10 +714,14 @@ function withheldAcceptanceResult(
   }
 }
 
-function requestedAction(params: unknown): "describe" | "preview" | "submit" | "inspect" {
+function requestedAction(params: unknown): DeliveryAction {
   if (typeof params !== "object" || params === null || Array.isArray(params)) return "inspect";
   const action = (params as Record<string, unknown>).action;
-  return action === "describe" || action === "preview" || action === "submit" || action === "inspect"
+  return action === "describe"
+    || action === "preview"
+    || action === "submit"
+    || action === "inspect"
+    || action === "request_review"
     ? action
     : "inspect";
 }
@@ -791,6 +872,124 @@ function inspectFacts(
   };
 }
 
+function requestReviewFacts(
+  host: HumanReviewOperationResult,
+  selector: AcceptanceSelector,
+  inspection: AcceptedInspectionResult | null,
+  current: AcceptanceVisibility | null,
+  pathsWithheldReason: string | null,
+  extraWarnings: readonly string[],
+  humanReviewConfigured: boolean,
+): Record<string, unknown> {
+  const filesAvailable = pathsWithheldReason === null
+    && inspection !== null
+    && inspection.acceptance !== null
+    && current !== null
+    && current.state === "visible"
+    && inspection.delivery.state === "intact"
+    && inspection.delivery.files !== null
+    && inspection.delivery.files.length > 0;
+  const files = filesAvailable ? fileRows(inspection.delivery.files) : null;
+  const reviewVisible = current !== null
+    && current.state === "visible"
+    && current.taskId === selector.expectedTaskId;
+  return {
+    format: DELIVERY_RESULT_FORMAT,
+    action: "request_review",
+    acceptanceImplemented: true,
+    acceptanceConfigured: true,
+    humanReviewConfigured,
+    selectors: { ...selector },
+    operation: {
+      performed: true,
+      outcome: host.operation.outcome,
+      operationCommitted: host.operation.operationCommitted,
+      idempotent: host.operation.idempotent === true,
+      newCommit: host.operation.operationCommitted === true && host.operation.idempotent !== true,
+    },
+    outcome: host.operation.outcome,
+    review: {
+      state: host.review.state,
+      reviewId: reviewVisible ? safeNullable(host.review.reviewId, 160) : null,
+      reason: safeNullable(host.review.reason, 1024),
+    },
+    taskAccepted: topTaskAccepted(current),
+    currentTaskId: topCurrentTaskId(current),
+    currentTaskStatus: topCurrentTaskStatus(current),
+    visibility: visibilityFacts(current),
+    acceptance: acceptanceFacts(selector, host.operation.acceptance, host.operation.operationCommitted),
+    integrity: integrityFacts(inspection),
+    unknown: hazardFacts(host.operation.unknown),
+    files,
+    manifest: filesAvailable ? inspection.delivery.manifest : null,
+    requirements: filesAvailable ? inspection.delivery.requirements : null,
+    paths: pathsFacts(inspection, filesAvailable, pathsWithheldReason),
+    reason: safeNullable(host.operation.reason ?? host.review.reason, 2048),
+    warnings: [...host.operation.warnings, ...extraWarnings].slice(0, 20).map((warning) => safeText(warning, 512)),
+    // A human-review request is an explicit user interaction. Do not invite a
+    // retry loop after rejection or cancellation.
+    retryable: false,
+    limits: MODEL_LIMITS,
+  };
+}
+
+function reviewExceptionFacts(
+  selector: AcceptanceSelector,
+  classification: ReturnType<typeof classifySubmitException>,
+  current: AcceptanceVisibility | null,
+  reason: string,
+  humanReviewConfigured: boolean,
+): Record<string, unknown> {
+  const state = classification.outcome === "committed"
+    ? "committed"
+    : classification.outcome === "unknown"
+      ? "unknown"
+      : "unavailable";
+  return {
+    format: DELIVERY_RESULT_FORMAT,
+    action: "request_review",
+    acceptanceImplemented: true,
+    acceptanceConfigured: true,
+    humanReviewConfigured,
+    selectors: { ...selector },
+    operation: {
+      performed: true,
+      outcome: classification.outcome,
+      operationCommitted: classification.operationCommitted,
+      idempotent: false,
+      newCommit: false,
+    },
+    outcome: classification.outcome,
+    review: { state, reviewId: null, reason: safeText(reason, 1024) },
+    taskAccepted: topTaskAccepted(current),
+    currentTaskId: topCurrentTaskId(current),
+    currentTaskStatus: topCurrentTaskStatus(current),
+    visibility: visibilityFacts(current),
+    acceptance: acceptanceFacts(selector, classification.acceptance, classification.operationCommitted),
+    integrity: null,
+    unknown: classification.outcome === "unknown"
+      ? {
+        task: null,
+        acceptanceId: null,
+        deliveryId: safeText(selector.deliveryId, 128),
+        recordDigest: null,
+        reason: safeText(classification.reason, 1024),
+      }
+      : null,
+    files: null,
+    manifest: null,
+    requirements: null,
+    paths: {
+      available: false,
+      withheldReason: "the request_review call threw; no accepted file path was checked or claimed in this response",
+    },
+    reason: safeText(`${classification.reason}; review error: ${reason}`, 2048),
+    warnings: ["the request_review call failed unexpectedly; no approval or not-committed claim is invented beyond the host owner facts"],
+    retryable: false,
+    limits: MODEL_LIMITS,
+  };
+}
+
 async function collectInspection(
   acceptance: AcceptanceService,
   context: OmpToolContext,
@@ -815,6 +1014,7 @@ export function createDeliveryEntry(pi: DeliveryApi, options: DeliveryEntryOptio
   const owner = options.owner;
   const service = options.service;
   const acceptance = options.acceptance;
+  const humanReviewConfigured = acceptance?.humanReviewConfigured() === true;
   if (currentTaskOwner() !== owner) {
     throw new DeliveryEntryError("The published task owner is not the owner this delivery entry was created for.");
   }
@@ -846,8 +1046,104 @@ export function createDeliveryEntry(pi: DeliveryApi, options: DeliveryEntryOptio
     }
   };
 
+  const executeReview = async (
+    selector: AcceptanceSelector,
+    signal: AbortSignal | undefined,
+    context: OmpToolContext,
+  ): Promise<DeliveryToolResult> => {
+    if (acceptance === undefined) {
+      return withheldAcceptanceResult(
+        owner,
+        context,
+        "request_review",
+        selector,
+        false,
+        "the host did not configure an acceptance root; local human review is unavailable",
+      );
+    }
+    let host: HumanReviewOperationResult;
+    try {
+      host = await acceptance.requestHumanReview(context, selector, signal);
+    } catch (error) {
+      const classified = classifySubmitException(owner, selector);
+      return buildModelResult(reviewExceptionFacts(selector, classified, null, errorMessage(error), humanReviewConfigured), true);
+    }
+
+    let inspection: AcceptedInspectionResult | null = null;
+    let inspectionWarning: string | null = null;
+    let pathsWithheldReason: string | null = null;
+    if (host.operation.outcome === "committed") {
+      if (signal?.aborted) {
+        pathsWithheldReason = "the call was aborted after the commit; committed facts are retained and no path was read";
+      } else if (host.operation.current.state !== "visible") {
+        pathsWithheldReason = `the current target is not visible (${host.operation.current.state}); committed facts are retained and no path was read`;
+      } else if (currentTaskOwner() !== owner) {
+        pathsWithheldReason = "the published owner changed after the commit; committed facts are retained and no path is shown";
+      } else {
+        const collected = await collectInspection(acceptance, context, selector, signal);
+        inspection = collected.inspection;
+        inspectionWarning = collected.warning;
+        if (inspection !== null && currentTaskOwner() !== owner) {
+          inspectionWarning = "the published owner changed after accepted file inspection; no path is shown";
+        } else if (inspection !== null && signal?.aborted) {
+          inspectionWarning = "the call was aborted after accepted file inspection; no path is shown";
+        }
+      }
+    } else {
+      pathsWithheldReason = host.operation.outcome === "unknown"
+        ? "the acceptance installation outcome is unknown; no blind retry or file path is claimed"
+        : host.operation.reason ?? host.review.reason ?? "the review did not commit; no accepted file path exists for this response";
+    }
+
+    const current = finalCurrentVisibility(context, selector);
+    if (host.operation.outcome === "committed") {
+      if (current === null) {
+        pathsWithheldReason = "the delivery entry, published owner or acceptance service changed after the commit; committed facts are retained and no path is shown";
+      } else if (current.state !== "visible") {
+        pathsWithheldReason = `the current target is not visible (${current.state})${current.reason === null ? "" : `: ${current.reason}`}; committed facts are retained and no path is shown`;
+      } else if (signal?.aborted) {
+        pathsWithheldReason = "the call was aborted after accepted files were checked; committed facts are retained and no path is shown";
+      } else if (inspection === null) {
+        pathsWithheldReason = inspectionWarning ?? "no accepted file path was checked for this response";
+      } else if (inspection.acceptance === null
+        || inspection.delivery.state !== "intact"
+        || inspection.delivery.files === null) {
+        pathsWithheldReason = inspection.delivery.reason
+          ?? "the accepted delivery files could not be proven intact; no path is shown as available";
+      }
+    }
+
+    const extraWarnings = [
+      ...(inspectionWarning === null ? [] : [inspectionWarning]),
+      ...(inspection !== null && inspection.record.state !== "intact"
+        ? ["the historical acceptance record is not intact; the committed acceptance fact is retained separately"]
+        : []),
+    ];
+    try {
+      return buildModelResult(
+        requestReviewFacts(host, selector, inspection, current, pathsWithheldReason, extraWarnings, humanReviewConfigured),
+        host.operation.outcome !== "committed",
+      );
+    } catch (error) {
+      const fallbackReason = `the review response could not be formatted: ${errorMessage(error)}`;
+      return buildModelResult(
+        {
+          ...requestReviewFacts(host, selector, null, current, fallbackReason, extraWarnings, humanReviewConfigured),
+          files: null,
+          manifest: null,
+          requirements: null,
+          paths: {
+            available: false,
+            withheldReason: "the response was degraded; no accepted path was checked or claimed",
+          },
+        },
+        host.operation.outcome !== "committed",
+      );
+    }
+  };
+
   const executeAcceptance = async (
-    action: "submit" | "inspect",
+    action: AcceptanceAction,
     selector: AcceptanceSelector,
     signal: AbortSignal | undefined,
     context: OmpToolContext,
@@ -859,8 +1155,15 @@ export function createDeliveryEntry(pi: DeliveryApi, options: DeliveryEntryOptio
         action,
         selector,
         false,
-        "the host did not configure an acceptance root; submit and accepted-history inspect are not enabled",
+        action === "request_review"
+          ? "the host did not configure an acceptance root; local human review is unavailable"
+          : "the host did not configure an acceptance root; submit and accepted-history inspect are not enabled",
+        undefined,
+        humanReviewConfigured,
       );
+    }
+    if (action === "request_review") {
+      return executeReview(selector, signal, context);
     }
     if (action === "inspect") {
       const collected = await collectInspection(acceptance, context, selector, signal);
@@ -1074,8 +1377,8 @@ export function createDeliveryEntry(pi: DeliveryApi, options: DeliveryEntryOptio
   const tool: DeliveryTool = {
     name: DELIVERY_TOOL,
     label: "Candidate delivery, submit and accepted history",
-    description: DESCRIPTION,
-    parameters: DELIVERY_PARAMETERS,
+    description: deliveryDescription(humanReviewConfigured),
+    parameters: deliveryParameters(humanReviewConfigured),
     approval: "write",
     loadMode: "essential",
     async execute(_toolCallId, params, signal, _onUpdate, context) {
@@ -1111,15 +1414,17 @@ export function createDeliveryEntry(pi: DeliveryApi, options: DeliveryEntryOptio
           null,
           acceptance !== undefined,
           errorMessage(error),
+          undefined,
+          humanReviewConfigured,
         );
       }
       try {
         if (parsed.action === "describe") {
-          const described = service.describe(context);
+          const described = withHumanReviewDescribe(service.describe(context), humanReviewConfigured);
           assertEntryResponseBound(described);
           return described;
         }
-        if (parsed.action === "submit" || parsed.action === "inspect") {
+        if (parsed.action === "submit" || parsed.action === "inspect" || parsed.action === "request_review") {
           return await executeAcceptance(parsed.action, parsed.request, signal, context);
         }
         if (signal?.aborted) {
@@ -1185,9 +1490,13 @@ export function createDeliveryEntry(pi: DeliveryApi, options: DeliveryEntryOptio
           owner,
           context,
           parsed.action,
-          parsed.action === "submit" || parsed.action === "inspect" ? parsed.request : null,
+          parsed.action === "submit" || parsed.action === "inspect" || parsed.action === "request_review"
+            ? parsed.request
+            : null,
           acceptance !== undefined,
           "delivery was withheld because the current context or files could not be proven",
+          undefined,
+          humanReviewConfigured,
         );
       }
     },

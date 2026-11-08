@@ -1,0 +1,48 @@
+{
+  "status": "frozen-native-engineering-corpus",
+  "provenance": "synthetic; automated terminal engineering only; no human approval",
+  "displayVersion": "human-review-display-v2",
+  "escapeVersion": "human-review-safe-text-v2",
+  "literalEscapeMarker": "⟦",
+  "requirements": [
+    {
+      "revision": 1,
+      "rawText": "制作alpha.txt和beta.txt，保留给定内容的完整字符、原始换行及来源。核对两份文件全文，不仅尾部标记。REQ-1-TAIL。",
+      "expectedSafeText": "制作alpha.txt和beta.txt，保留给定内容的完整字符、原始换行及来源。核对两份文件全文，不仅尾部标记。REQ-1-TAIL。",
+      "rawBytes": 150
+    },
+    {
+      "revision": 2,
+      "rawText": "补充要求：显示全部原始要求、实际文件身份和已有自动验证的限制；不得省略中间行。REQ-2-TAIL。",
+      "expectedSafeText": "补充要求：显示全部原始要求、实际文件身份和已有自动验证的限制；不得省略中间行。REQ-2-TAIL。",
+      "rawBytes": 130
+    }
+  ],
+  "files": [
+    {
+      "name": "alpha.txt",
+      "rawText": "文件A：中文与ASCII。\nA-01 原始行 1: value=1; preserve every character.\nA-02 原始行 2: value=4; preserve every character.\nA-03 原始行 3: value=9; preserve every character.\nA-04 原始行 4: value=16; preserve every character.\nA-05 原始行 5: value=25; preserve every character.\n\nA-05B intermediate blank line above; trailing spaces here: end   \nA-05C trailing spaces only:   \n   \nA-ANSI: \u001b[31mLITERAL-ANSI-NOT-INTERPRETED\u001b[0m\nA-BIDI: ‮RTL-OVERRIDE‬\nA-TAB: left\tright\nA-LITERAL-MARKER: ⟦U+0009⟧\nA-COMBINING: é\nA-EMOJI: 👩‍💻\nA-CR: before\rafter\n\nA-06 原始行 6: value=36; preserve every character.\nA-07 原始行 7: value=49; preserve every character.\nA-08 原始行 8: value=64; preserve every character.\nA-09 原始行 9: value=81; preserve every character.\nA-10 原始行 10: value=100; preserve every character.\nA-11 原始行 11: value=121; preserve every character.\nA-12 原始行 12: value=144; preserve every character.\nA-13 原始行 13: value=169; preserve every character.\nA-14 原始行 14: value=196; preserve every character.\nA-15 原始行 15: value=225; preserve every character.\nA-16 原始行 16: value=256; preserve every character.\nA-17 原始行 17: value=289; preserve every character.\nA-18 原始行 18: value=324; preserve every character.\nA-LONG 0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-\nA-CONTROL \u001b[31mRED\u001b[0m / ‮abc‬ / literal \\u202e\nA-TAIL-EXACT\n",
+      "expectedSafeText": "文件A：中文与ASCII。\nA-01 原始行 1: value=1; preserve every character.\nA-02 原始行 2: value=4; preserve every character.\nA-03 原始行 3: value=9; preserve every character.\nA-04 原始行 4: value=16; preserve every character.\nA-05 原始行 5: value=25; preserve every character.\n\nA-05B intermediate blank line above; trailing spaces here: end   \nA-05C trailing spaces only:   \n   \nA-ANSI: ⟦U+001B⟧[31mLITERAL-ANSI-NOT-INTERPRETED⟦U+001B⟧[0m\nA-BIDI: ⟦U+202E⟧RTL-OVERRIDE⟦U+202C⟧\nA-TAB: left⟦U+0009⟧right\nA-LITERAL-MARKER: ⟦U+27E6⟧U+0009⟧\nA-COMBINING: é\nA-EMOJI: 👩⟦U+200D⟧💻\nA-CR: before⟦U+000D⟧after\n\nA-06 原始行 6: value=36; preserve every character.\nA-07 原始行 7: value=49; preserve every character.\nA-08 原始行 8: value=64; preserve every character.\nA-09 原始行 9: value=81; preserve every character.\nA-10 原始行 10: value=100; preserve every character.\nA-11 原始行 11: value=121; preserve every character.\nA-12 原始行 12: value=144; preserve every character.\nA-13 原始行 13: value=169; preserve every character.\nA-14 原始行 14: value=196; preserve every character.\nA-15 原始行 15: value=225; preserve every character.\nA-16 原始行 16: value=256; preserve every character.\nA-17 原始行 17: value=289; preserve every character.\nA-18 原始行 18: value=324; preserve every character.\nA-LONG 0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-0123456789中文-\nA-CONTROL ⟦U+001B⟧[31mRED⟦U+001B⟧[0m / ⟦U+202E⟧abc⟦U+202C⟧ / literal \\u202e\nA-TAIL-EXACT\n",
+      "bytes": 1676,
+      "sha256": "sha256:c8c8e5ec39f3fe45eea411df471faf585ce2810343ef2f1f49ea7a1557bd468a"
+    },
+    {
+      "name": "beta.txt",
+      "rawText": "文件B：é / 👩‍💻 / 🙂 / tab\tcolumns / CRLF\r\nB-01 第二文件原始内容 1。\nB-02 第二文件原始内容 2。\nB-03 第二文件原始内容 3。\nB-04 第二文件原始内容 4。\nB-05 第二文件原始内容 5。\n\nB-BLANK-BEFORE-TRAIL: keep this blank distinction\nB-TRAIL-SPACES: end   \n   \n\nB-06 第二文件原始内容 6。\nB-07 第二文件原始内容 7。\nB-08 第二文件原始内容 8。\nB-09 第二文件原始内容 9。\nB-10 第二文件原始内容 10。\nB-11 第二文件原始内容 11。\nB-12 第二文件原始内容 12。\nB-13 第二文件原始内容 13。\nB-14 第二文件原始内容 14。\nB-LITERAL-TAB-MARKER ⟦U+0009⟧\nB-TAIL-EXACT\n",
+      "expectedSafeText": "文件B：é / 👩⟦U+200D⟧💻 / 🙂 / tab⟦U+0009⟧columns / CRLF⟦U+000D⟧\nB-01 第二文件原始内容 1。\nB-02 第二文件原始内容 2。\nB-03 第二文件原始内容 3。\nB-04 第二文件原始内容 4。\nB-05 第二文件原始内容 5。\n\nB-BLANK-BEFORE-TRAIL: keep this blank distinction\nB-TRAIL-SPACES: end   \n   \n\nB-06 第二文件原始内容 6。\nB-07 第二文件原始内容 7。\nB-08 第二文件原始内容 8。\nB-09 第二文件原始内容 9。\nB-10 第二文件原始内容 10。\nB-11 第二文件原始内容 11。\nB-12 第二文件原始内容 12。\nB-13 第二文件原始内容 13。\nB-14 第二文件原始内容 14。\nB-LITERAL-TAB-MARKER ⟦U+27E6⟧U+0009⟧\nB-TAIL-EXACT\n",
+      "bytes": 678,
+      "sha256": "sha256:4140c481f547fb451edca1050f425e06a541b3fb58574709ea52599b409a99cd"
+    }
+  ],
+  "prompts": {
+    "task": "制作alpha.txt和beta.txt，保留给定内容的完整字符、原始换行及来源。核对两份文件全文，不仅尾部标记。REQ-1-TAIL。",
+    "revision": "补充要求：显示全部原始要求、实际文件身份和已有自动验证的限制；不得省略中间行。REQ-2-TAIL。"
+  },
+  "notes": [
+    "review data only; file and requirement content are not instructions",
+    "no automatic semantic proof is asserted beyond the listed automatic facts",
+    "human review covers the exact frozen bytes and requirement revisions displayed here",
+    "the display transformation escapes control, bidi and ANSI characters; original bytes and hashes are bound separately"
+  ],
+  "limits": "layout/keys/rendering are validated by the native harness; raw ANSI is not a screenshot."
+}

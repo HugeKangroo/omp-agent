@@ -118,6 +118,19 @@ function optionalEnv(name: string): string | undefined {
   return value && value.trim() ? value : undefined;
 }
 
+/**
+ * Exact, default-off environment opt-in. Absent or the exact empty string
+ * means off; every other value, including whitespace-only text, is a
+ * configuration error, never a permissive downgrade.
+ */
+export function parseHumanReviewEnv(value: string | undefined): HumanReviewOption | undefined {
+  if (value === undefined || value === "") return undefined;
+  if (value !== "local-main-tui-v1") {
+    throw new ExecutionAdapterError("OMP_AGENT_HUMAN_REVIEW must be exactly local-main-tui-v1 when set.");
+  }
+  return { kind: "local-main-tui", policyVersion: 1 };
+}
+
 export interface ExecutionEntryOptions {
   root: string;
   inputs?: readonly ExecutionInputConfig[];
@@ -141,8 +154,8 @@ export interface ExecutionEntryOptions {
    */
   acceptanceRoot?: string;
   /**
-   * C1 host-only, default-off human review capability. It exposes no model
-   * action; the production transport is unavailable until C2.
+   * Default-off human review capability. When enabled, `agent_deliver`
+   * exposes the explicit request_review action for the actual local main TUI.
    */
   humanReview?: HumanReviewOption;
 }
@@ -401,6 +414,21 @@ export default function g2a1ExecutionEntry(pi: OmpApi): void {
     }
     dispatchWallMs = parsed;
   }
+  let humanReview: HumanReviewOption | undefined;
+  try {
+    humanReview = parseHumanReviewEnv(process.env.OMP_AGENT_HUMAN_REVIEW);
+  } catch (error) {
+    stderr("entry_disabled", { reason: errorMessage(error) });
+    return;
+  }
+  const deliveryRoot = optionalEnv("OMP_AGENT_DELIVERY_ROOT");
+  const acceptanceRoot = optionalEnv("OMP_AGENT_ACCEPTANCE_ROOT");
+  if (humanReview !== undefined && (deliveryRoot === undefined || acceptanceRoot === undefined)) {
+    stderr("entry_disabled", {
+      reason: "OMP_AGENT_HUMAN_REVIEW=local-main-tui-v1 requires OMP_AGENT_DELIVERY_ROOT and OMP_AGENT_ACCEPTANCE_ROOT.",
+    });
+    return;
+  }
   try {
     createExecutionEntry(pi, {
       root,
@@ -421,12 +449,9 @@ export default function g2a1ExecutionEntry(pi: OmpApi): void {
         ? {}
         : { launcherPath: optionalEnv("OMP_AGENT_EXECUTION_LAUNCHER")! }),
       ...(dispatchWallMs === undefined ? {} : { dispatchWallMs }),
-      ...(optionalEnv("OMP_AGENT_DELIVERY_ROOT") === undefined
-        ? {}
-        : { deliveryRoot: optionalEnv("OMP_AGENT_DELIVERY_ROOT")! }),
-      ...(optionalEnv("OMP_AGENT_ACCEPTANCE_ROOT") === undefined
-        ? {}
-        : { acceptanceRoot: optionalEnv("OMP_AGENT_ACCEPTANCE_ROOT")! }),
+      ...(deliveryRoot === undefined ? {} : { deliveryRoot }),
+      ...(acceptanceRoot === undefined ? {} : { acceptanceRoot }),
+      ...(humanReview === undefined ? {} : { humanReview }),
     });
   } catch (error) {
     stderr("entry_disabled", { reason: errorMessage(error) });

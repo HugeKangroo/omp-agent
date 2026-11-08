@@ -449,6 +449,11 @@ export class AcceptanceService {
     this.abortPendingReview("cancelled", "the acceptance service is disposed");
   }
 
+  /** Host-only capability projection; never model-visible authority. */
+  humanReviewConfigured(): boolean {
+    return this.humanReviewEnabled;
+  }
+
   private abortPendingReview(state: HumanReviewState, reason: string): void {
     const pending = this.pendingReview;
     if (pending === null || pending.abort !== null) return;
@@ -1487,6 +1492,53 @@ export class AcceptanceService {
       pending.phase = "presenting";
       stopped = stopBeforePresentation();
       if (stopped !== null) return stopped;
+      /**
+       * Read-only display veto created inside this exact pending review. It
+       * re-proves the live subject/reachable task after adapter lazy loads and
+       * before the custom factory mounts, then repeats only pure in-process
+       * checks. It never mints, approves, commits or reads a new external
+       * context getter after the final pure guards.
+       */
+      const displayGuard = (): boolean => {
+        if (this.disposed
+          || currentTaskOwner() !== this.owner
+          || this.pendingReview !== pending
+          || pending.phase !== "presenting"
+          || pending.abort !== null
+          || !this.owner.reservationCurrent(token)
+          || this.reviewElapsed(pending)) {
+          return false;
+        }
+        if (!this.humanReviewContext(context)) return false;
+        const subject = this.liveSubject(context);
+        if (subject === null) return false;
+        let reachable: ManagedTask;
+        try {
+          reachable = this.owner.reachableTask(subject);
+        } catch {
+          return false;
+        }
+        const contextAvailable = this.humanReviewContext(context);
+        if (this.disposed
+          || currentTaskOwner() !== this.owner
+          || this.pendingReview !== pending
+          || pending.phase !== "presenting"
+          || pending.abort !== null
+          || !this.owner.reservationCurrent(token)
+          || this.reviewElapsed(pending)
+          || controller.signal.aborted
+          || !contextAvailable) {
+          return false;
+        }
+        const latest = this.owner.snapshot().currentTask;
+        return latest !== null
+          && latest.status === "active"
+          && latest.taskId === reachable.taskId
+          && latest.taskRevision === reachable.taskRevision
+          && latest.status === reachable.status
+          && sameFrozen(frozenOf(latest), expected)
+          && sameFrozen(frozenOf(reachable), expected);
+      };
       let abortResolve: (() => void) | undefined;
       const abortPromise = new Promise<null>((resolve) => {
         abortResolve = () => resolve(null);
@@ -1500,6 +1552,8 @@ export class AcceptanceService {
           issuedAt: pending.issuedAt,
           expiresAt: pending.expiresAt,
           signal: controller.signal,
+          context,
+          displayGuard,
         }))
         .catch((error): HumanReviewTransportResult => ({
           kind: "unavailable",

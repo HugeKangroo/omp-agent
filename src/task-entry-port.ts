@@ -13,6 +13,50 @@ export interface OmpSessionManager {
   getBranch(): readonly unknown[];
 }
 
+export interface OmpCustomTerminal {
+  readonly columns?: number;
+  readonly rows?: number;
+}
+
+export interface OmpCustomPaint {
+  readonly viewport: readonly string[];
+  readonly columns: number;
+  readonly rows: number;
+  readonly alt: boolean;
+}
+
+export interface OmpCustomComponent {
+  render(width: number): readonly string[];
+  handleInput?(data: string): void;
+  capturesInput?(data: string): boolean;
+  dispose?(): void;
+}
+
+export interface OmpCustomTui {
+  readonly terminal: OmpCustomTerminal;
+  addPaintListener?(listener: (paint: OmpCustomPaint) => void): () => void;
+  requestRender?(force?: boolean): void;
+}
+
+export interface OmpCustomOptions {
+  signal?: AbortSignal;
+  overlay?: boolean;
+  overlayOptions?: Record<string, unknown>;
+}
+
+/** Narrow projection of the verified public `ExtensionUIContext.custom`. */
+export interface OmpCustomUi {
+  custom?<T>(
+    factory: (
+      tui: OmpCustomTui,
+      theme: unknown,
+      keybindings: unknown,
+      done: (result: T) => void,
+    ) => OmpCustomComponent | Promise<OmpCustomComponent>,
+    options?: OmpCustomOptions,
+  ): Promise<T>;
+}
+
 export interface OmpToolContext {
   cwd: string;
   agent?: { kind?: "main" | "sub" };
@@ -21,6 +65,8 @@ export interface OmpToolContext {
   mode?: "tui" | "rpc" | "json" | "print";
   /** Optional host UI availability projection; require true for local review. */
   hasUI?: boolean;
+  /** Present only on hosts that expose the public custom-component API. */
+  ui?: OmpCustomUi;
 }
 
 /** OMP may report a symlinked temp cwd; compare both sides canonically. */
