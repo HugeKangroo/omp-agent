@@ -199,6 +199,8 @@ export interface AcceptedDeliveryInspection {
   state: "intact" | "changed" | "unavailable";
   reason: string | null;
   files: DeliveryFileRow[] | null;
+  manifest: { path: string; bytes: number; sha256: string } | null;
+  requirements: { path: string; bytes: number; sha256: string } | null;
 }
 
 /** Opaque host-only evidence token; only the issuing service can seal it. */
@@ -734,24 +736,53 @@ function deliveryKey(input: {
   }));
 }
 
-function rejection(reason: string, options: { action: "describe" | "preview" | "recheck"; busy?: boolean }): DeliveryToolResult {
+function rejection(reason: string, options: {
+  action: "describe" | "preview" | "recheck";
+  busy?: boolean;
+  acceptanceConfigured?: boolean;
+  task?: { taskId: string; status: string } | null;
+  taskFacts?: { taskId: string | null; status: string | null; accepted: boolean | null } | null;
+}): DeliveryToolResult {
+  const accepted = options.taskFacts !== undefined
+    ? options.taskFacts === null ? null : options.taskFacts.accepted
+    : options.task === undefined || options.task === null
+      ? null
+      : options.task.status === "accepted";
+  const taskId = options.taskFacts !== undefined
+    ? options.taskFacts?.taskId ?? null
+    : options.task?.taskId ?? null;
+  const status = options.taskFacts !== undefined
+    ? options.taskFacts?.status ?? null
+    : options.task?.status ?? null;
+  const configured = options.acceptanceConfigured === true;
+  const submissionReason = configured ? "call_withheld" : "host_acceptance_root_not_configured";
   const text = bounded([
     `agent_deliver ${options.action} rejected`,
-    "taskAccepted: false",
-    "acceptanceImplemented: false",
+    `taskAccepted: ${accepted === null ? "null" : accepted}`,
+    `currentTaskId: ${taskId === null ? "null" : JSON.stringify(taskId)}`,
+    `currentTaskStatus: ${status === null ? "null" : status}`,
+    "acceptanceImplemented: true",
+    `acceptanceConfigured: ${configured}`,
     "submissionAvailable: false",
-    `reason: ${reason}`,
+    `submissionReason: ${submissionReason}`,
+    `withheld: true`,
+    `reason: ${deliverySafeText(reason)}`,
     ...(options.busy === true ? ["busy: true"] : []),
   ].join("\n"));
   return {
     content: [{ type: "text", text }],
     details: {
       action: options.action,
-      taskAccepted: false,
-      acceptanceImplemented: false,
+      taskAccepted: accepted,
+      currentTaskId: taskId,
+      currentTaskStatus: status,
+      acceptanceImplemented: true,
+      acceptanceConfigured: configured,
       submissionAvailable: false,
+      submissionReason,
       busy: options.busy === true,
       withheld: true,
+      reason,
     },
     isError: true,
   };
@@ -1148,6 +1179,7 @@ export class DeliveryService {
   private readonly allocations = new Map<string, number>();
   private held = false;
   private disposed = false;
+  private acceptanceConfigured = false;
 
   constructor(options: DeliveryServiceOptions) {
     if (currentTaskOwner() !== options.owner) {
@@ -1175,6 +1207,14 @@ export class DeliveryService {
   dispose(): void {
     this.disposed = true;
     this.held = false;
+  }
+
+  /**
+   * Host-only wiring fact set after the same-process acceptance coordinator is
+   * constructed. It grants nothing: every submit still rechecks live state.
+   */
+  setAcceptanceConfigured(configured: boolean): void {
+    this.acceptanceConfigured = configured;
   }
 
   /** Synchronous live authority read used by the entry's final guard. */
@@ -1298,8 +1338,14 @@ export class DeliveryService {
     return { snapshot, unsupported, supported };
   }
 
-  private blockers(activity: ExecutionActivitySnapshot, unsupported: readonly string[]): string[] {
-    const blockers = ["submission_not_implemented"];
+  private blockers(
+    activity: ExecutionActivitySnapshot,
+    unsupported: readonly string[],
+    taskStatus?: string,
+  ): string[] {
+    const blockers: string[] = [];
+    if (!this.acceptanceConfigured) blockers.push("acceptance_not_configured");
+    if (taskStatus === "accepted") blockers.push("task_already_accepted");
     if (activity.disposed) blockers.push("disposed");
     if (activity.busy) blockers.push("busy");
     if (activity.unresolvedCompletions.length > 0 || activity.unresolvedOmitted > 0) blockers.push("unresolved_completion");
@@ -1340,53 +1386,144 @@ export class DeliveryService {
     }
   }
 
+  /**
+   * Read-only describe path: a visible reachable task in any terminal state,
+   * without active-only preview admission. External context getters are
+   * followed by pure published-owner/snapshot rechecks.
+   */
+  private visibleDescribeTask(context: OmpToolContext): ManagedTask | null {
+    if (this.disposed || currentTaskOwner() !== this.owner) return null;
+    try {
+      const before = this.owner.snapshot();
+      if (before.binding.state !== "attached") return null;
+      if (before.acceptanceHazard !== null) return null;
+      const subject = subjectFromContext(context, this.owner.workspaceRoot);
+      if (subject.agentKind !== "main") return null;
+      const task = this.owner.reachableTask(subject);
+      if (this.disposed || currentTaskOwner() !== this.owner) return null;
+      const after = this.owner.snapshot();
+      if (after.binding.state !== "attached" || after.acceptanceHazard !== null) return null;
+      const finalTask = after.currentTask;
+      if (finalTask === null
+        || finalTask.taskId !== task.taskId
+        || finalTask.taskRevision !== task.taskRevision
+        || finalTask.status !== task.status) {
+        return null;
+      }
+      return task;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Model projection fact for a rejected call. Top-level acceptance facts are
+   * exposed only for the actually visible main-session task; a detached or
+   * unavailable binding yields null rather than reusing another task's status.
+   */
+  private currentTaskFacts(context: OmpToolContext): {
+    taskId: string | null;
+    status: string | null;
+    accepted: boolean | null;
+  } {
+    const unavailable = { taskId: null, status: null, accepted: null } as const;
+    if (this.disposed || currentTaskOwner() !== this.owner) return unavailable;
+    try {
+      if (this.owner.snapshot().acceptanceHazard !== null) return unavailable;
+      if (this.owner.bindingStatus().state !== "attached") return unavailable;
+      const subject = subjectFromContext(context, this.owner.workspaceRoot);
+      if (subject.agentKind !== "main") return unavailable;
+      const task = this.owner.reachableTask(subject);
+      // subjectFromContext and reachableTask run external context getters.
+      // Recheck only pure in-process facts before exposing the earlier read.
+      if (this.disposed || currentTaskOwner() !== this.owner) return unavailable;
+      const after = this.owner.snapshot();
+      if (after.acceptanceHazard !== null || after.binding.state !== "attached") return unavailable;
+      const finalTask = after.currentTask;
+      if (finalTask === null
+        || finalTask.taskId !== task.taskId
+        || finalTask.taskRevision !== task.taskRevision
+        || finalTask.status !== task.status) {
+        return unavailable;
+      }
+      return { taskId: task.taskId, status: task.status, accepted: task.status === "accepted" };
+    } catch {
+      return unavailable;
+    }
+  }
+
   private unavailableDescribe(reason: string): DeliveryToolResult {
+    const blockers = this.acceptanceConfigured
+      ? ["task_unavailable"]
+      : ["acceptance_not_configured", "task_unavailable"];
+    const submissionReason = this.acceptanceConfigured ? "task_unavailable" : "acceptance_not_configured";
     const text = bounded([
       `agent_deliver describe ${DELIVERY_BUNDLE_VERSION}`,
-      "taskAccepted: false",
-      "acceptanceImplemented: false",
-      "submissionAvailable: false",
-      "submissionReason: not_implemented",
+      "taskAccepted: null",
+      "currentTaskStatus: null",
+      "currentTaskId: null",
       "taskAvailable: false",
       "task: null",
+      "acceptanceImplemented: true",
+      `acceptanceConfigured: ${this.acceptanceConfigured}`,
+      "submissionAvailable: false",
+      `submissionReason: ${submissionReason}`,
+      `submissionMode: ${this.acceptanceConfigured ? "unavailable" : "unconfigured"}`,
+      "candidateEligibility: not_checked",
       `contract: ${JSON.stringify({ status: "unavailable" })}`,
       `unavailableReason: ${deliverySafeText(reason)}`,
-      `submissionBlockers: ${JSON.stringify(["submission_not_implemented", "task_unavailable"])}`,
-      "capability: no current task identity, contract or delivery path is presented while the live binding is unavailable",
+      `submissionBlockers: ${JSON.stringify(blockers)}`,
+      "capability: no current task identity, contract or delivery path is presented while the live binding is unavailable; describe never promises that any delivery can be accepted",
     ].join("\n"));
     return {
       content: [{ type: "text", text }],
       details: {
         action: "describe",
-        taskAccepted: false,
-        acceptanceImplemented: false,
-        submissionAvailable: false,
-        submissionReason: "not_implemented",
+        taskAccepted: null,
+        currentTaskStatus: null,
+        currentTaskId: null,
         taskAvailable: false,
         task: null,
+        acceptanceImplemented: true,
+        acceptanceConfigured: this.acceptanceConfigured,
+        submissionAvailable: false,
+        submissionReason,
+        submissionMode: this.acceptanceConfigured ? "unavailable" : "unconfigured",
+        candidateEligibility: "not_checked",
         contract: { status: "unavailable" },
         unavailableReason: reason,
-        submissionBlockers: ["submission_not_implemented", "task_unavailable"],
+        submissionBlockers: blockers,
       },
     };
   }
 
   describe(context: OmpToolContext): DeliveryToolResult {
-    if (this.disposed) return rejection("the delivery service is disposed", { action: "describe" });
+    if (this.disposed) {
+      return rejection("the delivery service is disposed", {
+        action: "describe",
+        acceptanceConfigured: this.acceptanceConfigured,
+      });
+    }
+    const initial = this.visibleDescribeTask(context);
+    if (initial === null) {
+      return this.unavailableDescribe("the live task, main-session context or bound conversation changed during describe");
+    }
     const activity = this.activityFacts();
-    const afterActivity = this.liveIdentity(context);
-    if (afterActivity === null) {
+    const afterActivity = this.visibleDescribeTask(context);
+    if (afterActivity === null
+      || !sameFrozen(frozenOf(afterActivity), frozenOf(initial))
+      || afterActivity.status !== initial.status) {
       return this.unavailableDescribe("the live task, main-session context or bound conversation changed during describe");
     }
-    const task = this.readTask(context, true);
-    if (task === null || !sameFrozen(frozenOf(task), afterActivity)) {
-      return this.unavailableDescribe("the live task identity changed while describe read the owner");
-    }
+    const task = initial;
     const contract = this.contractLine(context);
-    const finalIdentity = this.liveIdentity(context);
-    if (finalIdentity === null || !sameFrozen(finalIdentity, frozenOf(task))) {
+    const finalRead = this.visibleDescribeTask(context);
+    if (finalRead === null
+      || !sameFrozen(frozenOf(finalRead), frozenOf(task))
+      || finalRead.status !== task.status) {
       return this.unavailableDescribe("the live task, main-session context or bound conversation changed during describe");
     }
+    const finalIdentity = frozenOf(finalRead);
     const contractView = contract.status !== "available"
       ? { status: contract.status }
       : contract.task !== null && !sameFrozen(contract.task, finalIdentity)
@@ -1394,6 +1531,21 @@ export class DeliveryService {
         : contract.summary === null
           ? { state: "none" }
           : { state: "bound", summary: contract.summary };
+    const terminal = task.status !== "active";
+    const submissionReason = this.acceptanceConfigured
+      ? task.status === "accepted"
+        ? "task_already_accepted"
+        : task.status === "cancelled"
+          ? "task_cancelled"
+          : "configured_guarded"
+      : "host_acceptance_root_not_configured";
+    const submissionMode = !this.acceptanceConfigured
+      ? "unconfigured"
+      : terminal
+        ? "terminal"
+        : "guarded";
+    const blockers = this.blockers(activity.snapshot, activity.unsupported, task.status);
+    if (!this.acceptanceConfigured) blockers.push("acceptance_not_configured");
     const fixed = {
       version: DELIVERY_BUNDLE_VERSION,
       deliveryRoot: this.root.path,
@@ -1402,6 +1554,8 @@ export class DeliveryService {
       task: {
         taskId: task.taskId,
         taskRevision: task.taskRevision,
+        status: task.status,
+        accepted: task.status === "accepted",
         requirementsDigest: requirementsDigest(task.requirementSources),
       },
       contract: contractView,
@@ -1421,7 +1575,7 @@ export class DeliveryService {
           ? "only the local execution adapter is observed; these other side-effect capabilities are not known to be idle"
           : "only the local execution adapter is observed; no other authorized side-effect capability exists",
       },
-      submissionBlockers: this.blockers(activity.snapshot, activity.unsupported),
+      submissionBlockers: [...new Set(blockers)],
       limits: {
         maxBundlesPerTask: MAX_DELIVERY_BUNDLES_PER_TASK,
         maxArtifacts: MAX_DELIVERY_ARTIFACTS,
@@ -1432,17 +1586,27 @@ export class DeliveryService {
         maxInlinePreviewBytes: MAX_DELIVERY_INLINE_BYTES,
         maxResponseBytes: MAX_DELIVERY_RESPONSE_BYTES,
       },
-      taskAccepted: false,
-      acceptanceImplemented: false,
-      submissionAvailable: false,
-      submissionReason: "not_implemented",
+      taskAccepted: task.status === "accepted",
+      currentTaskId: task.taskId,
+      currentTaskStatus: task.status,
+      acceptanceImplemented: true,
+      acceptanceConfigured: this.acceptanceConfigured,
+      submissionAvailable: this.acceptanceConfigured && task.status === "active",
+      submissionReason,
+      submissionMode,
+      candidateEligibility: "not_checked",
     };
     const text = deliverySafeText([
       `agent_deliver describe ${DELIVERY_BUNDLE_VERSION}`,
-      "taskAccepted: false",
-      "acceptanceImplemented: false",
-      "submissionAvailable: false",
-      "submissionReason: not_implemented",
+      `taskAccepted: ${fixed.taskAccepted}`,
+      `currentTaskId: ${fixed.currentTaskId}`,
+      `currentTaskStatus: ${fixed.currentTaskStatus}`,
+      `acceptanceImplemented: ${fixed.acceptanceImplemented}`,
+      `acceptanceConfigured: ${fixed.acceptanceConfigured}`,
+      `submissionAvailable: ${fixed.submissionAvailable}`,
+      `submissionReason: ${fixed.submissionReason}`,
+      `submissionMode: ${fixed.submissionMode}`,
+      `candidateEligibility: ${fixed.candidateEligibility}`,
       `deliveryRoot: ${JSON.stringify({ path: this.root.path, dev: this.root.dev, ino: this.root.ino })}`,
       `executionRoot: ${JSON.stringify(this.executionRoot)}`,
       `task: ${JSON.stringify(fixed.task)}`,
@@ -1451,19 +1615,28 @@ export class DeliveryService {
       `activityCoverage: ${JSON.stringify(fixed.activityCoverage)}`,
       `submissionBlockers: ${JSON.stringify(fixed.submissionBlockers)}`,
       `limits: ${JSON.stringify(fixed.limits)}`,
-      "capability: bounded candidate-file export only; preview never submits, accepts, reviews, reserves ownership, verifies or cancels anything",
+      "capability: bounded candidate-file export only; describe does not read delivery candidates and cannot promise that any delivery is acceptable. preview never submits, accepts, reviews, reserves ownership, verifies or cancels anything; submit requires a separate guarded call. Accepted or cancelled tasks are reported as terminal; inspect accepted history separately.",
     ].join("\n"));
     if (new TextEncoder().encode(text).byteLength > MAX_DELIVERY_CONTENT_BYTES) {
-      return rejection("describe facts exceeded the fixed content budget; no task, contract or path facts are shown.", { action: "describe" });
+      return rejection("describe facts exceeded the fixed content budget; no task, contract or path facts are shown.", {
+        action: "describe",
+        acceptanceConfigured: this.acceptanceConfigured,
+        task,
+      });
     }
     const result: DeliveryToolResult = {
       content: [{ type: "text", text }],
       details: {
         action: "describe",
-        taskAccepted: false,
-        acceptanceImplemented: false,
-        submissionAvailable: false,
-        submissionReason: "not_implemented",
+        taskAccepted: fixed.taskAccepted,
+        currentTaskId: fixed.currentTaskId,
+        currentTaskStatus: fixed.currentTaskStatus,
+        acceptanceImplemented: true,
+        acceptanceConfigured: this.acceptanceConfigured,
+        submissionAvailable: fixed.submissionAvailable,
+        submissionReason: fixed.submissionReason,
+        submissionMode: fixed.submissionMode,
+        candidateEligibility: fixed.candidateEligibility,
         deliveryRoot: this.root.path,
         task: fixed.task,
         contract: fixed.contract,
@@ -1812,12 +1985,18 @@ export class DeliveryService {
         unresolvedOmitted: activity.snapshot.unresolvedOmitted,
         disposed: activity.snapshot.disposed,
       };
+    const submissionReason = this.acceptanceConfigured
+      ? "configured_guarded"
+      : "host_acceptance_root_not_configured";
     const lines = [
       `agent_deliver preview ${DELIVERY_BUNDLE_VERSION}`,
       "taskAccepted: false",
-      "acceptanceImplemented: false",
-      "submissionAvailable: false",
-      "submissionReason: not_implemented",
+      "acceptanceImplemented: true",
+      `acceptanceConfigured: ${this.acceptanceConfigured}`,
+      `submissionAvailable: ${this.acceptanceConfigured}`,
+      `submissionReason: ${submissionReason}`,
+      `submissionMode: ${this.acceptanceConfigured ? "guarded" : "unconfigured"}`,
+      "candidateEligibility: not_checked",
       `deliveryId: ${payload.deliveryId}`,
       `task: ${JSON.stringify(payload.task)}`,
       `runId: ${payload.run.runId}`,
@@ -1865,9 +2044,12 @@ export class DeliveryService {
       details: {
         action: "preview",
         taskAccepted: false,
-        acceptanceImplemented: false,
-        submissionAvailable: false,
-        submissionReason: "not_implemented",
+        acceptanceImplemented: true,
+        acceptanceConfigured: this.acceptanceConfigured,
+        submissionAvailable: this.acceptanceConfigured,
+        submissionReason: this.acceptanceConfigured ? "configured_guarded" : "host_acceptance_root_not_configured",
+        submissionMode: this.acceptanceConfigured ? "guarded" : "unconfigured",
+        candidateEligibility: "not_checked",
         deliveryId: record.deliveryId,
         taskId: record.task.taskId,
         taskRevision: record.task.taskRevision,
@@ -1937,13 +2119,34 @@ export class DeliveryService {
     request: DeliveryPreviewRequest,
     signal?: AbortSignal,
   ): Promise<DeliveryPreviewOutcome> {
-    if (this.disposed) return { result: rejection("the delivery service is disposed.", { action: "preview" }) };
-    if (signal?.aborted) return { result: rejection("the call was aborted before delivery admission.", { action: "preview" }) };
+    if (this.disposed) {
+      return {
+        result: rejection("the delivery service is disposed.", {
+          action: "preview",
+          acceptanceConfigured: this.acceptanceConfigured,
+          taskFacts: this.currentTaskFacts(context),
+        }),
+      };
+    }
+    if (signal?.aborted) {
+      return {
+        result: rejection("the call was aborted before delivery admission.", {
+          action: "preview",
+          acceptanceConfigured: this.acceptanceConfigured,
+          taskFacts: this.currentTaskFacts(context),
+        }),
+      };
+    }
     if (!this.acquire()) {
       return {
         result: rejection(
           "another delivery call already owns this service; the call was rejected without queueing.",
-          { action: "preview", busy: true },
+          {
+            action: "preview",
+            busy: true,
+            acceptanceConfigured: this.acceptanceConfigured,
+            taskFacts: this.currentTaskFacts(context),
+          },
         ),
       };
     }
@@ -2388,14 +2591,25 @@ export class DeliveryService {
         return {
           result: rejection(
             "another delivery or verification call owns the live service; the preview was rejected without queueing.",
-            { action: "preview", busy: true },
+            {
+              action: "preview",
+              busy: true,
+              acceptanceConfigured: this.acceptanceConfigured,
+              taskFacts: this.currentTaskFacts(context),
+            },
           ),
         };
       }
       const safe = error instanceof DeliveryError || error instanceof CandidateError
         ? error.message
         : "delivery preview was withheld because the host could not prove the inputs, evidence and files are still current.";
-      return { result: rejection(safe, { action: "preview" }) };
+      return {
+        result: rejection(safe, {
+          action: "preview",
+          acceptanceConfigured: this.acceptanceConfigured,
+          taskFacts: this.currentTaskFacts(context),
+        }),
+      };
     } finally {
       this.release();
     }
@@ -2619,19 +2833,59 @@ export class DeliveryService {
     expected: FrozenTaskRef,
     deliveryId: string,
   ): Promise<AcceptedDeliveryInspection> {
-    if (this.disposed) return { state: "unavailable", reason: "the delivery service is disposed", files: null };
+    if (this.disposed) {
+      return {
+        state: "unavailable",
+        reason: "the delivery service is disposed",
+        files: null,
+        manifest: null,
+        requirements: null,
+      };
+    }
     const record = this.records.get(deliveryId);
     if (record === undefined) {
-      return { state: "unavailable", reason: "the delivery id is not registered by this service instance", files: null };
+      return {
+        state: "unavailable",
+        reason: "the delivery id is not registered by this service instance",
+        files: null,
+        manifest: null,
+        requirements: null,
+      };
     }
     if (!sameFrozen(record.task, expected)) {
-      return { state: "unavailable", reason: "the registered delivery belongs to a different task identity", files: null };
+      return {
+        state: "unavailable",
+        reason: "the registered delivery belongs to a different task identity",
+        files: null,
+        manifest: null,
+        requirements: null,
+      };
     }
     try {
-      await this.verifyBundle(record);
-      return { state: "intact", reason: null, files: this.renderFileRows(record) };
+      const bundle = await this.verifyBundle(record);
+      return {
+        state: "intact",
+        reason: null,
+        files: this.renderFileRows(record),
+        manifest: {
+          path: record.manifest.path,
+          bytes: bundle.manifest.bytes,
+          sha256: bundle.manifest.sha256,
+        },
+        requirements: {
+          path: record.requirements.path,
+          bytes: bundle.requirements.bytes,
+          sha256: bundle.requirements.sha256,
+        },
+      };
     } catch (error) {
-      return { state: "changed", reason: errorMessage(error), files: null };
+      return {
+        state: "changed",
+        reason: errorMessage(error),
+        files: null,
+        manifest: null,
+        requirements: null,
+      };
     }
   }
 

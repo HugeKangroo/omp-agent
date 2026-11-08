@@ -31,9 +31,13 @@ A verification contract is bound by the host. The model cannot select a weaker v
 
 Delivery selects registered candidates from a particular run. The service checks the original evidence, creates separate read-only files, and checks the copied bytes. A delivery includes the requirement sources and a manifest. Repeated requests check the existing files before returning the same bundle.
 
-Delivery preview and final task acceptance are distinct. The experimental model interface currently exposes verification and preview. An explicitly configured host acceptance API rechecks complete semantic coverage, a matching current pass receipt, task revision, and actual file identities. It installs a record without replacing an existing target before transitioning the owner to accepted. Late notification or maintenance failures cannot reverse a completed commit; an uncertain outcome remains unknown and blocks further mutation.
+Delivery preview and final task acceptance are distinct. The experimental model interface supports verification, preview, submission, and accepted-file inspection. Submission selects an existing delivery and task revision; it cannot supply a receipt, verdict, confirmation flag, or arbitrary path. An explicitly configured acceptance service rechecks complete semantic coverage, a matching current pass receipt, task revision, and actual file identities. It installs a record without replacing an existing target before transitioning the owner to accepted. Late notification or maintenance failures cannot reverse a completed commit; an uncertain outcome remains unknown and blocks further mutation.
 
-Accepted records and delivery integrity are separate facts. Later damage does not erase historical acceptance. Model submission and accepted-file inspection are the next interface increment; a successful preview alone does not imply acceptance.
+The record-store port comes from the actual task owner and is captured once by the acceptance service. This preserves the issuing store across OMP entry factories and imported modules. Record installation remains a fixed owner operation.
+
+Submission and inspection return bounded JSON in model-visible tool content. Operation commitment, current task visibility, historical acceptance, and file integrity have separate fields. Read-only inspection creates no new acceptance. Later damage does not erase historical acceptance, and a successful preview alone does not imply acceptance.
+
+Late cancellation, revision, or execution cannot reopen an accepted task. A context change, abort, or disposal during a call can withhold current information and file paths while preserving the original operation result. Historical execution and verification records retain the facts recorded when they were created.
 
 ## Current limits
 

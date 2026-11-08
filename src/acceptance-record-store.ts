@@ -64,6 +64,31 @@ export interface PreparedAcceptanceBinding {
   recordDigest: string;
 }
 
+/** Bounded host-only input for one prepared acceptance record. */
+export interface PrepareAcceptanceRecordInput {
+  root: AcceptanceRoot;
+  acceptanceId: string;
+  deliveryId: string;
+  acceptedAt: string;
+  task: FrozenTaskRef;
+  record: unknown;
+}
+
+/**
+ * Immutable record-store surface sourced from one loaded store module. The
+ * owner captures the instance created by its own lexical module and the
+ * acceptance service uses that instance for resolve/prepare/binding/read/
+ * discard. Installation and postcommit maintenance are deliberately absent:
+ * only the owner's fixed commit path may call them.
+ */
+export interface AcceptanceRecordStorePort {
+  resolveRoot(configured: string, executionRoot: string, deliveryRoot: string | null): AcceptanceRoot;
+  prepare(input: PrepareAcceptanceRecordInput): object;
+  binding(value: object): PreparedAcceptanceBinding;
+  read(root: AcceptanceRoot, acceptanceId: string, expectedTask?: FrozenTaskRef): AcceptanceRecordRead;
+  discard(value: object): string[];
+}
+
 interface PreparedState {
   root: AcceptanceRoot;
   binding: PreparedAcceptanceBinding;
@@ -410,14 +435,7 @@ function cleanupOwnTemp(state: PreparedState): string[] {
  * Write one bounded record to a host-private `wx` temporary file, fsync and
  * verify its exact bytes. The returned object is opaque to model-facing code.
  */
-export function prepareAcceptanceRecord(input: {
-  root: AcceptanceRoot;
-  acceptanceId: string;
-  deliveryId: string;
-  acceptedAt: string;
-  task: FrozenTaskRef;
-  record: unknown;
-}): object {
+export function prepareAcceptanceRecord(input: PrepareAcceptanceRecordInput): object {
   const issued = assertRoot(input.root);
   const root = input.root;
   const acceptanceId = fileComponent(input.acceptanceId, "acceptanceId");
@@ -765,6 +783,23 @@ export function readAcceptanceRecord(
 /** Record path helper for host diagnostics only; never model-facing. */
 export function acceptanceRecordPath(root: AcceptanceRoot, acceptanceId: string): string {
   return path.join(assertRoot(root).path, recordFileName(acceptanceId));
+}
+
+/**
+ * One frozen port bound to this module instance's private issuer registries.
+ * Owner construction captures it; the acceptance coordinator captures the
+ * owner's instance before any await. Callers cannot inject a port or writer.
+ */
+const RECORD_STORE_PORT: AcceptanceRecordStorePort = Object.freeze({
+  resolveRoot: resolveAcceptanceRoot,
+  prepare: prepareAcceptanceRecord,
+  binding: preparedAcceptanceBinding,
+  read: readAcceptanceRecord,
+  discard: discardPreparedAcceptanceRecordSync,
+});
+
+export function acceptanceRecordStorePort(): AcceptanceRecordStorePort {
+  return RECORD_STORE_PORT;
 }
 
 export { within as acceptancePathWithin };

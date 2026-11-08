@@ -17,10 +17,11 @@ import {
 } from "./task-requirements.ts";
 import type { FrozenTaskRef } from "./execution-candidates.ts";
 import {
+  acceptanceRecordStorePort,
   installPreparedAcceptanceRecordSync,
   maintainInstalledAcceptanceRecordSync,
-  preparedAcceptanceBinding,
   type AcceptanceInstallResult,
+  type AcceptanceRecordStorePort,
 } from "./acceptance-record-store.ts";
 
 /**
@@ -397,6 +398,8 @@ export class TaskOwner {
   private readonly trustedControlTypes: Set<string>;
   private readonly now: () => string;
   private readonly newId: () => string;
+  /** Fixed at construction from this module's lexical record-store instance. */
+  private readonly recordStore: AcceptanceRecordStorePort;
   private readonly onStateChange: ((snapshot: TaskOwnerSnapshot) => void) | undefined;
   private readonly onEvent: ((event: Record<string, unknown> & { type: string }) => void) | undefined;
   private readonly onListenerFailure: ((failure: TaskOwnerListenerFailure) => void) | undefined;
@@ -437,9 +440,19 @@ export class TaskOwner {
     this.trustedControlTypes = new Set((options.trustedControlTypes ?? []).map((item) => identifier(item, "trusted control type")));
     this.now = options.now ?? (() => new Date().toISOString());
     this.newId = options.id ?? (() => randomUUID());
+    this.recordStore = acceptanceRecordStorePort();
     this.onStateChange = options.onStateChange;
     this.onEvent = options.onEvent;
     this.onListenerFailure = options.onListenerFailure;
+  }
+
+  /**
+   * Host-only immutable record-store port fixed at construction. The acceptance
+   * coordinator captures this instance once; commit never re-reads it from an
+   * external getter between the final evidence seal and fixed installation.
+   */
+  acceptanceRecordStore(): AcceptanceRecordStorePort {
+    return this.recordStore;
   }
 
   /**
@@ -1071,7 +1084,7 @@ export class TaskOwner {
         operationCommitted: false,
       };
     }
-    const binding = preparedAcceptanceBinding(preparedRecord);
+    const binding = this.recordStore.binding(preparedRecord);
     if (!sameFrozen(binding.task, state.task)) {
       throw new TaskOwnerError("The prepared acceptance record belongs to a different task identity.");
     }

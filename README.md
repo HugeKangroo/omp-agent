@@ -23,7 +23,7 @@ OMP 负责模型与工具调用循环；插件维护任务身份、要求版本�
 | 宿主接收 | 对完整可信契约、适用验证和实际文件再次核对，幂等记录接收结果，并区分提交事实、可见性和后续完整性 |
 | 运行记录 | 保留执行、取消、完成状态不明及验证失败等事实，避免把工具成功直接等同于任务完成 |
 
-验证通过与任务最终接收是不同状态。实验模型工具目前提供候选验证和交付预览。最终接收已有宿主 API，模型 submit/inspect 接入、连续任务及跨进程恢复仍在开发中。
+验证通过与任务最终接收是不同状态。实验模型工具支持验证、交付预览、提交及已接收文件查询；提交只在宿主证据完整且再次检查通过后生效。人工复核、连续任务及跨进程恢复仍在开发中。
 
 ## 开发与验证
 
@@ -43,6 +43,7 @@ bun run test:omp
 bun run test:entry
 bun run test:jobs
 bun run scripts/test-execution.ts
+bun run test:delivery
 ```
 
 这些命令使用确定性本地测试模型，不调用付费模型。`OMP_COMMAND` 可指定 OMP 可执行文件。
@@ -54,12 +55,14 @@ bun run scripts/test-execution.ts
 | `src/extension.ts` | `agent_status` 及受管测试工具 | 默认接入与权限边界测试 |
 | `src/task-entry.ts` | `agent_task` | 建立、检查、修订和取消当前任务 |
 | `src/execution-entry.ts` | `agent_execute`、`agent_verify` | 受控执行及宿主验证，需先加载任务入口 |
-| 显式配置交付目录 | `agent_deliver` | 查看交付能力、生成并预览候选交付文件 |
+| 显式配置交付目录 | `agent_deliver` | 查看能力、生成与预览交付文件；配置接收目录后可提交及查询 |
 | `src/job-entry.ts` | `agent_job` | 独立的作业适配实验，需先加载任务入口 |
 
 执行与验证请求必须引用当前任务及要求版本。运行、产物和回执 ID 只用于选择已登记对象，不授予权限。路径、运行环境、资源限制及验证策略由宿主配置，模型不能通过工具参数修改。
 
-交付功能需要宿主显式提供绝对 `deliveryRoot`；实验入口对应环境变量为 `OMP_AGENT_DELIVERY_ROOT`。未配置时不注册交付工具。交付目录不能与执行目录重叠。宿主 API 的最终接收另需显式提供 `acceptanceRoot`（`OMP_AGENT_ACCEPTANCE_ROOT`），且三个根目录两两不重叠；当前尚未向模型暴露提交操作。
+交付功能需要宿主显式提供绝对 `deliveryRoot`；实验入口对应环境变量为 `OMP_AGENT_DELIVERY_ROOT`。未配置时不注册交付工具。交付目录不能与执行目录重叠。最终接收另需显式提供 `acceptanceRoot`（`OMP_AGENT_ACCEPTANCE_ROOT`），且三个根目录两两不重叠。未配置接收目录时仍可预览，提交会明确返回未启用。
+
+`agent_deliver submit` 和 `inspect` 只接受现有 `deliveryId` 及任务身份、版本。结果分别报告本次提交、当前任务、历史接收与文件完整性；只读查询不会重新提交。路径仅在当前上下文和实际文件检查都有效时返回。
 
 ## 使用边界
 

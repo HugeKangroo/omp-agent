@@ -389,7 +389,8 @@ describe("G2-B1b verification entry", () => {
       const wrongDescribe = await f.tools.get(VERIFICATION_TOOL)!.execute("describe", { action: "describe" }, undefined, undefined, wrongBranchContext);
       expect(wrongDescribe.isError).toBe(true);
       expect(textOf(wrongDescribe)).not.toContain("contractId");
-      expect(textOf(wrongDescribe)).toContain("taskAccepted: false");
+      expect(textOf(wrongDescribe)).toContain("taskAccepted: null");
+      expect(textOf(wrongDescribe)).toContain("currentTaskStatus: null");
 
       release();
       const verified = await first;
@@ -439,7 +440,8 @@ describe("G2-B1b verification entry", () => {
       }, undefined, undefined, f.ctx);
       const text = textOf(result);
       expect(result.isError).toBe(true);
-      expect(text).toContain("taskAccepted: false");
+      expect(text).toContain("taskAccepted: null");
+      expect(text).toContain("currentTaskStatus: null");
       expect(text).toContain("withheld");
       expect(text).not.toContain("outcome: pass");
       expect(text).not.toContain(receiptId);

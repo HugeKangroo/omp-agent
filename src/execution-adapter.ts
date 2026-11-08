@@ -23,6 +23,7 @@ import {
 import { writeJsonAtomicSync } from "./host-record.ts";
 import { requirementsDigest } from "./task-requirements.ts";
 import {
+  currentTaskOwner,
   subjectFromContext,
   type OmpToolContext,
 } from "./task-entry-port.ts";
@@ -954,15 +955,33 @@ function scalar(value: unknown, limit = 500): unknown {
   return typeof value === "string" && value.length > limit ? `${value.slice(0, limit)}…` : value;
 }
 
-function errorResult(message: string): ExecutionToolResult {
+function errorResult(
+  message: string,
+  terminal?: { taskAccepted: boolean | null; currentTaskStatus: string | null },
+): ExecutionToolResult {
   const text = `${EXECUTION_TOOL}: ${message}`;
   const bounded = Buffer.byteLength(text, "utf8") > 8 * 1024 ? `${text.slice(0, 8 * 1024)}…` : text;
-  // Appended after bounding so the no-acceptance fact survives a truncated
-  // diagnostic. The message stays the actual diagnostic; this helper is used
-  // from different stages, so it never claims no admission or execution.
+  if (terminal === undefined) {
+    // Appended after bounding so the no-acceptance fact survives a truncated
+    // diagnostic. This stage has no visible task read to project.
+    return {
+      content: [{ type: "text", text: `${bounded}\ntaskAccepted: false` }],
+      details: { error: message.slice(0, 2000), taskAccepted: false },
+      isError: true,
+    };
+  }
+  // Appended after bounding so the actual visible terminal fact survives a
+  // truncated diagnostic.
   return {
-    content: [{ type: "text", text: `${bounded}\ntaskAccepted: false` }],
-    details: { error: message.slice(0, 2000), taskAccepted: false },
+    content: [{
+      type: "text",
+      text: `${bounded}\ntaskAccepted: ${terminal.taskAccepted}\ncurrentTaskStatus: ${terminal.currentTaskStatus ?? "null"}`,
+    }],
+    details: {
+      error: message.slice(0, 2000),
+      taskAccepted: terminal.taskAccepted,
+      currentTaskStatus: terminal.currentTaskStatus,
+    },
     isError: true,
   };
 }
@@ -1156,6 +1175,7 @@ interface DescribeModelViewFacts {
   taskId: string;
   taskRevision: number;
   taskStatus: string;
+  taskAccepted: boolean | null;
   binding: BindingStatus;
   runtimes: Record<ExecutionRuntime, ExecutionRuntimeInfo>;
   limits: Record<string, number | string>;
@@ -1167,9 +1187,11 @@ function renderDescribeModelView(facts: DescribeModelViewFacts): string {
   const lines: string[] = [];
   lines.push(`${EXECUTION_TOOL} model-visible execution view ${EXECUTION_MODEL_VIEW_VERSION}`);
   lines.push("action=describe");
-  lines.push(`task taskId=${modelString(facts.taskId)} taskRevision=${facts.taskRevision} taskStatus=${modelString(facts.taskStatus)}`);
+  lines.push(`task taskId=${modelString(facts.taskId)} taskRevision=${facts.taskRevision} taskStatus=${modelString(facts.taskStatus)} taskAccepted=${facts.taskAccepted === null ? "null" : facts.taskAccepted}`);
   lines.push(`binding state=${modelString(facts.binding.state)} reason=${modelString(facts.binding.reason)}`);
-  lines.push("authority candidateOnly=true taskAccepted=false; describe grants no execution authority and tool success is not task acceptance.");
+  lines.push(facts.taskAccepted === false
+    ? "authority candidateOnly=true taskAccepted=false; describe grants no execution authority and tool success is not task acceptance."
+    : "authority candidateOnly=true; describe grants no execution authority and tool success is not task acceptance.");
   lines.push("runtimes:");
   for (const runtime of EXECUTION_RUNTIMES) {
     const info = facts.runtimes[runtime];
@@ -1607,6 +1629,55 @@ export class ExecutionAdapter {
     };
   }
 
+  /**
+   * Actual visible terminal facts for a rejection. A tool that did not perform
+   * acceptance never proves the current task is unaccepted: visible accepted
+   * stays true, a visible non-accepted task is false, and unavailable,
+   * disposed, detached, changed or unknown-hazard states are null. Context
+   * getters are followed by pure owner/task identity rechecks.
+   */
+  visibleTerminalFacts(context: OmpToolContext): {
+    taskAccepted: boolean | null;
+    currentTaskStatus: string | null;
+  } {
+    const unavailable = { taskAccepted: null, currentTaskStatus: null } as const;
+    const published = currentTaskOwner();
+    // The entry always constructs this adapter around the published owner.
+    // Direct host/test construction may leave it unpublished; only a different
+    // live published owner proves a replacement.
+    const requirePublished = published !== undefined;
+    if (this.disposed || (requirePublished && published !== this.owner)) return unavailable;
+    try {
+      const before = this.owner.snapshot();
+      if (before.binding.state !== "attached") return unavailable;
+      const subject = subjectFromContext(context, this.workspaceRoot);
+      if (subject.agentKind !== "main") return unavailable;
+      const task = this.owner.reachableTask(subject);
+      if (this.disposed || (requirePublished && currentTaskOwner() !== this.owner)) return unavailable;
+      const after = this.owner.snapshot();
+      if (after.binding.state !== "attached") return unavailable;
+      const finalTask = after.currentTask;
+      if (finalTask === null
+        || finalTask.taskId !== task.taskId
+        || finalTask.taskRevision !== task.taskRevision
+        || finalTask.status !== task.status) {
+        return unavailable;
+      }
+      return {
+        taskAccepted: after.acceptanceHazard !== null
+          ? null
+          : finalTask.status === "accepted",
+        currentTaskStatus: finalTask.status,
+      };
+    } catch {
+      return unavailable;
+    }
+  }
+
+  private rejectionResult(message: string, context: OmpToolContext): ExecutionToolResult {
+    return errorResult(message, this.visibleTerminalFacts(context));
+  }
+
   /** Merge bounded reasons for one real dispatched run; identity never changes. */
   private latchUnresolved(
     runId: string,
@@ -1645,7 +1716,7 @@ export class ExecutionAdapter {
   }
 
   async describe(context: ExecutionToolContext): Promise<ExecutionToolResult> {
-    if (this.disposed) return errorResult("the execution adapter is disposed.");
+    if (this.disposed) return this.rejectionResult("the execution adapter is disposed.", context);
     try {
       const subject = subjectFromContext(context, this.workspaceRoot);
       this.owner.reachableTask(subject);
@@ -1676,17 +1747,17 @@ export class ExecutionAdapter {
       // Input inspection awaited host filesystem work. Rebuild the subject from
       // the actual live context; never expose metadata derived from a captured
       // branch or a binding that detached during inspection.
-      if (this.disposed) return errorResult("the execution adapter is disposed.");
+      if (this.disposed) return this.rejectionResult("the execution adapter is disposed.", context);
       let task: ManagedTask;
       try {
         task = this.owner.reachableTask(subjectFromContext(context, this.workspaceRoot));
       } catch (error) {
         safeAudit(this.audit, { type: "execution_describe_withheld", error: errorMessage(error) });
-        return errorResult(`describe was withheld: ${errorMessage(error)}`);
+        return this.rejectionResult(`describe was withheld: ${errorMessage(error)}`, context);
       }
       if (this.owner.bindingStatus().state !== "attached") {
         safeAudit(this.audit, { type: "execution_describe_withheld", error: "binding detached during describe" });
-        return errorResult("describe was withheld: the conversation binding detached during input inspection.");
+        return this.rejectionResult("describe was withheld: the conversation binding detached during input inspection.", context);
       }
       const budget = this.budgets.get(task.taskId);
       const limits: Record<string, number | string> = {
@@ -1701,6 +1772,11 @@ export class ExecutionAdapter {
         dispatched: budget?.dispatched ?? 0,
         reserved: budget?.reserved ?? 0,
       };
+      const taskAccepted = task.status === "accepted"
+        ? true
+        : this.owner.snapshot().acceptanceHazard !== null
+          ? null
+          : false;
       const response: ExecutionToolResult = {
         content: [{
           type: "text",
@@ -1708,6 +1784,7 @@ export class ExecutionAdapter {
             taskId: task.taskId,
             taskRevision: task.taskRevision,
             taskStatus: task.status,
+            taskAccepted,
             binding,
             runtimes: {
               python: runtimeSnapshot(this.runtimes.python),
@@ -1728,7 +1805,7 @@ export class ExecutionAdapter {
           taskStatus: task.status,
           binding,
           candidateOnly: true,
-          taskAccepted: false,
+          taskAccepted,
           runtimes: {
             python: runtimeSnapshot(this.runtimes.python),
             bun: runtimeSnapshot(this.runtimes.bun),
@@ -1781,7 +1858,7 @@ export class ExecutionAdapter {
       return response;
     } catch (error) {
       safeAudit(this.audit, { type: "execution_describe_rejected", error: errorMessage(error) });
-      return errorResult(errorMessage(error));
+      return this.rejectionResult(errorMessage(error), context);
     }
   }
 
@@ -1792,12 +1869,12 @@ export class ExecutionAdapter {
   ): Promise<ExecutionToolResult> {
     // Synchronous reservation happens before the first await: a second call
     // observes busy even while this call is still admitting or staging.
-    if (this.disposed) return errorResult("the execution adapter is disposed.");
+    if (this.disposed) return this.rejectionResult("the execution adapter is disposed.", context);
     if (signal?.aborted) {
-      return errorResult("the call was aborted before admission; no process was started and no dispatch budget was used.");
+      return this.rejectionResult("the call was aborted before admission; no process was started and no dispatch budget was used.", context);
     }
     if (typeof args.expectedTaskId !== "string" || !IDENTIFIER.test(args.expectedTaskId)) {
-      return errorResult("expectedTaskId is required and must be a valid task identifier; no admission, budget or process occurred.");
+      return this.rejectionResult("expectedTaskId is required and must be a valid task identifier; no admission, budget or process occurred.", context);
     }
     let subject: TaskSubject;
     let current: ManagedTask;
@@ -1805,19 +1882,19 @@ export class ExecutionAdapter {
       subject = subjectFromContext(context, this.workspaceRoot);
       current = this.owner.reachableTask(subject);
     } catch (error) {
-      return errorResult(errorMessage(error));
+      return this.rejectionResult(errorMessage(error), context);
     }
     if (current.taskId !== args.expectedTaskId) {
-      return errorResult("expectedTaskId does not match the current task; no admission, budget or process occurred.");
+      return errorResult("expectedTaskId does not match the current task; no admission, budget or process occurred.", this.visibleTerminalFacts(context));
     }
     if (this.busy) {
       safeAudit(this.audit, { type: "execution_busy_rejected", taskId: current.taskId, taskRevision: current.taskRevision });
-      return errorResult("another execution is already active in this adapter; the second call was not admitted or spawned.");
+      return this.rejectionResult("another execution is already active in this adapter; the second call was not admitted or spawned.", context);
     }
     const allowedIds = new Set(this.configInputs.map((input) => input.id));
     const unknown = args.inputIds.filter((inputId) => !allowedIds.has(inputId));
     if (unknown.length) {
-      return errorResult(`input handle(s) are not host-authorized: ${unknown.join(", ")}. No admission or process was started.`);
+      return this.rejectionResult(`input handle(s) are not host-authorized: ${unknown.join(", ")}. No admission or process was started.`, context);
     }
     const budget = this.budgetFor(current.taskId);
     if (budget.attempted + budget.reserved >= EXECUTION_LIMITS.maxDispatches) {
@@ -1828,8 +1905,9 @@ export class ExecutionAdapter {
         dispatched: budget.dispatched,
         reserved: budget.reserved,
       });
-      return errorResult(
+      return this.rejectionResult(
         `this task has used ${budget.attempted} of ${EXECUTION_LIMITS.maxDispatches} launch attempts (${budget.dispatched} actual spawns); no process was started.`,
+        context,
       );
     }
     this.busy = true;
@@ -1851,6 +1929,7 @@ export class ExecutionAdapter {
       if (current.taskRevision !== args.expectedTaskRevision) {
         return errorResult(
           `stale expectedTaskRevision ${args.expectedTaskRevision}; the owner is at ${current.taskRevision}. No admission or spawn occurred.`,
+          this.visibleTerminalFacts(context),
         );
       }
       const decision = this.owner.admit(subject, this.capabilityId, args.expectedTaskRevision);
@@ -1862,10 +1941,13 @@ export class ExecutionAdapter {
           taskId: decision.taskId,
           expectedTaskRevision: args.expectedTaskRevision,
         });
-        return errorResult(`execution was not admitted: ${decision.reason ?? "owner denied the call"}.`);
+        return errorResult(
+          `execution was not admitted: ${decision.reason ?? "owner denied the call"}.`,
+          this.visibleTerminalFacts(context),
+        );
       }
       if (decision.taskId !== args.expectedTaskId) {
-        return errorResult("the admitted task identity differs from expectedTaskId; no process was started.");
+        return this.rejectionResult("the admitted task identity differs from expectedTaskId; no process was started.", context);
       }
       // Admission is not a license to use a later revision: re-read the actual
       // task and binding after the owner's synchronous decision.
@@ -1873,16 +1955,19 @@ export class ExecutionAdapter {
       try {
         fresh = this.owner.reachableTask(subject);
       } catch (error) {
-        return errorResult(`no process was started: ${errorMessage(error)}`);
+        return this.rejectionResult(`no process was started: ${errorMessage(error)}`, context);
       }
       if (fresh.taskId !== decision.taskId
         || fresh.taskId !== args.expectedTaskId
         || fresh.taskRevision !== decision.taskRevision
         || fresh.status !== "active") {
-        return errorResult("the task changed between admission and preparation; no process was started.");
+        return errorResult(
+          "the task changed between admission and preparation; no process was started.",
+          this.visibleTerminalFacts(context),
+        );
       }
       if (this.owner.bindingStatus().state !== "attached") {
-        return errorResult("the conversation binding detached before preparation; no process was started.");
+        return this.rejectionResult("the conversation binding detached before preparation; no process was started.", context);
       }
       // Freeze the requirements identity at the actual admission point. Later
       // preparation, callbacks or amendments must never relabel this run with
@@ -1916,7 +2001,7 @@ export class ExecutionAdapter {
           callId,
           reason: this.disposed ? "adapter_disposed" : "call_aborted",
         });
-        return errorResult("the call was aborted after staging; the staged files were removed and no process was started.");
+        return this.rejectionResult("the call was aborted after staging; the staged files were removed and no process was started.", context);
       }
       // Rebuild the subject from the actual live OMP context. The subject
       // captured before staging may be stale; a disposed adapter or a changed
@@ -1928,7 +2013,7 @@ export class ExecutionAdapter {
         beforeSpawn = this.owner.reachableTask(liveSubject);
       } catch (error) {
         await rm(prepared.runRoot, { recursive: true, force: true });
-        return errorResult(`the live conversation context is no longer usable: ${errorMessage(error)}. No process was started.`);
+        return this.rejectionResult(`the live conversation context is no longer usable: ${errorMessage(error)}. No process was started.`, context);
       }
       if (this.disposed
         || beforeSpawn.taskId !== decision.taskId
@@ -1937,7 +2022,7 @@ export class ExecutionAdapter {
         || beforeSpawn.status !== "active"
         || this.owner.bindingStatus().state !== "attached") {
         await rm(prepared.runRoot, { recursive: true, force: true });
-        return errorResult("the task or conversation binding changed immediately before spawn; no process was started.");
+        return this.rejectionResult("the task or conversation binding changed immediately before spawn; no process was started.", context);
       }
 
       const recordPath = path.join(prepared.runRoot, "record.json");
@@ -1998,7 +2083,7 @@ export class ExecutionAdapter {
           taskRevision: decision.taskRevision,
           reason: revoked,
         });
-        return errorResult(`no process was started: ${revoked}.`);
+        return this.rejectionResult(`no process was started: ${revoked}.`, context);
       }
 
       budget.reserved -= 1;
@@ -2394,7 +2479,7 @@ export class ExecutionAdapter {
           error: errorMessage(error),
         });
       }
-      return errorResult(errorMessage(error));
+      return this.rejectionResult(errorMessage(error), context);
     } finally {
       // Bookkeeping release is unconditional: a rejected staging cleanup must
       // never leave the adapter falsely busy or retain a stale busy task.

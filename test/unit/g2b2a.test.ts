@@ -412,9 +412,11 @@ describe("G2-B2-A delivery", () => {
       expect(described.isError).toBeUndefined();
       const text = textOf(described);
       expect(text).toContain("taskAccepted: false");
-      expect(text).toContain("acceptanceImplemented: false");
+      expect(text).toContain("acceptanceImplemented: true");
+      expect(text).toContain("acceptanceConfigured: false");
       expect(text).toContain("submissionAvailable: false");
-      expect(text).toContain("submissionReason: not_implemented");
+      expect(text).toContain("submissionReason: host_acceptance_root_not_configured");
+      expect(text).toContain("candidateEligibility: not_checked");
       const coverage = JSON.parse(line(text, "activityCoverage: ")!) as {
         unsupportedCapabilityIds: string[];
         supportedCapabilityIds: string[];
@@ -422,7 +424,7 @@ describe("G2-B2-A delivery", () => {
       expect(coverage.supportedCapabilityIds).toEqual(["local-script"]);
       expect(coverage.unsupportedCapabilityIds).toEqual(["external-jobs"]);
       const blocks = JSON.parse(line(text, "submissionBlockers: ")!) as string[];
-      expect(blocks).toContain("submission_not_implemented");
+      expect(blocks).toContain("acceptance_not_configured");
       expect(blocks).toContain("activity_coverage_unsupported");
       expect(text).not.toContain("ready-to-accept");
     } finally {

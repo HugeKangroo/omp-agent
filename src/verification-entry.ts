@@ -17,6 +17,7 @@ import {
   renderVerificationRejectionModelView,
   type TrustedVerifier,
   type VerificationLookup,
+  type VerificationRejectionTerminal,
   type VerificationRequest,
   type VerificationResult,
 } from "./verification-service.ts";
@@ -146,7 +147,7 @@ const VERIFICATION_PARAMETERS = {
   required: ["action"],
 } as const;
 
-const DESCRIPTION = "Host-configured, read-only verification for the current managed task. describe reports the current task identity/revision/requirements digest, whether an immutable host contract is bound, the host config/verifier identity and version, condition descriptions, coverage and uncovered requirement revisions, fixed limits, and taskAccepted:false. describe never creates a task, binds a contract, runs a verifier, or spends verification attempts. verify requires expectedTaskId, expectedTaskRevision, runId and 1-8 unique artifactIds from that same run; these are optimistic guards, never authority. The host rechecks the live task/revision/branch/binding and the actual archived candidate bytes, then runs only a trusted host-configured read-only verifier. A fail or insufficient result is an honest check result, not task acceptance. Delivery policy: after producing the registered artifacts intended for the final candidate report, use agent_verify on that current task/revision/run/artifact selection before the final report; intermediate exploration outputs need not be verified. Script self-tests are supplementary and do not replace host-configured verification. Verification is distinct from owner acceptance, so an unavailable task-acceptance operation is not a reason to skip verification. Report the actual host outcome, coverage and remaining gaps: on fail, use feedback to repair and submit a new candidate if justified; on insufficient coverage, explain missing checks or review and never repeatedly verify the same unchanged candidate merely to seek a pass. Do not imply verified or accepted beyond evidence. If no current registered candidate exists or verification cannot act due to cancellation or unavailability, report that limitation and never invent selectors or receipts. No contract means insufficient; file existence or integrity alone never implies semantic acceptance. archiveRef is an internal host-relative reference only; it is not downloadable and implies no artifact://, file:// or other retrieval protocol. Every response is bounded and explicitly taskAccepted:false; the task's owner state is unchanged. Unknown or host-authority fields are refused by the plugin.";
+const DESCRIPTION = "Host-configured, read-only verification for the current managed task. describe reports the current task identity/revision/requirements digest, whether an immutable host contract is bound, the host config/verifier identity and version, condition descriptions, coverage and uncovered requirement revisions, fixed limits, and the current visible terminal projection. describe never creates a task, binds a contract, runs a verifier, or spends verification attempts. verify requires expectedTaskId, expectedTaskRevision, runId and 1-8 unique artifactIds from that same run; these are optimistic guards, never authority. The host rechecks the live task/revision/branch/binding and the actual archived candidate bytes, then runs only a trusted host-configured read-only verifier. A fail or insufficient result is an honest check result, not task acceptance. Delivery policy: after producing the registered artifacts intended for the final candidate report, use agent_verify on that current task/revision/run/artifact selection before the final report; intermediate exploration outputs need not be verified. When delivery and acceptance are host-configured and this actual receipt has complete usable semantic coverage, pass its real receiptId to agent_deliver preview for that same run/artifact selection, then submit the returned deliveryId and inspect; report the actual checked files, integrity and acceptance/current result. Missing, partial or failing evidence remains unaccepted. Script self-tests are supplementary and do not replace host-configured verification. Verification is distinct from owner acceptance, so an unavailable task-acceptance operation is not a reason to skip verification. Report the actual host outcome, coverage and remaining gaps: on fail, use feedback to repair and submit a new candidate if justified; on insufficient coverage, explain missing checks or review and never repeatedly verify the same unchanged candidate merely to seek a pass. Do not imply verified or accepted beyond evidence. If no current registered candidate exists or verification cannot act due to cancellation or unavailability, report that limitation and never invent selectors or receipts. No contract means insufficient; file existence or integrity alone never implies semantic acceptance. archiveRef is an internal host-relative reference only; it is not downloadable and implies no artifact://, file:// or other retrieval protocol. Every response is bounded. Historical verification receipts and execution records keep taskAccepted:false because checking did not accept the task; a current-task rejection may report a visible accepted terminal state as true, or null when acceptance is unknown, detached or unavailable. Verification itself never changes the owner task, and a separate guarded acceptance transaction may already have accepted a visible task; subsequent verification is then rejected rather than restated as false. Unknown or host-authority fields are refused by the plugin.";
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -164,14 +165,25 @@ function withAcceptanceFalse(text: string): string {
   return text.includes("taskAccepted: false") ? text : bounded(`taskAccepted: false\n${text}`);
 }
 
-function rejectionResult(reason: string, options: { isError?: boolean; action?: string } = {}): {
+function rejectionResult(reason: string, options: {
+  isError?: boolean;
+  action?: string;
+  terminal?: VerificationRejectionTerminal;
+} = {}): {
   content: Array<{ type: "text"; text: string }>;
   details: Record<string, unknown>;
   isError?: boolean;
 } {
+  const terminal = options.terminal ?? { taskAccepted: null, currentTaskStatus: null, currentTaskId: null };
   return {
-    content: [{ type: "text", text: withAcceptanceFalse(renderVerificationRejectionModelView(reason)) }],
-    details: { action: options.action ?? "verify", taskAccepted: false },
+    content: [{ type: "text", text: renderVerificationRejectionModelView(reason, terminal) }],
+    details: {
+      action: options.action ?? "verify",
+      taskAccepted: terminal.taskAccepted,
+      currentTaskStatus: terminal.currentTaskStatus,
+      currentTaskId: terminal.currentTaskId,
+      verificationPerformed: false,
+    },
     ...(options.isError === false ? {} : { isError: true }),
   };
 }
@@ -387,6 +399,38 @@ export function createVerificationEntry(pi: VerificationApi, options: Verificati
     return null;
   }
 
+  /**
+   * Pure post-getter visible terminal facts for a rejection. An acceptance
+   * hazard yields unknown/null rather than treating active status as proof
+   * that acceptance did not happen.
+   */
+  function visibleTerminalFacts(context: OmpToolContext): VerificationRejectionTerminal {
+    const unavailable = { taskAccepted: null, currentTaskStatus: null, currentTaskId: null } as const;
+    if (disposed || currentTaskOwner() !== owner) return unavailable;
+    try {
+      if (owner.snapshot().acceptanceHazard !== null) return unavailable;
+      const task = readTask(context, false);
+      if (task === null) return unavailable;
+      if (disposed || currentTaskOwner() !== owner) return unavailable;
+      const after = owner.snapshot();
+      if (after.acceptanceHazard !== null || after.binding.state !== "attached") return unavailable;
+      const finalTask = after.currentTask;
+      if (finalTask === null
+        || finalTask.taskId !== task.taskId
+        || finalTask.taskRevision !== task.taskRevision
+        || finalTask.status !== task.status) {
+        return unavailable;
+      }
+      return {
+        taskAccepted: task.status === "accepted",
+        currentTaskStatus: task.status,
+        currentTaskId: task.taskId,
+      };
+    } catch {
+      return unavailable;
+    }
+  }
+
   function finalGuard(context: OmpToolContext, expected: FrozenTaskRef): string | null {
     if (disposed) return "the verification entry is disposed";
     if (currentTaskOwner() !== owner) return "the managed task owner changed";
@@ -416,9 +460,9 @@ export function createVerificationEntry(pi: VerificationApi, options: Verificati
     isError?: boolean;
   } {
     const reason = readReason(context);
-    if (reason !== null) return rejectionResult(reason, { action: "describe" });
+    if (reason !== null) return rejectionResult(reason, { action: "describe", terminal: visibleTerminalFacts(context) });
     const task = readTask(context, true);
-    if (task === null) return rejectionResult("the current managed task is not reachable and active", { action: "describe" });
+    if (task === null) return rejectionResult("the current managed task is not reachable and active", { action: "describe", terminal: visibleTerminalFacts(context) });
     const frozen = frozenOf(task);
     const contract = store.contractFor(frozen);
     const sourceRevisions = [...new Set(task.requirementSources.map((source) => source.revision))].sort((left, right) => left - right);
@@ -454,7 +498,7 @@ export function createVerificationEntry(pi: VerificationApi, options: Verificati
       text = `${fixedLines(2).join("\n")}\ntruncated: true\nomittedFields: contract condition descriptions and coverage statements; condition coveredRevisions omitted\n`;
     }
     const guard = finalGuard(context, frozen);
-    if (guard !== null) return rejectionResult(`describe was withheld: ${guard}`, { action: "describe" });
+    if (guard !== null) return rejectionResult(`describe was withheld: ${guard}`, { action: "describe", terminal: visibleTerminalFacts(context) });
     return {
       content: [{ type: "text", text: withAcceptanceFalse(bounded(text)) }],
       details: {
@@ -553,20 +597,20 @@ export function createVerificationEntry(pi: VerificationApi, options: Verificati
       try {
         parsed = parseVerificationArguments(params);
       } catch (error) {
-        return rejectionResult(errorMessage(error), { action: "verify" });
+        return rejectionResult(errorMessage(error), { action: "verify", terminal: visibleTerminalFacts(context) });
       }
       try {
         if (parsed.action === "describe") return describe(context);
-        if (disposed) return rejectionResult("the verification entry is disposed", { action: "verify" });
-        if (signal?.aborted) return rejectionResult("verification was aborted before admission", { action: "verify" });
+        if (disposed) return rejectionResult("the verification entry is disposed", { action: "verify", terminal: visibleTerminalFacts(context) });
+        if (signal?.aborted) return rejectionResult("verification was aborted before admission", { action: "verify", terminal: visibleTerminalFacts(context) });
         if (!acquire(context)) {
-          return rejectionResult("another verification or host lookup already owns the live context; this call was rejected without queueing", { action: "verify" });
+          return rejectionResult("another verification or host lookup already owns the live context; this call was rejected without queueing", { action: "verify", terminal: visibleTerminalFacts(context) });
         }
         try {
           const reason = readReason(context);
-          if (reason !== null) return rejectionResult(reason, { action: "verify" });
+          if (reason !== null) return rejectionResult(reason, { action: "verify", terminal: visibleTerminalFacts(context) });
           const task = readTask(context, true);
-          if (task === null) return rejectionResult("the current managed task is not reachable and active", { action: "verify" });
+          if (task === null) return rejectionResult("the current managed task is not reachable and active", { action: "verify", terminal: visibleTerminalFacts(context) });
           const expected = frozenOf(task);
           const controller = new AbortController();
           controllers.add(controller);
@@ -585,7 +629,7 @@ export function createVerificationEntry(pi: VerificationApi, options: Verificati
           if (guard !== null || signal?.aborted === true || controller.signal.aborted) {
             return rejectionResult(
               `the verification result was withheld because the live context changed: ${guard ?? "the call was aborted"}`,
-              { action: "verify" },
+              { action: "verify", terminal: visibleTerminalFacts(context) },
             );
           }
           const text = withAcceptanceFalse(bounded(result.modelView));
@@ -612,6 +656,7 @@ export function createVerificationEntry(pi: VerificationApi, options: Verificati
         }
         return rejectionResult("verification was withheld because the current context or result could not be proven", {
           action: parsed.action,
+          terminal: visibleTerminalFacts(context),
         });
       }
     },

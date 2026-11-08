@@ -11,12 +11,8 @@ import {
   ACCEPTANCE_RECORD_POLICY_SOURCE,
   ACCEPTANCE_RECORD_VERSION,
   MAX_ACCEPTANCE_RECORD_BYTES,
-  discardPreparedAcceptanceRecordSync,
-  prepareAcceptanceRecord,
-  preparedAcceptanceBinding,
-  readAcceptanceRecord,
-  resolveAcceptanceRoot,
   type AcceptanceRecordRead,
+  type AcceptanceRecordStorePort,
   type AcceptanceRoot,
 } from "./acceptance-record-store.ts";
 import { currentTaskOwner, subjectFromContext, type OmpToolContext } from "./task-entry-port.ts";
@@ -71,6 +67,8 @@ export interface AcceptanceVisibility {
 export interface AcceptanceOperationResult {
   outcome: AcceptanceOutcome;
   operationCommitted: boolean | null;
+  /** True only when this call reused the exact already-committed selector. */
+  idempotent: boolean;
   taskAccepted: boolean | null;
   acceptance: AcceptanceReference | null;
   warnings: string[];
@@ -78,6 +76,20 @@ export interface AcceptanceOperationResult {
   current: AcceptanceVisibility;
   /** Defensive host facts when the installation outcome is unknown. */
   unknown?: AcceptanceHazardFacts | null;
+}
+
+/** Internal draft; the public boundary always normalizes an explicit boolean. */
+type AcceptanceOperationDraft = Omit<AcceptanceOperationResult, "idempotent"> & {
+  idempotent?: boolean;
+};
+
+export interface AcceptedInspectionFile {
+  artifactId: string;
+  relativePath: string;
+  name: string;
+  path: string;
+  bytes: number;
+  sha256: string;
 }
 
 export interface AcceptedInspectionResult {
@@ -91,6 +103,9 @@ export interface AcceptedInspectionResult {
   delivery: {
     state: "intact" | "changed" | "unavailable" | "not_accepted" | "unknown";
     fileCount: number | null;
+    files: AcceptedInspectionFile[] | null;
+    manifest: { path: string; bytes: number; sha256: string } | null;
+    requirements: { path: string; bytes: number; sha256: string } | null;
     reason: string | null;
   };
   warnings: string[];
@@ -241,25 +256,29 @@ function boundedHazard(value: AcceptanceHazardFacts | null | undefined): Accepta
   };
 }
 
-function boundOperationResult(result: AcceptanceOperationResult): AcceptanceOperationResult {
-  result.warnings = result.warnings.slice(0, MAX_ACCEPTANCE_WARNINGS).map((warning) => safeDiagnostic(warning, 256));
-  result.reason = result.reason === null ? null : safeDiagnostic(result.reason, 1024);
-  result.current = boundedVisibility(result.current);
-  if ("unknown" in result) result.unknown = boundedHazard(result.unknown);
-  if (responseBytes(result) <= MAX_ACCEPTANCE_RESPONSE_BYTES) return result;
-  result.warnings = [];
-  result.reason = null;
-  result.current = boundedVisibility({ ...result.current, reason: "current visibility diagnostic omitted for the response budget" });
-  if ("unknown" in result && result.unknown !== null && result.unknown !== undefined) {
-    result.unknown = { ...result.unknown, reason: "unknown-installation diagnostic omitted for the response budget" };
+function boundOperationResult(result: AcceptanceOperationDraft): AcceptanceOperationResult {
+  const normalized: AcceptanceOperationResult = {
+    ...result,
+    idempotent: result.idempotent === true,
+  };
+  normalized.warnings = normalized.warnings.slice(0, MAX_ACCEPTANCE_WARNINGS).map((warning) => safeDiagnostic(warning, 256));
+  normalized.reason = normalized.reason === null ? null : safeDiagnostic(normalized.reason, 1024);
+  normalized.current = boundedVisibility(normalized.current);
+  if ("unknown" in normalized) normalized.unknown = boundedHazard(normalized.unknown);
+  if (responseBytes(normalized) <= MAX_ACCEPTANCE_RESPONSE_BYTES) return normalized;
+  normalized.warnings = [];
+  normalized.reason = null;
+  normalized.current = boundedVisibility({ ...normalized.current, reason: "current visibility diagnostic omitted for the response budget" });
+  if ("unknown" in normalized && normalized.unknown !== null && normalized.unknown !== undefined) {
+    normalized.unknown = { ...normalized.unknown, reason: "unknown-installation diagnostic omitted for the response budget" };
   }
-  if (responseBytes(result) > MAX_ACCEPTANCE_RESPONSE_BYTES) {
-    result.current = { state: "unavailable", taskId: null, status: null, accepted: null, reason: null };
+  if (responseBytes(normalized) > MAX_ACCEPTANCE_RESPONSE_BYTES) {
+    normalized.current = { state: "unavailable", taskId: null, status: null, accepted: null, reason: null };
   }
-  if (responseBytes(result) > MAX_ACCEPTANCE_RESPONSE_BYTES) {
+  if (responseBytes(normalized) > MAX_ACCEPTANCE_RESPONSE_BYTES) {
     throw new AcceptanceServiceError("The acceptance operation result exceeded its hard 64 KiB response budget after optional diagnostics were removed.");
   }
-  return result;
+  return normalized;
 }
 
 function boundInspectionResult(result: AcceptedInspectionResult): AcceptedInspectionResult {
@@ -282,6 +301,15 @@ function boundInspectionResult(result: AcceptedInspectionResult): AcceptedInspec
     result.current = { state: "unavailable", taskId: null, status: null, accepted: null, reason: null };
   }
   if (responseBytes(result) > MAX_ACCEPTANCE_RESPONSE_BYTES) {
+    result.delivery = {
+      ...result.delivery,
+      files: null,
+      manifest: null,
+      requirements: null,
+      reason: "checked file facts were omitted for the response budget; no path is claimed",
+    };
+  }
+  if (responseBytes(result) > MAX_ACCEPTANCE_RESPONSE_BYTES) {
     throw new AcceptanceServiceError("The acceptance inspection result exceeded its hard 64 KiB response budget after optional diagnostics were removed.");
   }
   return result;
@@ -291,6 +319,8 @@ export class AcceptanceService {
   private readonly owner: TaskOwner;
   private readonly delivery: DeliveryService;
   private readonly activity: () => ExecutionActivitySnapshot;
+  /** The actual owner's port, captured once before any await or file action. */
+  private readonly store: AcceptanceRecordStorePort;
   private readonly root: AcceptanceRoot;
   private readonly now: () => string;
   private readonly newId: () => string;
@@ -304,7 +334,10 @@ export class AcceptanceService {
     this.owner = options.owner;
     this.delivery = options.delivery;
     this.activity = options.activity;
-    this.root = resolveAcceptanceRoot(
+    // Capture the owner's immutable port once. No caller-supplied port is
+    // accepted, and no owner getter is consulted later around the commit.
+    this.store = options.owner.acceptanceRecordStore();
+    this.root = this.store.resolveRoot(
       options.acceptanceRoot,
       options.executionRoot,
       options.delivery.deliveryRootPath(),
@@ -550,6 +583,37 @@ export class AcceptanceService {
     return { ...finalBase, state: "visible", reason: null };
   }
 
+  /**
+   * Outermost synchronous current-state read for response assembly. It runs
+   * the same context getters as inspection, performs no file I/O, and rechecks
+   * the published owner/task after those getters. When a selector is supplied,
+   * a visible task that no longer matches it is projected as changed with no
+   * identity, never as the stale target.
+   */
+  finalVisibility(
+    context: OmpToolContext,
+    expectedTaskId?: string,
+    expectedTaskRevision?: number,
+  ): AcceptanceVisibility {
+    const current = this.visibility(context);
+    if (expectedTaskId === undefined || expectedTaskRevision === undefined) return current;
+    if (this.disposed || currentTaskOwner() !== this.owner) {
+      return this.hazardUnavailable("the published task owner or acceptance service changed");
+    }
+    const task = this.owner.snapshot().currentTask;
+    if (task === null) return current;
+    if (task.taskId !== expectedTaskId || task.taskRevision !== expectedTaskRevision) {
+      return {
+        state: "changed",
+        taskId: null,
+        status: null,
+        accepted: null,
+        reason: "the current task does not match the requested selector",
+      };
+    }
+    return current;
+  }
+
   private activityProblems(): string[] {
     let snapshot: ExecutionActivitySnapshot;
     try {
@@ -735,7 +799,7 @@ export class AcceptanceService {
     return {
       acceptance: null,
       record: { state: "unavailable", digestMatches: null, bytes: null, reason },
-      delivery: { state: "unavailable", fileCount: null, reason },
+      delivery: { state: "unavailable", fileCount: null, files: null, manifest: null, requirements: null, reason },
       warnings: [],
       reason,
       current: this.visibility(context),
@@ -749,7 +813,7 @@ export class AcceptanceService {
     return {
       acceptance: null,
       record: { state: "unknown", digestMatches: null, bytes: null, reason: hazard.reason },
-      delivery: { state: "unknown", fileCount: null, reason: hazard.reason },
+      delivery: { state: "unknown", fileCount: null, files: null, manifest: null, requirements: null, reason: hazard.reason },
       warnings: ["the acceptance installation outcome is unknown; no recovery or blind replay was attempted"],
       reason: "the acceptance record installation outcome is unknown",
       current,
@@ -761,7 +825,7 @@ export class AcceptanceService {
     return {
       acceptance: null,
       record: { state: "unavailable", digestMatches: null, bytes: null, reason },
-      delivery: { state: "unavailable", fileCount: null, reason },
+      delivery: { state: "unavailable", fileCount: null, files: null, manifest: null, requirements: null, reason },
       warnings: [],
       reason,
       current,
@@ -779,7 +843,7 @@ export class AcceptanceService {
       return {
         acceptance: null,
         record: { state: "not_accepted", digestMatches: null, bytes: null, reason: "the task is not accepted" },
-        delivery: { state: "not_accepted", fileCount: null, reason: "the task is not accepted" },
+        delivery: { state: "not_accepted", fileCount: null, files: null, manifest: null, requirements: null, reason: "the task is not accepted" },
         warnings: [],
         reason: "the current managed task is not accepted",
         current,
@@ -791,13 +855,13 @@ export class AcceptanceService {
       return {
         acceptance: null,
         record: { state: "not_accepted", digestMatches: null, bytes: null, reason: "the selector does not match the accepted record" },
-        delivery: { state: "not_accepted", fileCount: null, reason: "the selector does not match the accepted record" },
+        delivery: { state: "not_accepted", fileCount: null, files: null, manifest: null, requirements: null, reason: "the selector does not match the accepted record" },
         warnings: [],
         reason: "the requested task/revision/delivery does not match the accepted record",
         current,
       };
     }
-    const record = readAcceptanceRecord(this.root, reference.acceptanceId, frozenOf(task));
+    const record = this.store.read(this.root, reference.acceptanceId, frozenOf(task));
     const digestMatches = record.digest === null ? null : record.digest === reference.recordDigest;
     return {
       acceptance: copyReference(reference),
@@ -807,7 +871,7 @@ export class AcceptanceService {
         bytes: record.bytes,
         reason: record.reason,
       },
-      delivery: { state: "unavailable", fileCount: null, reason: "the delivery bundle has not been checked yet" },
+      delivery: { state: "unavailable", fileCount: null, files: null, manifest: null, requirements: null, reason: "the delivery bundle has not been checked yet" },
       warnings: [],
       reason: null,
       current,
@@ -817,22 +881,11 @@ export class AcceptanceService {
   private async acceptedReplay(
     context: OmpToolContext,
     selector: AcceptanceSelector,
-  ): Promise<AcceptanceOperationResult | null> {
+  ): Promise<AcceptanceOperationDraft | null> {
     if (currentTaskOwner() !== this.owner) return null;
     const task = this.owner.snapshot().currentTask;
     if (task === null || task.status !== "accepted" || task.acceptance === null) return null;
     const current = this.visibility(context);
-    if (current.state !== "visible") {
-      return {
-        outcome: "not_committed",
-        operationCommitted: false,
-        taskAccepted: true,
-        acceptance: null,
-        warnings: ["existing acceptance is withheld because the current task is not visible"],
-        reason: current.reason ?? "the accepted task is not visible from the live main-session context",
-        current,
-      };
-    }
     if (task.taskId !== selector.expectedTaskId || task.taskRevision !== selector.expectedTaskRevision) {
       return {
         outcome: "not_committed",
@@ -841,6 +894,19 @@ export class AcceptanceService {
         acceptance: null,
         warnings: [],
         reason: "the current task is already accepted under a different task identity; it cannot be replaced",
+        current,
+      };
+    }
+    if (current.state !== "visible") {
+      // A new caller that cannot see the accepted target must not receive any
+      // historical acceptance identity, even when it knows the selector.
+      return {
+        outcome: "not_committed",
+        operationCommitted: false,
+        taskAccepted: null,
+        acceptance: null,
+        warnings: [],
+        reason: current.reason ?? "the accepted target is not visible from this live caller; the historical acceptance is withheld",
         current,
       };
     }
@@ -855,23 +921,32 @@ export class AcceptanceService {
         current,
       };
     }
+    // Initial live visibility and the exact task/revision/delivery selector are
+    // proven. Privately capture the matching committed reference; a later
+    // inspection may lose visibility, but it cannot undo this committed fact.
+    const committedReference = copyReference(task.acceptance);
     const inspected = await this.inspect(context, selector);
     if (inspected.acceptance === null) {
       return {
-        outcome: "not_committed",
-        operationCommitted: false,
-        taskAccepted: true,
-        acceptance: null,
-        warnings: inspected.warnings,
-        reason: inspected.reason ?? "the accepted record is not visible for an idempotent replay",
+        outcome: "committed",
+        operationCommitted: true,
+        idempotent: true,
+        taskAccepted: inspected.current.state === "visible" ? true : null,
+        acceptance: committedReference,
+        warnings: [
+          "the original acceptance remains committed; this replay could not reconfirm the accepted record or files after an await",
+          ...inspected.warnings,
+        ].slice(0, MAX_ACCEPTANCE_WARNINGS),
+        reason: null,
         current: inspected.current,
       };
     }
     return {
       outcome: "committed",
       operationCommitted: true,
+      idempotent: true,
       taskAccepted: true,
-      acceptance: copyReference(inspected.acceptance),
+      acceptance: committedReference,
       warnings: [
         "existing acceptance was reused; no record was installed and no new side effect occurred",
         ...inspected.warnings,
@@ -943,6 +1018,9 @@ export class AcceptanceService {
       delivery: {
         state: delivery.state,
         fileCount: delivery.files === null ? null : delivery.files.length,
+        files: delivery.state === "intact" ? delivery.files : null,
+        manifest: delivery.state === "intact" ? delivery.manifest : null,
+        requirements: delivery.state === "intact" ? delivery.requirements : null,
         reason: delivery.reason,
       },
       current: after,
@@ -962,7 +1040,7 @@ export class AcceptanceService {
     context: OmpToolContext,
     selectorValue: unknown,
     signal?: AbortSignal,
-  ): Promise<AcceptanceOperationResult> {
+  ): Promise<AcceptanceOperationDraft> {
     if (this.disposed) {
       return {
         outcome: "not_committed",
@@ -1096,7 +1174,7 @@ export class AcceptanceService {
     const warnings: string[] = [];
     let preparedCandidate: object | null = null;
     let preparedDigest = "";
-    let committedResult: AcceptanceOperationResult | null = null;
+    let committedResult: AcceptanceOperationDraft | null = null;
     try {
       const activityProblems = this.activityProblems();
       if (activityProblems.length > 0) {
@@ -1237,7 +1315,7 @@ export class AcceptanceService {
       };
       let preparedRecord: object;
       try {
-        preparedRecord = prepareAcceptanceRecord({
+        preparedRecord = this.store.prepare({
           root: this.root,
           acceptanceId,
           deliveryId: selector.deliveryId,
@@ -1246,7 +1324,7 @@ export class AcceptanceService {
           record,
         });
         preparedCandidate = preparedRecord;
-        preparedDigest = preparedAcceptanceBinding(preparedRecord).recordDigest;
+        preparedDigest = this.store.binding(preparedRecord).recordDigest;
       } catch (error) {
         return {
           outcome: "not_committed", operationCommitted: false, taskAccepted: false,
@@ -1403,7 +1481,7 @@ export class AcceptanceService {
     } finally {
       try {
         if (preparedCandidate !== null) {
-          const cleanup = discardPreparedAcceptanceRecordSync(preparedCandidate);
+          const cleanup = this.store.discard(preparedCandidate);
           if (cleanup.length > 0) this.report("acceptance_prepared_cleanup", { warnings: cleanup.slice(0, 8) });
         }
       } catch (error) {

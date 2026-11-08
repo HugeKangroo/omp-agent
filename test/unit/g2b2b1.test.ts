@@ -6,6 +6,7 @@ import {
   copyFileSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
   rmSync,
@@ -25,7 +26,7 @@ import {
   resolveAcceptanceRoot,
 } from "../../src/acceptance-record-store.ts";
 import { DeliveryService } from "../../src/delivery-service.ts";
-import { createDeliveryEntry, DELIVERY_TOOL } from "../../src/delivery-entry.ts";
+import { createDeliveryEntry, DELIVERY_TOOL, parseDeliveryArguments } from "../../src/delivery-entry.ts";
 import { createExecutionEntry, type ExecutionEntryControls } from "../../src/execution-entry.ts";
 import {
   clearPublishedTaskOwner,
@@ -122,6 +123,10 @@ function textOf(result: ToolResult): string {
   return result.content.map((part) => part.text).join("\n");
 }
 
+function modelJson(result: ToolResult): Record<string, any> {
+  return JSON.parse(textOf(result)) as Record<string, any>;
+}
+
 function line(text: string, prefix: string): string | undefined {
   const found = text.split("\n").find((item) => item.startsWith(prefix));
   return found?.slice(prefix.length);
@@ -138,6 +143,7 @@ interface Fixture {
   ctx: OmpToolContext;
   entry: ExecutionEntryControls;
   tools: Map<string, RegisteredTool>;
+  handlers: Map<string, (event: unknown) => unknown>;
   cleanup: () => Promise<void>;
 }
 
@@ -181,11 +187,15 @@ function passSpec(overrides: Partial<TrustedContractSpec> = {}): TrustedContract
 async function fixture(options: {
   verifier?: TrustedVerifier;
   onEvent?: (event: Record<string, unknown> & { type: string }) => void;
+  withAcceptance?: boolean;
+  deliveryRoot?: string;
 } = {}): Promise<Fixture> {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "omp-agent-g2b2b1-")));
   const workspace = await realpath(await mkdtemp(path.join(tmpdir(), "omp-agent-g2b2b1-ws-")));
   WORKSPACE = workspace;
-  const deliveryRoot = await realpath(await mkdtemp(path.join(tmpdir(), "omp-agent-g2b2b1-del-")));
+  const deliveryRoot = options.deliveryRoot === undefined
+    ? await realpath(await mkdtemp(path.join(tmpdir(), "omp-agent-g2b2b1-del-")))
+    : await realpath(options.deliveryRoot);
   const acceptanceRoot = await realpath(await mkdtemp(path.join(tmpdir(), "omp-agent-g2b2b1-acc-")));
   let sequence = 0;
   const owner = new TaskOwner({
@@ -219,7 +229,7 @@ async function fixture(options: {
     launcherPath: LAUNCHER,
     trustedVerifiers: [options.verifier ?? passVerifier()],
     deliveryRoot,
-    acceptanceRoot,
+    ...(options.withAcceptance === false ? {} : { acceptanceRoot }),
   });
   return {
     root,
@@ -232,6 +242,7 @@ async function fixture(options: {
     ctx,
     entry,
     tools: fake.tools,
+    handlers: fake.handlers,
     cleanup: async () => {
       entry.dispose();
       clearPublishedTaskOwner();
@@ -337,6 +348,27 @@ function selector(f: Fixture, deliveryId: string): {
 
 function acceptanceOf(f: Fixture): AcceptanceService {
   return f.entry.acceptance!;
+}
+
+async function submitTool(
+  f: Fixture,
+  deliveryId: string,
+  signal?: AbortSignal,
+): Promise<ToolResult> {
+  return f.tools.get(DELIVERY_TOOL)!.execute("submit-tool", {
+    action: "submit",
+    ...selector(f, deliveryId),
+  }, signal, undefined, f.ctx);
+}
+
+async function inspectTool(
+  f: Fixture,
+  deliveryId: string,
+): Promise<ToolResult> {
+  return f.tools.get(DELIVERY_TOOL)!.execute("inspect-tool", {
+    action: "inspect",
+    ...selector(f, deliveryId),
+  }, undefined, undefined, f.ctx);
 }
 
 function sha256(data: Uint8Array | string): string {
@@ -1580,9 +1612,933 @@ describe("G2-B2-B1 host acceptance transaction", () => {
       await f.cleanup();
     }
   });
-});
 
-// Keep chmod import referenced for platforms where the same-byte replacement
-// test adjusts permissions in future fixtures.
+  test("accepted history and damaged copies are reported separately without claiming paths", async () => {
+    const f = await fixture();
+    try {
+      const prepared = await prepareAccepted(f);
+      const first = modelJson(await submitTool(f, prepared.deliveryId));
+      const acceptanceId = first.acceptance.acceptanceId as string;
+      const recordPath = path.join(f.acceptanceRoot, `record-${acceptanceId}.json`);
+      const inode = lstatSync(recordPath).ino;
+      rmSync(prepared.files[0]!.path);
+      const inspected = await inspectTool(f, prepared.deliveryId);
+      const facts = modelJson(inspected);
+      expect(facts.acceptance.historyCommitted).toBe(true);
+      expect(facts.acceptance.acceptanceId).toBe(acceptanceId);
+      expect(facts.taskAccepted).toBe(true);
+      expect(facts.integrity.record.state).toBe("intact");
+      expect(facts.integrity.delivery.state).toBe("changed");
+      expect(facts.files).toBeNull();
+      expect(facts.paths.available).toBe(false);
+      expect(facts.paths.withheldReason).toBeTruthy();
+
+      const replay = modelJson(await submitTool(f, prepared.deliveryId));
+      expect(replay.operation.outcome).toBe("committed");
+      expect(replay.operation.operationCommitted).toBe(true);
+      expect(replay.operation.idempotent).toBe(true);
+      expect(replay.acceptance.acceptanceId).toBe(acceptanceId);
+      expect(replay.files).toBeNull();
+      expect(replay.paths.available).toBe(false);
+      expect(lstatSync(recordPath).ino).toBe(inode);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("postcommit formatting failure falls back to a minimum truthful envelope", async () => {
+    const f = await fixture();
+    try {
+      const prepared = await prepareAccepted(f);
+      const service = acceptanceOf(f);
+      const original = service.inspect.bind(service);
+      service.inspect = async (...args: Parameters<AcceptanceService["inspect"]>) => {
+        const result = await original(...args);
+        const baseFile = result.delivery.files?.[0];
+        if (baseFile !== undefined && baseFile !== null) {
+          result.delivery = {
+            ...result.delivery,
+            files: Array.from({ length: 8 }, (_, index) => ({
+              ...baseFile,
+              artifactId: `artifact-budget-${index}`,
+              path: `/checked/${"x".repeat(5000)}-${index}`,
+            })),
+          };
+        }
+        return result;
+      };
+      const submitted = await submitTool(f, prepared.deliveryId);
+      const facts = modelJson(submitted);
+      expect(facts.operation.outcome).toBe("committed");
+      expect(facts.operation.operationCommitted).toBe(true);
+      expect(facts.acceptance.acceptanceId).toMatch(/^acceptance-/);
+      expect(facts.files).toBeNull();
+      expect(facts.paths.available).toBe(false);
+      expect(facts.paths.withheldReason).toContain("no path was checked");
+      expect(facts.reason).toContain("could not be formatted");
+      expect(Buffer.byteLength(textOf(submitted), "utf8")).toBeLessThanOrEqual(32 * 1024);
+      expect(Buffer.byteLength(JSON.stringify(submitted), "utf8")).toBeLessThanOrEqual(64 * 1024);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("postcommit inspection visibility loss withholds paths but keeps commit facts", async () => {
+    const f = await fixture();
+    try {
+      const prepared = await prepareAccepted(f);
+      const service = acceptanceOf(f);
+      const original = service.inspect.bind(service);
+      service.inspect = async (...args: Parameters<AcceptanceService["inspect"]>) => {
+        const result = await original(...args);
+        if (result.acceptance !== null) {
+          // Real navigation after the awaited inspection. The wrapper must not
+          // project the inspection's earlier current snapshot.
+          f.owner.navigate("session_switch");
+        }
+        return result;
+      };
+      const submitted = await submitTool(f, prepared.deliveryId);
+      const facts = modelJson(submitted);
+      expect(facts.operation.outcome).toBe("committed");
+      expect(facts.operation.operationCommitted).toBe(true);
+      expect(facts.taskAccepted).toBeNull();
+      expect(facts.currentTaskStatus).toBeNull();
+      expect(facts.visibility.state).toBe("detached");
+      expect(facts.acceptance.acceptanceId).toMatch(/^acceptance-/);
+      expect(facts.files).toBeNull();
+      expect(facts.paths.available).toBe(false);
+      expect(facts.paths.withheldReason).toBeTruthy();
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("delivery selector parser isolates submit/inspect and rejects authority fields", async () => {
+    const selectorArgs = {
+      action: "submit",
+      expectedTaskId: "task-fixture",
+      expectedTaskRevision: 1,
+      deliveryId: "delivery-fixture",
+    };
+    expect(parseDeliveryArguments(selectorArgs)).toEqual({
+      action: "submit",
+      request: {
+        expectedTaskId: "task-fixture",
+        expectedTaskRevision: 1,
+        deliveryId: "delivery-fixture",
+      },
+    });
+    expect(parseDeliveryArguments({ ...selectorArgs, action: "inspect" })).toEqual({
+      action: "inspect",
+      request: {
+        expectedTaskId: "task-fixture",
+        expectedTaskRevision: 1,
+        deliveryId: "delivery-fixture",
+      },
+    });
+    for (const extra of [
+      { runId: "run-other" },
+      { artifactIds: ["artifact-other"] },
+      { verificationReceiptId: "receipt-other" },
+      { unknownModelField: true },
+    ]) {
+      expect(() => parseDeliveryArguments({ ...selectorArgs, ...extra })).toThrow(/selector/);
+    }
+    for (const extra of [
+      { path: "/tmp/x" },
+      { receipt: {} },
+      { contract: {} },
+      { verdict: "pass" },
+      { accepted: true },
+      { confirmed: true },
+      { bytes: 1 },
+      { sha256: "sha256:00" },
+    ]) {
+      expect(() => parseDeliveryArguments({ ...selectorArgs, ...extra })).toThrow(/authority/);
+    }
+    expect(() => parseDeliveryArguments({
+      action: "describe",
+      deliveryId: "delivery-fixture",
+    })).toThrow(/describe/);
+    expect(() => parseDeliveryArguments({
+      action: "preview",
+      expectedTaskId: "task-fixture",
+      expectedTaskRevision: 1,
+      runId: "run-fixture",
+      artifactIds: ["artifact-fixture"],
+      deliveryId: "delivery-fixture",
+    })).toThrow(/preview/);
+    expect(() => parseDeliveryArguments({
+      action: "submit",
+      expectedTaskId: "task-fixture",
+      expectedTaskRevision: 1,
+    })).toThrow(/deliveryId/);
+  });
+
+  test("submit and inspect expose checked accepted files and idempotent history", async () => {
+    const f = await fixture();
+    try {
+      const prepared = await prepareAccepted(f);
+      const first = await submitTool(f, prepared.deliveryId);
+      expect(first.isError).toBeUndefined();
+      const firstFacts = modelJson(first);
+      expect(firstFacts.format).toBe("agent-deliver-result-v1");
+      expect(firstFacts.action).toBe("submit");
+      expect(firstFacts.operation.outcome).toBe("committed");
+      expect(firstFacts.operation.operationCommitted).toBe(true);
+      expect(firstFacts.operation.idempotent).toBe(false);
+      expect(firstFacts.operation.newCommit).toBe(true);
+      expect(firstFacts.taskAccepted).toBe(true);
+      expect(firstFacts.currentTaskStatus).toBe("accepted");
+      expect(firstFacts.acceptance.historyCommitted).toBe(true);
+      expect(firstFacts.acceptance.acceptanceId).toMatch(/^acceptance-/);
+      expect(firstFacts.paths.available).toBe(true);
+      expect(firstFacts.files).toHaveLength(1);
+      expect(firstFacts.files[0].path).toBe(prepared.files[0]!.path);
+      expect(firstFacts.files[0].sha256).toBe(sha256(readFileSync(firstFacts.files[0].path)));
+      expect(firstFacts.integrity.delivery.state).toBe("intact");
+      expect(firstFacts.integrity.archive.state).toBe("not_checked");
+      expect(Buffer.byteLength(textOf(first), "utf8")).toBeLessThanOrEqual(32 * 1024);
+      expect(Buffer.byteLength(JSON.stringify(first), "utf8")).toBeLessThanOrEqual(64 * 1024);
+
+      const acceptanceId = firstFacts.acceptance.acceptanceId as string;
+      const recordPath = path.join(f.acceptanceRoot, `record-${acceptanceId}.json`);
+      const inode = lstatSync(recordPath).ino;
+      const replay = await submitTool(f, prepared.deliveryId);
+      const replayFacts = modelJson(replay);
+      expect(replayFacts.operation.outcome).toBe("committed");
+      expect(replayFacts.operation.operationCommitted).toBe(true);
+      expect(replayFacts.operation.idempotent).toBe(true);
+      expect(replayFacts.operation.newCommit).toBe(false);
+      expect(replayFacts.acceptance.acceptanceId).toBe(acceptanceId);
+      expect(replayFacts.paths.available).toBe(true);
+      expect(lstatSync(recordPath).ino).toBe(inode);
+
+      const inspected = await inspectTool(f, prepared.deliveryId);
+      expect(inspected.isError).toBeUndefined();
+      const inspectFacts = modelJson(inspected);
+      expect(inspectFacts.action).toBe("inspect");
+      expect(inspectFacts.operation.performed).toBe(false);
+      expect(inspectFacts.operation.readOnly).toBe(true);
+      expect(inspectFacts.operation.newCommit).toBe(false);
+      expect(inspectFacts.acceptance.historyCommitted).toBe(true);
+      expect(inspectFacts.acceptance.acceptanceId).toBe(acceptanceId);
+      expect(inspectFacts.paths.available).toBe(true);
+      expect(inspectFacts.files[0].path).toBe(prepared.files[0]!.path);
+
+      const describedAfter = await f.tools.get(DELIVERY_TOOL)!.execute(
+        "describe-after-accepted", { action: "describe" }, undefined, undefined, f.ctx,
+      );
+      expect(describedAfter.isError).toBeUndefined();
+      const describedText = textOf(describedAfter);
+      expect(describedText).toContain("taskAccepted: true");
+      expect(describedText).toContain("currentTaskStatus: accepted");
+      expect(describedText).toContain("acceptanceConfigured: true");
+      expect(describedText).toContain("submissionAvailable: false");
+      expect(describedText).toContain("task_already_accepted");
+      expect(describedText).not.toContain("currentTaskStatus: cancelled");
+
+      const task = f.owner.snapshot().currentTask!;
+      const previewAfter = await f.tools.get(DELIVERY_TOOL)!.execute("preview-after-accepted", {
+        action: "preview",
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: task.taskRevision,
+        runId: prepared.runId,
+        artifactIds: prepared.artifactIds,
+      }, undefined, undefined, f.ctx);
+      expect(previewAfter.isError).toBe(true);
+      expect(textOf(previewAfter)).toContain("taskAccepted: true");
+      expect(textOf(previewAfter)).toContain("accepted and terminal");
+      expect(textOf(previewAfter)).not.toContain("cancelled");
+
+      const verifyAfter = await f.tools.get(VERIFICATION_TOOL)!.execute("verify-after-accepted", {
+        action: "verify",
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: task.taskRevision,
+        runId: prepared.runId,
+        artifactIds: prepared.artifactIds,
+      }, undefined, undefined, f.ctx);
+      expect(verifyAfter.isError).toBe(true);
+      expect(textOf(verifyAfter)).toMatch(/taskAccepted: true/);
+      expect(textOf(verifyAfter)).toContain("currentTaskStatus: accepted");
+      expect(textOf(verifyAfter)).toContain("verificationPerformed: false");
+      expect(textOf(verifyAfter)).not.toContain("taskAccepted: false");
+
+      const runAfter = await f.tools.get("agent_execute")!.execute("run-after-accepted", {
+        action: "run",
+        runtime: "python",
+        source: "print('must-not-run')\n",
+        inputIds: [],
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: task.taskRevision,
+      }, undefined, undefined, f.ctx);
+      expect(runAfter.isError).toBe(true);
+      expect(textOf(runAfter)).toMatch(/taskAccepted: true/);
+      expect(textOf(runAfter)).toContain("currentTaskStatus: accepted");
+      expect(textOf(runAfter)).not.toContain("cancelled");
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("unconfigured acceptance is explicit and writes no record", async () => {
+    const f = await fixture({ withAcceptance: false });
+    try {
+      expect(f.entry.acceptance).toBeUndefined();
+      expect(f.entry.delivery).toBeDefined();
+      const described = await f.tools.get(DELIVERY_TOOL)!.execute(
+        "describe-unconfigured", { action: "describe" }, undefined, undefined, f.ctx,
+      );
+      const describedText = textOf(described);
+      expect(describedText).toContain("acceptanceImplemented: true");
+      expect(describedText).toContain("acceptanceConfigured: false");
+      expect(describedText).toContain("submissionAvailable: false");
+      expect(describedText).toContain("acceptance_not_configured");
+
+      const run = await runSource(f);
+      const artifactIds = run.artifacts.map((artifact) => artifact.artifactId);
+      const previewed = await preview(f, run.runId, artifactIds);
+      const submitted = await f.tools.get(DELIVERY_TOOL)!.execute("submit-unconfigured", {
+        action: "submit",
+        ...selector(f, previewed.deliveryId),
+      }, undefined, undefined, f.ctx);
+      expect(submitted.isError).toBe(true);
+      const submitFacts = modelJson(submitted);
+      expect(submitFacts.acceptanceConfigured).toBe(false);
+      expect(submitFacts.operation.performed).toBe(false);
+      expect(submitFacts.operation.outcome).toBe("not_committed");
+      expect(submitFacts.operation.operationCommitted).toBe(false);
+      expect(submitFacts.taskAccepted).toBe(false);
+      expect(submitFacts.paths.available).toBe(false);
+      expect(submitFacts.reason).toContain("acceptance root");
+
+      const inspected = await f.tools.get(DELIVERY_TOOL)!.execute("inspect-unconfigured", {
+        action: "inspect",
+        ...selector(f, previewed.deliveryId),
+      }, undefined, undefined, f.ctx);
+      expect(inspected.isError).toBe(true);
+      const inspectFacts = modelJson(inspected);
+      expect(inspectFacts.acceptanceConfigured).toBe(false);
+      expect(inspectFacts.operation.performed).toBe(false);
+      expect(inspectFacts.operation.readOnly).toBe(true);
+      expect(inspectFacts.operation.newCommit).toBe(false);
+      expect(inspectFacts.paths.available).toBe(false);
+      expect(readdirSync(f.acceptanceRoot).filter((name) => name.startsWith("record-"))).toHaveLength(0);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("acceptance-only and overlapping root configuration fail closed", async () => {
+    const f = await fixture();
+    try {
+      const acceptanceOnly = fakePi();
+      expect(() => createExecutionEntry(acceptanceOnly.pi, {
+        root: f.root,
+        pythonPath: PYTHON,
+        bunPath: BUN,
+        launcherPath: LAUNCHER,
+        acceptanceRoot: f.acceptanceRoot,
+      })).toThrow(/deliveryRoot/);
+      expect(acceptanceOnly.tools.size).toBe(0);
+
+      const overlapping = fakePi();
+      expect(() => createExecutionEntry(overlapping.pi, {
+        root: f.root,
+        pythonPath: PYTHON,
+        bunPath: BUN,
+        launcherPath: LAUNCHER,
+        deliveryRoot: f.deliveryRoot,
+        acceptanceRoot: f.deliveryRoot,
+      })).toThrow(/overlap/);
+      expect(overlapping.tools.size).toBe(1);
+      const disposed = await overlapping.tools.get(VERIFICATION_TOOL)!.execute(
+        "disposed-verify", { action: "describe" }, undefined, undefined, f.ctx,
+      );
+      expect(disposed.isError).toBe(true);
+      expect(textOf(disposed)).toContain("disposed");
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("postcommit navigation and abort retain commit facts but withhold paths", async () => {
+    let ownerRef: TaskOwner | undefined;
+    const navigated = await fixture({
+      onEvent: (event) => {
+        if (event.type === "task_accepted") ownerRef?.navigate("session_switch");
+      },
+    });
+    ownerRef = navigated.owner;
+    try {
+      const prepared = await prepareAccepted(navigated);
+      const submitted = await submitTool(navigated, prepared.deliveryId);
+      const facts = modelJson(submitted);
+      expect(facts.operation.outcome).toBe("committed");
+      expect(facts.operation.operationCommitted).toBe(true);
+      expect(facts.operation.idempotent).toBe(false);
+      expect(facts.taskAccepted).toBeNull();
+      expect(facts.currentTaskStatus).toBeNull();
+      expect(facts.visibility.state).toBe("detached");
+      expect(facts.acceptance.historyCommitted).toBe(true);
+      expect(facts.acceptance.acceptanceId).toMatch(/^acceptance-/);
+      expect(facts.paths.available).toBe(false);
+      expect(facts.paths.withheldReason).toContain("not visible");
+      expect(facts.files).toBeNull();
+      expect(textOf(submitted)).not.toContain("cancelled");
+
+      const inspected = await inspectTool(navigated, prepared.deliveryId);
+      const inspectFacts = modelJson(inspected);
+      expect(inspectFacts.acceptance.historyCommitted).toBeNull();
+      expect(inspectFacts.acceptance.acceptanceId).toBeNull();
+      expect(inspectFacts.taskAccepted).toBeNull();
+      expect(inspectFacts.paths.available).toBe(false);
+      expect(inspectFacts.integrity).toBeNull();
+
+      const unauthorizedRetry = await submitTool(navigated, prepared.deliveryId);
+      const retryFacts = modelJson(unauthorizedRetry);
+      expect(retryFacts.operation.operationCommitted).toBe(false);
+      expect(retryFacts.operation.idempotent).toBe(false);
+      expect(retryFacts.acceptance.acceptanceId).toBeNull();
+      expect(retryFacts.paths.available).toBe(false);
+      expect(textOf(unauthorizedRetry)).not.toContain(String(facts.acceptance.acceptanceId));
+    } finally {
+      await navigated.cleanup();
+    }
+
+    const controller = new AbortController();
+    const aborted = await fixture({
+      onEvent: (event) => {
+        if (event.type === "task_accepted") controller.abort();
+      },
+    });
+    try {
+      const prepared = await prepareAccepted(aborted);
+      const submitted = await submitTool(aborted, prepared.deliveryId, controller.signal);
+      const facts = modelJson(submitted);
+      expect(facts.operation.outcome).toBe("committed");
+      expect(facts.operation.operationCommitted).toBe(true);
+      expect(facts.taskAccepted).toBe(true);
+      expect(facts.currentTaskStatus).toBe("accepted");
+      expect(facts.paths.available).toBe(false);
+      expect(facts.paths.withheldReason).toContain("aborted");
+      expect(facts.acceptance.acceptanceId).toMatch(/^acceptance-/);
+      expect(textOf(submitted)).not.toContain("cancelled");
+    } finally {
+      await aborted.cleanup();
+    }
+  });
+
+  test("unknown installation facts stay unclaimed through submit and inspect", async () => {
+    const f = await fixture();
+    try {
+      const prepared = await prepareAccepted(f);
+      const task = f.owner.snapshot().currentTask!;
+      const hazard = {
+        task: {
+          ownerId: task.ownerId,
+          taskId: task.taskId,
+          taskRevision: task.taskRevision,
+          requirementsDigest: requirementsDigest(task.requirementSources),
+        },
+        acceptanceId: "acceptance-entry-unknown",
+        deliveryId: prepared.deliveryId,
+        recordDigest: "sha256:" + "a".repeat(64),
+        reason: "fixture installation outcome unknown",
+      };
+      (f.owner as unknown as { acceptanceHazard: unknown }).acceptanceHazard = hazard;
+      const submitted = await submitTool(f, prepared.deliveryId);
+      const facts = modelJson(submitted);
+      expect(facts.operation.outcome).toBe("unknown");
+      expect(facts.operation.operationCommitted).toBeNull();
+      expect(facts.operation.idempotent).toBe(false);
+      expect(facts.taskAccepted).toBeNull();
+      expect(facts.currentTaskStatus).toBeNull();
+      expect(facts.acceptance.historyCommitted).toBeNull();
+      expect(facts.acceptance.acceptanceId).toBeNull();
+      expect(facts.unknown.acceptanceId).toBe(hazard.acceptanceId);
+      expect(facts.unknown.recordDigest).toBe(hazard.recordDigest);
+      expect(facts.paths.available).toBe(false);
+      expect(facts.files).toBeNull();
+
+      const inspected = await inspectTool(f, prepared.deliveryId);
+      const inspectFacts = modelJson(inspected);
+      expect(inspectFacts.operation.performed).toBe(false);
+      expect(inspectFacts.acceptance.historyCommitted).toBeNull();
+      expect(inspectFacts.unknown.acceptanceId).toBe(hazard.acceptanceId);
+      expect(inspectFacts.paths.available).toBe(false);
+      expect(inspectFacts.integrity.record.state).toBe("unknown");
+      expect(inspectFacts.integrity.delivery.state).toBe("unknown");
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("no-contract submit is not accepted and carries no accepted path", async () => {
+    const f = await fixture();
+    try {
+      const run = await runSource(f);
+      const artifactIds = run.artifacts.map((artifact) => artifact.artifactId);
+      const previewed = await preview(f, run.runId, artifactIds);
+      const submitted = await submitTool(f, previewed.deliveryId);
+      expect(submitted.isError).toBe(true);
+      const facts = modelJson(submitted);
+      expect(facts.operation.outcome).toBe("not_committed");
+      expect(facts.operation.operationCommitted).toBe(false);
+      expect(facts.operation.idempotent).toBe(false);
+      expect(facts.operation.newCommit).toBe(false);
+      expect(facts.taskAccepted).toBe(false);
+      expect(facts.currentTaskStatus).toBe("active");
+      expect(facts.acceptance.historyCommitted).toBe(false);
+      expect(facts.acceptance.acceptanceId).toBeNull();
+      expect(facts.files).toBeNull();
+      expect(facts.paths.available).toBe(false);
+      expect(facts.reason).toContain("contract");
+      expect(f.owner.snapshot().currentTask!.status).toBe("active");
+      expect(readdirSync(f.acceptanceRoot).filter((name) => name.startsWith("record-"))).toHaveLength(0);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("record store port preserves issuance across independent loaded module graphs", async () => {
+    const graphA = await import("../../src/acceptance-record-store.ts" + "?graph=owner") as typeof import("../../src/acceptance-record-store.ts");
+    const graphB = await import("../../src/acceptance-record-store.ts" + "?graph=service") as typeof import("../../src/acceptance-record-store.ts");
+    expect(graphA.preparedAcceptanceBinding).not.toBe(graphB.preparedAcceptanceBinding);
+    expect(graphA.resolveAcceptanceRoot).not.toBe(graphB.resolveAcceptanceRoot);
+    const parent = await realpath(await mkdtemp(path.join(tmpdir(), "omp-agent-g2b2b2-graph-")));
+    const executionRoot = path.join(parent, "execution");
+    const deliveryRoot = path.join(parent, "delivery");
+    const acceptanceRoot = path.join(parent, "acceptance");
+    mkdirSync(executionRoot, { mode: 0o700 });
+    mkdirSync(deliveryRoot, { mode: 0o700 });
+    mkdirSync(acceptanceRoot, { mode: 0o700 });
+    try {
+      const root = graphA.resolveAcceptanceRoot(acceptanceRoot, executionRoot, deliveryRoot);
+      const prepared = graphA.prepareAcceptanceRecord({
+        root,
+        acceptanceId: "acceptance-graph",
+        deliveryId: "delivery-graph",
+        acceptedAt: NOW,
+        task: {
+          ownerId: "owner-graph",
+          taskId: "task-graph",
+          taskRevision: 1,
+          requirementsDigest: `sha256:${"a".repeat(64)}`,
+        },
+        record: { graph: "owner" },
+      });
+      const digest = graphA.preparedAcceptanceBinding(prepared).recordDigest;
+      expect(digest).toMatch(/^sha256:/);
+      expect(() => graphB.preparedAcceptanceBinding(prepared)).toThrow(/not issued/);
+
+      const ownerPort = graphA.acceptanceRecordStorePort();
+      const servicePort = graphB.acceptanceRecordStorePort();
+      expect(ownerPort).not.toBe(servicePort);
+      expect(graphA.acceptanceRecordStorePort()).toBe(ownerPort);
+      expect(Object.isFrozen(ownerPort)).toBe(true);
+      expect(ownerPort.binding(prepared).recordDigest).toBe(digest);
+      expect(() => servicePort.binding(prepared)).toThrow(/not issued/);
+      expect(servicePort.read(root, "acceptance-graph").state).toBe("unavailable");
+    } finally {
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+
+  test("owner port is captured at construction and never re-read around commit", async () => {
+    const f = await fixture();
+    try {
+      const port = f.owner.acceptanceRecordStore();
+      expect(Object.isFrozen(port)).toBe(true);
+      expect(f.owner.acceptanceRecordStore()).toBe(port);
+      const prepared = await prepareAccepted(f);
+      const delivery = f.entry.delivery!;
+      const original = delivery.readAcceptanceEvidence.bind(delivery);
+      let replaced = false;
+      delivery.readAcceptanceEvidence = async (...args) => {
+        if (!replaced) {
+          replaced = true;
+          Object.defineProperty(f.owner, "acceptanceRecordStore", {
+            configurable: true,
+            value: () => {
+              throw new Error("late owner store getter must not be used");
+            },
+          });
+        }
+        return original(...args);
+      };
+      const result = await acceptanceOf(f).submit(f.ctx, selector(f, prepared.deliveryId));
+      expect(replaced).toBe(true);
+      expect(result.outcome).toBe("committed");
+      expect(result.operationCommitted).toBe(true);
+      expect(result.acceptance).not.toBeNull();
+      expect(f.owner.snapshot().currentTask!.status).toBe("accepted");
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("inspect rechecks actual visibility after the awaited service inspection", async () => {
+    for (const mutation of ["navigate", "owner", "dispose"] as const) {
+      const f = await fixture();
+      try {
+        const prepared = await prepareAccepted(f);
+        const submitted = await submitTool(f, prepared.deliveryId);
+        expect(modelJson(submitted).operation.operationCommitted).toBe(true);
+        const service = acceptanceOf(f);
+        const actual = service.inspect.bind(service);
+        let reached = false;
+        service.inspect = async (...args: Parameters<AcceptanceService["inspect"]>) => {
+          const result = await actual(...args);
+          reached = true;
+          if (mutation === "navigate") f.owner.navigate("session_switch");
+          if (mutation === "owner") publishTaskOwner(new TaskOwner({ workspaceRoot: f.workspace }));
+          if (mutation === "dispose") f.entry.dispose();
+          return result;
+        };
+        const response = await inspectTool(f, prepared.deliveryId);
+        expect(reached).toBe(true);
+        const facts = modelJson(response);
+        expect(facts.taskAccepted).toBeNull();
+        expect(facts.currentTaskStatus).toBeNull();
+        expect(facts.visibility.state).not.toBe("visible");
+        expect(facts.files).toBeNull();
+        expect(facts.paths.available).toBe(false);
+        expect(textOf(response)).not.toContain(prepared.files[0]!.path);
+        expect(f.owner.snapshot().currentTask!.status).toBe("accepted");
+      } finally {
+        await f.cleanup();
+      }
+    }
+  });
+
+  test("submit aborted after the actual accepted inspection keeps commit but withholds paths", async () => {
+    const f = await fixture();
+    try {
+      const prepared = await prepareAccepted(f);
+      const service = acceptanceOf(f);
+      const actual = service.inspect.bind(service);
+      const controller = new AbortController();
+      let inspected = false;
+      service.inspect = async (...args: Parameters<AcceptanceService["inspect"]>) => {
+        const result = await actual(...args);
+        if (!inspected && result.acceptance !== null && result.delivery.state === "intact") {
+          inspected = true;
+          controller.abort("late fixture abort after actual accepted inspection");
+        }
+        return result;
+      };
+      const submitted = await submitTool(f, prepared.deliveryId, controller.signal);
+      expect(inspected).toBe(true);
+      expect(controller.signal.aborted).toBe(true);
+      const facts = modelJson(submitted);
+      expect(facts.operation.outcome).toBe("committed");
+      expect(facts.operation.operationCommitted).toBe(true);
+      expect(facts.taskAccepted).toBe(true);
+      expect(facts.currentTaskStatus).toBe("accepted");
+      expect(facts.visibility.state).toBe("visible");
+      const task = f.owner.snapshot().currentTask!;
+      expect(task.status).toBe("accepted");
+      expect(facts.acceptance.acceptanceId).toBe(task.acceptance!.acceptanceId);
+      expect(facts.acceptance.recordDigest).toBe(task.acceptance!.recordDigest);
+      expect(sha256(readFileSync(path.join(f.acceptanceRoot, `record-${task.acceptance!.acceptanceId}.json`))))
+        .toBe(task.acceptance!.recordDigest);
+      expect(facts.files).toBeNull();
+      expect(facts.manifest).toBeNull();
+      expect(facts.requirements).toBeNull();
+      expect(facts.paths.available).toBe(false);
+      expect(facts.paths.withheldReason).toContain("aborted");
+      expect(textOf(submitted)).not.toContain(prepared.files[0]!.path);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("standalone delivery entry disposal during actual accepted inspect hides prior record facts", async () => {
+    const f = await fixture();
+    try {
+      const prepared = await prepareAccepted(f);
+      const first = modelJson(await submitTool(f, prepared.deliveryId));
+      expect(first.operation.operationCommitted).toBe(true);
+      const task = f.owner.snapshot().currentTask!;
+      const recordPath = path.join(f.acceptanceRoot, `record-${task.acceptance!.acceptanceId}.json`);
+      const recordBefore = readFileSync(recordPath);
+      const inodeBefore = lstatSync(recordPath).ino;
+      let standalone: RegisteredTool | undefined;
+      const controls = createDeliveryEntry({
+        registerTool(tool) {
+          standalone = tool;
+        },
+      }, {
+        owner: f.owner,
+        service: f.entry.delivery!,
+        acceptance: f.entry.acceptance!,
+      });
+      expect(standalone).toBeTruthy();
+      const service = acceptanceOf(f);
+      const actual = service.inspect.bind(service);
+      let disposedAfterRealRead = false;
+      service.inspect = async (...args: Parameters<AcceptanceService["inspect"]>) => {
+        const result = await actual(...args);
+        if (!disposedAfterRealRead && result.acceptance !== null && result.delivery.state === "intact") {
+          disposedAfterRealRead = true;
+          controls.dispose();
+        }
+        return result;
+      };
+      const response = await standalone!.execute(
+        "standalone-late-dispose",
+        { action: "inspect", ...selector(f, prepared.deliveryId) },
+        undefined,
+        undefined,
+        f.ctx,
+      );
+      expect(disposedAfterRealRead).toBe(true);
+      const disposedDelivery = await f.entry.delivery!.inspectAcceptedDelivery({
+        ownerId: task.ownerId,
+        taskId: task.taskId,
+        taskRevision: task.taskRevision,
+        requirementsDigest: requirementsDigest(task.requirementSources),
+      }, prepared.deliveryId);
+      expect(disposedDelivery.state).toBe("unavailable");
+      expect(disposedDelivery.reason).toContain("disposed");
+      const stillLiveAcceptance = f.entry.acceptance!.finalVisibility(f.ctx, task.taskId, task.taskRevision);
+      expect(stillLiveAcceptance.state).toBe("visible");
+      const facts = modelJson(response);
+      expect(response.isError).toBe(true);
+      expect(facts.paths.available).toBe(false);
+      expect(facts.files).toBeNull();
+      expect(facts.manifest).toBeNull();
+      expect(facts.requirements).toBeNull();
+      expect(facts.acceptance?.acceptanceId ?? null).toBeNull();
+      expect(facts.integrity).toBeNull();
+      expect(textOf(response)).not.toContain(prepared.files[0]!.path);
+      expect(textOf(response)).not.toContain(task.acceptance!.acceptanceId);
+      expect(readFileSync(recordPath)).toEqual(recordBefore);
+      expect(lstatSync(recordPath).ino).toBe(inodeBefore);
+      expect(f.owner.snapshot().currentTask!.status).toBe("accepted");
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("submit projects a fresh current state after a late replacement owner", async () => {
+    const f = await fixture();
+    try {
+      const prepared = await prepareAccepted(f);
+      const service = acceptanceOf(f);
+      const actual = service.inspect.bind(service);
+      let replaced = false;
+      service.inspect = async (...args: Parameters<AcceptanceService["inspect"]>) => {
+        const result = await actual(...args);
+        if (result.acceptance !== null && !replaced) {
+          replaced = true;
+          publishTaskOwner(new TaskOwner({ workspaceRoot: f.workspace }));
+        }
+        return result;
+      };
+      const submitted = await submitTool(f, prepared.deliveryId);
+      expect(replaced).toBe(true);
+      const facts = modelJson(submitted);
+      expect(facts.operation.outcome).toBe("committed");
+      expect(facts.operation.operationCommitted).toBe(true);
+      expect(facts.acceptance.acceptanceId).toBe(f.owner.snapshot().currentTask!.acceptance!.acceptanceId);
+      expect(facts.taskAccepted).toBeNull();
+      expect(facts.currentTaskId).toBeNull();
+      expect(facts.currentTaskStatus).toBeNull();
+      expect(facts.visibility.state).not.toBe("visible");
+      expect(facts.files).toBeNull();
+      expect(facts.paths.available).toBe(false);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("authorized idempotent replay keeps the committed reference when inspection loses visibility", async () => {
+    const f = await fixture();
+    try {
+      const prepared = await prepareAccepted(f);
+      const first = modelJson(await submitTool(f, prepared.deliveryId));
+      expect(first.operation.outcome).toBe("committed");
+      const reference = f.owner.snapshot().currentTask!.acceptance!;
+      const delivery = f.entry.delivery!;
+      const original = delivery.inspectAcceptedDelivery.bind(delivery);
+      let navigated = false;
+      delivery.inspectAcceptedDelivery = async (...args) => {
+        const result = await original(...args);
+        if (!navigated) {
+          navigated = true;
+          f.owner.navigate("session_switch");
+        }
+        return result;
+      };
+      const replay = await submitTool(f, prepared.deliveryId);
+      expect(navigated).toBe(true);
+      const facts = modelJson(replay);
+      expect(facts.operation.outcome).toBe("committed");
+      expect(facts.operation.operationCommitted).toBe(true);
+      expect(facts.operation.idempotent).toBe(true);
+      expect(facts.operation.newCommit).toBe(false);
+      expect(facts.acceptance.historyCommitted).toBe(true);
+      expect(facts.acceptance.acceptanceId).toBe(reference.acceptanceId);
+      expect(facts.acceptance.recordDigest).toBe(reference.recordDigest);
+      expect(facts.taskAccepted).toBeNull();
+      expect(facts.currentTaskStatus).toBeNull();
+      expect(facts.visibility.state).not.toBe("visible");
+      expect(facts.paths.available).toBe(false);
+      expect(facts.files).toBeNull();
+
+      const unauthorized = await submitTool(f, prepared.deliveryId);
+      const denied = modelJson(unauthorized);
+      expect(denied.operation.outcome).toBe("not_committed");
+      expect(denied.operation.operationCommitted).toBe(false);
+      expect(denied.acceptance.acceptanceId).toBeNull();
+      expect(denied.acceptance.recordDigest).toBeNull();
+      expect(denied.paths.available).toBe(false);
+      expect(denied.files).toBeNull();
+      expect(textOf(unauthorized)).not.toContain(reference.acceptanceId);
+      expect(textOf(unauthorized)).not.toContain(reference.recordDigest);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("execution early rejections project visible acceptance and unknown honestly", async () => {
+    const accepted = await fixture();
+    try {
+      const prepared = await prepareAccepted(accepted);
+      expect(modelJson(await submitTool(accepted, prepared.deliveryId)).operation.operationCommitted).toBe(true);
+      const task = accepted.owner.snapshot().currentTask!;
+      const base = {
+        action: "run" as const,
+        runtime: "python" as const,
+        source: "print('must-not-run')\n",
+        inputIds: [] as string[],
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: task.taskRevision,
+      };
+      const malformed = await accepted.tools.get("agent_execute")!.execute(
+        "early-malformed",
+        { ...base, path: "authority-is-not-allowed" },
+        undefined,
+        undefined,
+        accepted.ctx,
+      );
+      expect(malformed.isError).toBe(true);
+      expect(malformed.details).toMatchObject({ taskAccepted: true, currentTaskStatus: "accepted" });
+      expect(textOf(malformed)).not.toContain("taskAccepted: false");
+
+      const controller = new AbortController();
+      controller.abort();
+      const aborted = await accepted.tools.get("agent_execute")!.execute(
+        "early-aborted",
+        base,
+        controller.signal,
+        undefined,
+        accepted.ctx,
+      );
+      expect(aborted.isError).toBe(true);
+      expect(aborted.details).toMatchObject({ taskAccepted: true, currentTaskStatus: "accepted" });
+      expect(textOf(aborted)).not.toContain("taskAccepted: false");
+
+      accepted.entry.dispose();
+      const disposed = await accepted.tools.get("agent_execute")!.execute(
+        "early-disposed",
+        base,
+        undefined,
+        undefined,
+        accepted.ctx,
+      );
+      expect(disposed.isError).toBe(true);
+      expect(disposed.details).toMatchObject({ taskAccepted: null, currentTaskStatus: null });
+      expect(textOf(disposed)).not.toContain("taskAccepted: false");
+    } finally {
+      await accepted.cleanup();
+    }
+
+    const unknown = await fixture();
+    try {
+      const task = unknown.owner.snapshot().currentTask!;
+      (unknown.owner as unknown as { acceptanceHazard: unknown }).acceptanceHazard = {
+        task: {
+          ownerId: task.ownerId,
+          taskId: task.taskId,
+          taskRevision: task.taskRevision,
+          requirementsDigest: requirementsDigest(task.requirementSources),
+        },
+        acceptanceId: "acceptance-unit-unknown",
+        deliveryId: "delivery-unit-unknown",
+        recordDigest: `sha256:${"a".repeat(64)}`,
+        reason: "unit unknown installation",
+      };
+      const response = await unknown.tools.get("agent_execute")!.execute(
+        "unknown-run",
+        {
+          action: "run",
+          runtime: "python",
+          source: "print('blocked')\n",
+          inputIds: [],
+          expectedTaskId: task.taskId,
+          expectedTaskRevision: task.taskRevision,
+        },
+        undefined,
+        undefined,
+        unknown.ctx,
+      );
+      expect(response.isError).toBe(true);
+      expect(response.details).toMatchObject({ taskAccepted: null, currentTaskStatus: "active" });
+      expect(textOf(response)).not.toContain("taskAccepted: false");
+    } finally {
+      await unknown.cleanup();
+    }
+
+    const shutdown = await fixture();
+    try {
+      const prepared = await prepareAccepted(shutdown);
+      expect(modelJson(await submitTool(shutdown, prepared.deliveryId)).operation.operationCommitted).toBe(true);
+      const handlers = shutdown.handlers.get("session_shutdown");
+      expect(handlers).toBeDefined();
+      await handlers!({});
+      const described = await shutdown.tools.get("agent_execute")!.execute(
+        "shutdown-describe",
+        { action: "describe" },
+        undefined,
+        undefined,
+        shutdown.ctx,
+      );
+      expect(described.isError).toBe(true);
+      expect(described.details).toMatchObject({ taskAccepted: null, currentTaskStatus: null });
+      expect(textOf(described)).not.toContain("taskAccepted: false");
+    } finally {
+      await shutdown.cleanup();
+    }
+  });
+
+  test("accepted paths round-trip exactly through JSON with format controls in the root", async () => {
+    const parent = await realpath(await mkdtemp(path.join(tmpdir(), "omp-agent-g2b2b2-bidi-")));
+    const deliveryRoot = path.join(parent, "del-\u202e-root");
+    mkdirSync(deliveryRoot, { mode: 0o700 });
+    const f = await fixture({ deliveryRoot });
+    try {
+      const prepared = await prepareAccepted(f);
+      const submitted = await submitTool(f, prepared.deliveryId);
+      const raw = textOf(submitted);
+      expect(raw).not.toContain("\u202e");
+      expect(raw).toContain("\\u202e");
+      const facts = modelJson(submitted);
+      expect(facts.paths.available).toBe(true);
+      expect(facts.files[0].path).toBe(prepared.files[0]!.path);
+      expect(facts.files[0].path).toContain("\u202e");
+      expect(facts.manifest.path.startsWith(f.deliveryRoot)).toBe(true);
+      expect(facts.manifest.path).toContain("\u202e");
+      expect(sha256(readFileSync(facts.files[0].path))).toBe(facts.files[0].sha256);
+      expect(sha256(readFileSync(facts.manifest.path))).toBe(facts.manifest.sha256);
+    } finally {
+      await f.cleanup();
+      await rm(parent, { recursive: true, force: true });
+    }
+  });
+});
 void chmodSync;
 void readFile;

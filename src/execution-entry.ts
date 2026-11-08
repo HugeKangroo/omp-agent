@@ -161,6 +161,14 @@ export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions)
   const owner = currentTaskOwner();
   if (!owner) throw new ExecutionAdapterError("The task owner must be loaded before the execution entry.");
   if (!path.isAbsolute(options.root)) throw new ExecutionAdapterError("Execution root must be absolute.");
+  if (options.acceptanceRoot !== undefined) {
+    if (options.deliveryRoot === undefined) {
+      throw new ExecutionAdapterError("acceptanceRoot requires an explicit deliveryRoot.");
+    }
+    if (!path.isAbsolute(options.acceptanceRoot)) {
+      throw new ExecutionAdapterError("acceptanceRoot must be an explicit absolute host path.");
+    }
+  }
   const audit = createFileAudit(options.auditPath);
   const adapter = new ExecutionAdapter(owner, {
     root: options.root,
@@ -191,8 +199,11 @@ export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions)
 
   // The fourth tool exists only on an explicit absolute host delivery root.
   // A misconfigured root fails closed: every already-created service is
-  // released and the already-registered handlers fail closed.
+  // released and the already-registered handlers fail closed. Acceptance is
+  // validated and constructed before the tool is registered so a failed
+  // opt-in cannot leave an operative delivery handler behind.
   let deliveryService: DeliveryService | undefined;
+  let acceptanceService: AcceptanceService | undefined;
   let deliveryEntry: DeliveryEntryControls | undefined;
   if (options.deliveryRoot !== undefined) {
     try {
@@ -205,34 +216,25 @@ export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions)
         deliveryRoot: options.deliveryRoot,
         executionRoot: options.root,
       });
-      deliveryEntry = createDeliveryEntry(pi, { owner, service: deliveryService });
-    } catch (error) {
-      deliveryEntry?.dispose();
-      verification.dispose();
-      adapter.dispose();
-      throw error;
-    }
-  }
-
-  let acceptanceService: AcceptanceService | undefined;
-  if (options.acceptanceRoot !== undefined) {
-    if (deliveryService === undefined) {
-      deliveryEntry?.dispose();
-      verification.dispose();
-      adapter.dispose();
-      throw new ExecutionAdapterError("acceptanceRoot requires an explicit deliveryRoot.");
-    }
-    try {
-      acceptanceService = new AcceptanceService({
+      if (options.acceptanceRoot !== undefined) {
+        acceptanceService = new AcceptanceService({
+          owner,
+          delivery: deliveryService,
+          activity: () => adapter.activitySnapshot(),
+          acceptanceRoot: options.acceptanceRoot,
+          executionRoot: options.root,
+        });
+      }
+      deliveryService.setAcceptanceConfigured(acceptanceService !== undefined);
+      deliveryEntry = createDeliveryEntry(pi, {
         owner,
-        delivery: deliveryService,
-        activity: () => adapter.activitySnapshot(),
-        acceptanceRoot: options.acceptanceRoot,
-        executionRoot: options.root,
+        service: deliveryService,
+        ...(acceptanceService === undefined ? {} : { acceptance: acceptanceService }),
       });
     } catch (error) {
       deliveryEntry?.dispose();
-      deliveryService.dispose();
+      acceptanceService?.dispose();
+      deliveryService?.dispose();
       verification.dispose();
       adapter.dispose();
       throw error;
@@ -251,7 +253,10 @@ export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions)
   const ownerStillCurrent = (): boolean => currentTaskOwner() === owner;
   const ownerChangedResult = (): ReturnType<typeof executionErrorResult> => {
     safeAudit(audit, { type: "execution_tool_rejected", error: "the published task owner changed" });
-    return executionErrorResult("the managed task owner changed; this entry can no longer act for the current task.");
+    return executionErrorResult(
+      "the managed task owner changed; this entry can no longer act for the current task.",
+      { taskAccepted: null, currentTaskStatus: null },
+    );
   };
 
   try {
@@ -263,13 +268,21 @@ export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions)
       approval: "exec",
       loadMode: "essential",
       async execute(_toolCallId, params, signal, _onUpdate, context) {
-        if (disposed) return executionErrorResult("the execution entry is disposed; no effect occurred.");
+        if (disposed) {
+          return executionErrorResult(
+            "the execution entry is disposed; no effect occurred.",
+            { taskAccepted: null, currentTaskStatus: null },
+          );
+        }
         if (!ownerStillCurrent()) return ownerChangedResult();
         try {
           const parsed = parseExecutionArguments(params);
           if (signal?.aborted) {
             safeAudit(audit, { type: "execution_tool_aborted", action: parsed.action });
-            return executionErrorResult("the call was aborted before the execution adapter acted; no effect occurred.");
+            return executionErrorResult(
+              "the call was aborted before the execution adapter acted; no effect occurred.",
+              adapter.visibleTerminalFacts(context),
+            );
           }
           safeAudit(audit, {
             type: "execution_tool_attempt",
@@ -285,7 +298,7 @@ export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions)
           return await adapter.run(context, parsed, signal);
         } catch (error) {
           safeAudit(audit, { type: "execution_tool_rejected", error: errorMessage(error) });
-          return executionErrorResult(errorMessage(error));
+          return executionErrorResult(errorMessage(error), adapter.visibleTerminalFacts(context));
         }
       },
     });
