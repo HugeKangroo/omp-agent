@@ -80,6 +80,10 @@ const WATCHDOG_CONTROL_MAX_LINE_BYTES = 4096;
 const WATCHDOG_CONTROL_MAX_TOTAL_BYTES = 64 * 1024;
 const WATCHDOG_CONTROL_MAX_EVENTS = 16;
 const WATCHDOG_SETTLE_MS = 2000;
+/** Bounded latch of dispatched runs whose external completion is unproven. */
+const MAX_UNRESOLVED_COMPLETIONS = 64;
+/** Per-run reason list stays small and stable. */
+const MAX_UNRESOLVED_REASONS = 8;
 // A terminal control message is a claim, not proof that the direct child
 // exited. Allow only a small bounded window for the OS 'exit' event to be
 // delivered before treating the watchdog loss as real.
@@ -297,6 +301,37 @@ interface ActiveRun {
   taskId: string;
   taskRevision: number;
   stop: (reason: StopReason) => void;
+}
+
+/** Frozen identity of the task the current reservation was taken for. */
+export interface ExecutionBusyTask {
+  taskId: string;
+  taskRevision: number;
+}
+
+/**
+ * A run that was actually dispatched but whose external completion could not
+ * be proven from trusted host facts. The identity is frozen at admission and
+ * is never relabeled from a later owner snapshot.
+ */
+export interface ExecutionUnresolvedCompletion {
+  runId: string;
+  taskId: string;
+  taskRevision: number;
+  reasonCodes: string[];
+}
+
+/** Read-only defensive copy of the adapter's observable activity. */
+export interface ExecutionActivitySnapshot {
+  ownerId: string;
+  capabilityId: string;
+  disposed: boolean;
+  busy: boolean;
+  busyTask: ExecutionBusyTask | null;
+  activeRunId: string | null;
+  unresolvedCompletions: ExecutionUnresolvedCompletion[];
+  /** Oldest completions dropped from the bounded latch, if any. */
+  unresolvedOmitted: number;
 }
 
 interface ArtifactRecord {
@@ -1022,6 +1057,37 @@ function copiedArtifact(item: ArtifactRecord): ArtifactRecord {
   };
 }
 
+/**
+ * Conservative completion classification from trusted process-control facts.
+ * `launchStage === "unknown"` is deliberately not a reason: it records the
+ * observation boundary for interpreter startup after an acknowledged handshake,
+ * not whether the external run ended.
+ */
+function unresolvedReasonCodes(outcome: DispatchOutcome): string[] {
+  if (!outcome.spawned) return [];
+  const reasons: string[] = [];
+  if (outcome.spawnError !== null) reasons.push("spawn_or_termination_error");
+  if (!outcome.groupGone) reasons.push("process_group_unconfirmed");
+  // A host-forced watchdog kill after the known PID and the script group are
+  // both verified gone is confirmed cleanup, not an unknown completion. Keep
+  // protocol/control reasons only when that settlement is not proven.
+  const hostKillSettled = outcome.watchdog.watchdogKilledByHost === true
+    && outcome.watchdog.pidGone === true
+    && outcome.groupGone;
+  if (!hostKillSettled) {
+    if (!outcome.watchdog.armed) {
+      reasons.push("watchdog_arm_unconfirmed");
+    } else {
+      if (outcome.watchdog.watchdogTerminated !== true) reasons.push("watchdog_exit_unconfirmed");
+      if (outcome.watchdog.controlError !== null) reasons.push("watchdog_control_unconfirmed");
+      if (outcome.watchdog.unexpectedControlEof) reasons.push("watchdog_control_eof");
+      if (!outcome.watchdog.controlEnded) reasons.push("watchdog_control_not_ended");
+    }
+  }
+  if (outcome.hostRecordError !== null) reasons.push("after_spawn_host_record_unconfirmed");
+  return reasons.slice(0, MAX_UNRESOLVED_REASONS);
+}
+
 function copiedWatchdog(item: WatchdogOutcome): WatchdogOutcome {
   return {
     ...item,
@@ -1391,14 +1457,19 @@ export class ExecutionAdapter {
   private readonly runtimes: Record<ExecutionRuntime, ExecutionRuntimeInfo>;
   private readonly candidateRegistry: CandidateRegistry;
   readonly candidates: CandidateReadPort;
+  private readonly ownerId: string;
   private readonly budgets = new Map<string, RunBudget>();
+  private readonly unresolved = new Map<string, ExecutionUnresolvedCompletion>();
+  private unresolvedOmitted = 0;
   private readonly unsubscribe: () => void;
   private active: ActiveRun | undefined;
+  private busyTask: ExecutionBusyTask | null = null;
   private busy = false;
   private disposed = false;
 
   constructor(owner: TaskOwner, config: ExecutionConfig) {
     this.owner = owner;
+    this.ownerId = owner.snapshot().ownerId;
     this.workspaceRoot = owner.workspaceRoot;
     const configuredRoot = absolute(config.root, "Execution root");
     this.root = existsSync(configuredRoot) ? realpathSync(configuredRoot) : configuredRoot;
@@ -1488,6 +1559,67 @@ export class ExecutionAdapter {
     if (this.active) this.active.stop("disposed");
     this.unsubscribe();
     safeAudit(this.audit, { type: "execution_adapter_disposed" });
+  }
+
+  /**
+   * Synchronous, defensive activity facts for host policy and delivery. It
+   * calls no host callback (no now/id/audit), exposes no controller/array and
+   * never uses the owner's current task to relabel an old reservation or run.
+   * Dispose and revision changes do not clear an unresolved completion.
+   */
+  activitySnapshot(): ExecutionActivitySnapshot {
+    return {
+      ownerId: this.ownerId,
+      capabilityId: this.capabilityId,
+      disposed: this.disposed,
+      busy: this.busy,
+      busyTask: this.busyTask === null ? null : { ...this.busyTask },
+      activeRunId: this.active?.runId ?? null,
+      unresolvedCompletions: [...this.unresolved.values()].map((item) => ({
+        runId: item.runId,
+        taskId: item.taskId,
+        taskRevision: item.taskRevision,
+        reasonCodes: [...item.reasonCodes],
+      })),
+      unresolvedOmitted: this.unresolvedOmitted,
+    };
+  }
+
+  /** Merge bounded reasons for one real dispatched run; identity never changes. */
+  private latchUnresolved(
+    runId: string,
+    taskId: string,
+    taskRevision: number,
+    reasons: readonly string[],
+  ): void {
+    if (reasons.length === 0) return;
+    const existing = this.unresolved.get(runId);
+    if (existing) {
+      const merged = new Set(existing.reasonCodes);
+      for (const reason of reasons) merged.add(reason);
+      existing.reasonCodes = [...merged].slice(0, MAX_UNRESOLVED_REASONS);
+      return;
+    }
+    if (this.unresolved.size >= MAX_UNRESOLVED_COMPLETIONS) {
+      const oldest = this.unresolved.keys().next();
+      if (oldest.done !== true) {
+        this.unresolved.delete(oldest.value);
+        this.unresolvedOmitted += 1;
+      }
+    }
+    this.unresolved.set(runId, {
+      runId,
+      taskId,
+      taskRevision,
+      reasonCodes: [...new Set(reasons)].slice(0, MAX_UNRESOLVED_REASONS),
+    });
+    safeAudit(this.audit, {
+      type: "execution_completion_unconfirmed",
+      runId,
+      taskId,
+      taskRevision,
+      reasons: [...new Set(reasons)].slice(0, MAX_UNRESOLVED_REASONS),
+    });
   }
 
   async describe(context: ExecutionToolContext): Promise<ExecutionToolResult> {
@@ -1679,12 +1811,20 @@ export class ExecutionAdapter {
       );
     }
     this.busy = true;
+    // Freeze the task identity from the actual task read at the same
+    // synchronous reservation point. No later owner snapshot may relabel it.
+    this.busyTask = { taskId: current.taskId, taskRevision: current.taskRevision };
     budget.reserved += 1;
     let attemptedDispatch = false;
     let recordPersisted = false;
     let finalAuditSent = false;
     let runId: string | undefined;
     let preparedRoot: string | undefined;
+    let dispatchTaskId: string | undefined;
+    let dispatchTaskRevision: number | undefined;
+    let possiblyDispatched = false;
+    let dispatchOutcomeClassified = false;
+    let finalHostRecordConfirmed = false;
     try {
       if (current.taskRevision !== args.expectedTaskRevision) {
         return errorResult(
@@ -1842,6 +1982,8 @@ export class ExecutionAdapter {
       budget.reserved -= 1;
       budget.attempted += 1;
       attemptedDispatch = true;
+      dispatchTaskId = decision.taskId;
+      dispatchTaskRevision = decision.taskRevision;
       let stop: (reason: StopReason) => void = () => undefined;
       const active: ActiveRun = {
         runId,
@@ -1850,6 +1992,7 @@ export class ExecutionAdapter {
         stop: (reason) => stop(reason),
       };
       this.active = active;
+      possiblyDispatched = true;
       let outcome: DispatchOutcome;
       try {
         outcome = await this.dispatch(
@@ -1869,6 +2012,14 @@ export class ExecutionAdapter {
       } finally {
         if (this.active === active) this.active = undefined;
       }
+      // Completion is classified only from actual process-control and host
+      // record facts. launchStage "unknown" after an ACK is not evidence that
+      // the external run is still unfinished. Outcome classification alone is
+      // not final host completion accounting: only a persisted completed
+      // record confirms that below.
+      dispatchOutcomeClassified = true;
+      possiblyDispatched = outcome.spawned;
+      this.latchUnresolved(runId, decision.taskId, decision.taskRevision, unresolvedReasonCodes(outcome));
 
       let artifacts: ArtifactRecord[] = [];
       let rejections: ArtifactRejection[] = [];
@@ -1946,9 +2097,17 @@ export class ExecutionAdapter {
       let finalRecordError: string | null = null;
       try {
         this.recordWriter(recordPath, record);
+        finalHostRecordConfirmed = true;
       } catch (error) {
         finalRecordError = `final host record write failed: ${errorMessage(error)}`;
         safeAudit(this.audit, { type: "execution_record_write_failed", runId, error: finalRecordError });
+        // A missing final record means the durable completion account is
+        // unproven only when an external process actually exists. A trusted
+        // known-no-spawn outcome keeps this as a host-record diagnostic and
+        // never creates an unresolved external run.
+        if (possiblyDispatched) {
+          this.latchUnresolved(runId, decision.taskId, decision.taskRevision, ["final_host_record_unconfirmed"]);
+        }
       }
       // Register actual archived candidates only after the trusted archive
       // path has completed. The frozen task/digest was captured at admission;
@@ -2188,6 +2347,23 @@ export class ExecutionAdapter {
         withheldReason: finalWithheldReason,
       });
     } catch (error) {
+      // A throw after a possible/actual dispatch but before the final completed
+      // host record leaves external completion unproven. Observed process
+      // cleanup alone is not final host completion accounting. Known no-spawn
+      // outcomes and earlier preparation/admission failures never latch.
+      if (attemptedDispatch
+        && possiblyDispatched
+        && runId !== undefined
+        && dispatchTaskId !== undefined
+        && dispatchTaskRevision !== undefined
+        && !finalHostRecordConfirmed) {
+        this.latchUnresolved(
+          runId,
+          dispatchTaskId,
+          dispatchTaskRevision,
+          [dispatchOutcomeClassified ? "final_host_record_unconfirmed" : "dispatch_outcome_unconfirmed"],
+        );
+      }
       if (!finalAuditSent) {
         safeAudit(this.audit, {
           type: "execution_failed",
@@ -2198,15 +2374,30 @@ export class ExecutionAdapter {
       }
       return errorResult(errorMessage(error));
     } finally {
-      if (!attemptedDispatch) {
-        budget.reserved = Math.max(0, budget.reserved - 1);
-        if (preparedRoot && !recordPersisted) {
-          // No untrusted process ever existed and no host run record was
-          // committed; remove the explicitly owned staging tree.
-          await rm(preparedRoot, { recursive: true, force: true });
+      // Bookkeeping release is unconditional: a rejected staging cleanup must
+      // never leave the adapter falsely busy or retain a stale busy task.
+      try {
+        if (!attemptedDispatch) {
+          budget.reserved = Math.max(0, budget.reserved - 1);
+          if (preparedRoot && !recordPersisted) {
+            // No untrusted process ever existed and no host run record was
+            // committed; remove the explicitly owned staging tree.
+            try {
+              await rm(preparedRoot, { recursive: true, force: true });
+            } catch (error) {
+              safeAudit(this.audit, {
+                type: "execution_staging_cleanup_failed",
+                runId: runId ?? null,
+                root: preparedRoot,
+                error: errorMessage(error),
+              });
+            }
+          }
         }
+      } finally {
+        this.busy = false;
+        this.busyTask = null;
       }
-      this.busy = false;
     }
   }
 

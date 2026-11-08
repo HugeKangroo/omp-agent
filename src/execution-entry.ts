@@ -10,7 +10,13 @@ import {
   type ExecutionInputConfig,
 } from "./execution-adapter.ts";
 import { currentTaskOwner, type OmpToolContext } from "./task-entry-port.ts";
-import { createVerificationEntry, type VerificationHostControls } from "./verification-entry.ts";
+import { createDeliveryEntry, type DeliveryEntryControls } from "./delivery-entry.ts";
+import { DeliveryService } from "./delivery-service.ts";
+import {
+  createVerificationEntry,
+  type VerificationCurrentContract,
+  type VerificationHostControls,
+} from "./verification-entry.ts";
 import type { VerificationLookup } from "./verification-service.ts";
 import type { TrustedVerifier } from "./verification-service.ts";
 
@@ -41,7 +47,7 @@ interface OmpApi {
   registerTool(tool: OmpTool): void;
 }
 
-export const EXECUTION_ENTRY_VERSION = "0.1.0-g2b1b.0";
+export const EXECUTION_ENTRY_VERSION = "0.1.0-g2b2a.0";
 
 const EXECUTION_PARAMETERS = {
   type: "object",
@@ -122,12 +128,20 @@ export interface ExecutionEntryOptions {
   terminationGraceMs?: number;
   /** Host-only trusted verifier implementations; never model-selectable. */
   trustedVerifiers?: readonly TrustedVerifier[];
+  /**
+   * Explicit absolute host delivery root. When absent, no delivery tool is
+   * registered and no delivery files can be created.
+   */
+  deliveryRoot?: string;
 }
 
 export interface ExecutionEntryControls {
   adapter: ExecutionAdapter;
   bindContract(context: OmpToolContext, spec: TrustedContractSpec): AcceptanceContract;
   lookup(context: OmpToolContext, receiptId: string): Promise<VerificationLookup | null>;
+  currentContract(context: OmpToolContext): VerificationCurrentContract;
+  /** Present only when the host explicitly configured a delivery root. */
+  delivery?: DeliveryService;
   dispose(): void;
 }
 
@@ -167,9 +181,36 @@ export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions)
     throw error;
   }
 
+  // The fourth tool exists only on an explicit absolute host delivery root.
+  // A misconfigured root fails closed: every already-created service is
+  // released and the already-registered handlers fail closed.
+  let deliveryService: DeliveryService | undefined;
+  let deliveryEntry: DeliveryEntryControls | undefined;
+  if (options.deliveryRoot !== undefined) {
+    try {
+      deliveryService = new DeliveryService({
+        owner,
+        candidates: adapter.candidates,
+        activity: () => adapter.activitySnapshot(),
+        currentContract: verification.currentContract,
+        lookup: verification.lookup,
+        deliveryRoot: options.deliveryRoot,
+        executionRoot: options.root,
+      });
+      deliveryEntry = createDeliveryEntry(pi, { owner, service: deliveryService });
+    } catch (error) {
+      deliveryEntry?.dispose();
+      deliveryService?.dispose();
+      verification.dispose();
+      adapter.dispose();
+      throw error;
+    }
+  }
+
   const dispose = (): void => {
     if (disposed) return;
     disposed = true;
+    deliveryEntry?.dispose();
     verification.dispose();
     adapter.dispose();
   };
@@ -234,6 +275,8 @@ export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions)
     adapter,
     bindContract: verification.bindContract,
     lookup: verification.lookup,
+    currentContract: verification.currentContract,
+    ...(deliveryService === undefined ? {} : { delivery: deliveryService }),
     dispose,
   };
 }
@@ -306,6 +349,9 @@ export default function g2a1ExecutionEntry(pi: OmpApi): void {
         ? {}
         : { launcherPath: optionalEnv("OMP_AGENT_EXECUTION_LAUNCHER")! }),
       ...(dispatchWallMs === undefined ? {} : { dispatchWallMs }),
+      ...(optionalEnv("OMP_AGENT_DELIVERY_ROOT") === undefined
+        ? {}
+        : { deliveryRoot: optionalEnv("OMP_AGENT_DELIVERY_ROOT")! }),
     });
   } catch (error) {
     stderr("entry_disabled", { reason: errorMessage(error) });

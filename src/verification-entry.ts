@@ -51,6 +51,11 @@ export class VerificationEntryError extends Error {
   override name = "VerificationEntryError";
 }
 
+/** The entry's one live context slot is owned by another verification/host call. */
+export class VerificationGateBusyError extends VerificationEntryError {
+  override name = "VerificationGateBusyError";
+}
+
 export interface VerificationTool {
   name: string;
   label: string;
@@ -85,9 +90,23 @@ export interface VerificationEntryOptions {
   id?: () => string;
 }
 
+export interface VerificationCurrentContract {
+  /** Frozen identity read from this call's actual live context. */
+  task: FrozenTaskRef;
+  /** Current bound contract for that exact identity, or a valid null. */
+  contract: AcceptanceContract | null;
+}
+
 export interface VerificationHostControls {
   bindContract(context: OmpToolContext, spec: TrustedContractSpec): AcceptanceContract;
   lookup(context: OmpToolContext, receiptId: string): Promise<VerificationLookup | null>;
+  /**
+   * Read-only current contract port. It binds nothing, runs no verifier,
+   * spends no attempts and does not reuse a prior call context. A legitimate
+   * revision reads the new identity and its contract/null; stale selectors are
+   * rejected by the caller (preview/recheck), not by this read port.
+   */
+  currentContract(context: OmpToolContext): VerificationCurrentContract;
   dispose(): void;
 }
 
@@ -447,6 +466,32 @@ export function createVerificationEntry(pi: VerificationApi, options: Verificati
     };
   }
 
+  function currentContract(context: OmpToolContext): VerificationCurrentContract {
+    if (disposed) throw new VerificationEntryError("The verification entry is disposed.");
+    if (!acquire(context)) {
+      throw new VerificationGateBusyError(
+        "Another verification or host lookup owns the live context; the current contract read was rejected without queueing.",
+      );
+    }
+    try {
+      const reason = readReason(context);
+      if (reason !== null) throw new VerificationEntryError(`Contract read was rejected: ${reason}.`);
+      const task = readTask(context, true);
+      if (task === null) {
+        throw new VerificationEntryError("Contract read was rejected: the current task is not reachable and active.");
+      }
+      // Read the identity and contract from this call's actual live context;
+      // never reuse a prior call's task or fall back to owner.snapshot().
+      const taskRef = frozenOf(task);
+      const contract = store.contractFor(taskRef);
+      const guard = finalGuard(context, taskRef);
+      if (guard !== null) throw new VerificationEntryError(`Contract read was withheld: ${guard}.`);
+      return { task: taskRef, contract };
+    } finally {
+      release(context);
+    }
+  }
+
   function bindContract(context: OmpToolContext, spec: TrustedContractSpec): AcceptanceContract {
     if (disposed) throw new VerificationEntryError("The verification entry is disposed.");
     if (!acquire(context)) {
@@ -470,7 +515,7 @@ export function createVerificationEntry(pi: VerificationApi, options: Verificati
   async function lookup(context: OmpToolContext, receiptId: string): Promise<VerificationLookup | null> {
     if (disposed) throw new VerificationEntryError("The verification entry is disposed.");
     if (!acquire(context)) {
-      throw new VerificationEntryError("Another verification or host lookup owns the live context; lookup was rejected without queueing.");
+      throw new VerificationGateBusyError("Another verification or host lookup owns the live context; lookup was rejected without queueing.");
     }
     try {
       const reason = readReason(context);
@@ -597,5 +642,5 @@ export function createVerificationEntry(pi: VerificationApi, options: Verificati
     service.dispose();
   };
 
-  return { bindContract, lookup, dispose };
+  return { bindContract, lookup, currentContract, dispose };
 }
