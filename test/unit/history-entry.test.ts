@@ -75,11 +75,23 @@ describe("B2a history tool transport", () => {
       required: ["action"],
     });
     const properties = tool.parameters.properties as Record<string, Record<string, unknown>>;
-    expect(properties.action).toMatchObject({ type: "string", enum: ["list", "inspect"] });
+    expect(properties.action).toMatchObject({
+      type: "string",
+      enum: ["list", "inspect", "list_runs", "inspect_run"],
+    });
     expect(properties.limit).toMatchObject({ type: "integer", minimum: 1, maximum: 16 });
     expect(properties.cursor).toMatchObject({ type: "string" });
     expect(properties.selector).toMatchObject({ type: "string" });
-    expect(Object.keys(properties).sort()).toEqual(["action", "cursor", "limit", "selector"]);
+    expect(properties.taskSelector).toMatchObject({ type: "string" });
+    expect(properties.runSelector).toMatchObject({ type: "string" });
+    expect(Object.keys(properties).sort()).toEqual([
+      "action",
+      "cursor",
+      "limit",
+      "runSelector",
+      "selector",
+      "taskSelector",
+    ]);
   });
 
   test("accepts omitted optional metadata with defaults and rejects every extra authority field", () => {
@@ -106,6 +118,31 @@ describe("B2a history tool transport", () => {
       ok: true,
       action: "inspect",
       selector,
+    });
+    const runSelector = `hrun_${"c".repeat(32)}`;
+    const runCursor = `hrcur_${"d".repeat(32)}`;
+    expect(parseHistoryArguments({ action: "list_runs", taskSelector: selector })).toEqual({
+      ok: true,
+      action: "list_runs",
+      taskSelector: selector,
+      limit: 16,
+    });
+    expect(parseHistoryArguments({
+      action: "list_runs",
+      taskSelector: selector,
+      limit: 3,
+      cursor: runCursor,
+    })).toEqual({
+      ok: true,
+      action: "list_runs",
+      taskSelector: selector,
+      limit: 3,
+      cursor: runCursor,
+    });
+    expect(parseHistoryArguments({ action: "inspect_run", runSelector })).toEqual({
+      ok: true,
+      action: "inspect_run",
+      runSelector,
     });
 
     const rejected: unknown[] = [
@@ -134,6 +171,22 @@ describe("B2a history tool transport", () => {
       { action: "inspect", selector, limit: 1 },
       { action: "inspect", selector, cursor },
       { action: "inspect", selector, path: "/tmp/x" },
+      { action: "inspect", selector: runSelector },
+      { action: "inspect", runSelector },
+      { action: "list_runs" },
+      { action: "list_runs", taskSelector: selector, selector },
+      { action: "list_runs", taskSelector: selector, runSelector },
+      { action: "list_runs", taskSelector: runSelector },
+      { action: "list_runs", taskSelector: selector, path: "/tmp/x" },
+      { action: "list_runs", taskSelector: selector, cursor },
+      { action: "list_runs", taskSelector: selector, limit: 17 },
+      { action: "inspect_run" },
+      { action: "inspect_run", runSelector: "hrun_short" },
+      { action: "inspect_run", runSelector: selector },
+      { action: "inspect_run", runSelector, selector },
+      { action: "inspect_run", runSelector, taskSelector: selector },
+      { action: "inspect_run", runSelector, artifactIds: ["artifact-1"] },
+      { action: "inspect_run", runSelector, runId: "run-1" },
     ];
     for (const value of rejected) expect(parseHistoryArguments(value).ok).toBe(false);
     expect(HISTORY_PARAMETERS.additionalProperties).toBe(false);
@@ -178,6 +231,33 @@ describe("B2a history tool transport", () => {
       registerFailureContext(),
     );
     expect(errorOf(missingSelector)).toMatchObject({ action: "inspect", error: "invalid_arguments" });
+
+    const listRuns = await tool.execute(
+      "call-list-runs",
+      { action: "list_runs", taskSelector: `hsel_${"a".repeat(32)}` },
+      undefined,
+      undefined,
+      registerFailureContext(),
+    );
+    expect(errorOf(listRuns)).toMatchObject({ action: "list_runs", error: "session_unavailable" });
+
+    const inspectRun = await tool.execute(
+      "call-inspect-run",
+      { action: "inspect_run", runSelector: `hrun_${"b".repeat(32)}` },
+      undefined,
+      undefined,
+      registerFailureContext(),
+    );
+    expect(errorOf(inspectRun)).toMatchObject({ action: "inspect_run", error: "session_unavailable" });
+
+    const mixed = await tool.execute(
+      "call-mixed",
+      { action: "inspect_run", selector: `hsel_${"a".repeat(32)}` },
+      undefined,
+      undefined,
+      registerFailureContext(),
+    );
+    expect(errorOf(mixed)).toMatchObject({ action: "inspect_run", error: "invalid_arguments" });
   });
 
   test("aborted invocation is refused without reading the host context", async () => {
@@ -222,6 +302,20 @@ describe("B2a history tool transport", () => {
       false,
     );
     expect(errorOf(multibyte).error).toBe("too_large");
+
+    for (const action of ["list_runs", "inspect_run"] as const) {
+      const runOversized = formatHistoryResult(
+        action,
+        { schemaVersion: "agent-history-view-v1", action, facts: "x".repeat(300 * 1024) },
+        false,
+      );
+      expect(errorOf(runOversized)).toEqual({
+        schemaVersion: "agent-history-view-v1",
+        action,
+        error: "too_large",
+      });
+      expect(runOversized.content[0]!.text.length).toBeLessThan(1024);
+    }
   });
 
   test("dispose clears the registered view status", () => {

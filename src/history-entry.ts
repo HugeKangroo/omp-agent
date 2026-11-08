@@ -6,6 +6,8 @@ import type { OmpToolContext } from "./task-entry-port.ts";
 import {
   createHistoryView,
   HISTORY_CURSOR_PATTERN,
+  HISTORY_RUN_CURSOR_PATTERN,
+  HISTORY_RUN_SELECTOR_PATTERN,
   HISTORY_SELECTOR_PATTERN,
   HISTORY_QUERY_PAGE_LIMIT,
   HISTORY_VIEW_SCHEMA_VERSION,
@@ -13,6 +15,7 @@ import {
   type HistoryViewErrorCode,
   type HistoryViewOptions,
   type HistoryWithheldReason,
+  type HistoryRunWithheldReason,
 } from "./history-view.ts";
 
 /**
@@ -27,14 +30,16 @@ export const HISTORY_TOOL = "agent_history" as const;
 
 const LIST_KEYS = ["action", "limit", "cursor"] as const;
 const INSPECT_KEYS = ["action", "selector"] as const;
+const LIST_RUNS_KEYS = ["action", "taskSelector", "limit", "cursor"] as const;
+const INSPECT_RUN_KEYS = ["action", "runSelector"] as const;
 
 export const HISTORY_PARAMETERS = {
   type: "object",
   properties: {
     action: {
       type: "string",
-      enum: ["list", "inspect"],
-      description: "Read-only action. list returns bounded recorded summaries and opaque selectors; inspect returns one complete recorded item.",
+      enum: ["list", "inspect", "list_runs", "inspect_run"],
+      description: "Read-only action. list/inspect return recorded task history; list_runs returns bounded run associations for one host-issued task selector; inspect_run returns archived run evidence through one host-issued run selector.",
     },
     limit: {
       type: "integer",
@@ -44,11 +49,19 @@ export const HISTORY_PARAMETERS = {
     },
     cursor: {
       type: "string",
-      description: "Opaque cursor returned by a previous list. Do not construct or reuse it after the locator set changes.",
+      description: "Opaque cursor returned by a previous list or list_runs. Do not construct or reuse it after the locator set changes.",
     },
     selector: {
       type: "string",
-      description: "Opaque selector returned by list. It is a lookup key, never authority, and cannot name a path, root, instance, session, task or revision.",
+      description: "Opaque task selector returned by list. It is a lookup key, never authority, and cannot name a path, root, instance, session, task or revision.",
+    },
+    taskSelector: {
+      type: "string",
+      description: "Existing opaque task selector returned by list. Required by list_runs; it cannot name a path, root, instance, task or revision.",
+    },
+    runSelector: {
+      type: "string",
+      description: "Opaque run selector returned by list_runs. It is a distinct lookup key namespace, never authority, and cannot name a path, root, instance, task, run or artifact.",
     },
   },
   required: ["action"],
@@ -88,10 +101,14 @@ export interface HistoryEntryControls {
   status(): HistoryQueryStatus;
 }
 
+type HistoryAction = "list" | "inspect" | "list_runs" | "inspect_run" | "invalid";
+
 type ParsedArguments =
   | { ok: true; action: "list"; limit: number; cursor?: string }
   | { ok: true; action: "inspect"; selector: string }
-  | { ok: false; action: "list" | "inspect" | "invalid" };
+  | { ok: true; action: "list_runs"; taskSelector: string; limit: number; cursor?: string }
+  | { ok: true; action: "inspect_run"; runSelector: string }
+  | { ok: false; action: HistoryAction };
 
 function plainObject(value: unknown): Record<string, unknown> | null {
   return typeof value === "object" && value !== null && !Array.isArray(value)
@@ -139,13 +156,50 @@ export function parseHistoryArguments(params: unknown): ParsedArguments {
     }
     return { ok: true, action: "inspect", selector };
   }
+  if (action === "list_runs") {
+    if (!onlyAllowedKeys(record, LIST_RUNS_KEYS) || !Object.hasOwn(record, "taskSelector")) {
+      return { ok: false, action: "list_runs" };
+    }
+    const taskSelector = record.taskSelector;
+    if (typeof taskSelector !== "string" || !HISTORY_SELECTOR_PATTERN.test(taskSelector)) {
+      return { ok: false, action: "list_runs" };
+    }
+    const limit = record.limit;
+    if (limit !== undefined
+      && (typeof limit !== "number" || !Number.isSafeInteger(limit)
+        || limit < 1 || limit > HISTORY_QUERY_PAGE_LIMIT)) {
+      return { ok: false, action: "list_runs" };
+    }
+    const cursor = record.cursor;
+    if (cursor !== undefined
+      && (typeof cursor !== "string" || !HISTORY_RUN_CURSOR_PATTERN.test(cursor))) {
+      return { ok: false, action: "list_runs" };
+    }
+    return {
+      ok: true,
+      action: "list_runs",
+      taskSelector,
+      limit: limit === undefined ? HISTORY_QUERY_PAGE_LIMIT : limit,
+      ...(cursor === undefined ? {} : { cursor }),
+    };
+  }
+  if (action === "inspect_run") {
+    if (!onlyAllowedKeys(record, INSPECT_RUN_KEYS) || !Object.hasOwn(record, "runSelector")) {
+      return { ok: false, action: "inspect_run" };
+    }
+    const runSelector = record.runSelector;
+    if (typeof runSelector !== "string" || !HISTORY_RUN_SELECTOR_PATTERN.test(runSelector)) {
+      return { ok: false, action: "inspect_run" };
+    }
+    return { ok: true, action: "inspect_run", runSelector };
+  }
   return { ok: false, action: "invalid" };
 }
 
 function errorPayload(
-  action: "list" | "inspect" | "invalid",
+  action: HistoryAction,
   error: HistoryViewErrorCode,
-  reason?: HistoryWithheldReason,
+  reason?: HistoryWithheldReason | HistoryRunWithheldReason,
 ): Record<string, unknown> {
   return {
     schemaVersion: HISTORY_VIEW_SCHEMA_VERSION,
@@ -157,7 +211,7 @@ function errorPayload(
 
 /** One versioned JSON content payload; the complete envelope is size checked. */
 export function formatHistoryResult(
-  action: "list" | "inspect" | "invalid",
+  action: HistoryAction,
   payload: unknown,
   isError: boolean,
 ): HistoryToolResult {
@@ -184,12 +238,12 @@ export function createHistoryEntry(
   const tool: HistoryTool = {
     name: HISTORY_TOOL,
     label: "Recorded task history",
-    description: "Read bounded local historical task records on this exact session branch. Only the actual main agent in the active daily composition may use it. list returns recorded status summaries and opaque host selectors; inspect returns one complete recorded item. Both are read-only local records: they do not restore authority, prove acceptance evidence, associate runs, or change the current task. Selectors and cursors cannot name paths, roots, instances, owners, tasks, revisions, sessions or permissions.",
+    description: "Read bounded local historical task records on this exact session branch. Only the actual main agent in the active daily composition may use it. list returns recorded status summaries and opaque host selectors; inspect returns one complete recorded item; list_runs returns bounded archived-run associations for one host-issued task selector; inspect_run re-reads one selected archived run and its exact selected artifact set through local record facts only. All actions are read-only local records: they do not restore authority, prove acceptance evidence, prove a live process, or change the current task. Selectors and cursors cannot name paths, roots, instances, owners, tasks, runs, artifacts, revisions, sessions or permissions.",
     parameters: HISTORY_PARAMETERS,
     approval: "read",
     loadMode: "essential",
     async execute(_toolCallId, params, signal, _onUpdate, context) {
-      let action: "list" | "inspect" | "invalid" = "invalid";
+      let action: HistoryAction = "invalid";
       try {
         const parsed = parseHistoryArguments(params);
         action = parsed.action;
@@ -210,6 +264,36 @@ export function createHistoryEntry(
           );
           if (!outcome.ok) {
             return formatHistoryResult(parsed.action, errorPayload(parsed.action, outcome.code), true);
+          }
+          return formatHistoryResult(parsed.action, outcome.view, false);
+        }
+        if (parsed.action === "list_runs") {
+          const outcome = view.listRuns(
+            context,
+            {
+              taskSelector: parsed.taskSelector,
+              limit: parsed.limit,
+              ...(parsed.cursor === undefined ? {} : { cursor: parsed.cursor }),
+            },
+            signal,
+          );
+          if (!outcome.ok) {
+            return formatHistoryResult(
+              parsed.action,
+              errorPayload(parsed.action, outcome.code, outcome.reason),
+              true,
+            );
+          }
+          return formatHistoryResult(parsed.action, outcome.view, false);
+        }
+        if (parsed.action === "inspect_run") {
+          const outcome = view.inspectRun(context, parsed.runSelector, signal);
+          if (!outcome.ok) {
+            return formatHistoryResult(
+              parsed.action,
+              errorPayload(parsed.action, outcome.code, outcome.reason),
+              true,
+            );
           }
           return formatHistoryResult(parsed.action, outcome.view, false);
         }

@@ -12,9 +12,20 @@ import {
   HISTORY_LOCATOR_CUSTOM_TYPE,
   HISTORY_LOCATOR_DATA_BYTES_LIMIT,
   HISTORY_LOCATOR_VERSION,
+  HISTORY_RUN_ARTIFACT_LIMIT,
+  HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+  HISTORY_RUN_LOCATOR_DATA_BYTES_LIMIT,
+  HISTORY_RUN_LOCATOR_VERSION,
   HISTORY_SESSION_BRANCH_ENTRY_LIMIT,
   type HistoryLocatorData,
+  type HistoryRunLocatorData,
 } from "./history-session.ts";
+import {
+  checkRunEvidence,
+  RUN_RECORD_FILE_NAME,
+  type HistoryItemReference,
+  type RunEvidenceResult,
+} from "./history-evidence.ts";
 import { genuineUserText, parseBranch, type BranchEntry } from "./task-branch.ts";
 import {
   canonicalWorkspaceRoot,
@@ -46,9 +57,21 @@ export const HISTORY_QUERY_READ_BUDGET_BYTES = HISTORY_FILE_BYTES_LIMIT * HISTOR
 
 export const HISTORY_CURSOR_PATTERN = /^hcur_[0-9a-f]{32}$/;
 export const HISTORY_SELECTOR_PATTERN = /^hsel_[0-9a-f]{32}$/;
+/** Run selectors and cursors use namespaces distinct from task selectors. */
+export const HISTORY_RUN_SELECTOR_PATTERN = /^hrun_[0-9a-f]{32}$/;
+export const HISTORY_RUN_CURSOR_PATTERN = /^hrcur_[0-9a-f]{32}$/;
+/** Complete selected-branch run-locator occurrence bound. */
+export const HISTORY_QUERY_RUN_CANDIDATE_LIMIT = 128 as const;
+/**
+ * Conservative precharge for one inspect_run, not measured IO. It exceeds the
+ * derived worst case: 3 task reads + two record/source/input/artifact scans.
+ */
+export const HISTORY_RUN_EVIDENCE_PRECHARGE_BYTES = 12 * 1024 * 1024;
 
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 const SAFE_INSTANCE_COMPONENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const SAFE_RUN_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const BOUNDED_RUN_IDENTITY = /^[A-Za-z0-9][A-Za-z0-9:._-]{0,255}$/;
 const NATIVE_ABORTED_GETTER = Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get;
 
 /**
@@ -85,6 +108,24 @@ const SOURCE_LEDGER_KEYS = [
   "observedAt",
   "committedAt",
   "previousRevision",
+] as const;
+const RUN_LOCATOR_KEYS = [
+  "version",
+  "instanceId",
+  "ownerId",
+  "historyId",
+  "digest",
+  "taskId",
+  "taskRevision",
+  "requirementsDigest",
+  "originSessionId",
+  "runId",
+  "callId",
+  "runDirectory",
+  "artifactIds",
+  "recordWriteReturned",
+  "byteIntegrity",
+  "authorityRestored",
 ] as const;
 
 export type HistoryViewErrorCode =
@@ -127,6 +168,31 @@ export type HistoryWithheldReason =
   | "session_mismatch"
   | "source_mismatch";
 
+export type HistoryRunWithheldReason =
+  | "run_conflict"
+  | "run_locator_invalid"
+  | "run_locator_unsupported"
+  | "run_session_mismatch"
+  | "run_source_mismatch"
+  | "run_task_inactive"
+  | "run_task_locator_conflict"
+  | "run_task_locator_missing"
+  | "run_task_mismatch"
+  | "run_task_order";
+
+const RUN_WITHHELD_REASONS: readonly HistoryRunWithheldReason[] = [
+  "run_conflict",
+  "run_locator_invalid",
+  "run_locator_unsupported",
+  "run_session_mismatch",
+  "run_source_mismatch",
+  "run_task_inactive",
+  "run_task_locator_conflict",
+  "run_task_locator_missing",
+  "run_task_mismatch",
+  "run_task_order",
+];
+
 const WITHHELD_REASONS: readonly HistoryWithheldReason[] = [
   "budget_exhausted",
   "history_changed",
@@ -166,7 +232,7 @@ export interface HistoryViewEvidence {
   bridge: {
     selectedBranch: "checked";
     requirementLedger: "checked";
-    runEvidence: "not_checked";
+    runEvidence: "checked" | "not_checked";
   };
 }
 
@@ -223,6 +289,105 @@ export interface HistoryInspectView {
   evidence: HistoryViewEvidence;
 }
 
+export interface HistoryRunAssociation {
+  historyId: string;
+  digest: string;
+  taskId: string;
+  taskRevision: number;
+  requirementsDigest: string;
+  runId: string;
+  callId: string;
+  runDirectory: string;
+  artifactIds: string[];
+  recordWriteReturned: true;
+  byteIntegrity: "not_checked";
+  authorityRestored: false;
+}
+
+export interface HistoryRunListSummary extends HistoryRunAssociation {
+  selector: string;
+}
+
+export interface HistoryRunListCoverage {
+  candidates: number;
+  evaluated: number;
+  inspected: number;
+  returned: number;
+  withheld: number;
+  duplicatesCollapsed: number;
+  more: boolean;
+  withheldReasons: Readonly<Record<HistoryRunWithheldReason, number>>;
+}
+
+export interface HistoryRunListBudgetView extends HistoryQueryBudgetView {}
+
+export interface HistoryRunInspectBudgetView {
+  taskInspections: number;
+  runEvidenceCalls: number;
+  /** Conservative whole-action precharge, not measured IO. */
+  prechargedBytes: number;
+  precharge: "conservative_not_measured";
+  bytesLimit: number;
+}
+
+export interface HistoryRunListView {
+  schemaVersion: typeof HISTORY_VIEW_SCHEMA_VERSION;
+  action: "list_runs";
+  scope: "selected_branch";
+  result: "visible_runs" | "no_visible_runs";
+  items: HistoryRunListSummary[];
+  nextCursor: string | null;
+  coverage: HistoryRunListCoverage;
+  budget: HistoryRunListBudgetView;
+  evidence: HistoryViewEvidence;
+}
+
+export interface HistoryRunVerification {
+  instance: "exact" | "mismatch";
+  history: "exact" | "mismatch";
+  run: "exact" | "mismatch";
+  metadata: RunEvidenceResult["metadata"]["state"];
+  /** Exact set equality, not only A.selection.allPresent. */
+  artifactSet: "exact" | "mismatch";
+}
+
+export interface HistoryRunInspectView {
+  schemaVersion: typeof HISTORY_VIEW_SCHEMA_VERSION;
+  action: "inspect_run";
+  scope: "selected_branch";
+  /** Association-level failure state; A's own state remains in runEvidence. */
+  state: RunEvidenceResult["state"];
+  /** Archived facts, never a success or current-process claim. */
+  result: "archived_run_evidence" | "withheld_archived_run_evidence";
+  association: HistoryRunAssociation;
+  verification: HistoryRunVerification;
+  runEvidence: RunEvidenceResult;
+  budget: HistoryRunInspectBudgetView;
+  evidence: HistoryViewEvidence;
+}
+
+export interface HistoryRunListRequest {
+  taskSelector: string;
+  limit?: number;
+  cursor?: string;
+}
+
+export type HistoryRunListOutcome =
+  | { ok: true; view: HistoryRunListView }
+  | {
+    ok: false;
+    code: HistoryViewErrorCode;
+    reason?: HistoryWithheldReason | HistoryRunWithheldReason;
+  };
+
+export type HistoryRunInspectOutcome =
+  | { ok: true; view: HistoryRunInspectView }
+  | {
+    ok: false;
+    code: HistoryViewErrorCode;
+    reason?: HistoryWithheldReason | HistoryRunWithheldReason;
+  };
+
 export interface HistoryListRequest {
   limit: number;
   cursor?: string;
@@ -264,6 +429,16 @@ export interface HistoryViewControls {
     selector: string,
     signal?: AbortSignal,
   ): HistoryInspectOutcome;
+  listRuns(
+    context: OmpToolContext,
+    request: HistoryRunListRequest,
+    signal?: AbortSignal,
+  ): HistoryRunListOutcome;
+  inspectRun(
+    context: OmpToolContext,
+    runSelector: string,
+    signal?: AbortSignal,
+  ): HistoryRunInspectOutcome;
   navigate(event: string): void;
   dispose(): void;
   status(): HistoryQueryStatus;
@@ -289,6 +464,57 @@ interface CandidateOccurrence {
 interface CandidateCollection {
   occurrences: CandidateOccurrence[];
   signature: string;
+}
+
+interface RunOccurrence {
+  entryId: string;
+  entryIndex: number;
+  data: HistoryRunLocatorData | null;
+  key: string | null;
+  runKey: string | null;
+  claimedHistoryId: string | null;
+  preReason: HistoryRunWithheldReason | null;
+}
+
+interface RunCollection {
+  occurrences: RunOccurrence[];
+  signature: string;
+}
+
+interface IssuedRunSelector {
+  entryId: string;
+  key: string;
+  runKey: string;
+  taskSelector: string;
+  taskEntryId: string;
+  taskKey: string;
+  signature: string;
+  manager: OmpSessionManager;
+}
+
+interface RunCursorEntry {
+  position: number;
+  taskEntryId: string;
+  taskKey: string;
+  signature: string;
+  manager: OmpSessionManager;
+}
+
+interface RunListingState {
+  primaryByKey: Map<string, string>;
+  cursors: Map<string, RunCursorEntry>;
+}
+
+interface RunSeal {
+  collection: RunCollection;
+  taskOccurrence: CandidateOccurrence;
+  item: HistoryItem;
+  runs: readonly RunOccurrence[];
+}
+
+interface RunAssociation {
+  ok: boolean;
+  reason?: HistoryRunWithheldReason;
 }
 
 interface TargetMetadata {
@@ -340,11 +566,18 @@ interface CurrentView {
   selectors: Map<string, IssuedSelector>;
   selectorByKey: Map<string, string>;
   listing: ListingState;
+  runSignature: string | undefined;
+  runManager: OmpSessionManager | undefined;
+  runSelectors: Map<string, IssuedRunSelector>;
+  runSelectorByKey: Map<string, string>;
+  runListing: RunListingState;
 }
 
 interface BudgetState {
   inspections: number;
   prechargedBytes: number;
+  /** The precharge already covers this read as part of a whole action. */
+  wholeActionPrecharge?: boolean;
 }
 
 interface SelectedRow {
@@ -364,7 +597,12 @@ function emptyWithheldReasons(): Record<HistoryWithheldReason, number> {
     Record<HistoryWithheldReason, number>;
 }
 
-function evidence(): HistoryViewEvidence {
+function emptyRunWithheldReasons(): Record<HistoryRunWithheldReason, number> {
+  return Object.fromEntries(RUN_WITHHELD_REASONS.map((reason) => [reason, 0])) as
+    Record<HistoryRunWithheldReason, number>;
+}
+
+function evidence(runEvidence: "checked" | "not_checked" = "not_checked"): HistoryViewEvidence {
   return {
     historical: true,
     authorityRestored: false,
@@ -382,7 +620,7 @@ function evidence(): HistoryViewEvidence {
     bridge: {
       selectedBranch: "checked",
       requirementLedger: "checked",
-      runEvidence: "not_checked",
+      runEvidence,
     },
   };
 }
@@ -582,6 +820,296 @@ function collectCandidates(
     `${occurrence.entryId}\0${occurrence.entryIndex}\0${occurrence.key ?? occurrence.preReason ?? "invalid"}`,
   ).join("\n");
   return { ok: true, collection: { occurrences, signature } };
+}
+
+function parseRunLocatorData(
+  value: unknown,
+): { ok: true; data: HistoryRunLocatorData } | { ok: false; reason: HistoryRunWithheldReason } {
+  const record = plainObject(value);
+  if (record === null || !exactKeys(record, RUN_LOCATOR_KEYS)) {
+    return { ok: false, reason: "run_locator_invalid" };
+  }
+  const version = record.version;
+  if (typeof version !== "number" || !Number.isSafeInteger(version)) {
+    return { ok: false, reason: "run_locator_invalid" };
+  }
+  if (version !== HISTORY_RUN_LOCATOR_VERSION) {
+    return { ok: false, reason: "run_locator_unsupported" };
+  }
+  const instanceId = record.instanceId;
+  if (typeof instanceId !== "string" || !SAFE_INSTANCE_COMPONENT.test(instanceId)) {
+    return { ok: false, reason: "run_locator_invalid" };
+  }
+  const identifiers: Array<[string, string]> = [];
+  for (const key of ["ownerId", "historyId", "digest", "taskId", "originSessionId"] as const) {
+    const candidate = record[key];
+    if (typeof candidate !== "string" || !IDENTIFIER.test(candidate)) {
+      return { ok: false, reason: "run_locator_invalid" };
+    }
+    identifiers.push([key, candidate]);
+  }
+  const taskRevision = record.taskRevision;
+  if (typeof taskRevision !== "number" || !Number.isSafeInteger(taskRevision) || taskRevision < 1) {
+    return { ok: false, reason: "run_locator_invalid" };
+  }
+  const requirementsDigest = record.requirementsDigest;
+  if (typeof requirementsDigest !== "string" || !BOUNDED_RUN_IDENTITY.test(requirementsDigest)) {
+    return { ok: false, reason: "run_locator_invalid" };
+  }
+  const runId = record.runId;
+  const callId = record.callId;
+  const runDirectory = record.runDirectory;
+  if (typeof runId !== "string" || !SAFE_RUN_TOKEN.test(runId)
+    || typeof callId !== "string" || !SAFE_RUN_TOKEN.test(callId)
+    || typeof runDirectory !== "string" || !SAFE_RUN_TOKEN.test(runDirectory)) {
+    return { ok: false, reason: "run_locator_invalid" };
+  }
+  const artifactIdsValue = record.artifactIds;
+  if (!Array.isArray(artifactIdsValue) || artifactIdsValue.length > HISTORY_RUN_ARTIFACT_LIMIT) {
+    return { ok: false, reason: "run_locator_invalid" };
+  }
+  const artifactIds: string[] = [];
+  const seen = new Set<string>();
+  for (const artifactId of artifactIdsValue) {
+    if (typeof artifactId !== "string" || !SAFE_RUN_TOKEN.test(artifactId) || seen.has(artifactId)) {
+      return { ok: false, reason: "run_locator_invalid" };
+    }
+    seen.add(artifactId);
+    artifactIds.push(artifactId);
+  }
+  if (record.recordWriteReturned !== true
+    || record.byteIntegrity !== "not_checked"
+    || record.authorityRestored !== false) {
+    return { ok: false, reason: "run_locator_invalid" };
+  }
+  const data: HistoryRunLocatorData = {
+    version: HISTORY_RUN_LOCATOR_VERSION,
+    instanceId,
+    ownerId: identifiers[0]![1],
+    historyId: identifiers[1]![1],
+    digest: identifiers[2]![1],
+    taskId: identifiers[3]![1],
+    taskRevision,
+    requirementsDigest,
+    originSessionId: identifiers[4]![1],
+    runId,
+    callId,
+    runDirectory,
+    artifactIds,
+    recordWriteReturned: true,
+    byteIntegrity: "not_checked",
+    authorityRestored: false,
+  };
+  let encoded: string;
+  try {
+    encoded = JSON.stringify(data);
+  } catch {
+    return { ok: false, reason: "run_locator_invalid" };
+  }
+  if (Buffer.byteLength(encoded, "utf8") > HISTORY_RUN_LOCATOR_DATA_BYTES_LIMIT) {
+    return { ok: false, reason: "run_locator_invalid" };
+  }
+  return { ok: true, data };
+}
+
+function runReferenceKey(data: HistoryRunLocatorData): string {
+  return [data.ownerId, data.taskId, data.taskRevision, data.runId, data.callId].join("\u0000");
+}
+
+/** Diagnostics only; malformed locator payloads are still strictly refused. */
+function claimedHistoryIdOf(value: unknown): string | null {
+  const record = plainObject(value);
+  if (record === null) return null;
+  const historyId = record.historyId;
+  return typeof historyId === "string"
+    && historyId.length > 0
+    && historyId.length <= 128
+    && !historyId.includes("\u0000")
+    ? historyId
+    : null;
+}
+
+function collectRunCandidates(
+  entries: readonly BranchEntry[],
+  sessionId: string,
+): { ok: true; collection: RunCollection } | { ok: false; code: HistoryViewErrorCode } {
+  const runEntries: Array<{ entry: BranchEntry; index: number }> = [];
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]!;
+    if (entry.type === "custom" && entry.value.customType === HISTORY_RUN_LOCATOR_CUSTOM_TYPE) {
+      runEntries.push({ entry, index });
+    }
+  }
+  if (runEntries.length > HISTORY_QUERY_RUN_CANDIDATE_LIMIT) {
+    return { ok: false, code: "limit" };
+  }
+  const occurrences: RunOccurrence[] = runEntries.map(({ entry, index }) => {
+    const parsed = parseRunLocatorData(entry.value.data);
+    if (!parsed.ok) {
+      return {
+        entryId: entry.id,
+        entryIndex: index,
+        data: null,
+        key: null,
+        runKey: null,
+        claimedHistoryId: claimedHistoryIdOf(entry.value.data),
+        preReason: parsed.reason,
+      };
+    }
+    if (parsed.data.originSessionId !== sessionId) {
+      return {
+        entryId: entry.id,
+        entryIndex: index,
+        data: parsed.data,
+        key: JSON.stringify(parsed.data),
+        runKey: runReferenceKey(parsed.data),
+        claimedHistoryId: parsed.data.historyId,
+        preReason: "run_session_mismatch",
+      };
+    }
+    return {
+      entryId: entry.id,
+      entryIndex: index,
+      data: parsed.data,
+      key: JSON.stringify(parsed.data),
+      runKey: runReferenceKey(parsed.data),
+      claimedHistoryId: parsed.data.historyId,
+      preReason: null,
+    };
+  });
+
+  // The complete bounded run collection is parsed and conflict-checked before
+  // any page mints a selector, so a later conflict cannot hide behind paging.
+  const byReference = new Map<string, RunOccurrence[]>();
+  for (const occurrence of occurrences) {
+    if (occurrence.data === null || occurrence.runKey === null) continue;
+    const list = byReference.get(occurrence.runKey) ?? [];
+    list.push(occurrence);
+    byReference.set(occurrence.runKey, list);
+  }
+  for (const list of byReference.values()) {
+    if (new Set(list.map((occurrence) => occurrence.key)).size <= 1) continue;
+    for (const occurrence of list) occurrence.preReason = "run_conflict";
+  }
+
+  // A malformed locator's claimed history still assigns it to a selected
+  // task, so the bounded claim is part of the complete run collection.
+  const signature = occurrences.map((occurrence) =>
+    `${occurrence.entryId}\0${occurrence.entryIndex}\0${JSON.stringify(occurrence.claimedHistoryId)}\0${occurrence.key ?? occurrence.preReason ?? "invalid"}`,
+  ).join("\n");
+  return { ok: true, collection: { occurrences, signature } };
+}
+
+function rawHistoryId(value: unknown): unknown {
+  const record = plainObject(value);
+  return record === null ? undefined : record.historyId;
+}
+
+/** Task identity excluding origin session, which has its own explicit reason. */
+function runClaimsTask(
+  item: HistoryItem,
+  taskData: HistoryLocatorData,
+  data: HistoryRunLocatorData,
+): boolean {
+  return data.instanceId === taskData.instanceId
+    && data.ownerId === taskData.ownerId
+    && data.historyId === item.historyId
+    && data.digest === item.digest
+    && data.taskId === item.taskId
+    && data.taskRevision === item.taskRevision
+    && data.requirementsDigest === item.requirementsDigest;
+}
+
+function sameTaskLocatorData(
+  value: unknown,
+  expected: Record<string, unknown>,
+): boolean {
+  const record = plainObject(value);
+  if (record === null || !exactKeys(record, LOCATOR_KEYS)) return false;
+  return LOCATOR_KEYS.every((key) => record[key] === expected[key]);
+}
+
+function taskLocatorForRun(
+  item: HistoryItem,
+  taskData: HistoryLocatorData,
+  entries: readonly BranchEntry[],
+  sessionId: string,
+  runIndex: number,
+): RunAssociation {
+  const expected: Record<string, unknown> = {
+    version: HISTORY_LOCATOR_VERSION,
+    instanceId: taskData.instanceId,
+    ownerId: taskData.ownerId,
+    historyId: item.historyId,
+    digest: item.digest,
+    taskId: item.taskId,
+    taskRevision: item.taskRevision,
+    originSessionId: item.anchor.sessionId,
+  };
+  const exact: number[] = [];
+  const claiming: number[] = [];
+  for (let index = 0; index < entries.length; index += 1) {
+    const entry = entries[index]!;
+    if (entry.type !== "custom" || entry.value.customType !== HISTORY_LOCATOR_CUSTOM_TYPE) continue;
+    if (sameTaskLocatorData(entry.value.data, expected)) exact.push(index);
+    if (rawHistoryId(entry.value.data) === item.historyId) claiming.push(index);
+  }
+  if (exact.length === 0 && claiming.length === 0) {
+    return { ok: false, reason: "run_task_locator_missing" };
+  }
+  if (exact.length !== 1 || claiming.length !== exact.length) {
+    return { ok: false, reason: "run_task_locator_conflict" };
+  }
+  const index = exact[0]!;
+  if (!ledgerMatches(item, entries, index, sessionId)) {
+    return { ok: false, reason: "run_source_mismatch" };
+  }
+  if (index >= runIndex) return { ok: false, reason: "run_task_order" };
+  return { ok: true };
+}
+
+function associateRun(
+  item: HistoryItem,
+  taskData: HistoryLocatorData,
+  occurrence: RunOccurrence,
+  entries: readonly BranchEntry[],
+  sessionId: string,
+): RunAssociation {
+  if (occurrence.data === null) {
+    return { ok: false, reason: occurrence.preReason ?? "run_locator_invalid" };
+  }
+  if (!runClaimsTask(item, taskData, occurrence.data)) {
+    return { ok: false, reason: "run_task_mismatch" };
+  }
+  if (occurrence.preReason !== null) return { ok: false, reason: occurrence.preReason };
+  return taskLocatorForRun(item, taskData, entries, sessionId, occurrence.entryIndex);
+}
+
+function associatedRunOccurrences(
+  collection: RunCollection,
+  item: HistoryItem,
+  taskData: HistoryLocatorData,
+  entries: readonly BranchEntry[],
+  sessionId: string,
+): RunOccurrence[] {
+  const candidates: RunOccurrence[] = [];
+  for (const occurrence of collection.occurrences) {
+    if (occurrence.claimedHistoryId !== item.historyId) continue;
+    const association = associateRun(item, taskData, occurrence, entries, sessionId);
+    candidates.push(association.ok ? occurrence : { ...occurrence, preReason: association.reason! });
+  }
+  return candidates;
+}
+
+function exactlyEqualStringSets(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  const leftSorted = [...left].sort();
+  const rightSorted = [...right].sort();
+  return leftSorted.every((value, index) => value === rightSorted[index]);
+}
+
+function pairKey(taskEntryId: string, runKey: string): string {
+  return `${taskEntryId}\u0000${runKey}`;
 }
 
 function ledgerMatches(
@@ -828,6 +1356,47 @@ function encodeCursor(): string {
   return `hcur_${randomUUID().replaceAll("-", "")}`;
 }
 
+function encodeRunSelector(): string {
+  return `hrun_${randomUUID().replaceAll("-", "")}`;
+}
+
+function encodeRunCursor(): string {
+  return `hrcur_${randomUUID().replaceAll("-", "")}`;
+}
+
+function uniqueRunSelector(existing: ReadonlyMap<string, unknown>): string | undefined {
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const selector = encodeRunSelector();
+    if (!existing.has(selector)) return selector;
+  }
+  return undefined;
+}
+
+function runCursorForPosition(
+  listing: RunListingState,
+  position: number,
+  taskEntryId: string,
+  taskKey: string,
+  signature: string,
+  manager: OmpSessionManager,
+): string | undefined {
+  for (const [cursor, value] of listing.cursors) {
+    if (value.position === position
+      && value.taskEntryId === taskEntryId
+      && value.taskKey === taskKey
+      && value.signature === signature) {
+      return cursor;
+    }
+  }
+  for (let attempt = 0; attempt < 4; attempt += 1) {
+    const cursor = encodeRunCursor();
+    if (listing.cursors.has(cursor)) continue;
+    listing.cursors.set(cursor, { position, taskEntryId, taskKey, signature, manager });
+    return cursor;
+  }
+  return undefined;
+}
+
 function cursorForPosition(listing: ListingState, position: number): string {
   for (const [cursor, value] of listing.cursors) {
     if (value === position) return cursor;
@@ -865,7 +1434,7 @@ class HistoryView implements HistoryViewControls {
     return {
       disposed: this.disposed,
       view: this.current === undefined ? "none" : "active",
-      selectors: this.current?.selectors.size ?? 0,
+      selectors: (this.current?.selectors.size ?? 0) + (this.current?.runSelectors.size ?? 0),
       generation: this.generation,
       lastError: this.lastError,
     };
@@ -928,11 +1497,17 @@ class HistoryView implements HistoryViewControls {
       if (!resolved.ok) {
         cached = { ok: false, reason: resolved.reason };
       } else if (budget.inspections >= HISTORY_QUERY_INSPECTION_LIMIT
-        || budget.prechargedBytes + HISTORY_FILE_BYTES_LIMIT > HISTORY_QUERY_READ_BUDGET_BYTES) {
+        || budget.prechargedBytes
+          + (budget.wholeActionPrecharge === true ? 0 : HISTORY_FILE_BYTES_LIMIT)
+          > HISTORY_QUERY_READ_BUDGET_BYTES) {
         return { ok: false, fatal: "budget_exhausted" };
       } else {
+        // The whole-action precharge already includes this task read; do not
+        // double count it, but still account for the inspection itself.
         budget.inspections += 1;
-        budget.prechargedBytes += HISTORY_FILE_BYTES_LIMIT;
+        if (budget.wholeActionPrecharge !== true) {
+          budget.prechargedBytes += HISTORY_FILE_BYTES_LIMIT;
+        }
         const target = resolved.target;
         const selector: HistoryInspectSelector = {
           historyId: data.historyId,
@@ -989,6 +1564,7 @@ class HistoryView implements HistoryViewControls {
     rows: readonly SelectedRow[],
     cache: ReadonlyMap<string, InspectionCacheEntry>,
     signal: AbortSignal | undefined,
+    runSeal?: RunSeal,
   ): HistoryViewErrorCode | undefined {
     if (this.disposed) return "disposed";
     if (hostAborted(signal)) return "aborted";
@@ -1039,6 +1615,38 @@ class HistoryView implements HistoryViewControls {
       }
     }
 
+    if (runSeal !== undefined) {
+      if (view.runSignature !== runSeal.collection.signature) return "new_list_required";
+      const finalRuns = collectRunCandidates(finalScope.entries, finalScope.sessionId);
+      if (!finalRuns.ok) return finalRuns.code === "limit" ? "limit" : "scope_changed";
+      if (finalRuns.collection.signature !== runSeal.collection.signature) {
+        return "new_list_required";
+      }
+      const finalTask = finalCollection.collection.occurrences.find(
+        (occurrence) => occurrence.entryId === runSeal.taskOccurrence.entryId,
+      );
+      if (finalTask === undefined
+        || finalTask.key !== runSeal.taskOccurrence.key
+        || finalTask.data === null
+        || !ledgerMatches(runSeal.item, finalScope.entries, finalTask.entryIndex, finalScope.sessionId)) {
+        return "scope_changed";
+      }
+      for (const run of runSeal.runs) {
+        const finalRun = finalRuns.collection.occurrences.find(
+          (occurrence) => occurrence.entryId === run.entryId,
+        );
+        if (finalRun === undefined || finalRun.key !== run.key) return "scope_changed";
+        const association = associateRun(
+          runSeal.item,
+          finalTask.data,
+          finalRun,
+          finalScope.entries,
+          finalScope.sessionId,
+        );
+        if (!association.ok) return "scope_changed";
+      }
+    }
+
     const finalBase = readRootBase(this.stateRoot);
     if (!finalBase.ok || !sameMetadataList(base.metadata, finalBase.base.metadata)) {
       return "scope_changed";
@@ -1057,6 +1665,75 @@ class HistoryView implements HistoryViewControls {
     if (this.disposed) return "disposed";
     if (this.generation !== view.generation) return "new_list_required";
     return undefined;
+  }
+
+  private resetRunState(view: CurrentView, signature: string): void {
+    view.runSignature = signature;
+    view.runSelectors.clear();
+    view.runSelectorByKey.clear();
+    view.runListing.primaryByKey.clear();
+    view.runListing.cursors.clear();
+  }
+
+  private resolveTaskSelection(
+    taskSelector: string,
+    scope: QueryScope,
+    base: RootBase,
+    budget: BudgetState,
+    cache: Map<string, InspectionCacheEntry>,
+  ): {
+    ok: true;
+    occurrence: CandidateOccurrence;
+    item: HistoryItem;
+    taskData: HistoryLocatorData;
+    target: InstanceTarget;
+  } | {
+    ok: false;
+    code: HistoryViewErrorCode;
+    reason?: HistoryWithheldReason | HistoryRunWithheldReason;
+  } {
+    if (!HISTORY_SELECTOR_PATTERN.test(taskSelector)) {
+      return { ok: false, code: "unknown_selector" };
+    }
+    const view = this.current;
+    if (view === undefined) return { ok: false, code: "new_list_required" };
+    const issued = view.selectors.get(taskSelector);
+    if (issued === undefined) return { ok: false, code: "unknown_selector" };
+    const taskCollection = collectCandidates(scope.entries, scope.sessionId);
+    if (!taskCollection.ok) return { ok: false, code: taskCollection.code };
+    const occurrence = taskCollection.collection.occurrences.find(
+      (candidate) => candidate.entryId === issued.entryId && candidate.key === issued.key,
+    );
+    if (occurrence === undefined) {
+      this.current = undefined;
+      return { ok: false, code: "new_list_required" };
+    }
+    const evaluated = this.inspectOccurrence(occurrence, scope, base, budget, cache);
+    if (evaluated.fatal !== undefined) return { ok: false, code: evaluated.fatal };
+    if (!evaluated.ok) {
+      return {
+        ok: false,
+        code: "withheld",
+        reason: evaluated.reason ?? "history_unavailable",
+      };
+    }
+    if (evaluated.item!.recordedStatus !== "active") {
+      return { ok: false, code: "withheld", reason: "run_task_inactive" };
+    }
+    if (occurrence.data === null) {
+      return { ok: false, code: "withheld", reason: "run_task_locator_missing" };
+    }
+    const cached = cache.get(occurrence.key!);
+    if (cached === undefined || !cached.ok || cached.target === undefined) {
+      return { ok: false, code: "withheld", reason: "run_task_locator_missing" };
+    }
+    return {
+      ok: true,
+      occurrence,
+      item: evaluated.item!,
+      taskData: occurrence.data,
+      target: cached.target,
+    };
   }
 
   list(
@@ -1119,6 +1796,11 @@ class HistoryView implements HistoryViewControls {
           selectors: new Map(),
           selectorByKey: new Map(),
           listing: { primaryByKey: new Map(), cursors: new Map() },
+          runSignature: undefined,
+          runManager: undefined,
+          runSelectors: new Map(),
+          runSelectorByKey: new Map(),
+          runListing: { primaryByKey: new Map(), cursors: new Map() },
         };
         this.current = view;
       }
@@ -1333,6 +2015,504 @@ class HistoryView implements HistoryViewControls {
         item: evaluated.item!,
         budget: budgetView(budget),
         evidence: evidence(),
+      },
+    };
+  }
+
+  listRuns(
+    context: OmpToolContext,
+    request: HistoryRunListRequest,
+    signal?: AbortSignal,
+  ): HistoryRunListOutcome {
+    if (this.disposed) return this.fail("disposed");
+    const limit = request.limit ?? HISTORY_QUERY_PAGE_LIMIT;
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > HISTORY_QUERY_PAGE_LIMIT) {
+      return this.fail("invalid_arguments");
+    }
+    if (!HISTORY_SELECTOR_PATTERN.test(request.taskSelector)) {
+      return this.fail("invalid_arguments");
+    }
+    if (request.cursor !== undefined && !HISTORY_RUN_CURSOR_PATTERN.test(request.cursor)) {
+      return this.fail("cursor_invalid");
+    }
+    if (hostAborted(signal)) return this.fail("aborted");
+    const composition = this.checkComposition();
+    if (!composition.ok) return this.fail(composition.code);
+
+    const startGeneration = this.generation;
+    const scopeResult = readScope(this.workspaceRoot, context);
+    if (!scopeResult.ok) return this.fail(scopeResult.code);
+    if (this.generation !== startGeneration) {
+      this.current = undefined;
+      return this.fail("new_list_required");
+    }
+    const scope = { ...scopeResult.scope, generation: this.generation };
+    const baseResult = readRootBase(this.stateRoot);
+    if (!baseResult.ok) {
+      this.current = undefined;
+      return this.fail("unavailable");
+    }
+    const collection = collectCandidates(scope.entries, scope.sessionId);
+    if (!collection.ok) {
+      this.current = undefined;
+      return this.fail(collection.code);
+    }
+    const runCollection = collectRunCandidates(scope.entries, scope.sessionId);
+    if (!runCollection.ok) {
+      this.current = undefined;
+      return this.fail(runCollection.code);
+    }
+    const view = this.current;
+    if (view === undefined
+      || view.generation !== this.generation
+      || view.signature !== collection.collection.signature
+      || view.sessionId !== scope.sessionId
+      || view.file !== scope.file) {
+      this.current = undefined;
+      return this.fail("new_list_required");
+    }
+    if (view.runManager !== scope.manager) {
+      // Run tokens are bound to the actual manager object. Task selectors and
+      // cursors retain their existing behavior.
+      this.resetRunState(view, view.runSignature ?? runCollection.collection.signature);
+      view.runManager = scope.manager;
+      if (request.cursor !== undefined) return this.fail("new_list_required");
+    }
+    if (view.runSignature !== runCollection.collection.signature) {
+      // A changed or extended run-locator collection invalidates old run
+      // selectors and cursors, but not the task selectors from the same view.
+      this.resetRunState(view, runCollection.collection.signature);
+      if (request.cursor !== undefined) return this.fail("new_list_required");
+    }
+
+    const budget: BudgetState = { inspections: 0, prechargedBytes: 0 };
+    const cache = new Map<string, InspectionCacheEntry>();
+    const task = this.resolveTaskSelection(
+      request.taskSelector,
+      scope,
+      baseResult.base,
+      budget,
+      cache,
+    );
+    if (!task.ok) {
+      if (task.code === "withheld") {
+        return { ok: false, code: "withheld", reason: task.reason ?? "run_task_mismatch" };
+      }
+      return this.fail(task.code);
+    }
+
+    const candidates = associatedRunOccurrences(
+      runCollection.collection,
+      task.item,
+      task.taskData,
+      scope.entries,
+      scope.sessionId,
+    );
+    let start = 0;
+    if (request.cursor !== undefined) {
+      const cursor = view.runListing.cursors.get(request.cursor);
+      if (cursor === undefined
+        || cursor.taskEntryId !== task.occurrence.entryId
+        || cursor.taskKey !== task.occurrence.key
+        || cursor.signature !== runCollection.collection.signature
+        || cursor.manager !== scope.manager) {
+        return this.fail("cursor_invalid");
+      }
+      start = cursor.position;
+    }
+    if (start > candidates.length
+      || (request.cursor !== undefined && start >= candidates.length)) {
+      return this.fail("cursor_invalid");
+    }
+    const window = candidates.slice(start, start + limit);
+    const primary = new Map(view.runListing.primaryByKey);
+    const withheldReasons = emptyRunWithheldReasons();
+    const rows: RunOccurrence[] = [];
+    let withheld = 0;
+    let duplicates = 0;
+    let fatal: HistoryViewErrorCode | undefined;
+    for (const occurrence of window) {
+      if (hostAborted(signal)) {
+        fatal = "aborted";
+        break;
+      }
+      if (occurrence.preReason !== null || occurrence.runKey === null) {
+        withheldReasons[occurrence.preReason ?? "run_locator_invalid"] += 1;
+        withheld += 1;
+        continue;
+      }
+      const key = pairKey(task.occurrence.entryId, occurrence.runKey);
+      const existing = primary.get(key);
+      if (existing === undefined) {
+        primary.set(key, occurrence.entryId);
+        rows.push(occurrence);
+      } else if (existing === occurrence.entryId) {
+        rows.push(occurrence);
+      } else {
+        duplicates += 1;
+      }
+    }
+    if (fatal !== undefined) return this.fail(fatal);
+
+    const failure = this.verifyFresh(
+      scope,
+      baseResult.base,
+      collection.collection,
+      view,
+      [],
+      cache,
+      signal,
+      {
+        collection: runCollection.collection,
+        taskOccurrence: task.occurrence,
+        item: task.item,
+        runs: rows,
+      },
+    );
+    if (failure !== undefined) {
+      if (failure === "new_list_required") {
+        this.resetRunState(view, runCollection.collection.signature);
+      } else {
+        this.invalidateForFailure(failure);
+      }
+      return this.fail(failure);
+    }
+
+    const items: HistoryRunListSummary[] = [];
+    let selectorOverflow = false;
+    for (const occurrence of rows) {
+      const data = occurrence.data!;
+      const key = pairKey(task.occurrence.entryId, occurrence.runKey!);
+      let selector = view.runSelectorByKey.get(key);
+      const issued = selector === undefined ? undefined : view.runSelectors.get(selector);
+      if (selector === undefined
+        || issued === undefined
+        || issued.entryId !== occurrence.entryId
+        || issued.key !== occurrence.key
+        || issued.taskSelector !== request.taskSelector
+        || issued.taskEntryId !== task.occurrence.entryId
+        || issued.signature !== runCollection.collection.signature
+        || issued.manager !== scope.manager) {
+        if (view.runSelectors.size >= HISTORY_QUERY_RUN_CANDIDATE_LIMIT) {
+          selectorOverflow = true;
+          break;
+        }
+        const minted = uniqueRunSelector(view.runSelectors);
+        if (minted === undefined) return this.fail("unavailable");
+        selector = minted;
+        view.runSelectorByKey.set(key, selector);
+        view.runSelectors.set(selector, {
+          entryId: occurrence.entryId,
+          key: occurrence.key!,
+          runKey: occurrence.runKey!,
+          taskSelector: request.taskSelector,
+          taskEntryId: task.occurrence.entryId,
+          taskKey: task.occurrence.key!,
+          signature: runCollection.collection.signature,
+          manager: scope.manager,
+        });
+      }
+      items.push({
+        selector,
+        historyId: data.historyId,
+        digest: data.digest,
+        taskId: data.taskId,
+        taskRevision: data.taskRevision,
+        requirementsDigest: data.requirementsDigest,
+        runId: data.runId,
+        callId: data.callId,
+        runDirectory: data.runDirectory,
+        artifactIds: [...data.artifactIds],
+        recordWriteReturned: true,
+        byteIntegrity: "not_checked",
+        authorityRestored: false,
+      });
+    }
+    if (selectorOverflow) return this.fail("limit");
+
+    const nextPosition = start + window.length;
+    const more = nextPosition < candidates.length;
+    const nextCursor = more
+      ? runCursorForPosition(
+        view.runListing,
+        nextPosition,
+        task.occurrence.entryId,
+        task.occurrence.key!,
+        runCollection.collection.signature,
+        scope.manager,
+      )
+      : null;
+    if (nextCursor === undefined) return this.fail("unavailable");
+    view.runListing.primaryByKey = primary;
+
+    this.lastError = null;
+    return {
+      ok: true,
+      view: {
+        schemaVersion: HISTORY_VIEW_SCHEMA_VERSION,
+        action: "list_runs",
+        scope: "selected_branch",
+        result: items.length > 0 ? "visible_runs" : "no_visible_runs",
+        items,
+        nextCursor,
+        coverage: {
+          candidates: candidates.length,
+          evaluated: window.length,
+          inspected: budget.inspections,
+          returned: items.length,
+          withheld,
+          duplicatesCollapsed: duplicates,
+          more,
+          withheldReasons,
+        },
+        budget: budgetView(budget),
+        evidence: evidence(),
+      },
+    };
+  }
+
+  inspectRun(
+    context: OmpToolContext,
+    runSelector: string,
+    signal?: AbortSignal,
+  ): HistoryRunInspectOutcome {
+    if (this.disposed) return this.fail("disposed");
+    if (!HISTORY_RUN_SELECTOR_PATTERN.test(runSelector)) {
+      return this.fail("unknown_selector");
+    }
+    if (hostAborted(signal)) return this.fail("aborted");
+    const composition = this.checkComposition();
+    if (!composition.ok) return this.fail(composition.code);
+
+    const startGeneration = this.generation;
+    const scopeResult = readScope(this.workspaceRoot, context);
+    if (!scopeResult.ok) return this.fail(scopeResult.code);
+    if (this.generation !== startGeneration) {
+      this.current = undefined;
+      return this.fail("new_list_required");
+    }
+    const scope = { ...scopeResult.scope, generation: this.generation };
+    const baseResult = readRootBase(this.stateRoot);
+    if (!baseResult.ok) {
+      this.current = undefined;
+      return this.fail("unavailable");
+    }
+    const collection = collectCandidates(scope.entries, scope.sessionId);
+    if (!collection.ok) {
+      this.current = undefined;
+      return this.fail(collection.code);
+    }
+    const runCollection = collectRunCandidates(scope.entries, scope.sessionId);
+    if (!runCollection.ok) {
+      this.current = undefined;
+      return this.fail(runCollection.code);
+    }
+    const view = this.current;
+    if (view === undefined
+      || view.generation !== this.generation
+      || view.signature !== collection.collection.signature
+      || view.sessionId !== scope.sessionId
+      || view.file !== scope.file) {
+      this.current = undefined;
+      return this.fail("new_list_required");
+    }
+    if (view.runManager !== scope.manager) {
+      this.resetRunState(view, runCollection.collection.signature);
+      view.runManager = scope.manager;
+      return this.fail("new_list_required");
+    }
+    if (view.runSignature !== runCollection.collection.signature) {
+      this.resetRunState(view, runCollection.collection.signature);
+      return this.fail("new_list_required");
+    }
+    const issued = view.runSelectors.get(runSelector);
+    if (issued === undefined) return this.fail("unknown_selector");
+    if (issued.signature !== runCollection.collection.signature
+      || issued.manager !== scope.manager) {
+      this.resetRunState(view, runCollection.collection.signature);
+      return this.fail("new_list_required");
+    }
+    const occurrence = runCollection.collection.occurrences.find(
+      (candidate) => candidate.entryId === issued.entryId && candidate.key === issued.key,
+    );
+    if (occurrence === undefined) {
+      this.resetRunState(view, runCollection.collection.signature);
+      return this.fail("new_list_required");
+    }
+
+    // Reserve and check the complete conservative whole-action envelope before
+    // the outer task inspection reads any history file. A is called at most
+    // once below and its initial/final reads are included in this amount.
+    const budget: BudgetState = {
+      inspections: 0,
+      prechargedBytes: HISTORY_RUN_EVIDENCE_PRECHARGE_BYTES,
+      wholeActionPrecharge: true,
+    };
+    const cache = new Map<string, InspectionCacheEntry>();
+    const task = this.resolveTaskSelection(
+      issued.taskSelector,
+      scope,
+      baseResult.base,
+      budget,
+      cache,
+    );
+    if (!task.ok) {
+      if (task.code === "withheld") {
+        return {
+          ok: false,
+          code: "withheld",
+          reason: task.reason as HistoryWithheldReason | HistoryRunWithheldReason,
+        };
+      }
+      return this.fail(task.code);
+    }
+    if (task.occurrence.entryId !== issued.taskEntryId
+      || task.occurrence.key !== issued.taskKey) {
+      this.current = undefined;
+      return this.fail("new_list_required");
+    }
+    const association = associateRun(
+      task.item,
+      task.taskData,
+      occurrence,
+      scope.entries,
+      scope.sessionId,
+    );
+    if (!association.ok) {
+      return {
+        ok: false,
+        code: "withheld",
+        reason: association.reason ?? "run_task_mismatch",
+      };
+    }
+
+    const failure = this.verifyFresh(
+      scope,
+      baseResult.base,
+      collection.collection,
+      view,
+      [],
+      cache,
+      signal,
+      {
+        collection: runCollection.collection,
+        taskOccurrence: task.occurrence,
+        item: task.item,
+        runs: [occurrence],
+      },
+    );
+    if (failure !== undefined) {
+      if (failure === "new_list_required") {
+        this.resetRunState(view, runCollection.collection.signature);
+      } else {
+        this.invalidateForFailure(failure);
+      }
+      return this.fail(failure);
+    }
+
+    const data = occurrence.data!;
+    const itemReference: HistoryItemReference = {
+      historyId: task.item.historyId,
+      digest: task.item.digest,
+      taskId: task.item.taskId,
+      taskRevision: task.item.taskRevision,
+    };
+    let runEvidence: RunEvidenceResult;
+    try {
+      runEvidence = checkRunEvidence({
+        instance: {
+          instanceRoot: task.target.instanceRoot,
+          instanceId: data.instanceId,
+          ownerId: data.ownerId,
+          workspaceRoot: this.workspaceRoot,
+        },
+        item: itemReference,
+        expectedRunId: data.runId,
+        expectedCallId: data.callId,
+        runLocator: `${data.runDirectory}/${RUN_RECORD_FILE_NAME}`,
+        artifactIds: data.artifactIds,
+      });
+    } catch {
+      return this.fail("unavailable");
+    }
+
+    // All host callbacks and file inspection are over. Only pure result
+    // binding runs below; A's own state axes are preserved unflattened.
+    const historyExact = runEvidence.history !== null
+      && runEvidence.history.historyId === task.item.historyId
+      && runEvidence.history.digest === task.item.digest
+      && runEvidence.history.taskId === task.item.taskId
+      && runEvidence.history.taskRevision === task.item.taskRevision
+      && runEvidence.history.requirementsDigest === task.item.requirementsDigest
+      && runEvidence.history.recordedStatus === task.item.recordedStatus;
+    const runExact = runEvidence.run !== null
+      && runEvidence.run.runId === data.runId
+      && runEvidence.run.callId === data.callId
+      && runEvidence.run.locator === `${data.runDirectory}/${RUN_RECORD_FILE_NAME}`;
+    const instanceExact = runEvidence.instance !== null
+      && runEvidence.instance.instance === data.instanceId
+      && runEvidence.instance.owner === data.ownerId
+      && runEvidence.instance.workspace === this.workspaceRoot;
+    const metadataExact = runEvidence.metadata.state === "matched";
+    const selection = runEvidence.selection;
+    const artifactSetExact = selection !== null
+      && selection.allPresent
+      && exactlyEqualStringSets(data.artifactIds, selection.requested)
+      && exactlyEqualStringSets(data.artifactIds, selection.recorded);
+    const exact = historyExact && runExact && instanceExact && metadataExact && artifactSetExact;
+    const state = exact
+      ? runEvidence.state
+      : runEvidence.state === "consistent" || runEvidence.state === "incomplete"
+        ? "mismatch"
+        : runEvidence.state;
+
+    // Only native abort and internal lifecycle state may be consulted after A.
+    // No composition callback or host scope getter runs here.
+    if (hostAborted(signal)) return this.fail("aborted");
+    if (this.disposed) return this.fail("disposed");
+    if (this.current !== view || this.generation !== view.generation) {
+      return this.fail("new_list_required");
+    }
+
+    this.lastError = null;
+    return {
+      ok: true,
+      view: {
+        schemaVersion: HISTORY_VIEW_SCHEMA_VERSION,
+        action: "inspect_run",
+        scope: "selected_branch",
+        state,
+        result: exact ? "archived_run_evidence" : "withheld_archived_run_evidence",
+        association: {
+          historyId: data.historyId,
+          digest: data.digest,
+          taskId: data.taskId,
+          taskRevision: data.taskRevision,
+          requirementsDigest: data.requirementsDigest,
+          runId: data.runId,
+          callId: data.callId,
+          runDirectory: data.runDirectory,
+          artifactIds: [...data.artifactIds],
+          recordWriteReturned: true,
+          byteIntegrity: "not_checked",
+          authorityRestored: false,
+        },
+        verification: {
+          instance: instanceExact ? "exact" : "mismatch",
+          history: historyExact ? "exact" : "mismatch",
+          run: runExact ? "exact" : "mismatch",
+          metadata: runEvidence.metadata.state,
+          artifactSet: artifactSetExact ? "exact" : "mismatch",
+        },
+        runEvidence,
+        budget: {
+          taskInspections: budget.inspections,
+          runEvidenceCalls: 1,
+          prechargedBytes: budget.prechargedBytes,
+          precharge: "conservative_not_measured",
+          bytesLimit: HISTORY_QUERY_READ_BUDGET_BYTES,
+        },
+        evidence: evidence("checked"),
       },
     };
   }

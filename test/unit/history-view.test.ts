@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { createHash } from "node:crypto";
 import {
   appendFileSync,
   mkdirSync,
@@ -18,10 +19,16 @@ import {
   type HistoryItem,
   type HistoryProjectionWriter,
 } from "../../src/history-projection.ts";
-import { HISTORY_LOCATOR_CUSTOM_TYPE } from "../../src/history-session.ts";
+import {
+  HISTORY_LOCATOR_CUSTOM_TYPE,
+  HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+} from "../../src/history-session.ts";
 import {
   createHistoryView,
   HISTORY_CURSOR_PATTERN,
+  HISTORY_RUN_CURSOR_PATTERN,
+  HISTORY_RUN_EVIDENCE_PRECHARGE_BYTES,
+  HISTORY_RUN_SELECTOR_PATTERN,
   HISTORY_SELECTOR_PATTERN,
   HISTORY_VIEW_SCHEMA_VERSION,
   type HistoryViewControls,
@@ -39,6 +46,10 @@ const OWNER_ID = "owner-g3b2-view";
 const FRESH_OWNER_ID = "owner-g3b2-fresh";
 const INSTANCE_ID = "instance-g3b2-view";
 const NOW = "2026-11-09T00:00:00.000Z";
+const RUN_SOURCE = Buffer.from("print('view run evidence')\n", "utf8");
+const RUN_INPUT = Buffer.from("view input — α\n", "utf8");
+const RUN_ARTIFACT = Buffer.from("view artifact — 42\n", "utf8");
+const RUN_ARTIFACT_EXTRA = Buffer.from("unselected record artifact\n", "utf8");
 
 type Entry = Record<string, unknown> & { id: string; parentId: string | null };
 
@@ -50,6 +61,7 @@ interface ContextOptions {
   omitSessionFile?: boolean;
   branchRead?: (count: number) => void;
   leafRead?: (count: number) => void;
+  manager?: OmpSessionManager;
 }
 
 interface Harness {
@@ -126,6 +138,7 @@ function harness(): Harness {
   const sessionFile = path.join(root, "session.jsonl");
   writeFileSync(sessionFile, "", { mode: 0o600 });
   let sequence = 0;
+  let stableManager: OmpSessionManager | undefined;
   const owner = new TaskOwner({
     workspaceRoot: workspace,
     ownerId: OWNER_ID,
@@ -272,9 +285,24 @@ function harness(): Harness {
       return { item: result.item, entry };
     },
     context(options = {}) {
+      const isDefault = options.sessionId === undefined
+        && options.sessionFile === undefined
+        && options.cwd === undefined
+        && options.agentKind === undefined
+        && options.omitSessionFile === undefined
+        && options.branchRead === undefined
+        && options.leafRead === undefined
+        && options.manager === undefined;
+      if (isDefault && stableManager !== undefined) {
+        return {
+          cwd: workspace,
+          agent: { kind: "main" },
+          sessionManager: stableManager,
+        };
+      }
       let branchReads = 0;
       let leafReads = 0;
-      const manager: OmpSessionManager = {
+      const manager: OmpSessionManager = options.manager ?? {
         getSessionId: () => options.sessionId ?? h.sessionId,
         getLeafId: () => {
           leafReads += 1;
@@ -290,6 +318,7 @@ function harness(): Harness {
           getSessionFile: () => options.sessionFile ?? h.sessionFile,
         }),
       };
+      if (isDefault) stableManager = manager;
       return {
         cwd: options.cwd ?? workspace,
         agent: { kind: options.agentKind ?? "main" },
@@ -339,6 +368,227 @@ function expectWithheldPage(
   expect(listed.view.coverage.withheldReasons[reason]).toBeGreaterThanOrEqual(count);
   expect(listed.view.coverage.evaluated).toBe(count);
   expect(listed.view.coverage.inspected).toBe(inspected);
+}
+
+function sha256(bytes: Uint8Array | string): string {
+  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+interface RunFixtureOptions {
+  locatorId?: string;
+  runId?: string;
+  callId?: string;
+  runDirectory?: string;
+  selectedArtifactIds?: string[];
+  recordedArtifactIds?: string[];
+  includeInput?: boolean;
+  withProcess?: boolean;
+  phase?: string;
+  artifactBytes?: Record<string, Buffer>;
+}
+
+interface RunFixture {
+  runId: string;
+  callId: string;
+  runDirectory: string;
+  runRoot: string;
+  recordPath: string;
+  selectedArtifactIds: string[];
+  recordedArtifactIds: string[];
+  artifactPaths: Map<string, string>;
+  data: Record<string, unknown>;
+  entry: Entry;
+}
+
+function artifactBytesFor(artifactId: string): Buffer {
+  return artifactId === "artifact-2" ? RUN_ARTIFACT_EXTRA : RUN_ARTIFACT;
+}
+
+function runLocatorData(
+  h: Harness,
+  item: HistoryItem,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    version: 1,
+    instanceId: INSTANCE_ID,
+    ownerId: OWNER_ID,
+    historyId: item.historyId,
+    digest: item.digest,
+    taskId: item.taskId,
+    taskRevision: item.taskRevision,
+    requirementsDigest: item.requirementsDigest,
+    originSessionId: item.anchor.sessionId,
+    runId: "run-fixed",
+    callId: "call-fixed",
+    runDirectory: "run-fixed",
+    artifactIds: ["artifact-1"],
+    recordWriteReturned: true,
+    byteIntegrity: "not_checked",
+    authorityRestored: false,
+    ...overrides,
+  };
+}
+
+function writeRunFixture(
+  h: Harness,
+  item: HistoryItem,
+  options: RunFixtureOptions = {},
+): RunFixture {
+  const runId = options.runId ?? "run-fixed";
+  const callId = options.callId ?? "call-fixed";
+  const runDirectory = options.runDirectory ?? "run-fixed";
+  const selectedArtifactIds = options.selectedArtifactIds ?? ["artifact-1"];
+  const recordedArtifactIds = options.recordedArtifactIds ?? selectedArtifactIds;
+  const includeInput = options.includeInput ?? true;
+  const withProcess = options.withProcess ?? true;
+  const phase = options.phase ?? "completed";
+  const runRoot = path.join(h.instanceRoot, "execution", runDirectory);
+  mkdirSync(path.join(runRoot, "source"), { recursive: true, mode: 0o700 });
+  mkdirSync(path.join(runRoot, "inputs"), { recursive: true, mode: 0o700 });
+  mkdirSync(path.join(runRoot, "artifacts"), { recursive: true, mode: 0o700 });
+  writeFileSync(path.join(runRoot, "source", "script.py"), RUN_SOURCE, { mode: 0o600 });
+  const inputBytes = RUN_INPUT;
+  if (includeInput) {
+    writeFileSync(path.join(runRoot, "inputs", "input-1.bin"), inputBytes, { mode: 0o600 });
+  }
+  const artifactPaths = new Map<string, string>();
+  for (const artifactId of recordedArtifactIds) {
+    const bytes = options.artifactBytes?.[artifactId] ?? artifactBytesFor(artifactId);
+    const artifactPath = path.join(runRoot, "artifacts", `${artifactId}.bin`);
+    writeFileSync(artifactPath, bytes, { mode: 0o600 });
+    artifactPaths.set(artifactId, artifactPath);
+  }
+  const watchdog = {
+    protocol: "g2a2-watchdog-v1",
+    armed: true,
+    ackSent: true,
+    controlEnded: true,
+    watchdogTerminated: true,
+    controlError: null,
+    unexpectedControlEof: false,
+    watchdogKilledByHost: false,
+    handshakeError: null,
+    triggerReason: null,
+    pidGone: true,
+  };
+  const artifacts = recordedArtifactIds.map((artifactId) => {
+    const bytes = options.artifactBytes?.[artifactId] ?? artifactBytesFor(artifactId);
+    return {
+      artifactId,
+      relativePath: `${artifactId}.txt`,
+      bytes: bytes.length,
+      sha256: sha256(bytes),
+      archiveRef: `${runDirectory}/artifacts/${artifactId}.bin`,
+      verified: true,
+    };
+  });
+  const record: Record<string, unknown> = {
+    schemaVersion: 1,
+    limitsVersion: "g2a2-v1",
+    runId,
+    callId,
+    taskId: item.taskId,
+    ownerId: OWNER_ID,
+    taskRevision: item.taskRevision,
+    requirementsDigest: item.requirementsDigest,
+    anchorMessageId: item.anchor.messageId,
+    capabilityId: "local-script",
+    runtime: "python",
+    runtimeVersion: "3.9.6",
+    source: { bytes: RUN_SOURCE.length, sha256: sha256(RUN_SOURCE) },
+    inputs: includeInput ? [{
+      id: "input-1",
+      bytes: inputBytes.length,
+      sha256: sha256(inputBytes),
+      stagedPath: path.join(runRoot, "inputs", "input-1.bin"),
+      sourcePath: "/outside/never-read-by-evidence.txt",
+    }] : [],
+    interpreter: "/usr/bin/python3",
+    launcher: "/launcher",
+    profilePath: path.join(runRoot, "profile.sb"),
+    createdAt: NOW,
+    phase,
+    updatedAt: NOW,
+    ...(withProcess ? {
+      process: {
+        spawned: true,
+        pid: 12345,
+        pgid: 12345,
+        exitCode: 0,
+        signal: null,
+        durationMs: 5,
+        stopReason: null,
+        terminatedByHost: false,
+        groupGone: true,
+        groupCheckMs: 0,
+        spawnError: null,
+        launchStage: "unknown",
+        hostRecordError: null,
+        watchdog,
+      },
+      watchdog,
+    } : {}),
+    artifacts,
+    artifactRejections: [],
+    artifactTotalBytes: artifacts.reduce((total, artifact) => total + artifact.bytes, 0),
+    artifactLimitReached: false,
+    artifactExportError: null,
+    hostRecordError: null,
+    taskAccepted: false,
+    candidateOnly: true,
+  };
+  const recordPath = path.join(runRoot, "record.json");
+  writeFileSync(recordPath, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
+  const data = runLocatorData(h, item, {
+    runId,
+    callId,
+    runDirectory,
+    artifactIds: selectedArtifactIds,
+  });
+  const entry = h.appendEntry({
+    id: options.locatorId ?? `run-locator-${h.branch.length}`,
+    parentId: h.leafId,
+    type: "custom",
+    customType: HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+    data,
+  });
+  return {
+    runId,
+    callId,
+    runDirectory,
+    runRoot,
+    recordPath,
+    selectedArtifactIds,
+    recordedArtifactIds,
+    artifactPaths,
+    data,
+    entry,
+  };
+}
+
+function listedTaskSelector(h: Harness, view: HistoryViewControls): string {
+  const listed = view.list(h.context(), { limit: 16 });
+  expect(listed.ok).toBe(true);
+  if (!listed.ok) throw new Error("task list failed");
+  expect(listed.view.items).toHaveLength(1);
+  return listed.view.items[0]!.selector;
+}
+
+function listedRunSelector(
+  h: Harness,
+  view: HistoryViewControls,
+  taskSelector: string,
+): { selector: string; runId: string; artifactIds: string[] } {
+  const listed = view.listRuns(h.context(), { taskSelector });
+  expect(listed.ok).toBe(true);
+  if (!listed.ok) throw new Error("run list failed");
+  expect(listed.view.items).toHaveLength(1);
+  return {
+    selector: listed.view.items[0]!.selector,
+    runId: listed.view.items[0]!.runId,
+    artifactIds: listed.view.items[0]!.artifactIds,
+  };
 }
 
 describe("B2a selected-branch history view", () => {
@@ -1059,5 +1309,844 @@ describe("B2a selected-branch history view", () => {
       code: "unknown_selector",
     });
     expect(task.item.taskId).toBe(listed.view.items[0]!.taskId);
+  });
+
+  test("list_runs and inspect_run bind exact archived bytes and full identities", () => {
+    const h = harness();
+    const task = h.startTask("user-1", "Run it.");
+    const run = writeRunFixture(h, task.item);
+    const ownerBefore = h.owner.snapshot();
+    const fresh = new TaskOwner({ workspaceRoot: h.workspace, ownerId: FRESH_OWNER_ID });
+    const freshBefore = fresh.snapshot();
+    const executionBefore = readdirSync(path.join(h.instanceRoot, "execution")).sort();
+    const view = h.view();
+    const taskSelector = listedTaskSelector(h, view);
+
+    const listed = view.listRuns(h.context(), { taskSelector });
+    expect(listed.ok).toBe(true);
+    if (!listed.ok) return;
+    expect(listed.view.schemaVersion).toBe(HISTORY_VIEW_SCHEMA_VERSION);
+    expect(listed.view.action).toBe("list_runs");
+    expect(listed.view.result).toBe("visible_runs");
+    expect(listed.view.items).toHaveLength(1);
+    expect(listed.view.items[0]).toMatchObject({
+      historyId: task.item.historyId,
+      digest: task.item.digest,
+      taskId: task.item.taskId,
+      taskRevision: task.item.taskRevision,
+      requirementsDigest: task.item.requirementsDigest,
+      runId: run.runId,
+      callId: run.callId,
+      runDirectory: run.runDirectory,
+      artifactIds: ["artifact-1"],
+      recordWriteReturned: true,
+      byteIntegrity: "not_checked",
+      authorityRestored: false,
+    });
+    expect(listed.view.items[0]!.selector).toMatch(HISTORY_RUN_SELECTOR_PATTERN);
+    expect(listed.view.coverage).toMatchObject({
+      candidates: 1,
+      evaluated: 1,
+      inspected: 1,
+      returned: 1,
+      withheld: 0,
+      duplicatesCollapsed: 0,
+      more: false,
+    });
+    expect(listed.view.budget).toMatchObject({
+      inspections: 1,
+      prechargedBytes: 1024 * 1024,
+      bytesLimit: 16 * 1024 * 1024,
+    });
+    expect(JSON.stringify(listed.view)).not.toContain(h.root);
+    expect(JSON.stringify(listed.view)).not.toContain("print('view run evidence')");
+
+    const inspected = view.inspectRun(h.context(), listed.view.items[0]!.selector);
+    expect(inspected.ok).toBe(true);
+    if (!inspected.ok) return;
+    expect(inspected.view.action).toBe("inspect_run");
+    expect(inspected.view.result).toBe("archived_run_evidence");
+    expect(inspected.view.state).toBe("consistent");
+    expect(inspected.view.verification).toEqual({
+      instance: "exact",
+      history: "exact",
+      run: "exact",
+      metadata: "matched",
+      artifactSet: "exact",
+    });
+    expect(inspected.view.association).toMatchObject({
+      historyId: task.item.historyId,
+      digest: task.item.digest,
+      taskId: task.item.taskId,
+      taskRevision: task.item.taskRevision,
+      requirementsDigest: task.item.requirementsDigest,
+      runId: run.runId,
+      callId: run.callId,
+      runDirectory: run.runDirectory,
+      artifactIds: ["artifact-1"],
+      recordWriteReturned: true,
+      byteIntegrity: "not_checked",
+      authorityRestored: false,
+    });
+    const evidence = inspected.view.runEvidence;
+    expect(evidence.state).toBe("consistent");
+    expect(evidence.history).toMatchObject({
+      historyId: task.item.historyId,
+      digest: task.item.digest,
+      taskId: task.item.taskId,
+      taskRevision: task.item.taskRevision,
+      requirementsDigest: task.item.requirementsDigest,
+    });
+    expect(evidence.run).toMatchObject({
+      runId: run.runId,
+      callId: run.callId,
+      locator: `${run.runDirectory}/record.json`,
+    });
+    expect(evidence.metadata.state).toBe("matched");
+    expect(evidence.selection).toEqual({
+      requested: ["artifact-1"],
+      recorded: ["artifact-1"],
+      missing: [],
+      allPresent: true,
+    });
+    expect(evidence.bytes.state).toBe("verified");
+    expect(evidence.bytes.source).toMatchObject({
+      bytes: RUN_SOURCE.length,
+      sha256: sha256(RUN_SOURCE),
+      state: "matched",
+    });
+    expect(evidence.bytes.inputs).toHaveLength(1);
+    expect(evidence.bytes.inputs[0]).toMatchObject({
+      id: "input-1",
+      bytes: RUN_INPUT.length,
+      sha256: sha256(RUN_INPUT),
+      state: "matched",
+    });
+    expect(evidence.bytes.artifacts).toHaveLength(1);
+    expect(evidence.bytes.artifacts[0]).toMatchObject({
+      artifactId: "artifact-1",
+      relativePath: "artifact-1.txt",
+      bytes: RUN_ARTIFACT.length,
+      sha256: sha256(RUN_ARTIFACT),
+      state: "matched",
+    });
+    expect(evidence.processRecorded.state).toBe("completed_recorded");
+    expect(evidence.processCurrent).toBe("not_checked");
+    expect(evidence.acceptanceEvidence).toBe("not_checked");
+    expect(evidence.candidateRegistration).toBe("not_checked");
+    expect(evidence.branchVisibility).toBe("not_checked");
+    expect(evidence.authorityRestored).toBe(false);
+    expect(evidence.evidence).toBe("local-record");
+    expect(inspected.view.budget).toEqual({
+      taskInspections: 1,
+      runEvidenceCalls: 1,
+      prechargedBytes: HISTORY_RUN_EVIDENCE_PRECHARGE_BYTES,
+      precharge: "conservative_not_measured",
+      bytesLimit: 16 * 1024 * 1024,
+    });
+    expect(inspected.view.evidence).toMatchObject({
+      historical: true,
+      authorityRestored: false,
+      presentExecution: "not_checked",
+      acceptanceEvidence: "not_checked",
+      candidateRegistration: "not_checked",
+      bridge: {
+        selectedBranch: "checked",
+        requirementLedger: "checked",
+        runEvidence: "checked",
+      },
+    });
+    const wire = JSON.stringify(inspected.view);
+    expect(wire).not.toContain(h.instanceRoot);
+    expect(wire).not.toContain(h.stateRoot);
+    expect(wire).not.toContain(run.runRoot);
+    expect(wire).not.toContain("print('view run evidence')");
+    expect(wire).not.toContain("view artifact — 42");
+    expect(wire).not.toContain("\"success\"");
+    expect(readFileSync(run.artifactPaths.get("artifact-1")!)).toEqual(RUN_ARTIFACT);
+    expect(readdirSync(path.join(h.instanceRoot, "execution")).sort()).toEqual(executionBefore);
+    expect(h.owner.snapshot()).toEqual(ownerBefore);
+    expect(fresh.snapshot()).toEqual(freshBefore);
+    expect(fresh.snapshot().currentTask).toBeNull();
+  });
+
+  test("zero artifacts are legitimate and an unknown recorded process is not success", () => {
+    const zero = harness();
+    const zeroTask = zero.startTask("user-1", "Run without artifacts.");
+    writeRunFixture(zero, zeroTask.item, {
+      selectedArtifactIds: [],
+      recordedArtifactIds: [],
+      includeInput: false,
+    });
+    const zeroView = zero.view();
+    const zeroTaskSelector = listedTaskSelector(zero, zeroView);
+    const zeroRun = listedRunSelector(zero, zeroView, zeroTaskSelector);
+    const zeroInspected = zeroView.inspectRun(zero.context(), zeroRun.selector);
+    expect(zeroInspected.ok).toBe(true);
+    if (!zeroInspected.ok) return;
+    expect(zeroInspected.view.result).toBe("archived_run_evidence");
+    expect(zeroInspected.view.state).toBe("consistent");
+    expect(zeroInspected.view.verification.artifactSet).toBe("exact");
+    expect(zeroInspected.view.runEvidence.selection).toEqual({
+      requested: [],
+      recorded: [],
+      missing: [],
+      allPresent: true,
+    });
+    expect(zeroInspected.view.runEvidence.bytes.state).toBe("verified");
+    expect(zeroInspected.view.runEvidence.bytes.inputs).toEqual([]);
+    expect(zeroInspected.view.runEvidence.bytes.artifacts).toEqual([]);
+
+    const unknown = harness();
+    const unknownTask = unknown.startTask("user-1", "Run with an unknown process.");
+    writeRunFixture(unknown, unknownTask.item, { withProcess: false });
+    const unknownView = unknown.view();
+    const unknownTaskSelector = listedTaskSelector(unknown, unknownView);
+    const unknownRun = listedRunSelector(unknown, unknownView, unknownTaskSelector);
+    const unknownInspected = unknownView.inspectRun(unknown.context(), unknownRun.selector);
+    expect(unknownInspected.ok).toBe(true);
+    if (!unknownInspected.ok) return;
+    expect(unknownInspected.view.result).toBe("archived_run_evidence");
+    expect(unknownInspected.view.state).toBe("unknown");
+    expect(unknownInspected.view.runEvidence.state).toBe("unknown");
+    expect(unknownInspected.view.runEvidence.processRecorded.state).toBe("unknown_recorded");
+    expect(unknownInspected.view.runEvidence.metadata.state).toBe("matched");
+    const wire = JSON.stringify(unknownInspected.view);
+    expect(wire).not.toContain("\"success\"");
+    expect(wire).not.toContain("\"accepted\":" + "true");
+    expect(wire).not.toContain("print('view run evidence')");
+  });
+
+  test("exact artifact-set equality rejects an extra record artifact and a missing selected artifact", () => {
+    const extra = harness();
+    const extraTask = extra.startTask("user-1", "Run with an extra record artifact.");
+    writeRunFixture(extra, extraTask.item, {
+      selectedArtifactIds: ["artifact-1"],
+      recordedArtifactIds: ["artifact-1", "artifact-2"],
+    });
+    const extraView = extra.view();
+    const extraSelector = listedTaskSelector(extra, extraView);
+    const extraRun = listedRunSelector(extra, extraView, extraSelector);
+    const extraInspected = extraView.inspectRun(extra.context(), extraRun.selector);
+    expect(extraInspected.ok).toBe(true);
+    if (!extraInspected.ok) return;
+    expect(extraInspected.view.result).toBe("withheld_archived_run_evidence");
+    expect(extraInspected.view.state).toBe("mismatch");
+    expect(extraInspected.view.verification.artifactSet).toBe("mismatch");
+    expect(extraInspected.view.runEvidence.state).toBe("consistent");
+    expect(extraInspected.view.runEvidence.selection).toEqual({
+      requested: ["artifact-1"],
+      recorded: ["artifact-1", "artifact-2"],
+      missing: [],
+      allPresent: true,
+    });
+
+    const missing = harness();
+    const missingTask = missing.startTask("user-1", "Run with a missing selected artifact.");
+    writeRunFixture(missing, missingTask.item, {
+      selectedArtifactIds: ["artifact-1", "artifact-2"],
+      recordedArtifactIds: ["artifact-1"],
+    });
+    const missingView = missing.view();
+    const missingSelector = listedTaskSelector(missing, missingView);
+    const missingRun = listedRunSelector(missing, missingView, missingSelector);
+    const missingInspected = missingView.inspectRun(missing.context(), missingRun.selector);
+    expect(missingInspected.ok).toBe(true);
+    if (!missingInspected.ok) return;
+    expect(missingInspected.view.result).toBe("withheld_archived_run_evidence");
+    expect(missingInspected.view.state).toBe("mismatch");
+    expect(missingInspected.view.verification.artifactSet).toBe("mismatch");
+    expect(missingInspected.view.runEvidence.state).toBe("mismatch");
+    expect(missingInspected.view.runEvidence.selection).toEqual({
+      requested: ["artifact-1", "artifact-2"],
+      recorded: ["artifact-1"],
+      missing: ["artifact-2"],
+      allPresent: false,
+    });
+  });
+
+  test("actual byte modification and an unsafe run path are refused by real A reads", () => {
+    const changed = harness();
+    const changedTask = changed.startTask("user-1", "Run then change bytes.");
+    const changedRun = writeRunFixture(changed, changedTask.item);
+    const changedView = changed.view();
+    const changedTaskSelector = listedTaskSelector(changed, changedView);
+    const changedRunSelector = listedRunSelector(changed, changedView, changedTaskSelector);
+    const rewritten = Buffer.from("view artifact — 43\n", "utf8");
+    writeFileSync(changedRun.artifactPaths.get("artifact-1")!, rewritten);
+    const changedInspect = changedView.inspectRun(changed.context(), changedRunSelector.selector);
+    expect(changedInspect.ok).toBe(true);
+    if (!changedInspect.ok) return;
+    expect(changedInspect.view.result).toBe("archived_run_evidence");
+    expect(changedInspect.view.state).toBe("changed");
+    expect(changedInspect.view.verification.artifactSet).toBe("exact");
+    expect(changedInspect.view.runEvidence.state).toBe("changed");
+    expect(changedInspect.view.runEvidence.bytes.state).toBe("changed");
+    expect(changedInspect.view.runEvidence.bytes.artifacts[0]).toMatchObject({
+      artifactId: "artifact-1",
+      bytes: rewritten.length,
+      sha256: sha256(rewritten),
+      state: "changed",
+    });
+    expect(changedInspect.view.runEvidence.bytes.artifacts[0]!.sha256)
+      .not.toBe(sha256(RUN_ARTIFACT));
+
+    const linked = harness();
+    const linkedTask = linked.startTask("user-1", "Run through an unsafe path.");
+    const linkedRun = writeRunFixture(linked, linkedTask.item);
+    const linkedView = linked.view();
+    const linkedTaskSelector = listedTaskSelector(linked, linkedView);
+    const linkedRunSelector = listedRunSelector(linked, linkedView, linkedTaskSelector);
+    const outside = path.join(linked.root, "outside-run");
+    mkdirSync(outside, { mode: 0o700 });
+    rmSync(linkedRun.runRoot, { recursive: true, force: true });
+    symlinkSync(outside, linkedRun.runRoot, "dir");
+    const linkedInspect = linkedView.inspectRun(linked.context(), linkedRunSelector.selector);
+    expect(linkedInspect.ok).toBe(true);
+    if (!linkedInspect.ok) return;
+    expect(linkedInspect.view.result).toBe("withheld_archived_run_evidence");
+    expect(linkedInspect.view.state).toBe("changed");
+    expect(linkedInspect.view.runEvidence.state).toBe("changed");
+    expect(linkedInspect.view.runEvidence.run).toBeNull();
+    expect(linkedInspect.view.runEvidence.selection).toBeNull();
+    expect(linkedInspect.view.verification.artifactSet).toBe("mismatch");
+  });
+
+  test("task locator order, duplication, disappearance and wrong source prefix withhold run association", () => {
+    const order = harness();
+    const orderTask = order.startTask("user-1", "Run before task locator.");
+    const orderRun = writeRunFixture(order, orderTask.item);
+    const base = order.branch[0]!;
+    const source = order.branch.find((entry) => entry.id === "user-1")!;
+    const taskLocator = order.branch.find(
+      (entry) => entry.customType === HISTORY_LOCATOR_CUSTOM_TYPE,
+    )!;
+    order.branch = [base, source, orderRun.entry, taskLocator];
+    source.parentId = base.id;
+    orderRun.entry.parentId = source.id;
+    taskLocator.parentId = orderRun.entry.id;
+    order.leafId = taskLocator.id;
+    const orderView = order.view();
+    const orderTaskSelector = listedTaskSelector(order, orderView);
+    const orderListed = orderView.listRuns(order.context(), { taskSelector: orderTaskSelector });
+    expect(orderListed.ok).toBe(true);
+    if (!orderListed.ok) return;
+    expect(orderListed.view.items).toEqual([]);
+    expect(orderListed.view.coverage.withheldReasons.run_task_order).toBe(1);
+    expect(orderListed.view.coverage.inspected).toBe(1);
+
+    const duplicate = harness();
+    const duplicateTask = duplicate.startTask("user-1", "Duplicate task locator.");
+    writeRunFixture(duplicate, duplicateTask.item);
+    const duplicateView = duplicate.view();
+    const duplicateTaskSelector = listedTaskSelector(duplicate, duplicateView);
+    duplicate.appendLocator(duplicate.locatorData(duplicateTask.item), "task-locator-dup");
+    expect(duplicateView.listRuns(duplicate.context(), { taskSelector: duplicateTaskSelector }))
+      .toEqual({ ok: false, code: "new_list_required" });
+
+    const changed = harness();
+    const changedTask = changed.startTask("user-1", "Changed task locator.");
+    writeRunFixture(changed, changedTask.item);
+    const changedView = changed.view();
+    const changedTaskSelector = listedTaskSelector(changed, changedView);
+    const changedLocator = changed.branch.find(
+      (entry) => entry.customType === HISTORY_LOCATOR_CUSTOM_TYPE,
+    )!;
+    (changedLocator.data as Record<string, unknown>).digest =
+      `history-item-v1:sha256:${"0".repeat(64)}`;
+    expect(changedView.listRuns(changed.context(), { taskSelector: changedTaskSelector }))
+      .toEqual({ ok: false, code: "new_list_required" });
+
+    const sourceOrder = harness();
+    const sourceOrderTask = sourceOrder.startTask("user-1", "Source moved after locator.");
+    const sourceOrderRun = writeRunFixture(sourceOrder, sourceOrderTask.item);
+    const sourceOrderView = sourceOrder.view();
+    const sourceOrderTaskSelector = listedTaskSelector(sourceOrder, sourceOrderView);
+    const sourceOrderBase = sourceOrder.branch[0]!;
+    const sourceOrderSource = sourceOrder.branch.find((entry) => entry.id === "user-1")!;
+    const sourceOrderLocator = sourceOrder.branch.find(
+      (entry) => entry.customType === HISTORY_LOCATOR_CUSTOM_TYPE,
+    )!;
+    sourceOrder.branch = [
+      sourceOrderBase,
+      sourceOrderLocator,
+      sourceOrderSource,
+      sourceOrderRun.entry,
+    ];
+    sourceOrderLocator.parentId = sourceOrderBase.id;
+    sourceOrderSource.parentId = sourceOrderLocator.id;
+    sourceOrderRun.entry.parentId = sourceOrderSource.id;
+    sourceOrder.leafId = sourceOrderRun.entry.id;
+    expect(sourceOrderView.listRuns(sourceOrder.context(), {
+      taskSelector: sourceOrderTaskSelector,
+    })).toEqual({ ok: false, code: "new_list_required" });
+
+    const gone = harness();
+    const goneTask = gone.startTask("user-1", "Remove task locator.");
+    writeRunFixture(gone, goneTask.item);
+    const goneView = gone.view();
+    const goneTaskSelector = listedTaskSelector(gone, goneView);
+    gone.branch = gone.branch.filter(
+      (entry) => entry.customType !== HISTORY_LOCATOR_CUSTOM_TYPE,
+    );
+    for (let index = 1; index < gone.branch.length; index += 1) {
+      gone.branch[index]!.parentId = gone.branch[index - 1]!.id;
+    }
+    gone.leafId = gone.branch[gone.branch.length - 1]!.id;
+    expect(goneView.listRuns(gone.context(), { taskSelector: goneTaskSelector }))
+      .toEqual({ ok: false, code: "new_list_required" });
+
+    const rewritten = harness();
+    const rewrittenTask = rewritten.startTask("user-1", "Original source text.");
+    writeRunFixture(rewritten, rewrittenTask.item);
+    const rewrittenView = rewritten.view();
+    const rewrittenTaskSelector = listedTaskSelector(rewritten, rewrittenView);
+    (rewritten.branch.find((entry) => entry.id === "user-1")!.message as Record<string, unknown>)
+      .content = [{ type: "text", text: "Rewritten source text." }];
+    const rewrittenListed = rewrittenView.listRuns(rewritten.context(), {
+      taskSelector: rewrittenTaskSelector,
+    });
+    expect(rewrittenListed).toEqual({ ok: false, code: "withheld", reason: "source_mismatch" });
+  });
+
+  test("run selectors and cursors bind navigation, session file, appends and run collection changes", () => {
+    const h = harness();
+    const task = h.startTask("user-1", "Page runs.");
+    const first = writeRunFixture(h, task.item);
+    const secondData = runLocatorData(h, task.item, {
+      runId: "run-second",
+      callId: "call-second",
+      runDirectory: "run-second",
+    });
+    h.appendEntry({
+      id: "run-locator-second",
+      parentId: h.leafId,
+      type: "custom",
+      customType: HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+      data: secondData,
+    });
+    const view = h.view();
+    const taskSelector = listedTaskSelector(h, view);
+    const pageOne = view.listRuns(h.context(), { taskSelector, limit: 1 });
+    expect(pageOne.ok).toBe(true);
+    if (!pageOne.ok) return;
+    expect(pageOne.view.items.map((item) => item.runId)).toEqual(["run-fixed"]);
+    expect(pageOne.view.coverage.more).toBe(true);
+    expect(pageOne.view.nextCursor).toMatch(HISTORY_RUN_CURSOR_PATTERN);
+    const cursor = pageOne.view.nextCursor!;
+
+    h.appendAssistant("assistant-after-run-list");
+    const pageTwo = view.listRuns(h.context(), { taskSelector, limit: 1, cursor });
+    expect(pageTwo.ok).toBe(true);
+    if (!pageTwo.ok) return;
+    expect(pageTwo.view.items.map((item) => item.runId)).toEqual(["run-second"]);
+    expect(pageTwo.view.nextCursor).toBeNull();
+    const inspectedAfterAppend = view.inspectRun(h.context(), pageOne.view.items[0]!.selector);
+    expect(inspectedAfterAppend.ok).toBe(true);
+    if (inspectedAfterAppend.ok) {
+      expect(inspectedAfterAppend.view.association.runId).toBe(first.runId);
+    }
+
+    const thirdData = runLocatorData(h, task.item, {
+      runId: "run-third",
+      callId: "call-third",
+      runDirectory: "run-third",
+    });
+    h.appendEntry({
+      id: "run-locator-third",
+      parentId: h.leafId,
+      type: "custom",
+      customType: HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+      data: thirdData,
+    });
+    expect(view.listRuns(h.context(), { taskSelector, limit: 1, cursor })).toEqual({
+      ok: false,
+      code: "new_list_required",
+    });
+    expect(view.inspectRun(h.context(), pageOne.view.items[0]!.selector)).toEqual({
+      ok: false,
+      code: "unknown_selector",
+    });
+    const relisted = view.listRuns(h.context(), { taskSelector });
+    expect(relisted.ok).toBe(true);
+    if (relisted.ok) expect(relisted.view.items).toHaveLength(3);
+
+    const navigated = view.listRuns(h.context(), { taskSelector });
+    expect(navigated.ok).toBe(true);
+    if (!navigated.ok) return;
+    const runSelector = navigated.view.items[0]!.selector;
+    view.navigate("session_tree");
+    expect(view.inspectRun(h.context(), runSelector)).toEqual({
+      ok: false,
+      code: "new_list_required",
+    });
+
+    const sessionView = h.view();
+    const sessionTaskSelector = listedTaskSelector(h, sessionView);
+    const sessionListed = sessionView.listRuns(h.context(), { taskSelector: sessionTaskSelector });
+    expect(sessionListed.ok).toBe(true);
+    if (!sessionListed.ok) return;
+    h.sessionFile = path.join(h.root, "switched-run-session.jsonl");
+    writeFileSync(h.sessionFile, "");
+    expect(sessionView.listRuns(h.context(), { taskSelector: sessionTaskSelector })).toEqual({
+      ok: false,
+      code: "new_list_required",
+    });
+    expect(sessionView.inspectRun(h.context(), sessionListed.view.items[0]!.selector)).toEqual({
+      ok: false,
+      code: "new_list_required",
+    });
+
+    expect(sessionView.listRuns(h.context(), {
+      taskSelector: sessionListed.view.items[0]!.selector,
+    })).toEqual({ ok: false, code: "invalid_arguments" });
+    expect(sessionView.inspectRun(h.context(), sessionTaskSelector)).toEqual({
+      ok: false,
+      code: "unknown_selector",
+    });
+  });
+
+  test("run paging, duplicates and the complete collection bound stay bounded", () => {
+    const h = harness();
+    const task = h.startTask("user-1", "Many runs.");
+    for (let index = 0; index < 17; index += 1) {
+      h.appendEntry({
+        id: `run-many-${index}`,
+        parentId: h.leafId,
+        type: "custom",
+        customType: HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+        data: runLocatorData(h, task.item, {
+          runId: `run-many-${index}`,
+          callId: `call-many-${index}`,
+          runDirectory: `run-many-${index}`,
+        }),
+      });
+    }
+    const view = h.view();
+    const taskSelector = listedTaskSelector(h, view);
+    const pageOne = view.listRuns(h.context(), { taskSelector, limit: 16 });
+    expect(pageOne.ok).toBe(true);
+    if (!pageOne.ok) return;
+    expect(pageOne.view.items).toHaveLength(16);
+    expect(pageOne.view.coverage).toMatchObject({ candidates: 17, evaluated: 16, more: true });
+    expect(pageOne.view.nextCursor).toMatch(HISTORY_RUN_CURSOR_PATTERN);
+    const cursor = pageOne.view.nextCursor!;
+    const pageTwo = view.listRuns(h.context(), { taskSelector, limit: 16, cursor });
+    expect(pageTwo.ok).toBe(true);
+    if (!pageTwo.ok) return;
+    expect(pageTwo.view.items).toHaveLength(1);
+    expect(pageTwo.view.coverage.more).toBe(false);
+    expect(view.status().selectors).toBe(18);
+    expect(view.status().selectors).toBeLessThanOrEqual(128);
+
+    const duplicate = harness();
+    const duplicateTask = duplicate.startTask("user-1", "Duplicate run.");
+    const duplicateData = runLocatorData(duplicate, duplicateTask.item);
+    duplicate.appendEntry({
+      id: "run-dup-1",
+      parentId: duplicate.leafId,
+      type: "custom",
+      customType: HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+      data: duplicateData,
+    });
+    duplicate.appendEntry({
+      id: "run-dup-2",
+      parentId: duplicate.leafId,
+      type: "custom",
+      customType: HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+      data: duplicateData,
+    });
+    const duplicateView = duplicate.view();
+    const duplicateSelector = listedTaskSelector(duplicate, duplicateView);
+    const duplicateListed = duplicateView.listRuns(duplicate.context(), {
+      taskSelector: duplicateSelector,
+    });
+    expect(duplicateListed.ok).toBe(true);
+    if (!duplicateListed.ok) return;
+    expect(duplicateListed.view.items).toHaveLength(1);
+    expect(duplicateListed.view.coverage).toMatchObject({
+      candidates: 2,
+      returned: 1,
+      duplicatesCollapsed: 1,
+      withheld: 0,
+    });
+
+    const over = harness();
+    const overTask = over.startTask("user-1", "Too many runs.");
+    for (let index = 0; index < 129; index += 1) {
+      over.appendEntry({
+        id: `run-over-${index}`,
+        parentId: over.leafId,
+        type: "custom",
+        customType: HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+        data: runLocatorData(over, overTask.item, {
+          runId: `run-over-${index}`,
+          callId: `call-over-${index}`,
+          runDirectory: `run-over-${index}`,
+        }),
+      });
+    }
+    const overView = over.view();
+    const overSelector = listedTaskSelector(over, overView);
+    expect(overView.listRuns(over.context(), { taskSelector: overSelector })).toEqual({
+      ok: false,
+      code: "limit",
+    });
+  });
+
+  test("the final composition callback rewrites the archive and real A rejects the old bytes", () => {
+    const h = harness();
+    const task = h.startTask("user-1", "Rewrite at seal.");
+    const run = writeRunFixture(h, task.item);
+    let armed = false;
+    let armedCalls = 0;
+    const view = createHistoryView({
+      stateRoot: h.stateRoot,
+      workspaceRoot: h.workspace,
+      isCurrentComposition: () => {
+        if (armed) {
+          armedCalls += 1;
+          if (armedCalls === 2) {
+            writeFileSync(run.artifactPaths.get("artifact-1")!, "rewritten at final seal\n");
+          }
+        }
+        return true;
+      },
+    });
+    const taskSelector = listedTaskSelector(h, view);
+    const runSelector = listedRunSelector(h, view, taskSelector).selector;
+    const before = readFileSync(run.artifactPaths.get("artifact-1")!);
+    armed = true;
+    const inspected = view.inspectRun(h.context(), runSelector);
+    expect(inspected.ok).toBe(true);
+    if (!inspected.ok) return;
+    expect(armedCalls).toBe(2);
+    const after = readFileSync(run.artifactPaths.get("artifact-1")!);
+    expect(after).not.toEqual(before);
+    expect(after.toString("utf8")).toBe("rewritten at final seal\n");
+    expect(inspected.view.state).toBe("changed");
+    expect(inspected.view.runEvidence.state).toBe("changed");
+    expect(inspected.view.runEvidence.bytes.state).toBe("changed");
+    expect(inspected.view.runEvidence.bytes.artifacts[0]!.sha256)
+      .not.toBe(sha256(before));
+  });
+
+  test("malformed or unsupported run data claiming the actual history is withheld", () => {
+    const h = harness();
+    const task = h.startTask("user-1", "Malformed run claim.");
+    const valid = runLocatorData(h, task.item);
+    h.appendEntry({
+      id: "run-invalid-claim",
+      parentId: h.leafId,
+      type: "custom",
+      customType: HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+      data: { ...valid, extra: "not-allowlisted" },
+    });
+    h.appendEntry({
+      id: "run-unsupported-claim",
+      parentId: h.leafId,
+      type: "custom",
+      customType: HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+      data: { ...valid, version: 2, runId: "run-unsupported" },
+    });
+    const view = h.view();
+    const taskSelector = listedTaskSelector(h, view);
+    const listed = view.listRuns(h.context(), { taskSelector });
+    expect(listed.ok).toBe(true);
+    if (!listed.ok) return;
+    expect(listed.view.items).toEqual([]);
+    expect(listed.view.result).toBe("no_visible_runs");
+    expect(listed.view.coverage.candidates).toBe(2);
+    expect(listed.view.coverage.evaluated).toBe(2);
+    expect(listed.view.coverage.withheld).toBe(2);
+    expect(listed.view.coverage.withheldReasons).toMatchObject({
+      run_locator_invalid: 1,
+      run_locator_unsupported: 1,
+    });
+    expect(listed.view.coverage.inspected).toBe(1);
+    expect(view.status().selectors).toBe(1);
+  });
+
+  test("a malformed run claim's history assignment changes the run collection signature", () => {
+    const h = harness();
+    const first = h.startTask("user-1", "First task history.");
+    const second = h.reviseTask("user-2", "Second task history.");
+    writeRunFixture(h, second.item, {
+      runId: "run-stale-one",
+      callId: "call-stale-one",
+      runDirectory: "run-stale-one",
+    });
+    writeRunFixture(h, second.item, {
+      runId: "run-stale-two",
+      callId: "call-stale-two",
+      runDirectory: "run-stale-two",
+    });
+    const malformed = h.appendEntry({
+      id: "run-malformed-claim",
+      parentId: h.leafId,
+      type: "custom",
+      customType: HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+      data: {
+        ...runLocatorData(h, second.item, {
+          runId: "run-malformed",
+          callId: "call-malformed",
+          runDirectory: "run-malformed",
+        }),
+        historyId: first.item.historyId,
+        extra: "not-allowlisted",
+      },
+    });
+
+    const selectTask = (view: HistoryViewControls, historyId: string): string => {
+      const listed = view.list(h.context(), { limit: 16 });
+      expect(listed.ok).toBe(true);
+      if (!listed.ok) throw new Error("task list failed");
+      const item = listed.view.items.find((candidate) => candidate.historyId === historyId);
+      expect(item).toBeDefined();
+      return item!.selector;
+    };
+
+    const cursorView = h.view();
+    const cursorTask = selectTask(cursorView, second.item.historyId);
+    const cursorPage = cursorView.listRuns(h.context(), { taskSelector: cursorTask, limit: 1 });
+    expect(cursorPage.ok).toBe(true);
+    if (!cursorPage.ok) return;
+    expect(cursorPage.view.items.map((item) => item.runId)).toEqual(["run-stale-one"]);
+    const staleCursor = cursorPage.view.nextCursor!;
+    expect(staleCursor).toMatch(HISTORY_RUN_CURSOR_PATTERN);
+
+    const selectorView = h.view();
+    const selectorTask = selectTask(selectorView, second.item.historyId);
+    const selectorPage = selectorView.listRuns(h.context(), { taskSelector: selectorTask });
+    expect(selectorPage.ok).toBe(true);
+    if (!selectorPage.ok) return;
+    expect(selectorPage.view.items.map((item) => item.runId)).toEqual([
+      "run-stale-one",
+      "run-stale-two",
+    ]);
+    const staleSelector = selectorPage.view.items[0]!.selector;
+
+    malformed.data = {
+      ...(malformed.data as Record<string, unknown>),
+      historyId: second.item.historyId,
+    };
+
+    expect(cursorView.listRuns(h.context(), {
+      taskSelector: cursorTask,
+      limit: 1,
+      cursor: staleCursor,
+    })).toEqual({ ok: false, code: "new_list_required" });
+    expect(selectorView.inspectRun(h.context(), staleSelector)).toEqual({
+      ok: false,
+      code: "new_list_required",
+    });
+
+    const refreshedCursor = cursorView.listRuns(h.context(), { taskSelector: cursorTask, limit: 1 });
+    expect(refreshedCursor.ok).toBe(true);
+    if (refreshedCursor.ok) {
+      expect(refreshedCursor.view.items.map((item) => item.runId)).toEqual(["run-stale-one"]);
+      expect(refreshedCursor.view.nextCursor).toMatch(HISTORY_RUN_CURSOR_PATTERN);
+    }
+    const refreshedSelector = selectorView.listRuns(h.context(), { taskSelector: selectorTask });
+    expect(refreshedSelector.ok).toBe(true);
+    if (!refreshedSelector.ok) return;
+    expect(refreshedSelector.view.items.map((item) => item.runId)).toEqual([
+      "run-stale-one",
+      "run-stale-two",
+    ]);
+    expect(selectorView.inspectRun(h.context(), refreshedSelector.view.items[0]!.selector).ok).toBe(true);
+  });
+
+  test("run tokens bind the actual manager while task selectors keep prior behavior", () => {
+    const h = harness();
+    const task = h.startTask("user-1", "Swap manager.");
+    writeRunFixture(h, task.item);
+    h.appendEntry({
+      id: "run-manager-second",
+      parentId: h.leafId,
+      type: "custom",
+      customType: HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+      data: runLocatorData(h, task.item, {
+        runId: "run-manager-second",
+        callId: "call-manager-second",
+        runDirectory: "run-manager-second",
+      }),
+    });
+    const selectorView = h.view();
+    const selectorTask = listedTaskSelector(h, selectorView);
+    const selectorPage = selectorView.listRuns(h.context(), { taskSelector: selectorTask, limit: 1 });
+    expect(selectorPage.ok).toBe(true);
+    if (!selectorPage.ok) return;
+    const oldRunSelector = selectorPage.view.items[0]!.selector;
+
+    const cursorView = h.view();
+    const cursorTask = listedTaskSelector(h, cursorView);
+    const cursorPage = cursorView.listRuns(h.context(), { taskSelector: cursorTask, limit: 1 });
+    expect(cursorPage.ok).toBe(true);
+    if (!cursorPage.ok) return;
+    const cursor = cursorPage.view.nextCursor!;
+
+    const replacement = h.context({ branchRead() {} }).sessionManager!;
+    const swapped = h.context({ manager: replacement });
+    expect(selectorView.inspectRun(swapped, oldRunSelector)).toEqual({
+      ok: false,
+      code: "new_list_required",
+    });
+    expect(cursorView.listRuns(swapped, { taskSelector: cursorTask, limit: 1, cursor })).toEqual({
+      ok: false,
+      code: "new_list_required",
+    });
+
+    const relisted = selectorView.listRuns(swapped, { taskSelector: selectorTask });
+    expect(relisted.ok).toBe(true);
+    if (!relisted.ok) return;
+    expect(relisted.view.items).toHaveLength(2);
+    const newRunSelector = relisted.view.items[0]!.selector;
+    expect(newRunSelector).not.toBe(oldRunSelector);
+    const inspected = selectorView.inspectRun(swapped, newRunSelector);
+    expect(inspected.ok).toBe(true);
+    expect(selectorView.inspect(swapped, selectorTask).ok).toBe(true);
+  });
+
+  test("post-A navigation, disposal or native abort refuses the bound evidence", () => {
+    for (const mode of ["navigate", "dispose", "abort"] as const) {
+      const h = harness();
+      const task = h.startTask("user-1", `Reenter ${mode}.`);
+      writeRunFixture(h, task.item);
+      const view = h.view();
+      const taskSelector = listedTaskSelector(h, view);
+      const runSelector = listedRunSelector(h, view, taskSelector).selector;
+      const controller = new AbortController();
+      const original = HistoryProjectionReader.prototype.inspect;
+      let reads = 0;
+      let fired = false;
+      const spy = spyOn(HistoryProjectionReader.prototype, "inspect").mockImplementation(
+        function (this: HistoryProjectionReader, selector) {
+          const result = original.call(this, selector);
+          reads += 1;
+          if (reads === 2) {
+            fired = true;
+            if (mode === "navigate") view.navigate("during_a");
+            else if (mode === "dispose") view.dispose();
+            else controller.abort();
+          }
+          return result;
+        },
+      );
+      try {
+        const inspected = view.inspectRun(
+          h.context(),
+          runSelector,
+          mode === "abort" ? controller.signal : undefined,
+        );
+        expect(fired).toBe(true);
+        expect(inspected).toEqual({
+          ok: false,
+          code: mode === "abort" ? "aborted" : mode === "dispose" ? "disposed" : "new_list_required",
+        });
+      } finally {
+        spy.mockRestore();
+      }
+    }
   });
 });
