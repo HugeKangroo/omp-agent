@@ -1,5 +1,11 @@
 # Release notes
 
+## Real-model journey validation
+
+Recorded a bounded three-message file-task, cancellation and new-task journey through the configured entry. Independent checks confirmed actual artifact bytes, delivery paths, preserved previous files and truthful insufficient/active/cancelled reporting. Original automated attribution failures and recovered tool errors remain recorded; this is not a strict zero-error pass, semantic host acceptance or full Alpha validation.
+
+Documented the observed macOS Python override limitation: the system `xcrun` forwarding path can fail inside the execution sandbox even after a successful version probe. The configured entry already defaults to the direct interpreter. This increment changes documentation only.
+
 ## Default package entry
 
 The package now selects `src/daily-entry.ts` and includes `scripts/isolated-exec.py` alongside all runtime source files. It can be explicitly loaded by directory from a checkout or a locally packed and extracted archive. Missing `OMP_AGENT_CONFIG` leaves managed tools disabled without falling back to the old probe.

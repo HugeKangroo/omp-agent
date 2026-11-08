@@ -63,6 +63,8 @@ OMP 根据目录中的 `package.json` 加载这一组合入口，不要再同时
 
 当前启动会预检 Python、Bun 和 macOS 执行沙箱。未指定 `pythonPath` 时使用 `/Library/Developer/CommandLineTools/usr/bin/python3`；未指定 `bunPath` 时使用当前 Bun 或宿主 PATH 中可执行的 Bun。需要覆盖时，把对应绝对路径写入 JSON；入口不会安装运行时或自动放宽执行限制。
 
+在已验证的 macOS 环境中，`/usr/bin/python3` 的 `xcrun` 转发路径会被执行沙箱拒绝。覆盖 `pythonPath` 时应选择直接解释器；仅能成功查询版本，不代表该路径能在沙箱中运行。
+
 每次启动都会在 `stateRoot/instances/<新实例 ID>/` 中创建独立的执行、交付、接收目录和任务记录。同一进程内可在当前任务接收或取消后继续新任务；重启保留旧文件，但不会加载旧任务权限、候选索引或接收历史。这不是跨进程恢复。
 
 单入口默认不绑定自动语义验证契约。验证可能报告 `insufficient`；生成文件、成功预览或工具成功都不等于任务已接收。要启用人工审阅，在同一 JSON 中增加 `"humanReview": "local-main-tui-v1"`，并使用真实 OMP main-agent TUI；模型仍不能批准，RPC 或无 UI 环境也不能完成批准。该入口不读取旧实验入口的 `OMP_AGENT_HUMAN_REVIEW` 等分散配置来启用此功能。
