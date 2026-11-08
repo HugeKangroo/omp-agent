@@ -2922,6 +2922,15 @@ export class DeliveryService {
     }
     try {
       const bundle = await this.verifyBundle(record);
+      if (this.disposed) {
+        return {
+          state: "unavailable",
+          reason: "the delivery service was disposed while the accepted bundle was checked",
+          files: null,
+          manifest: null,
+          requirements: null,
+        };
+      }
       return {
         state: "intact",
         reason: null,

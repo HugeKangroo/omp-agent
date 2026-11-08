@@ -1397,6 +1397,17 @@ export class TaskOwner {
     return { ...task.acceptance };
   }
 
+  /**
+   * Pure retained identity read for a final exact-target recheck. Emits no
+   * event, changes no pointer and grants no visibility; callers must prove the
+   * target anchor against their own live subject.
+   */
+  retainedTask(taskId: string, taskRevision: number): ManagedTask | null {
+    const task = this.tasks.get(taskId);
+    if (!task || task.taskRevision !== taskRevision) return null;
+    return copyTask(task);
+  }
+
   start(
     subject: TaskSubject,
     understanding?: string,

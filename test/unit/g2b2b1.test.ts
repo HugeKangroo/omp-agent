@@ -377,6 +377,54 @@ async function inspectTool(
   }, undefined, undefined, f.ctx);
 }
 
+async function inspectWith(
+  f: Fixture,
+  exact: { expectedTaskId: string; expectedTaskRevision: number; deliveryId: string },
+  signal?: AbortSignal,
+): Promise<ToolResult> {
+  return f.tools.get(DELIVERY_TOOL)!.execute("inspect-target-tool", {
+    action: "inspect",
+    ...exact,
+  }, signal, undefined, f.ctx);
+}
+
+function startFollowUp(f: Fixture, text = "Start a separate follow-up task."): {
+  branch: Entry[];
+  task: NonNullable<ReturnType<TaskOwner["snapshot"]>["currentTask"]>;
+} {
+  const firstUser = f.branch[1] as Entry;
+  const assistantEntry: Entry = {
+    id: "assistant-historical-follow-up",
+    parentId: firstUser.id,
+    type: "message",
+    message: { role: "assistant", content: [{ type: "text", text: "accepted" }], attribution: "agent" },
+  };
+  const nextUser = user("user-historical-follow-up", assistantEntry.id, text);
+  const nextBranch = [...f.branch, assistantEntry, nextUser];
+  expect(f.owner.closeTurn({
+    sessionId: SESSION,
+    branch: f.branch,
+    messages: [{ ...(firstUser.message as Record<string, unknown>), id: firstUser.id }],
+  })).toBe(true);
+  expect(f.owner.observeInput({
+    sessionId: SESSION,
+    workspaceRoot: f.workspace,
+    source: "rpc",
+    text,
+    observedAt: NOW,
+    baseLeafId: assistantEntry.id,
+  }).accepted).toBe(true);
+  f.owner.observeAgentStart({ sessionId: SESSION, prompt: text, reason: "prompt" });
+  const next = f.owner.start(subject(nextBranch));
+  expect(next.created).toBe(true);
+  f.live.branch = nextBranch;
+  return { branch: nextBranch, task: next.task };
+}
+
+function acceptanceDirectory(f: Fixture): string[] {
+  return readdirSync(f.acceptanceRoot).sort();
+}
+
 function sha256(data: Uint8Array | string): string {
   return `sha256:${createHash("sha256").update(data).digest("hex")}`;
 }
@@ -1181,6 +1229,10 @@ describe("G2-B2-B1 host acceptance transaction", () => {
       expect(inspected.acceptance).toBeNull();
       expect(inspected.unknown?.acceptanceId).toBe(hazard.acceptanceId);
       expect(inspected.current.state).toBe("unknown");
+      expect(inspected.target.state).toBe("unknown");
+      expect(inspected.target.taskId).toBeNull();
+      expect(inspected.target.accepted).toBeNull();
+      expect(f.owner.snapshot().acceptanceHazard).toEqual(hazard);
     } finally {
       await f.cleanup();
     }
@@ -1529,6 +1581,81 @@ describe("G2-B2-B1 host acceptance transaction", () => {
       expect(afterNavigation.unknown).toEqual(hazard);
       expect(afterNavigation.record.state).toBe("unknown");
       expect(f.owner.snapshot().acceptanceHazard).toEqual(hazard);
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("B3-B1 unknown installation is withheld after the final actual anchor loss", async () => {
+    const f = await fixture();
+    try {
+      const prepared = await prepareAccepted(f);
+      const task = f.owner.snapshot().currentTask!;
+      const hazard = {
+        task: {
+          ownerId: task.ownerId,
+          taskId: task.taskId,
+          taskRevision: task.taskRevision,
+          requirementsDigest: requirementsDigest(task.requirementSources),
+        },
+        acceptanceId: "acceptance-final-context-fixture",
+        deliveryId: prepared.deliveryId,
+        recordDigest: "sha256:" + "d".repeat(64),
+        reason: "injected unknown installation outcome",
+      };
+      (f.owner as unknown as { acceptanceHazard: unknown }).acceptanceHazard = hazard;
+      const recordsBefore = acceptanceDirectory(f);
+
+      const control = modelJson(await inspectTool(f, prepared.deliveryId));
+      expect(control.unknown.acceptanceId).toBe(hazard.acceptanceId);
+      expect(control.unknown.recordDigest).toBe(hazard.recordDigest);
+      expect(control.visibility.state).toBe("unknown");
+      expect(control.target.state).toBe("unknown");
+      expect(control.taskAccepted).toBeNull();
+      expect(control.acceptance.acceptanceId).toBeNull();
+      expect(control.paths.available).toBe(false);
+
+      const service = acceptanceOf(f);
+      const actual = service.inspect.bind(service);
+      let armed = false;
+      service.inspect = async (...args: Parameters<AcceptanceService["inspect"]>) => {
+        const result = await actual(...args);
+        expect(result.unknown?.acceptanceId).toBe(hazard.acceptanceId);
+        if (!armed) {
+          armed = true;
+          // Real context boundary after the awaited inspection: the final
+          // getBranch no longer contains the task anchor while owner and task
+          // identity are unchanged.
+          f.live.branch = [{
+            id: "unreachable-history-branch",
+            parentId: null,
+            type: "custom",
+            customType: "fixture-navigation",
+            data: {},
+          }];
+        }
+        return result;
+      };
+      const late = await inspectTool(f, prepared.deliveryId);
+      expect(armed).toBe(true);
+      expect(late.isError).toBe(true);
+      const lateFacts = modelJson(late);
+      expect(late.details).toEqual(lateFacts);
+      expect(lateFacts.unknown).toBeNull();
+      expect(lateFacts.acceptance.acceptanceId).toBeNull();
+      expect(lateFacts.acceptance.recordDigest).toBeNull();
+      expect(lateFacts.target.state).toBe("unavailable");
+      expect(lateFacts.taskAccepted).toBeNull();
+      expect(lateFacts.currentTaskId).toBeNull();
+      expect(lateFacts.integrity).toBeNull();
+      expect(lateFacts.files).toBeNull();
+      expect(lateFacts.paths.available).toBe(false);
+      const raw = JSON.stringify(late);
+      expect(raw).not.toContain(hazard.acceptanceId);
+      expect(raw).not.toContain(hazard.recordDigest);
+      expect(f.owner.snapshot().acceptanceHazard).toEqual(hazard);
+      expect(f.owner.snapshot().currentTask!.taskId).toBe(task.taskId);
+      expect(acceptanceDirectory(f)).toEqual(recordsBefore);
     } finally {
       await f.cleanup();
     }
@@ -2606,6 +2733,364 @@ describe("G2-B2-B1 host acceptance transaction", () => {
     } finally {
       await f.cleanup();
       await rm(parent, { recursive: true, force: true });
+    }
+  });
+  test("B3-B1 accepted target A stays readable after current B starts", async () => {
+    const f = await fixture();
+    try {
+      const targetA = f.owner.snapshot().currentTask!;
+      const prepared = await prepareAccepted(f);
+      const submitted = await acceptanceOf(f).submit(f.ctx, selector(f, prepared.deliveryId));
+      expect(submitted.outcome).toBe("committed");
+      const reference = submitted.acceptance!;
+      const recordPath = path.join(f.acceptanceRoot, `record-${reference.acceptanceId}.json`);
+      const recordBytes = readFileSync(recordPath);
+      const recordInode = lstatSync(recordPath).ino;
+      const fileSha = sha256(readFileSync(prepared.files[0]!.path));
+
+      const follow = startFollowUp(f);
+      const inspected = await inspectWith(f, {
+        expectedTaskId: targetA.taskId,
+        expectedTaskRevision: targetA.taskRevision,
+        deliveryId: prepared.deliveryId,
+      });
+      expect(inspected.isError).toBeUndefined();
+      const facts = modelJson(inspected);
+      expect(facts.action).toBe("inspect");
+      expect(facts.operation).toEqual({ performed: false, readOnly: true, newCommit: false });
+      expect(facts.target).toEqual({
+        state: "visible",
+        taskId: targetA.taskId,
+        taskRevision: targetA.taskRevision,
+        status: "accepted",
+        accepted: true,
+        historical: true,
+        reason: null,
+      });
+      expect(facts.currentTaskId).toBe(follow.task.taskId);
+      expect(facts.currentTaskStatus).toBe("active");
+      expect(facts.taskAccepted).toBe(false);
+      expect(facts.visibility.state).toBe("visible");
+      expect(facts.acceptance).toEqual({
+        historyCommitted: true,
+        acceptanceId: reference.acceptanceId,
+        deliveryId: reference.deliveryId,
+        recordDigest: reference.recordDigest,
+        acceptedAt: reference.acceptedAt,
+      });
+      expect(facts.integrity.record.state).toBe("intact");
+      expect(facts.integrity.record.digestMatches).toBe(true);
+      expect(facts.integrity.delivery.state).toBe("intact");
+      expect(facts.paths.available).toBe(true);
+      expect(facts.files).toHaveLength(1);
+      expect(facts.files[0].path).toBe(prepared.files[0]!.path);
+      expect(facts.files[0].sha256).toBe(fileSha);
+      expect(readFileSync(recordPath)).toEqual(recordBytes);
+      expect(lstatSync(recordPath).ino).toBe(recordInode);
+      expect(f.owner.snapshot().currentTask!.taskId).toBe(follow.task.taskId);
+      expect(f.owner.snapshot().currentTask!.status).toBe("active");
+      expect(f.owner.snapshot().currentTask!.acceptance).toBeNull();
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("B3-B1 mismatched historical selectors are refused without substituting current B", async () => {
+    for (const mismatch of ["revision", "delivery"] as const) {
+      const f = await fixture();
+      try {
+        const targetA = f.owner.snapshot().currentTask!;
+        const prepared = await prepareAccepted(f);
+        const submitted = await acceptanceOf(f).submit(f.ctx, selector(f, prepared.deliveryId));
+        expect(submitted.outcome).toBe("committed");
+        const reference = submitted.acceptance!;
+        const follow = startFollowUp(f);
+        const recordPath = path.join(f.acceptanceRoot, `record-${reference.acceptanceId}.json`);
+        const recordBytes = readFileSync(recordPath);
+        const recordInode = lstatSync(recordPath).ino;
+        const recordsBefore = acceptanceDirectory(f);
+        const tasksCreated = f.owner.snapshot().tasksCreated;
+
+        const wrongSelector = mismatch === "revision"
+          ? {
+              expectedTaskId: targetA.taskId,
+              expectedTaskRevision: targetA.taskRevision + 1,
+              deliveryId: prepared.deliveryId,
+            }
+          : {
+              expectedTaskId: targetA.taskId,
+              expectedTaskRevision: targetA.taskRevision,
+              deliveryId: "delivery-not-the-accepted-target",
+            };
+        const refused = await inspectWith(f, wrongSelector);
+        expect(refused.isError).toBe(true);
+        const facts = modelJson(refused);
+        expect(facts.target.state).toBe("unavailable");
+        expect(facts.target.taskId).toBeNull();
+        expect(facts.target.accepted).toBeNull();
+        expect(facts.acceptance.acceptanceId).toBeNull();
+        expect(facts.acceptance.recordDigest).toBeNull();
+        expect(facts.integrity).toBeNull();
+        expect(facts.files).toBeNull();
+        expect(facts.manifest).toBeNull();
+        expect(facts.requirements).toBeNull();
+        expect(facts.paths.available).toBe(false);
+        expect(facts.currentTaskId).toBe(follow.task.taskId);
+        expect(facts.currentTaskStatus).toBe("active");
+        expect(facts.taskAccepted).toBe(false);
+        expect(textOf(refused)).not.toContain(reference.acceptanceId);
+        expect(textOf(refused)).not.toContain(reference.recordDigest);
+        expect(textOf(refused)).not.toContain(prepared.files[0]!.path);
+        expect(f.owner.snapshot().currentTask!.taskId).toBe(follow.task.taskId);
+        expect(f.owner.snapshot().tasksCreated).toBe(tasksCreated);
+        expect(acceptanceDirectory(f)).toEqual(recordsBefore);
+        expect(readFileSync(recordPath)).toEqual(recordBytes);
+        expect(lstatSync(recordPath).ino).toBe(recordInode);
+      } finally {
+        await f.cleanup();
+      }
+    }
+  });
+
+  test("B3-B1 historical acceptance is separate from later delivery damage", async () => {
+    const f = await fixture();
+    try {
+      const targetA = f.owner.snapshot().currentTask!;
+      const prepared = await prepareAccepted(f);
+      const submitted = await acceptanceOf(f).submit(f.ctx, selector(f, prepared.deliveryId));
+      expect(submitted.outcome).toBe("committed");
+      const reference = submitted.acceptance!;
+      const recordPath = path.join(f.acceptanceRoot, `record-${reference.acceptanceId}.json`);
+      const recordBytes = readFileSync(recordPath);
+      const recordInode = lstatSync(recordPath).ino;
+      const follow = startFollowUp(f);
+      chmodSync(prepared.files[0]!.path, 0o600);
+      writeFileSync(prepared.files[0]!.path, "damaged after acceptance\n");
+
+      const inspected = await inspectWith(f, {
+        expectedTaskId: targetA.taskId,
+        expectedTaskRevision: targetA.taskRevision,
+        deliveryId: prepared.deliveryId,
+      });
+      expect(inspected.isError).toBeUndefined();
+      const facts = modelJson(inspected);
+      expect(facts.target).toMatchObject({
+        state: "visible",
+        taskId: targetA.taskId,
+        status: "accepted",
+        accepted: true,
+        historical: true,
+      });
+      expect(facts.currentTaskId).toBe(follow.task.taskId);
+      expect(facts.currentTaskStatus).toBe("active");
+      expect(facts.taskAccepted).toBe(false);
+      expect(facts.acceptance.historyCommitted).toBe(true);
+      expect(facts.acceptance.acceptanceId).toBe(reference.acceptanceId);
+      expect(facts.acceptance.recordDigest).toBe(reference.recordDigest);
+      expect(facts.integrity.record.state).toBe("intact");
+      expect(facts.integrity.record.digestMatches).toBe(true);
+      expect(facts.integrity.delivery.state).toBe("changed");
+      expect(facts.files).toBeNull();
+      expect(facts.manifest).toBeNull();
+      expect(facts.requirements).toBeNull();
+      expect(facts.paths.available).toBe(false);
+      expect(readFileSync(recordPath)).toEqual(recordBytes);
+      expect(lstatSync(recordPath).ino).toBe(recordInode);
+      expect(f.owner.snapshot().currentTask!.acceptance).toBeNull();
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("B3-B1 final target eligibility loss withholds the prior record and paths", async () => {
+    for (const mutation of ["navigate", "owner"] as const) {
+      const f = await fixture();
+      try {
+        const targetA = f.owner.snapshot().currentTask!;
+        const prepared = await prepareAccepted(f);
+        const submitted = await acceptanceOf(f).submit(f.ctx, selector(f, prepared.deliveryId));
+        expect(submitted.outcome).toBe("committed");
+        const reference = submitted.acceptance!;
+        startFollowUp(f);
+        const delivery = f.entry.delivery!;
+        const original = delivery.inspectAcceptedDelivery.bind(delivery);
+        let mutated = false;
+        delivery.inspectAcceptedDelivery = async (...args) => {
+          const result = await original(...args);
+          if (!mutated) {
+            mutated = true;
+            if (mutation === "navigate") f.owner.navigate("session_switch");
+            else publishTaskOwner(new TaskOwner({ workspaceRoot: f.workspace }));
+          }
+          return result;
+        };
+        const response = await inspectWith(f, {
+          expectedTaskId: targetA.taskId,
+          expectedTaskRevision: targetA.taskRevision,
+          deliveryId: prepared.deliveryId,
+        });
+        expect(mutated).toBe(true);
+        expect(response.isError).toBe(true);
+        const facts = modelJson(response);
+        expect(facts.target.state).toBe("unavailable");
+        expect(facts.target.taskId).toBeNull();
+        expect(facts.acceptance.acceptanceId).toBeNull();
+        expect(facts.acceptance.recordDigest).toBeNull();
+        expect(facts.integrity).toBeNull();
+        expect(facts.files).toBeNull();
+        expect(facts.manifest).toBeNull();
+        expect(facts.requirements).toBeNull();
+        expect(facts.paths.available).toBe(false);
+        expect(facts.taskAccepted).toBeNull();
+        expect(facts.currentTaskStatus).toBeNull();
+        expect(textOf(response)).not.toContain(reference.acceptanceId);
+        expect(textOf(response)).not.toContain(reference.recordDigest);
+        expect(textOf(response)).not.toContain(prepared.files[0]!.path);
+        expect(f.owner.snapshot().acceptanceHazard).toBeNull();
+      } finally {
+        await f.cleanup();
+      }
+    }
+
+    const control = await fixture();
+    try {
+      const targetA = control.owner.snapshot().currentTask!;
+      const prepared = await prepareAccepted(control);
+      const submitted = await acceptanceOf(control).submit(control.ctx, selector(control, prepared.deliveryId));
+      expect(submitted.outcome).toBe("committed");
+      startFollowUp(control);
+      const inspected = await inspectWith(control, {
+        expectedTaskId: targetA.taskId,
+        expectedTaskRevision: targetA.taskRevision,
+        deliveryId: prepared.deliveryId,
+      });
+      expect(inspected.isError).toBeUndefined();
+      const facts = modelJson(inspected);
+      expect(facts.target.historical).toBe(true);
+      expect(facts.target.accepted).toBe(true);
+      expect(facts.files[0].path).toBe(prepared.files[0]!.path);
+      expect(facts.paths.available).toBe(true);
+    } finally {
+      await control.cleanup();
+    }
+  });
+
+  test("B3-B1 read-only historical inspection does not disturb active reserved B", async () => {
+    const f = await fixture();
+    try {
+      const targetA = f.owner.snapshot().currentTask!;
+      const prepared = await prepareAccepted(f);
+      const submitted = await acceptanceOf(f).submit(f.ctx, selector(f, prepared.deliveryId));
+      expect(submitted.outcome).toBe("committed");
+      const reference = submitted.acceptance!;
+      const follow = startFollowUp(f);
+      const recordPath = path.join(f.acceptanceRoot, `record-${reference.acceptanceId}.json`);
+      const recordBytes = readFileSync(recordPath);
+      const recordInode = lstatSync(recordPath).ino;
+      const recordsBefore = acceptanceDirectory(f);
+      const fileBytes = readFileSync(prepared.files[0]!.path);
+      const tasksCreated = f.owner.snapshot().tasksCreated;
+      const frozenB = {
+        ownerId: follow.task.ownerId,
+        taskId: follow.task.taskId,
+        taskRevision: follow.task.taskRevision,
+        requirementsDigest: requirementsDigest(follow.task.requirementSources),
+      };
+      const token = f.owner.reserveAcceptance(subject(follow.branch), frozenB);
+      expect(f.owner.reservationCurrent(token)).toBe(true);
+
+      const exactA = {
+        expectedTaskId: targetA.taskId,
+        expectedTaskRevision: targetA.taskRevision,
+        deliveryId: prepared.deliveryId,
+      };
+      const inspected = await inspectWith(f, exactA);
+      expect(inspected.isError).toBeUndefined();
+      const facts = modelJson(inspected);
+      expect(facts.target.accepted).toBe(true);
+      expect(facts.target.historical).toBe(true);
+      expect(facts.files[0].path).toBe(prepared.files[0]!.path);
+      expect(f.owner.reservationCurrent(token)).toBe(true);
+      expect(f.owner.snapshot().currentTask!.taskId).toBe(follow.task.taskId);
+      expect(f.owner.snapshot().currentTask!.status).toBe("active");
+      expect(f.owner.snapshot().currentTask!.acceptance).toBeNull();
+      expect(f.owner.snapshot().tasksCreated).toBe(tasksCreated);
+      expect(acceptanceDirectory(f)).toEqual(recordsBefore);
+      expect(readFileSync(recordPath)).toEqual(recordBytes);
+      expect(lstatSync(recordPath).ino).toBe(recordInode);
+      expect(readFileSync(prepared.files[0]!.path)).toEqual(fileBytes);
+
+      const delivery = f.entry.delivery!;
+      const originalInspect = delivery.inspectAcceptedDelivery.bind(delivery);
+      const controller = new AbortController();
+      let abortedAfterFiles = false;
+      delivery.inspectAcceptedDelivery = async (...args) => {
+        const result = await originalInspect(...args);
+        if (!abortedAfterFiles) {
+          abortedAfterFiles = true;
+          controller.abort("late abort after real accepted file check");
+        }
+        return result;
+      };
+      const aborted = await inspectWith(f, exactA, controller.signal);
+      delivery.inspectAcceptedDelivery = originalInspect;
+      expect(abortedAfterFiles).toBe(true);
+      expect(aborted.isError).toBeUndefined();
+      const abortedFacts = modelJson(aborted);
+      expect(abortedFacts.acceptance.historyCommitted).toBe(true);
+      expect(abortedFacts.files).toBeNull();
+      expect(abortedFacts.manifest).toBeNull();
+      expect(abortedFacts.requirements).toBeNull();
+      expect(abortedFacts.paths.available).toBe(false);
+      expect(abortedFacts.operation.readOnly).toBe(true);
+      expect(f.owner.reservationCurrent(token)).toBe(true);
+      expect(acceptanceDirectory(f)).toEqual(recordsBefore);
+      expect(readFileSync(recordPath)).toEqual(recordBytes);
+      expect(f.owner.snapshot().currentTask!.acceptance).toBeNull();
+
+      let standalone: RegisteredTool | undefined;
+      const controls = createDeliveryEntry({
+        registerTool(tool) {
+          standalone = tool;
+        },
+      }, {
+        owner: f.owner,
+        service: f.entry.delivery!,
+        acceptance: f.entry.acceptance!,
+      });
+      expect(standalone).toBeTruthy();
+      const service = acceptanceOf(f);
+      const actualInspect = service.inspect.bind(service);
+      let disposedAfterRealRead = false;
+      service.inspect = async (...args: Parameters<AcceptanceService["inspect"]>) => {
+        const result = await actualInspect(...args);
+        if (!disposedAfterRealRead) {
+          disposedAfterRealRead = true;
+          controls.dispose();
+        }
+        return result;
+      };
+      const disposed = await standalone!.execute("standalone-history-dispose", {
+        action: "inspect",
+        ...exactA,
+      }, undefined, undefined, f.ctx);
+      service.inspect = actualInspect;
+      expect(disposedAfterRealRead).toBe(true);
+      expect(disposed.isError).toBe(true);
+      const disposedFacts = modelJson(disposed);
+      expect(disposedFacts.acceptance?.acceptanceId ?? null).toBeNull();
+      expect(disposedFacts.integrity).toBeNull();
+      expect(disposedFacts.files).toBeNull();
+      expect(disposedFacts.paths.available).toBe(false);
+      expect(textOf(disposed)).not.toContain(reference.acceptanceId);
+      expect(textOf(disposed)).not.toContain(prepared.files[0]!.path);
+      expect(f.owner.reservationCurrent(token)).toBe(true);
+      expect(acceptanceDirectory(f)).toEqual(recordsBefore);
+      expect(readFileSync(recordPath)).toEqual(recordBytes);
+      expect(f.owner.snapshot().currentTask!.acceptance).toBeNull();
+      f.owner.releaseAcceptance(token);
+    } finally {
+      await f.cleanup();
     }
   });
 });

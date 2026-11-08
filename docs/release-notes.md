@@ -1,5 +1,11 @@
 # Release notes
 
+## Historical accepted inspection (B3-B1)
+
+`agent_deliver inspect` now reads an exact retained accepted target independently of the current task. After a later genuine message starts a new current task, selecting the earlier accepted task by exact task id, revision and delivery returns that target's accepted reference, record integrity and intact delivered files; the existing top-level current task fields and `visibility` continue to describe the actual current task. Target and current facts are reported separately, so a current change, refusal, record damage or unavailable final branch cannot substitute the current task for the requested history or relabel accepted history as unaccepted.
+
+Mismatched selectors are refused before the record is read. Every context getter or awaited bundle check is followed by pure retained-target/reference/owner checks for the last actual subject; if that final eligibility is lost, the prior record identity, files and paths are withheld together. Unknown-installation facts also require the exact selected task and final reachable session/anchor; loss of visibility withholds old identifiers without clearing the stored unknown outcome. Submit and `request_review` remain current-only. This is in-process retained history only: it does not add restart recovery, disk rebuild/scanning, historical re-execution, a daily entry or a package-default switch.
+
 ## Continuous task core and exact task guards (B3-A)
 
 Added in-process task continuity to the experimental task owner. After the current task is accepted or cancelled, a later genuine user message in the same workspace/session may create a new task; an active task is never replaced implicitly. The owner retains up to 128 tasks and 4096 message-anchor/control replay entries without silent eviction, keeps terminal identity and requirement ledgers immutable, and exposes bounded read-only history summaries plus explicit historical inspection. History is not durable cross-process recovery.

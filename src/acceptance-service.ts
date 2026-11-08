@@ -52,6 +52,7 @@ import {
   type AcceptanceReservationToken,
   type ManagedTask,
   type TaskOwner,
+  type TaskOwnerSnapshot,
   type TaskSubject,
 } from "./task-owner.ts";
 import { requirementsDigest } from "./task-requirements.ts";
@@ -131,6 +132,16 @@ export interface AcceptedInspectionFile {
   sha256: string;
 }
 
+export interface AcceptedInspectionTarget {
+  state: "visible" | "unavailable" | "unknown";
+  taskId: string | null;
+  taskRevision: number | null;
+  status: "active" | "cancelled" | "accepted" | null;
+  accepted: boolean | null;
+  historical: boolean | null;
+  reason: string | null;
+}
+
 export interface AcceptedInspectionResult {
   acceptance: AcceptanceReference | null;
   record: {
@@ -149,9 +160,20 @@ export interface AcceptedInspectionResult {
   };
   warnings: string[];
   reason: string | null;
+  /** Selector-selected retained task facts, independent of current. */
+  target: AcceptedInspectionTarget;
+  /** Actual current task facts, independent of the target. */
   current: AcceptanceVisibility;
   /** Defensive host facts when the installation outcome is unknown. */
   unknown?: AcceptanceHazardFacts | null;
+}
+
+interface AcceptedInspectionDraft {
+  acceptance: AcceptanceReference | null;
+  record: AcceptedInspectionResult["record"];
+  delivery: AcceptedInspectionResult["delivery"];
+  warnings: string[];
+  reason: string | null;
 }
 
 export interface AcceptanceServiceOptions {
@@ -255,6 +277,30 @@ function sameFrozen(left: FrozenTaskRef, right: FrozenTaskRef): boolean {
 
 function copyReference(value: AcceptanceReference): AcceptanceReference {
   return { ...value };
+}
+
+function sameReference(left: AcceptanceReference | null, right: AcceptanceReference | null): boolean {
+  if (left === null || right === null) return left === right;
+  return left.acceptanceId === right.acceptanceId
+    && left.deliveryId === right.deliveryId
+    && left.recordDigest === right.recordDigest
+    && left.acceptedAt === right.acceptedAt;
+}
+
+function unavailableTarget(reason: string | null): AcceptedInspectionTarget {
+  return {
+    state: "unavailable",
+    taskId: null,
+    taskRevision: null,
+    status: null,
+    accepted: null,
+    historical: null,
+    reason,
+  };
+}
+
+function unknownTarget(reason: string | null): AcceptedInspectionTarget {
+  return { ...unavailableTarget(reason), state: "unknown" };
 }
 
 function sortedByArtifact(rows: ReadonlyArray<{ artifactId: string }>): Array<{ artifactId: string }> {
@@ -375,6 +421,11 @@ function boundInspectionResult(result: AcceptedInspectionResult): AcceptedInspec
   result.record.reason = result.record.reason === null ? null : safeDiagnostic(result.record.reason, 512);
   result.delivery.reason = result.delivery.reason === null ? null : safeDiagnostic(result.delivery.reason, 512);
   result.current = boundedVisibility(result.current);
+  result.target = {
+    ...result.target,
+    taskId: result.target.taskId === null ? null : safeDiagnostic(result.target.taskId, 128),
+    reason: result.target.reason === null ? null : safeDiagnostic(result.target.reason, 512),
+  };
   if ("unknown" in result) result.unknown = boundedHazard(result.unknown);
   if (responseBytes(result) <= MAX_ACCEPTANCE_RESPONSE_BYTES) return result;
   result.warnings = [];
@@ -382,11 +433,24 @@ function boundInspectionResult(result: AcceptedInspectionResult): AcceptedInspec
   result.record.reason = null;
   result.delivery.reason = null;
   result.current = boundedVisibility({ ...result.current, reason: "current visibility diagnostic omitted for the response budget" });
+  result.target = { ...result.target, reason: "target visibility diagnostic omitted for the response budget" };
   if ("unknown" in result && result.unknown !== null && result.unknown !== undefined) {
     result.unknown = { ...result.unknown, reason: "unknown-installation diagnostic omitted for the response budget" };
   }
   if (responseBytes(result) > MAX_ACCEPTANCE_RESPONSE_BYTES) {
     result.current = { state: "unavailable", taskId: null, status: null, accepted: null, reason: null };
+  }
+  if (responseBytes(result) > MAX_ACCEPTANCE_RESPONSE_BYTES) {
+    result.target = { state: "unavailable", taskId: null, taskRevision: null, status: null, accepted: null, historical: null, reason: null };
+    result.acceptance = null;
+    result.record = { state: "unavailable", digestMatches: null, bytes: null, reason: "checked target facts were omitted for the response budget; no path is claimed" };
+    result.delivery = {
+      ...result.delivery,
+      files: null,
+      manifest: null,
+      requirements: null,
+      reason: "checked file facts were omitted for the response budget; no path is claimed",
+    };
   }
   if (responseBytes(result) > MAX_ACCEPTANCE_RESPONSE_BYTES) {
     result.delivery = {
@@ -983,13 +1047,22 @@ export class AcceptanceService {
     context: OmpToolContext,
     reason: string,
   ): AcceptedInspectionResult {
+    return this.withheldInspectionResult(reason, this.visibility(context), unavailableTarget(reason));
+  }
+
+  private withheldInspectionResult(
+    reason: string,
+    current: AcceptanceVisibility,
+    target: AcceptedInspectionTarget,
+  ): AcceptedInspectionResult {
     return {
       acceptance: null,
       record: { state: "unavailable", digestMatches: null, bytes: null, reason },
       delivery: { state: "unavailable", fileCount: null, files: null, manifest: null, requirements: null, reason },
       warnings: [],
       reason,
-      current: this.visibility(context),
+      target,
+      current,
     };
   }
 
@@ -1003,37 +1076,186 @@ export class AcceptanceService {
       delivery: { state: "unknown", fileCount: null, files: null, manifest: null, requirements: null, reason: hazard.reason },
       warnings: ["the acceptance installation outcome is unknown; no recovery or blind replay was attempted"],
       reason: "the acceptance record installation outcome is unknown",
+      target: unknownTarget(hazard.reason),
       current,
       unknown: { ...hazard, task: { ...hazard.task } },
     };
   }
 
   private withheldHazardInspection(reason: string, current: AcceptanceVisibility): AcceptedInspectionResult {
+    return this.withheldInspectionResult(reason, current, unavailableTarget(reason));
+  }
+
+  /**
+   * Pure unknown-installation authorization from the last actual subject read
+   * plus a pure owner snapshot. No external getter runs here. The original
+   * hazard is disclosable only for its exact frozen task, selector, session
+   * and anchor, and only while this service and the published owner live.
+   */
+  private hazardVisibilityReason(
+    subject: TaskSubject,
+    selector: AcceptanceSelector,
+    snapshot: TaskOwnerSnapshot,
+  ): string | null {
+    if (this.disposed) return "the acceptance service is disposed";
+    if (currentTaskOwner() !== this.owner) return "the published task owner changed";
+    const hazard = snapshot.acceptanceHazard;
+    if (hazard === null) return "no acceptance installation hazard is stored";
+    const task = snapshot.currentTask;
+    if (task === null) return "no current managed task exists";
+    if (!sameFrozen(frozenOf(task), hazard.task)) {
+      return "the current managed task does not match the stored acceptance operation";
+    }
+    if (selector.expectedTaskId !== hazard.task.taskId
+      || selector.expectedTaskRevision !== hazard.task.taskRevision
+      || selector.deliveryId !== hazard.deliveryId) {
+      return "the requested selector does not match the unknown acceptance operation";
+    }
+    return this.hazardReachability(subject, task);
+  }
+
+  /**
+   * Project only the actual current task from a subject already read plus a
+   * pure owner snapshot. No external getter runs here; a target result must
+   * never make an unknown or replaced current look accepted. An unknown is
+   * projected only while the exact selected hazard remains authorized from
+   * that last subject; an unauthorized hazard withholds all prior identity.
+   */
+  private projectCurrent(
+    subject: TaskSubject,
+    selector: AcceptanceSelector,
+    snapshot: TaskOwnerSnapshot,
+  ): AcceptanceVisibility {
+    const task = snapshot.currentTask;
+    if (task === null) {
+      return { state: "unavailable", taskId: null, status: null, accepted: null, reason: "no current managed task exists" };
+    }
+    if (snapshot.acceptanceHazard !== null) {
+      const reason = this.hazardVisibilityReason(subject, selector, snapshot);
+      if (reason !== null) return this.hazardUnavailable(reason);
+      return {
+        state: "unknown",
+        taskId: task.taskId,
+        status: task.status,
+        accepted: null,
+        reason: safeDiagnostic(snapshot.acceptanceHazard.reason, 512),
+      };
+    }
+    const base = {
+      taskId: task.taskId,
+      status: task.status,
+      accepted: task.status === "accepted",
+    } as const;
+    if (snapshot.binding.state !== "attached") {
+      return { ...base, state: "detached", reason: snapshot.binding.reason ?? "the conversation binding is detached" };
+    }
+    try {
+      const reachable = this.owner.reachableTask(subject);
+      if (!sameFrozen(frozenOf(reachable), frozenOf(task))) {
+        return { ...base, state: "changed", reason: "the live task identity changed" };
+      }
+    } catch (error) {
+      return { ...base, state: "changed", reason: errorMessage(error) };
+    }
+    return { ...base, state: "visible", reason: null };
+  }
+
+  /**
+   * Last-read target/current projection. The context getter runs once, then
+   * all target, reference, owner, binding, hazard and anchor checks are pure.
+   * A notification or getter may have changed the owner or navigated; nothing
+   * from an earlier snapshot is restored here.
+   */
+  private lastInspectionState(
+    context: OmpToolContext,
+    selector: AcceptanceSelector,
+  ): {
+    target: AcceptedInspectionTarget;
+    current: AcceptanceVisibility;
+    retained: ManagedTask | null;
+    reference: AcceptanceReference | null;
+  } {
+    const unavailable = (reason: string) => ({
+      target: unavailableTarget(reason),
+      current: this.hazardUnavailable(reason),
+      retained: null as ManagedTask | null,
+      reference: null as AcceptanceReference | null,
+    });
+    if (this.disposed) return unavailable("the acceptance service is disposed");
+    if (currentTaskOwner() !== this.owner) return unavailable("the published task owner changed");
+    const subject = this.liveSubject(context);
+    if (subject === null) return unavailable("the live main-session context or workspace is unavailable");
+    if (this.disposed) return unavailable("the acceptance service is disposed");
+    if (currentTaskOwner() !== this.owner) return unavailable("the published task owner changed");
+    const snapshot = this.owner.snapshot();
+    const current = this.projectCurrent(subject, selector, snapshot);
+    if (snapshot.acceptanceHazard !== null) {
+      if (current.state !== "unknown") {
+        const reason = current.reason
+          ?? "the unknown acceptance operation is no longer authorized from the last live context";
+        return { target: unavailableTarget(reason), current, retained: null, reference: null };
+      }
+      return {
+        target: unknownTarget(snapshot.acceptanceHazard.reason),
+        current,
+        retained: null,
+        reference: null,
+      };
+    }
+    if (snapshot.binding.state !== "attached") {
+      const reason = snapshot.binding.reason ?? "the conversation binding is detached";
+      return { target: unavailableTarget(reason), current, retained: null, reference: null };
+    }
+    const retained = this.owner.retainedTask(selector.expectedTaskId, selector.expectedTaskRevision);
+    if (retained === null) {
+      const reason = "the retained target task or revision is no longer available";
+      return { target: unavailableTarget(reason), current, retained: null, reference: null };
+    }
+    const reachability = this.hazardReachability(subject, retained);
+    if (reachability !== null) {
+      return { target: unavailableTarget(reachability), current, retained: null, reference: null };
+    }
+    const reference = this.owner.acceptedReference(retained.taskId);
     return {
-      acceptance: null,
-      record: { state: "unavailable", digestMatches: null, bytes: null, reason },
-      delivery: { state: "unavailable", fileCount: null, files: null, manifest: null, requirements: null, reason },
-      warnings: [],
-      reason,
+      target: {
+        state: "visible",
+        taskId: retained.taskId,
+        taskRevision: retained.taskRevision,
+        status: retained.status,
+        accepted: retained.status === "accepted",
+        historical: snapshot.currentTask === null || snapshot.currentTask.taskId !== retained.taskId,
+        reason: null,
+      },
       current,
+      retained,
+      reference,
     };
   }
 
-  private inspectSync(
+  /**
+   * Outermost inspection read for response assembly. Recomputes target and
+   * current from the last actual context without reading records or files.
+   */
+  finalInspectionVisibility(
     context: OmpToolContext,
     selector: AcceptanceSelector,
+  ): { target: AcceptedInspectionTarget; current: AcceptanceVisibility } {
+    const final = this.lastInspectionState(context, selector);
+    return { target: { ...final.target }, current: { ...final.current } };
+  }
+
+  private inspectTargetSync(
+    selector: AcceptanceSelector,
     task: ManagedTask,
-    current: AcceptanceVisibility,
-  ): AcceptedInspectionResult {
+  ): AcceptedInspectionDraft {
     const reference = task.acceptance;
     if (task.status !== "accepted" || reference === null) {
       return {
         acceptance: null,
-        record: { state: "not_accepted", digestMatches: null, bytes: null, reason: "the task is not accepted" },
-        delivery: { state: "not_accepted", fileCount: null, files: null, manifest: null, requirements: null, reason: "the task is not accepted" },
+        record: { state: "not_accepted", digestMatches: null, bytes: null, reason: "the target task is not accepted" },
+        delivery: { state: "not_accepted", fileCount: null, files: null, manifest: null, requirements: null, reason: "the target task is not accepted" },
         warnings: [],
-        reason: "the current managed task is not accepted",
-        current,
+        reason: "the retained target task is not accepted",
       };
     }
     if (task.taskId !== selector.expectedTaskId
@@ -1045,7 +1267,6 @@ export class AcceptanceService {
         delivery: { state: "not_accepted", fileCount: null, files: null, manifest: null, requirements: null, reason: "the selector does not match the accepted record" },
         warnings: [],
         reason: "the requested task/revision/delivery does not match the accepted record",
-        current,
       };
     }
     const record = this.store.read(this.root, reference.acceptanceId, frozenOf(task));
@@ -1061,7 +1282,54 @@ export class AcceptanceService {
       delivery: { state: "unavailable", fileCount: null, files: null, manifest: null, requirements: null, reason: "the delivery bundle has not been checked yet" },
       warnings: [],
       reason: null,
-      current,
+    };
+  }
+
+  private finalizeInspection(
+    context: OmpToolContext,
+    selector: AcceptanceSelector,
+    expectedTask: ManagedTask,
+    draft: AcceptedInspectionDraft,
+    extraWarnings: readonly string[],
+  ): AcceptedInspectionResult {
+    const final = this.lastInspectionState(context, selector);
+    if (final.target.state !== "visible" || final.retained === null) {
+      const reason = final.target.reason
+        ?? final.current.reason
+        ?? "the retained target is no longer visible from the live context; the prior record and paths are withheld";
+      return this.withheldInspectionResult(reason, final.current, final.target);
+    }
+    if (!sameFrozen(frozenOf(final.retained), frozenOf(expectedTask))) {
+      const reason = "the retained target identity changed while the accepted history was checked; the prior record and paths are withheld";
+      return this.withheldInspectionResult(reason, final.current, unavailableTarget(reason));
+    }
+    if (expectedTask.status === "accepted") {
+      if (expectedTask.acceptance === null
+        || final.reference === null
+        || !sameReference(final.reference, expectedTask.acceptance)) {
+        const reason = "the retained acceptance reference changed while the accepted history was checked; the prior record and paths are withheld";
+        return this.withheldInspectionResult(reason, final.current, unavailableTarget(reason));
+      }
+    } else if (final.reference !== null) {
+      const reason = "the retained target acquired an acceptance reference while it was checked; the prior record and paths are withheld";
+      return this.withheldInspectionResult(reason, final.current, unavailableTarget(reason));
+    }
+    const warnings = [...draft.warnings, ...extraWarnings];
+    return {
+      acceptance: draft.acceptance === null ? null : copyReference(draft.acceptance),
+      record: { ...draft.record },
+      delivery: {
+        state: draft.delivery.state,
+        fileCount: draft.delivery.fileCount,
+        files: draft.delivery.files === null ? null : draft.delivery.files.map((file) => ({ ...file })),
+        manifest: draft.delivery.manifest === null ? null : { ...draft.delivery.manifest },
+        requirements: draft.delivery.requirements === null ? null : { ...draft.delivery.requirements },
+        reason: draft.delivery.reason,
+      },
+      warnings: warnings.slice(0, MAX_ACCEPTANCE_WARNINGS),
+      reason: draft.reason,
+      target: final.target,
+      current: final.current,
     };
   }
 
@@ -1171,28 +1439,59 @@ export class AcceptanceService {
         ? this.withheldHazardInspection(access.reason ?? "the current context cannot access the unknown acceptance operation", access.current)
         : this.unknownInspection(access.hazard, access.current);
     }
-    const current = this.visibility(context);
-    if (current.state !== "visible") {
-      return this.withheldInspection(context, current.reason ?? "the current task is not visible from the live main-session context");
+    // Initial target authorization runs against the actual live main subject.
+    // inspectTarget notifies, so it is not trusted as the final observation.
+    const subject = this.liveSubject(context);
+    if (subject === null) {
+      return this.withheldInspection(context, "the live main-session context or workspace is unavailable");
     }
-    const task = this.owner.snapshot().currentTask;
-    if (task === null) return this.withheldInspection(context, "no current managed task exists");
-    const inspected = this.inspectSync(context, selector, task, current);
-    if (inspected.acceptance === null) return inspected;
-    const expected = frozenOf(task);
-    const delivery = await this.delivery.inspectAcceptedDelivery(expected, inspected.acceptance.deliveryId);
-    if (this.disposed) {
-      return this.withheldInspection(context, "the acceptance service was disposed while the delivery was checked");
-    }
+    if (this.disposed) return this.withheldInspection(context, "the acceptance service is disposed");
     if (currentTaskOwner() !== this.owner) {
-      return this.withheldInspection(context, "the published task owner changed while the delivery was checked");
+      return this.withheldInspection(context, "the published task owner changed");
     }
-    const after = this.visibility(context);
-    if (after.state !== "visible"
-      || currentTaskOwner() !== this.owner
-      || !sameFrozen(frozenOf(this.owner.snapshot().currentTask ?? task), expected)) {
-      return this.withheldInspection(context, after.reason ?? "the current task became invisible while the delivery was checked");
+    const before = this.owner.snapshot();
+    if (before.binding.state !== "attached") {
+      return this.withheldInspection(context, before.binding.reason ?? "the conversation binding is detached");
     }
+    let resolved: { target: ManagedTask; historical: boolean };
+    try {
+      resolved = this.owner.inspectTarget(subject, {
+        taskId: selector.expectedTaskId,
+        taskRevision: selector.expectedTaskRevision,
+      });
+    } catch (error) {
+      return this.withheldInspection(context, errorMessage(error));
+    }
+    if (this.disposed) return this.withheldInspection(context, "the acceptance service is disposed");
+    if (currentTaskOwner() !== this.owner) {
+      return this.withheldInspection(context, "the published task owner changed");
+    }
+    const afterTarget = this.owner.snapshot();
+    if (afterTarget.binding.state !== "attached") {
+      return this.withheldInspection(context, afterTarget.binding.reason ?? "the conversation binding is detached");
+    }
+    const target = this.owner.retainedTask(resolved.target.taskId, resolved.target.taskRevision);
+    if (target === null || !sameFrozen(frozenOf(target), frozenOf(resolved.target))) {
+      return this.withheldInspection(context, "the retained target changed while it was inspected");
+    }
+    if (target.status === "accepted"
+      && !sameReference(this.owner.acceptedReference(target.taskId), target.acceptance)) {
+      return this.withheldInspection(context, "the retained acceptance reference changed while it was inspected");
+    }
+    if (target.status === "accepted"
+      && target.acceptance !== null
+      && target.acceptance.deliveryId !== selector.deliveryId) {
+      return this.withheldInspection(
+        context,
+        "the selector delivery does not match the retained accepted target; no history was read",
+      );
+    }
+    const inspected = this.inspectTargetSync(selector, target);
+    if (inspected.acceptance === null) {
+      return this.finalizeInspection(context, selector, target, inspected, []);
+    }
+    const expected = frozenOf(target);
+    const delivery = await this.delivery.inspectAcceptedDelivery(expected, inspected.acceptance.deliveryId);
     const warnings = [...inspected.warnings];
     if (inspected.record.state !== "intact" || inspected.record.digestMatches !== true) {
       warnings.push("the historical acceptance record is not intact; the accepted fact is retained separately");
@@ -1200,7 +1499,7 @@ export class AcceptanceService {
     if (delivery.state !== "intact") {
       warnings.push("the frozen delivery files are changed or unavailable; the accepted fact is retained separately");
     }
-    return {
+    return this.finalizeInspection(context, selector, target, {
       ...inspected,
       delivery: {
         state: delivery.state,
@@ -1210,9 +1509,8 @@ export class AcceptanceService {
         requirements: delivery.state === "intact" ? delivery.requirements : null,
         reason: delivery.reason,
       },
-      current: after,
-      warnings: warnings.slice(0, MAX_ACCEPTANCE_WARNINGS),
-    };
+      warnings,
+    }, []);
   }
 
   /**

@@ -5,6 +5,7 @@ import type {
   AcceptanceSelector,
   AcceptanceVisibility,
   AcceptedInspectionResult,
+  AcceptedInspectionTarget,
   AcceptanceService,
   HumanReviewOperationResult,
 } from "./acceptance-service.ts";
@@ -102,16 +103,16 @@ const BASE_DELIVERY_PARAMETERS = {
     },
     expectedTaskId: {
       type: "string",
-      description: "Required for preview/submit/inspect. Optimistic identity guard copied from the current host task view; not authority.",
+      description: "Required for preview/submit/inspect/request_review. preview, submit and request_review copy the current taskId from the host task view; inspect copies the exact retained target taskId from host-visible history, which may be historical. It selects and guards only the requested target; never authority.",
     },
     expectedTaskRevision: {
       type: "integer",
       minimum: 1,
-      description: "Required for preview/submit/inspect. Optimistic revision guard; the host rechecks live state and actual bytes.",
+      description: "Required with expectedTaskId for preview/submit/inspect/request_review. Copy the target task's exact revision: the current revision for preview/submit/request_review, or the retained target revision for inspect. Never authority.",
     },
     deliveryId: {
       type: "string",
-      description: "Required for submit/inspect. An existing deliveryId from a successful preview; a selector, never authority or evidence.",
+      description: "Required for submit/inspect/request_review. An existing deliveryId from a successful preview of the target; a selector, never authority or evidence.",
     },
     runId: {
       type: "string",
@@ -154,7 +155,7 @@ function deliveryParameters(humanReviewConfigured: boolean): Record<string, unkn
   };
 }
 
-const DESCRIPTION = "Host-configured candidate delivery and guarded acceptance bridge for the current managed task. describe reports the current visible task identity/revision/status, the configured delivery root, host contract coverage, activity blockers, whether acceptance is implemented and host-configured, and the fixed limits. describe never reads delivery candidates and never promises that any delivery can be accepted; candidate eligibility is always not_checked until submit rechecks live state. preview requires expectedTaskId, expectedTaskRevision, runId and 1-8 unique artifactIds from that run; it writes private read-only copies, verifies actual bytes and returns real paths/names/sizes/sha256 plus a bounded UTF-8 preview. submit requires expectedTaskId, expectedTaskRevision and an existing deliveryId; these are optimistic selectors, never authority. The host calls the same-process acceptance coordinator, which rechecks the live contract, current verification receipt, frozen candidate set, delivered bytes, reservation and final evidence seal. A committed result reports the original operation and committed acceptance identity independently of later task navigation, appends checked file integrity when the accepted history is still visible, and an exact same-selector retry is idempotent: it installs no record and keeps the same acceptance identity. inspect is read-only: it reports the accepted record and integrity plus real checked file paths/names/bytes/sha256 when available, or explicitly reports no acceptance record, changed/missing files, detached visibility or unknown installation. Inspect never performs a new commit. No receipt, contract, verdict, path, digest, acceptance flag or confirmation is accepted from the model; unknown or host-authority fields are refused. Partial or incomplete semantic coverage, a fail/insufficient receipt and missing contracts are reported and are never converted into acceptance by retrying or fabricating evidence. Completion policy: when an intended final candidate has a current host verification receipt with complete usable semantic coverage and delivery/acceptance are configured, preview that exact run/artifact selection with its real receipt, submit the returned deliveryId, then inspect and report the actual checked files, integrity and acceptance/current result. Missing, partial or failing evidence remains honestly unaccepted; do not reverify unchanged candidates to seek a different result. If delivery or acceptance is not configured, state that boundary and do not imply acceptance. This is one generic lifecycle; acceptance remains optional host configuration.";
+const DESCRIPTION = "Host-configured candidate delivery and guarded acceptance bridge for the current managed task. describe reports the current visible task identity/revision/status, the configured delivery root, host contract coverage, activity blockers, whether acceptance is implemented and host-configured, and the fixed limits. describe never reads delivery candidates and never promises that any delivery can be accepted; candidate eligibility is always not_checked until submit rechecks live state. preview requires expectedTaskId, expectedTaskRevision, runId and 1-8 unique artifactIds from that run; it writes private read-only copies, verifies actual bytes and returns real paths/names/sizes/sha256 plus a bounded UTF-8 preview. submit requires expectedTaskId, expectedTaskRevision and an existing deliveryId; these are optimistic selectors, never authority. The host calls the same-process acceptance coordinator, which rechecks the live contract, current verification receipt, frozen candidate set, delivered bytes, reservation and final evidence seal. A committed result reports the original operation and committed acceptance identity independently of later task navigation, appends checked file integrity when the accepted history is still visible, and an exact same-selector retry is idempotent: it installs no record and keeps the same acceptance identity. inspect is read-only: it reports the accepted record and integrity plus real checked file paths/names/bytes/sha256 when available, or explicitly reports no acceptance record, changed/missing files, detached visibility or unknown installation. Inspect never performs a new commit. preview, submit and request_review select only the current managed task; inspect selects the exact retained target identity from host-visible history and may keep reporting accepted history after a later current task exists. Top-level currentTaskId, currentTaskStatus and taskAccepted describe the present task, while target and acceptance fields describe the selected target; file integrity is checked independently and changed or missing files do not erase accepted history. Selectors never grant authorization. No receipt, contract, verdict, path, digest, acceptance flag or confirmation is accepted from the model; unknown or host-authority fields are refused. Partial or incomplete semantic coverage, a fail/insufficient receipt and missing contracts are reported and are never converted into acceptance by retrying or fabricating evidence. Completion policy: when an intended final candidate has a current host verification receipt with complete usable semantic coverage and delivery/acceptance are configured, preview that exact run/artifact selection with its real receipt, submit the returned deliveryId, then inspect and report the actual checked files, integrity and acceptance/current result. Missing, partial or failing evidence remains honestly unaccepted; do not reverify unchanged candidates to seek a different result. If delivery or acceptance is not configured, state that boundary and do not imply acceptance. This is one generic lifecycle; acceptance remains optional host configuration.";
 
 const REVIEW_DESCRIPTION = " Local human review is configured only for the actual main agent in the local TUI with a UI installed. request_review requires expectedTaskId, expectedTaskRevision and an existing deliveryId, and only asks the local user to inspect the exact frozen requirements and delivered file bytes. It is an explicit user-review request, not a fallback from a failed automatic submit, and it never accepts model-provided approval, verdict, confirmation, receipt, token, capability, path, digest or content. The model cannot approve or decide; a rejection or cancellation leaves the task otherwise unchanged, and the same rejected request must not be repeated merely to seek a different answer. A committed request_review result is the same owner acceptance and reports the actual review state, current visibility and checked file integrity.";
 
@@ -371,6 +372,28 @@ function visibilityFacts(current: AcceptanceVisibility | null): {
   };
 }
 
+function targetFacts(target: AcceptedInspectionTarget): Record<string, unknown> {
+  return {
+    state: target.state,
+    taskId: target.taskId === null ? null : safeText(target.taskId, 128),
+    taskRevision: target.taskRevision,
+    status: target.status,
+    accepted: target.accepted,
+    historical: target.historical,
+    reason: safeNullable(target.reason, 1024),
+  };
+}
+
+const UNAVAILABLE_INSPECTION_TARGET: AcceptedInspectionTarget = {
+  state: "unavailable",
+  taskId: null,
+  taskRevision: null,
+  status: null,
+  accepted: null,
+  historical: null,
+  reason: null,
+};
+
 /**
  * Add only the host-configured human-review capability facts to describe.
  * Submit/inspect result envelopes are deliberately unchanged.
@@ -525,6 +548,7 @@ function buildModelResult(facts: Record<string, unknown>, isError: boolean): Del
       currentTaskId: facts.currentTaskId ?? null,
       currentTaskStatus: facts.currentTaskStatus ?? null,
       visibility: facts.visibility ?? null,
+      ...(facts.target === undefined ? {} : { target: facts.target }),
       acceptance: facts.acceptance ?? null,
       unknown: facts.unknown ?? null,
       paths: facts.paths ?? null,
@@ -671,6 +695,9 @@ function withheldAcceptanceResult(
     currentTaskId: topCurrentTaskId(current),
     currentTaskStatus: topCurrentTaskStatus(current),
     visibility: visibilityFacts(current),
+    ...(action === "inspect"
+      ? { target: targetFacts({ ...UNAVAILABLE_INSPECTION_TARGET, reason: safeText(reason, 1024) }) }
+      : {}),
     acceptance: selector === null
       ? null
       : acceptanceFacts(selector, null, null),
@@ -706,6 +733,7 @@ function withheldAcceptanceResult(
         action,
         taskAccepted: topTaskAccepted(current),
         currentTaskStatus: topCurrentTaskStatus(current),
+        ...(action === "inspect" ? { target: targetFacts(UNAVAILABLE_INSPECTION_TARGET) } : {}),
         acceptanceConfigured,
         withheld: true,
       },
@@ -827,6 +855,7 @@ function inspectFacts(
   inspection: AcceptedInspectionResult,
   selector: AcceptanceSelector,
   current: AcceptanceVisibility,
+  target: AcceptedInspectionTarget,
   pathsWithheldReason: string | null,
   extraWarnings: readonly string[],
 ): Record<string, unknown> {
@@ -837,7 +866,7 @@ function inspectFacts(
       : null;
   const filesAvailable = pathsWithheldReason === null
     && inspection.acceptance !== null
-    && current.state === "visible"
+    && target.state === "visible"
     && inspection.delivery.state === "intact"
     && inspection.delivery.files !== null
     && inspection.delivery.files.length > 0;
@@ -858,6 +887,7 @@ function inspectFacts(
     currentTaskId: topCurrentTaskId(current),
     currentTaskStatus: topCurrentTaskStatus(current),
     visibility: visibilityFacts(current),
+    target: targetFacts(target),
     acceptance: acceptanceFacts(selector, inspection.acceptance, historyCommitted),
     integrity: integrityFacts(inspection),
     unknown: hazardFacts(inspection.unknown),
@@ -1046,6 +1076,20 @@ export function createDeliveryEntry(pi: DeliveryApi, options: DeliveryEntryOptio
     }
   };
 
+  const finalInspectionVisibility = (
+    context: OmpToolContext,
+    selector: AcceptanceSelector,
+  ): { target: AcceptedInspectionTarget; current: AcceptanceVisibility } | null => {
+    if (acceptance === undefined) return null;
+    if (disposed) return null;
+    try {
+      const final = acceptance.finalInspectionVisibility(context, selector);
+      return disposed ? null : final;
+    } catch {
+      return null;
+    }
+  };
+
   const executeReview = async (
     selector: AcceptanceSelector,
     signal: AbortSignal | undefined,
@@ -1177,18 +1221,19 @@ export function createDeliveryEntry(pi: DeliveryApi, options: DeliveryEntryOptio
           collected.warning ?? "accepted history could not be read",
         );
       }
-      const current = finalCurrentVisibility(context, selector);
-      if (current === null) {
+      const final = finalInspectionVisibility(context, selector);
+      if (final === null) {
         return withheldAcceptanceResult(
           owner,
           context,
           "inspect",
           selector,
           true,
-          "accepted history was collected but the current entry, published owner or selector can no longer be proven; no path is claimed",
+          "accepted history was collected but the delivery entry, published owner or acceptance service can no longer be proven; no path is claimed",
           null,
         );
       }
+      const current = final.current;
       if (current.state === "unknown" && collected.inspection.unknown !== undefined) {
         // An authorized unknown installation is an original operation fact.
         // Keep it explicit, but never expose a path or current acceptance.
@@ -1197,22 +1242,27 @@ export function createDeliveryEntry(pi: DeliveryApi, options: DeliveryEntryOptio
             collected.inspection,
             selector,
             current,
-            current.reason ?? "the acceptance installation outcome is unknown; no path is claimed",
+            final.target,
+            final.target.reason ?? current.reason ?? "the acceptance installation outcome is unknown; no path is claimed",
             [],
           ),
           true,
         );
       }
-      if (current.state !== "visible") {
-        // Ordinary read-only history loses the B1 visibility boundary. Withhold
-        // the prior record and file facts rather than projecting stale data.
+      if (final.target.state !== "visible" || collected.inspection.target.state !== "visible") {
+        // The selector-selected retained target lost its own final eligibility
+        // or the service refused the exact match. Withhold the prior record,
+        // acceptance identity and paths; never substitute current for history.
         return withheldAcceptanceResult(
           owner,
           context,
           "inspect",
           selector,
           true,
-          current.reason ?? `the current target is not visible (${current.state}); accepted history is withheld`,
+          collected.inspection.reason
+            ?? final.target.reason
+            ?? current.reason
+            ?? `the retained target is not visible (${final.target.state}); accepted history is withheld`,
           current,
         );
       }
@@ -1220,7 +1270,7 @@ export function createDeliveryEntry(pi: DeliveryApi, options: DeliveryEntryOptio
         ? "the call was aborted after accepted files were checked; history is retained and no path is shown"
         : null;
       return buildModelResult(
-        inspectFacts(collected.inspection, selector, current, pathsWithheldReason, []),
+        inspectFacts(collected.inspection, selector, current, final.target, pathsWithheldReason, []),
         collected.inspection.unknown !== undefined
           || collected.inspection.record.state === "unknown"
           || collected.inspection.delivery.state === "unknown",

@@ -65,7 +65,7 @@ bun run test:delivery
 
 交付功能需要宿主显式提供绝对 `deliveryRoot`；实验入口对应环境变量为 `OMP_AGENT_DELIVERY_ROOT`。未配置时不注册交付工具。交付目录不能与执行目录重叠。最终接收另需显式提供 `acceptanceRoot`（`OMP_AGENT_ACCEPTANCE_ROOT`），且三个根目录两两不重叠。未配置接收目录时仍可预览，提交会明确返回未启用。
 
-`agent_deliver submit` 和 `inspect` 只接受现有 `deliveryId` 及任务身份、版本。结果分别报告本次提交、当前任务、历史接收与文件完整性；只读查询不会重新提交。路径仅在当前上下文和实际文件检查都有效时返回。
+`agent_deliver submit` 和 `inspect` 只接受现有 `deliveryId` 及任务身份、版本。提交和请求复核针对当前任务；`inspect` 可以用宿主历史中已知的精确选择器核对本进程内的旧接收结果。查询的 `target` 描述所选任务，顶层 `taskAccepted`、`currentTaskId` 和 `currentTaskStatus` 仍描述当前任务；只读查询不会切换或重新提交任务。历史接收事实与文件完整性分别报告，文件被改动不抹去原接收事实。路径仅在最后实际上下文和文件检查都有效时返回。
 
 人工复核默认关闭。实验入口仅在 `OMP_AGENT_HUMAN_REVIEW=local-main-tui-v1` 时启用，还需要交付和接收目录及实际 main-agent TUI 上下文。未设置或空字符串表示关闭，其他非空值均为配置错误。RPC、子 Agent 和无 UI 环境不能批准。
 
