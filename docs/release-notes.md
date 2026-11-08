@@ -1,5 +1,9 @@
 # Release notes
 
+## Frozen-candidate method transfer validation
+
+Recorded one independently selected method task after freezing the generic candidate, tools, guidance, model and budgets. Actual generated content, numerical checks, provenance, final paths and cleanup passed bounded independent review. Five recovered errors remain, so strict zero-error acceptance failed; host verification remained `insufficient` and did not accept the task. This documentation-only increment does not change defaults or establish full Alpha readiness. See the testing record for scope, usage and wording limitations.
+
 ## Operation-level capability guidance
 
 Daily guidance now asks the model to check whether the operations required by a task are supported before choosing an execution route. An available runtime does not imply that every operation is available. Known restrictions should not trigger trial runs or tool switching to evade them; unknown facts may be investigated through authorized, supported means. If no compliant route exists, an honest response explaining non-execution remains valid.
