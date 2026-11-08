@@ -14,7 +14,9 @@ bun run scripts/test-execution.ts
 bun run test:delivery
 ```
 
-`check` runs TypeScript checks and unit tests. The other commands start actual OMP processes with temporary profiles and local deterministic test providers or services. They do not call a paid model. `OMP_COMMAND` can override the OMP executable.
+`check` runs TypeScript checks, unit tests, and `test:human-review` in a separate Bun process. The isolated human-review suite substitutes the unavailable UI transport while exercising actual execution, verification, delivery, and record installation. It is an engineering simulation, not evidence of real user approval.
+
+The other commands above start actual OMP processes with temporary profiles and local deterministic test providers or services. They do not call a paid model. `OMP_COMMAND` can override the OMP executable.
 
 ## What the tests establish
 
@@ -24,12 +26,17 @@ bun run test:delivery
 - Delivery file identity, exact byte checks, bounded previews, and idempotent reads.
 - Host acceptance reservation, exact evidence checks, idempotent record installation, uncertain outcomes, and postcommit visibility.
 - Model-visible submit/inspect results, current versus historical acceptance, and rejection of late actions after acceptance.
+- Default-off human review, complete bounded display data, valid partial-check issuance, one-shot approval binding, and separate human/hybrid record schemas under a simulated transport.
 - Actual OMP entry-factory composition: the delivery suite separately loads the task entry and execution composition, then checks the installed record and real files. It also covers delivery without acceptance configuration and incomplete semantic coverage.
 - Job submission reconciliation when responses are delayed, interrupted, or lost.
 
 Deterministic integration tests establish interface and control behavior. They do not measure arbitrary task success rates or independently establish production readiness.
 
 ## Accepted baseline
+
+The optional human-review host mechanism passed type checking, 287 unit tests (2,885 assertions), and 11 isolated simulated-transport tests (92 assertions). Independent checks covered 30 host-evidence scenarios and two repaired boundary cases: preparation time reduces the remaining review deadline, and a throwing context getter cannot expose a replaced owner's task state. The production review adapter remains unavailable.
+
+The existing actual OMP delivery suite (five tests, 233 assertions), execution suite (six tests, 112 assertions), and independent native submission checks also passed on the initial host-mechanism source. The subsequent two repairs changed only the new human-review projection and timer, plus their tests; automatic acceptance and native entry wiring remained unchanged.
 
 The model submission and inspection baseline passed type checking and 274 unit tests (2,788 assertions). Five actual OMP delivery tests (233 assertions) and six execution integration tests (112 assertions) also passed on the reviewed source. The delivery suite checks cleanup after a deliberate assertion failure following a completed execution, and retains evidence when a completed run's watchdog identity is deliberately made unknown. These fixture-failure tests do not simulate a live unarmed watchdog; the execution suite separately covers host termination and watchdog behavior.
 

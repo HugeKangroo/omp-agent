@@ -1,5 +1,11 @@
 # Release notes
 
+## Human review host mechanism
+
+Added a default-off host mechanism that binds a review to exact requirements, selected delivery bytes, and a fixed deadline. Human/hybrid v2 records preserve the original automatic receipt; automatic acceptance continues to use v1. Invalid or failed configured checks cannot be bypassed by a review decision.
+
+The production review adapter remains unavailable, and no model review action or environment activation is enabled. Positive approval tests use an isolated simulated transport over the real execution and acceptance chain. A usable review UI and genuine user acceptance remain pending.
+
 ## Experimental model submission and inspection
 
 Added `agent_deliver submit` and `inspect` to the opt-in delivery interface. The model selects an existing delivery with exact task and revision guards. Submission reuses the host acceptance service; inspection is read-only. Both return bounded JSON in tool content, separating operation results, current visibility, historical acceptance, and file integrity.

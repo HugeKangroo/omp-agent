@@ -17,6 +17,10 @@ export interface OmpToolContext {
   cwd: string;
   agent?: { kind?: "main" | "sub" };
   sessionManager?: OmpSessionManager;
+  /** Optional host mode projection; human review additionally requires tui. */
+  mode?: "tui" | "rpc" | "json" | "print";
+  /** Optional host UI availability projection; require true for local review. */
+  hasUI?: boolean;
 }
 
 /** OMP may report a symlinked temp cwd; compare both sides canonically. */

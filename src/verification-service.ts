@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { AcceptanceContract, AcceptanceContractStore } from "./acceptance-contract.ts";
 import type {
   CandidateProvenance,
@@ -139,11 +140,27 @@ export interface VerificationReceipt {
   persistence: "process-only";
 }
 
+/**
+ * Private host-only issuance facts. They never enter the receipt JSON, model
+ * view or automatic outcome; absence means an older/unprovable receipt and can
+ * never be guessed into all-true.
+ */
+export interface VerificationReviewFacts {
+  receiptId: string;
+  receiptDigest: string;
+  resultSettled: boolean;
+  resultShapeValid: boolean;
+  exactConditionSet: boolean;
+  postVerifierCandidateRechecked: boolean;
+  issuedCurrent: boolean;
+}
+
 export interface VerificationLookup {
   receipt: VerificationReceipt;
   compatibility: VerificationCompatibility;
   usable: boolean;
   modelView: string;
+  reviewFacts: VerificationReviewFacts | null;
 }
 
 export interface VerificationResult {
@@ -171,6 +188,23 @@ interface VerifierRunOutcome {
   kind: "result" | "error" | "timeout" | "aborted";
   value?: unknown;
   error?: string;
+}
+
+type ReviewFactDraft = Omit<VerificationReviewFacts, "receiptId" | "receiptDigest" | "issuedCurrent">;
+
+const NO_REVIEW_FACTS: ReviewFactDraft = Object.freeze({
+  resultSettled: false,
+  resultShapeValid: false,
+  exactConditionSet: false,
+  postVerifierCandidateRechecked: false,
+});
+
+function verificationReceiptDigest(receipt: VerificationReceipt): string {
+  return `sha256:${createHash("sha256").update(JSON.stringify(receipt), "utf8").digest("hex")}`;
+}
+
+function copyReviewFacts(facts: VerificationReviewFacts | null): VerificationReviewFacts | null {
+  return facts === null ? null : { ...facts };
 }
 
 function errorMessage(error: unknown): string {
@@ -428,6 +462,7 @@ export class VerificationService {
   private readonly newId: () => string;
   private readonly budgets = new Map<string, VerificationBudget>();
   private readonly records = new Map<string, VerificationReceipt>();
+  private readonly reviewFactsById = new Map<string, VerificationReviewFacts>();
   private readonly pendingReceiptIds = new Set<string>();
   private readonly controllers = new Set<AbortController>();
   private disposed = false;
@@ -566,6 +601,7 @@ export class VerificationService {
     receipt: VerificationReceipt,
     budget: VerificationBudget,
     compatibility: VerificationCompatibility,
+    facts: ReviewFactDraft,
   ): VerificationResult {
     const bounded = this.fitReceipt(receipt);
     const receiptId = bounded.receiptId;
@@ -579,6 +615,21 @@ export class VerificationService {
     budget.receipts += 1;
     const usable = stored.outcome === "pass" && compatibility === "current";
     const modelView = renderVerificationModelView(stored, compatibility, usable);
+    const finalDigest = verificationReceiptDigest(stored);
+    // A receipt that was compressed to fit, or that already exceeded a
+    // verifier/result limit, can never carry all-true issuance facts. Facts
+    // are always bound to the final post-fit stored JSON and final live state.
+    const fitChanged = bounded !== receipt || bounded.limits.limitExceeded;
+    const finalFacts = fitChanged ? NO_REVIEW_FACTS : facts;
+    this.reviewFactsById.set(receiptId, {
+      receiptId,
+      receiptDigest: finalDigest,
+      resultSettled: finalFacts.resultSettled,
+      resultShapeValid: finalFacts.resultShapeValid,
+      exactConditionSet: finalFacts.exactConditionSet,
+      postVerifierCandidateRechecked: finalFacts.postVerifierCandidateRechecked,
+      issuedCurrent: compatibility === "current" && stored.issuedCurrent === true,
+    });
     return {
       receipt: copyReceipt(stored),
       modelView,
@@ -704,7 +755,7 @@ export class VerificationService {
         issuedAt: startedAt,
         persistence: "process-only",
       };
-      return this.publish(receipt, budget, finalCompatibility);
+      return this.publish(receipt, budget, finalCompatibility, NO_REVIEW_FACTS);
     };
     // The host clock callback above is a sensitive checkpoint.
     live = this.liveFacts();
@@ -766,6 +817,7 @@ export class VerificationService {
         budget,
         compatibility,
         startedAt,
+        NO_REVIEW_FACTS,
       );
     }
     const summary = candidateSummary(snapshot);
@@ -789,6 +841,7 @@ export class VerificationService {
         budget,
         compatibility,
         startedAt,
+        NO_REVIEW_FACTS,
       );
     }
     const verifier = this.verifiers.get(`${contract.verifier.id}\0${contract.verifier.version}`);
@@ -812,6 +865,7 @@ export class VerificationService {
         budget,
         compatibility,
         startedAt,
+        NO_REVIEW_FACTS,
       );
     }
     const validatorInput = copyCandidateSnapshot(snapshot);
@@ -826,6 +880,7 @@ export class VerificationService {
     let limitExceeded = false;
     let verifierConditions = new Map<string, { result: VerificationOutcome; detail: string | null }>();
     let verifierInvalidReason: string | null = null;
+    let resultShapeValid = false;
     if (runOutcome.kind === "result") {
       try {
         verifierResultBytes = encodedUtf8Bytes(runOutcome.value);
@@ -839,8 +894,12 @@ export class VerificationService {
       } else if (verifierInvalidReason === null) {
         try {
           const normalized = this.normalizeVerifierResult(runOutcome.value);
-          if (normalized.reason !== null) verifierInvalidReason = normalized.reason;
-          else verifierConditions = normalized.conditions;
+          if (normalized.reason !== null) {
+            verifierInvalidReason = normalized.reason;
+          } else {
+            verifierConditions = normalized.conditions;
+            resultShapeValid = true;
+          }
         } catch (error) {
           verifierInvalidReason = `trusted verifier result could not be read: ${errorMessage(error)}`;
         }
@@ -913,6 +972,16 @@ export class VerificationService {
       reason = recheckReason;
     }
     if (timedOut) reason ??= `trusted verifier timed out after ${this.timeoutMs} ms`;
+    const exactConditionSet = resultShapeValid
+      && unknownIds.length === 0
+      && verifierConditions.size === contractIds.size
+      && [...contractIds].every((conditionId) => verifierConditions.has(conditionId));
+    const reviewFacts: ReviewFactDraft = {
+      resultSettled: runOutcome.kind === "result",
+      resultShapeValid,
+      exactConditionSet,
+      postVerifierCandidateRechecked: recheckReason === null,
+    };
     const issuedAt = this.now();
     // A host clock callback is a sensitive checkpoint too: re-read live facts
     // immediately before the immutable record is published.
@@ -934,6 +1003,7 @@ export class VerificationService {
       budget,
       compatibility,
       issuedAt,
+      reviewFacts,
     );
   }
 
@@ -949,6 +1019,7 @@ export class VerificationService {
     budget: VerificationBudget,
     compatibility: VerificationCompatibility,
     issuedAt: string,
+    facts: ReviewFactDraft,
   ): VerificationResult {
     // Receipt id allocation calls the host id callback. Re-read every live fact
     // after it (and after any collision retry inside the allocator) before the
@@ -992,7 +1063,7 @@ export class VerificationService {
       issuedAt,
       persistence: "process-only",
     };
-    return this.publish(receipt, budget, finalCompatibility);
+    return this.publish(receipt, budget, finalCompatibility, facts);
   }
 
   private normalizeVerifierResult(value: unknown): {
@@ -1099,6 +1170,7 @@ export class VerificationService {
       compatibility,
       usable,
       modelView: renderVerificationModelView(stored, compatibility, usable),
+      reviewFacts: copyReviewFacts(this.reviewFactsById.get(stored.receiptId) ?? null),
     };
   }
 

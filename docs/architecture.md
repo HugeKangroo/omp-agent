@@ -39,6 +39,14 @@ Submission and inspection return bounded JSON in model-visible tool content. Ope
 
 Late cancellation, revision, or execution cannot reopen an accepted task. A context change, abort, or disposal during a call can withhold current information and file paths while preserving the original operation result. Historical execution and verification records retain the facts recorded when they were created.
 
+## Optional human review mechanism
+
+The host mechanism for human review is default-off and uses the same task owner, acceptance reservation, record-store port, and fixed commit path. A review prepares a complete bounded display of the current requirements and selected UTF-8 delivery files. The original bytes and display digest are bound separately. The deadline includes preparation and waiting; cancellation, revision, context loss, or file changes invalidate the pending review.
+
+Human and hybrid records use an explicit v2 schema. Automatic acceptance continues to write v1 records. A valid partial automatic check retains its original insufficient outcome; a human decision may supplement uncovered semantics, but cannot override a failed or invalid configured check. Private verification issuance facts distinguish valid partial evidence from malformed verifier results without changing the historical receipt or model-visible verification result.
+
+The production review adapter is currently unavailable. No model approval flag, approval callback option, or usable review UI is provided. Isolated tests substitute only the review transport to exercise the real evidence and record-installation chain; those tests do not establish actual user approval.
+
 ## Current limits
 
 Candidate and delivery registries are process-local. The project does not yet provide cross-process task recovery, a production job backend, or a general installation profile. Filesystem checks describe the observed local state and do not claim transaction isolation against arbitrary external processes.

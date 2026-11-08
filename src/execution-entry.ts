@@ -13,6 +13,7 @@ import { currentTaskOwner, type OmpToolContext } from "./task-entry-port.ts";
 import { createDeliveryEntry, type DeliveryEntryControls } from "./delivery-entry.ts";
 import { DeliveryService } from "./delivery-service.ts";
 import { AcceptanceService } from "./acceptance-service.ts";
+import type { HumanReviewOption } from "./human-review-types.ts";
 import {
   createVerificationEntry,
   type VerificationCurrentContract,
@@ -139,6 +140,11 @@ export interface ExecutionEntryOptions {
    * together with deliveryRoot; no model tool is exposed in B2-B1.
    */
   acceptanceRoot?: string;
+  /**
+   * C1 host-only, default-off human review capability. It exposes no model
+   * action; the production transport is unavailable until C2.
+   */
+  humanReview?: HumanReviewOption;
 }
 
 export interface ExecutionEntryControls {
@@ -167,6 +173,24 @@ export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions)
     }
     if (!path.isAbsolute(options.acceptanceRoot)) {
       throw new ExecutionAdapterError("acceptanceRoot must be an explicit absolute host path.");
+    }
+  }
+  if (options.humanReview !== undefined && options.humanReview !== false) {
+    if (options.deliveryRoot === undefined || options.acceptanceRoot === undefined) {
+      throw new ExecutionAdapterError("humanReview requires explicit deliveryRoot and acceptanceRoot.");
+    }
+    const value = options.humanReview as unknown;
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new ExecutionAdapterError("humanReview must be false or an explicit local-main-tui host option.");
+    }
+    const record = value as Record<string, unknown>;
+    const keys = Object.keys(record);
+    if (keys.length !== 2
+      || !keys.includes("kind")
+      || !keys.includes("policyVersion")
+      || record.kind !== "local-main-tui"
+      || record.policyVersion !== 1) {
+      throw new ExecutionAdapterError("humanReview must be {kind:'local-main-tui', policyVersion:1}.");
     }
   }
   const audit = createFileAudit(options.auditPath);
@@ -223,6 +247,7 @@ export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions)
           activity: () => adapter.activitySnapshot(),
           acceptanceRoot: options.acceptanceRoot,
           executionRoot: options.root,
+          ...(options.humanReview === undefined ? {} : { humanReview: options.humanReview }),
         });
       }
       deliveryService.setAcceptanceConfigured(acceptanceService !== undefined);

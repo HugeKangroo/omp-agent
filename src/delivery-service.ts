@@ -28,7 +28,9 @@ import type { ExecutionActivitySnapshot } from "./execution-adapter.ts";
 import { currentTaskOwner, subjectFromContext, type OmpToolContext } from "./task-entry-port.ts";
 import type { ManagedTask, TaskOwner, TaskSubject } from "./task-owner.ts";
 import { requirementsDigest } from "./task-requirements.ts";
-import type { VerificationLookup, VerificationReceipt } from "./verification-service.ts";
+import type { VerificationLookup, VerificationReceipt, VerificationReviewFacts } from "./verification-service.ts";
+import { buildHumanReviewPresentation } from "./human-review-policy.ts";
+import type { HumanReviewPresentation } from "./human-review-types.ts";
 
 /**
  * G2-B2-A delivery service.
@@ -181,6 +183,8 @@ export interface AcceptanceEvidence {
   receiptDigest: string | null;
   receiptCompatibility: string | null;
   receiptUsable: boolean;
+  /** Private host-only verification issuance facts; null for legacy/missing facts. */
+  reviewFacts: VerificationReviewFacts | null;
   candidate: AcceptanceCandidateEvidence;
   files: DeliveryFileRow[];
   manifest: { name: string; bytes: number; sha256: string };
@@ -206,6 +210,12 @@ export interface AcceptedDeliveryInspection {
 /** Opaque host-only evidence token; only the issuing service can seal it. */
 export interface AcceptanceEvidenceToken {
   readonly kind: "delivery-acceptance-evidence";
+}
+
+export interface AcceptanceReviewEvidence {
+  evidence: AcceptanceEvidence;
+  presentation: HumanReviewPresentation;
+  token: AcceptanceEvidenceToken;
 }
 
 const evidenceSeals = new WeakMap<object, () => string | null>();
@@ -2630,6 +2640,33 @@ export class DeliveryService {
     selector: AcceptanceEvidenceSelector,
     signal?: AbortSignal,
   ): Promise<{ evidence: AcceptanceEvidence; token: AcceptanceEvidenceToken }> {
+    const read = await this.readAcceptanceEvidenceInternal(context, selector, signal, false);
+    return { evidence: read.evidence, token: read.token };
+  }
+
+  /**
+   * Host-only read used by human review. It reuses the exact registered
+   * delivery/candidate/contract/receipt evidence and additionally freezes the
+   * bounded, complete UTF-8 display view from the actual delivered bytes.
+   */
+  async readAcceptanceReviewEvidence(
+    context: OmpToolContext,
+    selector: AcceptanceEvidenceSelector,
+    signal?: AbortSignal,
+  ): Promise<AcceptanceReviewEvidence> {
+    const read = await this.readAcceptanceEvidenceInternal(context, selector, signal, true);
+    if (read.presentation === undefined) {
+      throw new DeliveryError("the delivery service did not build a human-review presentation.");
+    }
+    return { evidence: read.evidence, presentation: read.presentation, token: read.token };
+  }
+
+  private async readAcceptanceEvidenceInternal(
+    context: OmpToolContext,
+    selector: AcceptanceEvidenceSelector,
+    signal: AbortSignal | undefined,
+    review: boolean,
+  ): Promise<{ evidence: AcceptanceEvidence; token: AcceptanceEvidenceToken; presentation?: HumanReviewPresentation }> {
     if (this.disposed) throw new DeliveryError("the delivery service is disposed.");
     if (signal?.aborted) throw new DeliveryError("the acceptance evidence read was aborted before admission.");
     const expectedTaskId = identifier(selector.expectedTaskId, "expectedTaskId");
@@ -2674,6 +2711,7 @@ export class DeliveryService {
     let receipt: VerificationReceipt | null = null;
     let receiptCompatibility: string | null = null;
     let receiptUsable = false;
+    let reviewFacts: VerificationReviewFacts | null = null;
     if (record.receiptId !== null) {
       let found: VerificationLookup | null;
       try {
@@ -2687,6 +2725,13 @@ export class DeliveryService {
       receipt = this.validateReceiptFacts(found, expected, record.runId, snapshot);
       receiptCompatibility = found.compatibility;
       receiptUsable = found.usable;
+      reviewFacts = found.reviewFacts === null ? null : { ...found.reviewFacts };
+      if (reviewFacts !== null) {
+        const exactReceiptDigest = sha256(JSON.stringify(receipt));
+        if (reviewFacts.receiptId !== receipt.receiptId || reviewFacts.receiptDigest !== exactReceiptDigest) {
+          throw new DeliveryError("the private verification issuance facts do not match the final receipt identity.");
+        }
+      }
       this.abortCheckpoint(signal, "the acceptance evidence read was aborted while the verification receipt was read.");
       if (this.finalGuard(context, expected) !== null) throw new DeliveryError("The live task changed during the acceptance evidence read.");
     } else if (record.receiptDigest !== null) {
@@ -2705,6 +2750,7 @@ export class DeliveryService {
       receiptDigest: receipt === null ? null : sha256(JSON.stringify(receipt)),
       receiptCompatibility,
       receiptUsable,
+      reviewFacts,
       candidate: {
         snapshotId: snapshot.snapshotId,
         runId: snapshot.runId,
@@ -2737,6 +2783,17 @@ export class DeliveryService {
       // Verification and preview legitimately resolve separate snapshots;
       // evidence is compared by bytes/digests, not required snapshot id equality.
       evidence.receiptSnapshotId = evidence.receipt.candidates.snapshotId;
+    }
+    let presentation: HumanReviewPresentation | undefined;
+    if (review) {
+      presentation = buildHumanReviewPresentation({
+        evidence,
+        requirementSources: task.requirementSources,
+        fileData: bundle.data,
+      });
+      if (this.finalGuard(context, expected) !== null) {
+        throw new DeliveryError("The live task changed while the full review display was prepared.");
+      }
     }
     if (typeof this.candidates.sealSnapshot !== "function") {
       throw new DeliveryError("the candidate registry cannot issue a synchronous acceptance seal.");
@@ -2825,7 +2882,9 @@ export class DeliveryService {
         return errorMessage(error);
       }
     });
-    return { evidence, token };
+    return presentation === undefined
+      ? { evidence, token }
+      : { evidence, token, presentation };
   }
 
   /** Read-only bundle check used by accepted history inspection. */

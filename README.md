@@ -34,7 +34,7 @@ bun install
 bun run check
 ```
 
-`check` 执行 TypeScript 类型检查和单元测试。
+`check` 执行 TypeScript 类型检查、单元测试，以及独立进程中的人工复核模拟测试。模拟测试仅验证宿主机制，不代表真人审阅。
 
 以下集成测试会启动实际 OMP，使用临时 profile、私有测试目录和本地测试服务：
 
@@ -63,6 +63,8 @@ bun run test:delivery
 交付功能需要宿主显式提供绝对 `deliveryRoot`；实验入口对应环境变量为 `OMP_AGENT_DELIVERY_ROOT`。未配置时不注册交付工具。交付目录不能与执行目录重叠。最终接收另需显式提供 `acceptanceRoot`（`OMP_AGENT_ACCEPTANCE_ROOT`），且三个根目录两两不重叠。未配置接收目录时仍可预览，提交会明确返回未启用。
 
 `agent_deliver submit` 和 `inspect` 只接受现有 `deliveryId` 及任务身份、版本。结果分别报告本次提交、当前任务、历史接收与文件完整性；只读查询不会重新提交。路径仅在当前上下文和实际文件检查都有效时返回。
+
+人工复核的宿主机制默认关闭，已有独立记录和文件绑定约束；当前构建的生产审阅界面仍返回不可用，也没有向模型开放请求人工批准的操作。部分覆盖或失败的自动验证不会因此变成通过。
 
 ## 使用边界
 

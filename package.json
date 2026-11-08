@@ -8,12 +8,13 @@
   "omp": { "extensions": ["./src/extension.ts"] },
   "files": ["src", "policy", "docs/architecture.md", "docs/testing.md", "docs/release-notes.md", "README.md"],
   "scripts": {
-    "check": "bun run typecheck && bun test test/unit",
+    "check": "bun run typecheck && bun test test/unit && bun run test:human-review",
     "test": "bun test test/unit",
     "test:omp": "bun run scripts/test-omp.ts",
     "test:entry": "bun run scripts/test-entry.ts",
     "test:jobs": "bun run scripts/test-jobs.ts",
     "test:delivery": "bun run scripts/test-delivery.ts",
+    "test:human-review": "bun test test/human-review",
     "typecheck": "bun x tsc --noEmit"
   },
   "devDependencies": {
