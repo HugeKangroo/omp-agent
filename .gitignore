@@ -2,3 +2,7 @@ node_modules/
 .DS_Store
 *.log
 coverage/
+docs/*
+!docs/architecture.md
+!docs/testing.md
+!docs/release-notes.md
