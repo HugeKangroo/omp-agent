@@ -124,7 +124,7 @@ integration("native G2-A1: real OMP registers agent_task/agent_execute, describe
   expect(runContent).toContain("taskAccepted=false");
   expect(runContent).toContain("attempts limit=8 attempted=1 dispatched=1 reserved=0 remaining=7");
   const toolsSeen = snapshot.fixtureAudit.find((event) => event.type === "model_turn" && Array.isArray(event.tools));
-  expect((toolsSeen!.tools as string[]).sort()).toEqual(["agent_execute", "agent_task"]);
+  expect((toolsSeen!.tools as string[]).sort()).toEqual(["agent_execute", "agent_task", "agent_verify"]);
 
   const completed = snapshot.executionAudit.filter((event) => event.type === "execution_completed");
   expect(completed.length).toBe(1);
@@ -263,7 +263,7 @@ integration("native G2-A1: genuine user cancellation stops a long running script
   // The real agent_task cancel was forwarded only after the sandbox script
   // published its own ready marker; no extra authority tool existed.
   const toolsSeen = snapshot.fixtureAudit.find((event) => event.type === "model_turn" && Array.isArray(event.tools));
-  expect((toolsSeen!.tools as string[]).sort()).toEqual(["agent_execute", "agent_task"]);
+  expect((toolsSeen!.tools as string[]).sort()).toEqual(["agent_execute", "agent_task", "agent_verify"]);
   const emitted = snapshot.fixtureAudit
     .filter((event) => event.type === "tool_call_emitted")
     .map((event) => String(event.tool));

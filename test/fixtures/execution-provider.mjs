@@ -88,6 +88,40 @@ export default function executionFixtureProvider(pi) {
         const turn = step++;
         const toolResults = context.messages.filter((message) => message.role === "toolResult");
         const lastToolResult = textOf(toolResults.at(-1)?.content);
+        const parseTaskIdentity = (text) => {
+          const taskLine = text.split("\n").find((line) => line.startsWith("task: "));
+          if (taskLine) {
+            try {
+              const value = JSON.parse(taskLine.slice("task: ".length));
+              if (typeof value?.taskId === "string" && Number.isSafeInteger(value?.taskRevision)) {
+                return { taskId: value.taskId, taskRevision: value.taskRevision };
+              }
+            } catch {
+              // Not the describe projection.
+            }
+          }
+          try {
+            const value = JSON.parse(text);
+            if (typeof value?.task?.taskId === "string" && Number.isSafeInteger(value.task.taskRevision)) {
+              return { taskId: value.task.taskId, taskRevision: value.task.taskRevision };
+            }
+          } catch {
+            // Not the agent_task JSON response.
+          }
+          return null;
+        };
+        const taskIdentity = toolResults
+          .map((message) => parseTaskIdentity(textOf(message.content)))
+          .filter(Boolean)
+          .at(-1) ?? null;
+        const requiredTaskIdentity = () => {
+          if (taskIdentity === null) {
+            throw new Error("execution fixture: model-visible content exposed no real task identity; refusing to fabricate expectedTaskId");
+          }
+          return taskIdentity;
+        };
+        let emissionIdentity;
+        const identityOf = () => emissionIdentity ??= requiredTaskIdentity();
         const requiredMarkers = scenario === "normal" && turn === 2
           ? [
             "model-visible execution view g2a3-model-view-v1",
@@ -151,7 +185,8 @@ export default function executionFixtureProvider(pi) {
                 runtime: "python",
                 source: PYTHON_SOURCE,
                 inputIds: ["alpha"],
-                expectedTaskRevision: 1,
+                expectedTaskId: identityOf().taskId,
+                expectedTaskRevision: identityOf().taskRevision,
               },
             };
           } else {
@@ -175,7 +210,8 @@ export default function executionFixtureProvider(pi) {
                 runtime: "bun",
                 source: BUN_NORMAL_SOURCE,
                 inputIds: ["alpha"],
-                expectedTaskRevision: 1,
+                expectedTaskId: identityOf().taskId,
+                expectedTaskRevision: identityOf().taskRevision,
               },
             };
           } else {
@@ -199,7 +235,8 @@ export default function executionFixtureProvider(pi) {
                 runtime: "python",
                 source: HOST_DEATH_SOURCE,
                 inputIds: [],
-                expectedTaskRevision: 1,
+                expectedTaskId: identityOf().taskId,
+                expectedTaskRevision: identityOf().taskRevision,
               },
             };
           } else {
@@ -224,7 +261,8 @@ export default function executionFixtureProvider(pi) {
                   runtime: "python",
                   source: LONG_SOURCE,
                   inputIds: [],
-                  expectedTaskRevision: 1,
+                  expectedTaskId: identityOf().taskId,
+                  expectedTaskRevision: identityOf().taskRevision,
                 },
               },
               {
@@ -255,7 +293,8 @@ export default function executionFixtureProvider(pi) {
                 runtime: "python",
                 source: LONG_SOURCE,
                 inputIds: [],
-                expectedTaskRevision: 1,
+                expectedTaskId: identityOf().taskId,
+                expectedTaskRevision: identityOf().taskRevision,
               },
             };
           } else {

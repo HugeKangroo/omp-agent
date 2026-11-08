@@ -15,7 +15,7 @@ const EXECUTION_ENTRY_PATH = path.join(REPO_ROOT, "src/execution-entry.ts");
 const PROVIDER = "g2a-fixture";
 const MODEL = "scripted";
 const API = "g2a-fixture-api";
-const EXPECTED_TOOLS = ["agent_execute", "agent_task"];
+const EXPECTED_TOOLS = ["agent_execute", "agent_task", "agent_verify"];
 
 export interface ExecutionRunOptions {
   scenario: string;

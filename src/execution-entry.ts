@@ -1,5 +1,6 @@
 import path from "node:path";
 import { createFileAudit, type AuditEvent, type AuditSink } from "./audit.ts";
+import type { AcceptanceContract, TrustedContractSpec } from "./acceptance-contract.ts";
 import {
   EXECUTION_TOOL,
   ExecutionAdapter,
@@ -9,6 +10,9 @@ import {
   type ExecutionInputConfig,
 } from "./execution-adapter.ts";
 import { currentTaskOwner, type OmpToolContext } from "./task-entry-port.ts";
+import { createVerificationEntry, type VerificationHostControls } from "./verification-entry.ts";
+import type { VerificationLookup } from "./verification-service.ts";
+import type { TrustedVerifier } from "./verification-service.ts";
 
 /**
  * Explicit G2-A1 execution entry. Loaded only by a private harness after the
@@ -37,7 +41,7 @@ interface OmpApi {
   registerTool(tool: OmpTool): void;
 }
 
-export const EXECUTION_ENTRY_VERSION = "0.1.0-g2a3.0";
+export const EXECUTION_ENTRY_VERSION = "0.1.0-g2b1b.0";
 
 const EXECUTION_PARAMETERS = {
   type: "object",
@@ -62,17 +66,24 @@ const EXECUTION_PARAMETERS = {
       maxItems: 8,
       description: "Host-authorized input handles to copy read-only into the child sandbox. Unknown handles are refused.",
     },
+    expectedTaskId: {
+      type: "string",
+      description: "Required for run. Optimistic identity guard copied from the current host task view. The owner checks it at admission and again immediately before spawn; it is never authority.",
+    },
     expectedTaskRevision: {
       type: "integer",
       minimum: 1,
-      description: "Optimistic guard for run. The owner checks it at admission and again immediately before spawn.",
+      description: "Required for run. Optimistic guard for run. The owner checks it at admission and again immediately before spawn.",
     },
   },
-  additionalProperties: false,
+  // OMP 18.18 repairs a closed object schema by deleting unknown keys before
+  // execute. Passthrough keeps them for the strict parser, which rejects
+  // host-authority fields instead of silently normalizing them.
+  additionalProperties: true,
   required: ["action"],
 } as const;
 
-const DESCRIPTION = "Generic local candidate execution for the current managed task. describe reports the versioned model-visible execution view: actual host-selected Python/Bun versions, truthful limits, the current task identity/revision, authorized input handles (id, bytes, sha256, writable:false, availability) and remaining launch attempts without creating authority. run executes one bounded task-local Python or Bun script in a fresh private work directory. Inside the script, cwd is that writable workDir; OMP_WORK_DIR and OMP_INPUTS_MANIFEST are host-provided environment entries. Read OMP_INPUTS_MANIFEST as JSON; manifest.handles[inputId] is {path, bytes, sha256, writable:false} and the manifest also carries workDir, sourcePath and runtime. Pass inputIds to stage read-only copies, use only the current manifest paths, use only runtime stdlib/builtins (no installs, network or subprocess creation), and write intended candidate files as ordinary top-level files directly in the current cwd with relative paths so the host archives them; no copy-back to a host workspace is supported. Every run is fresh, and previous-run archives are not automatically readable or writable inputs. run returns the real runId/revision/runtime, observed process and watchdog facts, explicit output observed/retained/shown/omitted/truncated counts, candidate artifact rows with artifactId/relativePath/archiveRef/bytes/sha256, export rejections, host-record/control errors, taskAccepted:false and remaining attempts. Exit 0 is candidate generation only and is never task acceptance. The host chooses paths, runtime, environment and limits; paths, shell commands, environment variables, endpoints, identities, budgets and policies are not accepted from the model.";
+const DESCRIPTION = "Generic local candidate execution for the current managed task. describe reports the versioned model-visible execution view: actual host-selected Python/Bun versions, truthful limits, the current task identity/revision, authorized input handles (id, bytes, sha256, writable:false, availability) and remaining launch attempts without creating authority. run executes one bounded task-local Python or Bun script in a fresh private work directory. run requires expectedTaskId and expectedTaskRevision from the current host task view; both are optimistic guards, never authority, and a missing or wrong value is rejected before admission, launch budget, staging or spawn. Inside the script, cwd is that writable workDir; OMP_WORK_DIR and OMP_INPUTS_MANIFEST are host-provided environment entries. Read OMP_INPUTS_MANIFEST as JSON; manifest.handles[inputId] is {path, bytes, sha256, writable:false} and the manifest also carries workDir, sourcePath and runtime. Pass inputIds to stage read-only copies, use only the current manifest paths, use only runtime stdlib/builtins (no installs, network or subprocess creation), and write intended candidate files as ordinary top-level files directly in the current cwd with relative paths so the host archives them; no copy-back to a host workspace is supported. Every run is fresh, and previous-run archives are not automatically readable or writable inputs. run returns the real runId/revision/runtime, observed process and watchdog facts, explicit output observed/retained/shown/omitted/truncated counts, candidate artifact rows with artifactId/relativePath/archiveRef/bytes/sha256, export rejections, host-record/control errors, taskAccepted:false and remaining attempts. Exit 0 is candidate generation only and is never task acceptance. Delivery policy: after producing the registered artifacts intended for the final candidate report, use agent_verify on that current task/revision/run/artifact selection before the final report; intermediate exploration outputs need not be verified. Script self-tests are supplementary and do not replace host-configured verification. Verification is distinct from owner acceptance, so an unavailable task-acceptance operation is not a reason to skip verification. Report the actual host outcome, coverage and remaining gaps: on fail, use feedback to repair and submit a new candidate if justified; on insufficient coverage, explain missing checks or review and never repeatedly verify the same unchanged candidate merely to seek a pass. Do not imply verified or accepted beyond evidence. If no current registered candidate exists or verification cannot act due to cancellation or unavailability, report that limitation and never invent selectors or receipts. The host chooses paths, runtime, environment and limits; paths, shell commands, environment variables, endpoints, identities, budgets and policies are not accepted from the model; unknown or host-authority fields are refused by the plugin.";
 
 function stderr(message: string, details?: unknown): void {
   try {
@@ -109,16 +120,22 @@ export interface ExecutionEntryOptions {
   launcherPath?: string;
   dispatchWallMs?: number;
   terminationGraceMs?: number;
+  /** Host-only trusted verifier implementations; never model-selectable. */
+  trustedVerifiers?: readonly TrustedVerifier[];
+}
+
+export interface ExecutionEntryControls {
+  adapter: ExecutionAdapter;
+  bindContract(context: OmpToolContext, spec: TrustedContractSpec): AcceptanceContract;
+  lookup(context: OmpToolContext, receiptId: string): Promise<VerificationLookup | null>;
+  dispose(): void;
 }
 
 /**
  * Build the entry around the already-published owner. Exported for the private
  * harness and unit tests; the default export is the OMP factory.
  */
-export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions): {
-  adapter: ExecutionAdapter;
-  dispose(): void;
-} {
+export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions): ExecutionEntryControls {
   const owner = currentTaskOwner();
   if (!owner) throw new ExecutionAdapterError("The task owner must be loaded before the execution entry.");
   if (!path.isAbsolute(options.root)) throw new ExecutionAdapterError("Execution root must be absolute.");
@@ -136,48 +153,89 @@ export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions)
   });
   safeAudit(audit, { type: "execution_entry_started", version: EXECUTION_ENTRY_VERSION });
 
-  pi.registerTool({
-    name: EXECUTION_TOOL,
-    label: "Generic local execution",
-    description: DESCRIPTION,
-    parameters: EXECUTION_PARAMETERS,
-    approval: "exec",
-    loadMode: "essential",
-    async execute(_toolCallId, params, signal, _onUpdate, context) {
-      try {
-        const parsed = parseExecutionArguments(params);
-        if (signal?.aborted) {
-          safeAudit(audit, { type: "execution_tool_aborted", action: parsed.action });
-          return executionErrorResult("the call was aborted before the execution adapter acted; no effect occurred.");
-        }
-        safeAudit(audit, {
-          type: "execution_tool_attempt",
-          action: parsed.action,
-          runtime: parsed.action === "run" ? parsed.runtime : null,
-          sessionId: context.sessionManager?.getSessionId() ?? null,
-          agentKind: context.agent?.kind === "main" ? "main" : "sub",
-        });
-        if (parsed.action === "describe") return await adapter.describe(context);
-        return await adapter.run(context, parsed, signal);
-      } catch (error) {
-        safeAudit(audit, { type: "execution_tool_rejected", error: errorMessage(error) });
-        return executionErrorResult(errorMessage(error));
-      }
-    },
-  });
-  safeAudit(audit, { type: "execution_tool_registered", name: EXECUTION_TOOL });
-
   let disposed = false;
+  let verification: VerificationHostControls;
+  try {
+    verification = createVerificationEntry(pi, {
+      owner,
+      candidates: adapter.candidates,
+      workspaceRoot: owner.workspaceRoot,
+      ...(options.trustedVerifiers === undefined ? {} : { trustedVerifiers: options.trustedVerifiers }),
+    });
+  } catch (error) {
+    adapter.dispose();
+    throw error;
+  }
+
   const dispose = (): void => {
     if (disposed) return;
     disposed = true;
+    verification.dispose();
     adapter.dispose();
   };
-  pi.on("session_shutdown", () => {
+
+  const ownerStillCurrent = (): boolean => currentTaskOwner() === owner;
+  const ownerChangedResult = (): ReturnType<typeof executionErrorResult> => {
+    safeAudit(audit, { type: "execution_tool_rejected", error: "the published task owner changed" });
+    return executionErrorResult("the managed task owner changed; this entry can no longer act for the current task.");
+  };
+
+  try {
+    pi.registerTool({
+      name: EXECUTION_TOOL,
+      label: "Generic local execution",
+      description: DESCRIPTION,
+      parameters: EXECUTION_PARAMETERS,
+      approval: "exec",
+      loadMode: "essential",
+      async execute(_toolCallId, params, signal, _onUpdate, context) {
+        if (disposed) return executionErrorResult("the execution entry is disposed; no effect occurred.");
+        if (!ownerStillCurrent()) return ownerChangedResult();
+        try {
+          const parsed = parseExecutionArguments(params);
+          if (signal?.aborted) {
+            safeAudit(audit, { type: "execution_tool_aborted", action: parsed.action });
+            return executionErrorResult("the call was aborted before the execution adapter acted; no effect occurred.");
+          }
+          safeAudit(audit, {
+            type: "execution_tool_attempt",
+            action: parsed.action,
+            runtime: parsed.action === "run" ? parsed.runtime : null,
+            sessionId: context.sessionManager?.getSessionId() ?? null,
+            agentKind: context.agent?.kind === "main" ? "main" : "sub",
+          });
+          // The audit sink is a host callback and may replace the published
+          // owner. Never rebind this already-created adapter to another owner.
+          if (!ownerStillCurrent()) return ownerChangedResult();
+          if (parsed.action === "describe") return await adapter.describe(context);
+          return await adapter.run(context, parsed, signal);
+        } catch (error) {
+          safeAudit(audit, { type: "execution_tool_rejected", error: errorMessage(error) });
+          return executionErrorResult(errorMessage(error));
+        }
+      },
+    });
+  } catch (error) {
     dispose();
-    return undefined;
-  });
-  return { adapter, dispose };
+    throw error;
+  }
+  safeAudit(audit, { type: "execution_tool_registered", name: EXECUTION_TOOL });
+
+  try {
+    pi.on("session_shutdown", () => {
+      dispose();
+      return undefined;
+    });
+  } catch (error) {
+    dispose();
+    throw error;
+  }
+  return {
+    adapter,
+    bindContract: verification.bindContract,
+    lookup: verification.lookup,
+    dispose,
+  };
 }
 
 function parseInputManifest(value: string | undefined): ExecutionInputConfig[] {

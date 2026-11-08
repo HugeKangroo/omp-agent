@@ -271,6 +271,7 @@ async function runPython(f: Fixture, source: string, inputIds: string[] = []): P
     runtime: "python",
     source,
     inputIds,
+    expectedTaskId: f.owner.snapshot().currentTask!.taskId,
     expectedTaskRevision: f.owner.snapshot().currentTask!.taskRevision,
   });
   return { result, details: result.details as Record<string, any> };
@@ -895,6 +896,7 @@ describe("G2-B1a candidate registry, contract and verification", () => {
         runtime: "python",
         source: ANSWER_SOURCE,
         inputIds: [],
+        expectedTaskId: f.owner.snapshot().currentTask!.taskId,
         expectedTaskRevision: 1,
       });
       const details = result.details as Record<string, any>;
@@ -941,6 +943,7 @@ describe("G2-B1a candidate registry, contract and verification", () => {
         runtime: "python",
         source: ANSWER_SOURCE,
         inputIds: [],
+        expectedTaskId: f.owner.snapshot().currentTask!.taskId,
         expectedTaskRevision: 1,
       });
       const details = result.details as Record<string, any>;
@@ -984,6 +987,7 @@ describe("G2-B1a candidate registry, contract and verification", () => {
         runtime: "python",
         source: ANSWER_SOURCE,
         inputIds: [],
+        expectedTaskId: f.owner.snapshot().currentTask!.taskId,
         expectedTaskRevision: 1,
       });
       const details = result.details as Record<string, any>;

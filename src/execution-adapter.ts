@@ -98,7 +98,7 @@ const FORBIDDEN_RUN_KEYS = new Set([
   "ownerId", "capabilityId", "runId", "callId", "executionId", "budget",
   "policy", "permissions", "permission", "timeout", "limits", "sandbox",
   "profile", "outputPath", "artifactId", "token", "secret", "goal", "rawRequest",
-  "revision", "expectedTaskId",
+  "revision",
 ]);
 
 export class ExecutionAdapterError extends Error {
@@ -144,6 +144,7 @@ export type ExecutionArguments =
     runtime: ExecutionRuntime;
     source: string;
     inputIds: string[];
+    expectedTaskId: string;
     expectedTaskRevision: number;
   };
 
@@ -405,8 +406,9 @@ export function parseExecutionArguments(value: unknown, limits = EXECUTION_LIMIT
     if (unknown.length) throw new ExecutionAdapterError(`agent_execute describe has unsupported field(s): ${unknown.join(", ")}.`);
     return { action };
   }
-  const unknown = keys.filter((key) => !["action", "runtime", "source", "inputIds", "expectedTaskRevision"].includes(key));
+  const unknown = keys.filter((key) => !["action", "runtime", "source", "inputIds", "expectedTaskId", "expectedTaskRevision"].includes(key));
   if (unknown.length) throw new ExecutionAdapterError(`agent_execute run has unsupported field(s): ${unknown.join(", ")}.`);
+  const expectedTaskId = identifier(args.expectedTaskId, "expectedTaskId");
   const runtime = args.runtime;
   if (runtime !== "python" && runtime !== "bun") {
     throw new ExecutionAdapterError("agent_execute runtime must be python or bun.");
@@ -436,6 +438,7 @@ export function parseExecutionArguments(value: unknown, limits = EXECUTION_LIMIT
     runtime,
     source,
     inputIds,
+    expectedTaskId,
     expectedTaskRevision: positiveInteger(args.expectedTaskRevision, "expectedTaskRevision"),
   };
 }
@@ -897,7 +900,14 @@ function scalar(value: unknown, limit = 500): unknown {
 function errorResult(message: string): ExecutionToolResult {
   const text = `${EXECUTION_TOOL}: ${message}`;
   const bounded = Buffer.byteLength(text, "utf8") > 8 * 1024 ? `${text.slice(0, 8 * 1024)}…` : text;
-  return { content: [{ type: "text", text: bounded }], details: { error: message.slice(0, 2000) }, isError: true };
+  // Appended after bounding so the no-acceptance fact survives a truncated
+  // diagnostic. The message stays the actual diagnostic; this helper is used
+  // from different stages, so it never claims no admission or execution.
+  return {
+    content: [{ type: "text", text: `${bounded}\ntaskAccepted: false` }],
+    details: { error: message.slice(0, 2000), taskAccepted: false },
+    isError: true,
+  };
 }
 
 export function assertExecutionResponseBound(result: ExecutionToolResult): void {
@@ -1632,6 +1642,9 @@ export class ExecutionAdapter {
     if (signal?.aborted) {
       return errorResult("the call was aborted before admission; no process was started and no dispatch budget was used.");
     }
+    if (typeof args.expectedTaskId !== "string" || !IDENTIFIER.test(args.expectedTaskId)) {
+      return errorResult("expectedTaskId is required and must be a valid task identifier; no admission, budget or process occurred.");
+    }
     let subject: TaskSubject;
     let current: ManagedTask;
     try {
@@ -1639,6 +1652,9 @@ export class ExecutionAdapter {
       current = this.owner.reachableTask(subject);
     } catch (error) {
       return errorResult(errorMessage(error));
+    }
+    if (current.taskId !== args.expectedTaskId) {
+      return errorResult("expectedTaskId does not match the current task; no admission, budget or process occurred.");
     }
     if (this.busy) {
       safeAudit(this.audit, { type: "execution_busy_rejected", taskId: current.taskId, taskRevision: current.taskRevision });
@@ -1686,6 +1702,9 @@ export class ExecutionAdapter {
         });
         return errorResult(`execution was not admitted: ${decision.reason ?? "owner denied the call"}.`);
       }
+      if (decision.taskId !== args.expectedTaskId) {
+        return errorResult("the admitted task identity differs from expectedTaskId; no process was started.");
+      }
       // Admission is not a license to use a later revision: re-read the actual
       // task and binding after the owner's synchronous decision.
       let fresh: ManagedTask;
@@ -1695,6 +1714,7 @@ export class ExecutionAdapter {
         return errorResult(`no process was started: ${errorMessage(error)}`);
       }
       if (fresh.taskId !== decision.taskId
+        || fresh.taskId !== args.expectedTaskId
         || fresh.taskRevision !== decision.taskRevision
         || fresh.status !== "active") {
         return errorResult("the task changed between admission and preparation; no process was started.");
@@ -1750,6 +1770,7 @@ export class ExecutionAdapter {
       }
       if (this.disposed
         || beforeSpawn.taskId !== decision.taskId
+        || beforeSpawn.taskId !== args.expectedTaskId
         || beforeSpawn.taskRevision !== decision.taskRevision
         || beforeSpawn.status !== "active"
         || this.owner.bindingStatus().state !== "attached") {

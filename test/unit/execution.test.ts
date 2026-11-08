@@ -9,6 +9,7 @@ import path from "node:path";
 import {
   EXECUTION_LIMITS,
   ExecutionAdapter,
+  executionErrorResult,
   parseExecutionArguments,
   sandboxProfile,
   type ExecutionToolContext,
@@ -59,6 +60,12 @@ function context(branch: readonly unknown[], leafId: string): ExecutionToolConte
 
 function sha256(bytes: Uint8Array | string): string {
   return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+}
+
+function currentTaskId(owner: TaskOwner): string {
+  const task = owner.snapshot().currentTask;
+  if (!task) throw new Error("test fixture: no current task");
+  return task.taskId;
 }
 
 interface Fixture {
@@ -207,17 +214,21 @@ describe("agent_execute argument parsing", () => {
       runtime: "python",
       source: "print('x')",
       inputIds: ["alpha"],
+      expectedTaskId: "task-1",
       expectedTaskRevision: 1,
-    })).toMatchObject({ action: "run", runtime: "python", inputIds: ["alpha"], expectedTaskRevision: 1 });
+    })).toMatchObject({ action: "run", runtime: "python", inputIds: ["alpha"], expectedTaskId: "task-1", expectedTaskRevision: 1 });
   });
 
   test("rejects host authority, paths, environment and duplicate handles", () => {
     const forbidden = [
-      { action: "run", runtime: "python", source: "x", expectedTaskRevision: 1, path: "/etc/passwd" },
-      { action: "run", runtime: "python", source: "x", expectedTaskRevision: 1, env: { A: "B" } },
-      { action: "run", runtime: "python", source: "x", expectedTaskRevision: 1, taskId: "task-1" },
-      { action: "run", runtime: "python", source: "x", expectedTaskRevision: 1, interpreter: "/bin/sh" },
-      { action: "run", runtime: "python", source: "x", inputIds: ["a", "a"], expectedTaskRevision: 1 },
+      { action: "run", runtime: "python", source: "x", expectedTaskRevision: 1 },
+      { action: "run", runtime: "python", source: "x", expectedTaskId: "../task", expectedTaskRevision: 1 },
+      { action: "run", runtime: "python", source: "x", expectedTaskId: "", expectedTaskRevision: 1 },
+      { action: "run", runtime: "python", source: "x", expectedTaskId: "task-1", expectedTaskRevision: 1, path: "/etc/passwd" },
+      { action: "run", runtime: "python", source: "x", expectedTaskId: "task-1", expectedTaskRevision: 1, env: { A: "B" } },
+      { action: "run", runtime: "python", source: "x", expectedTaskId: "task-1", expectedTaskRevision: 1, taskId: "task-1" },
+      { action: "run", runtime: "python", source: "x", expectedTaskId: "task-1", expectedTaskRevision: 1, interpreter: "/bin/sh" },
+      { action: "run", runtime: "python", source: "x", inputIds: ["a", "a"], expectedTaskId: "task-1", expectedTaskRevision: 1 },
       { action: "describe", taskId: "task-1" },
     ];
     for (const value of forbidden) expect(() => parseExecutionArguments(value)).toThrow();
@@ -228,8 +239,20 @@ describe("agent_execute argument parsing", () => {
       action: "run",
       runtime: "python",
       source: "x".repeat(EXECUTION_LIMITS.maxSourceBytes + 1),
+      expectedTaskId: "task-1",
       expectedTaskRevision: 1,
     })).toThrow();
+  });
+
+  test("oversized error diagnostics stay bounded and retain taskAccepted:false", () => {
+    const result = executionErrorResult(`diagnostic ${"x".repeat(20_000)}`);
+    expect(result.isError).toBe(true);
+    const text = result.content.map((part) => part.text).join("\n");
+    expect(text).toContain("…");
+    expect(text.endsWith("taskAccepted: false")).toBe(true);
+    expect(result.details).toMatchObject({ taskAccepted: false });
+    expect(String(result.details!.error).length).toBe(2000);
+    expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThan(EXECUTION_LIMITS.maxToolResponseBytes);
   });
 });
 
@@ -275,6 +298,7 @@ describe("agent_execute describe", () => {
         runtime: "python",
         source: "print('trusted runtime remains')",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       expect(result.isError).toBeUndefined();
@@ -339,6 +363,7 @@ describe("generic Python and Bun execution", () => {
         runtime: "python",
         source: PYTHON_INPUT_ARTIFACT,
         inputIds: ["alpha"],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -366,6 +391,7 @@ describe("generic Python and Bun execution", () => {
         runtime: "bun",
         source: BUN_INPUT_ARTIFACT,
         inputIds: ["alpha"],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -401,6 +427,7 @@ print("A" * 600 + "SENTINEL_BEYOND_500")
         runtime: "python",
         source,
         inputIds: ["alpha"],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const content = contentOf(result);
@@ -439,6 +466,7 @@ print("A" * 600 + "SENTINEL_BEYOND_500")
         runtime: "python",
         source: "import sys\nsys.stdout.write(\"€\" * 2000 + \"TAIL_BEYOND_PREVIEW\")\n",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const content = contentOf(result);
@@ -466,6 +494,7 @@ print("A" * 600 + "SENTINEL_BEYOND_500")
         runtime: "python",
         source: "import os\nos.write(1, b'\\xff' * 2000)\n",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -505,6 +534,7 @@ print("A" * 600 + "SENTINEL_BEYOND_500")
         runtime: "python",
         source: "import os\nos.write(1, b'\\xc0')\n",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -532,6 +562,7 @@ print("A" * 600 + "SENTINEL_BEYOND_500")
         runtime: "python",
         source: "import sys\nsys.stdout.write('\\uFFFD' * 2000)\n",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -558,6 +589,7 @@ print("A" * 600 + "SENTINEL_BEYOND_500")
         runtime: "python",
         source: "import sys\nsys.stdout.write('\\u20ac' * 30000)\n",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -589,6 +621,7 @@ print("A" * 600 + "SENTINEL_BEYOND_500")
         runtime: "python",
         source: "import os\nos.write(1, b'A' * 65534)\nos.write(1, b'\\xe0\\x80')\nos.write(1, b'TAIL')\n",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -617,6 +650,7 @@ describe("admission and concurrency boundaries", () => {
         runtime: "python",
         source: "print('never')",
         inputIds: ["not-authorized"],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       expect(unauthorized.isError).toBe(true);
@@ -626,6 +660,7 @@ describe("admission and concurrency boundaries", () => {
         runtime: "python",
         source: "print('never')",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 99,
       });
       expect(stale.isError).toBe(true);
@@ -637,6 +672,7 @@ describe("admission and concurrency boundaries", () => {
         runtime: "python",
         source: "print('never')",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       }, controller.signal);
       expect(aborted.isError).toBe(true);
@@ -657,7 +693,8 @@ describe("admission and concurrency boundaries", () => {
           runtime: "python",
           source: "print('never')",
           inputIds: [inputId],
-          expectedTaskRevision: 1,
+          expectedTaskId: currentTaskId(f.owner),
+        expectedTaskRevision: 1,
         });
         expect(result.isError).toBe(true);
         expect(String(detailsOf(result).error)).toMatch(/symbolic link|hard links/);
@@ -684,6 +721,7 @@ describe("admission and concurrency boundaries", () => {
         runtime: "python",
         source: "open('did-run.txt', 'w').write('side effect')\nprint('must not run')\n",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       expect(result.isError).toBe(true);
@@ -710,6 +748,7 @@ describe("admission and concurrency boundaries", () => {
         runtime: "python" as const,
         source,
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       };
       const first = f.adapter.run(f.ctx, args);
@@ -838,6 +877,7 @@ with open("own.txt", "w", encoding="utf-8") as handle:
         runtime: "python",
         source,
         inputIds: ["meta"],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -909,6 +949,7 @@ describe("limits, cancellation and evidence", () => {
         runtime: "python",
         source: "import signal, time\nsignal.signal(signal.SIGTERM, lambda *args: None)\ntime.sleep(20)\n",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -931,6 +972,7 @@ describe("limits, cancellation and evidence", () => {
         runtime: "python",
         source: "import os, time\nos.write(1, b'x' * 200000)\ntime.sleep(5)\n",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -978,6 +1020,7 @@ with open("fsize.json", "w", encoding="utf-8") as handle:
     json.dump(report, handle)
 `,
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -1002,6 +1045,7 @@ with open("fsize.json", "w", encoding="utf-8") as handle:
         runtime: "python",
         source: "open('marker.txt', 'w', encoding='utf-8').write('untrusted-code-ran')\nimport sys\nsys.exit(111)\n",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -1035,6 +1079,7 @@ with open("fsize.json", "w", encoding="utf-8") as handle:
         runtime: "python",
         source: "import time\ntime.sleep(10)\n",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -1074,6 +1119,7 @@ with open("fsize.json", "w", encoding="utf-8") as handle:
         runtime: "python",
         source: "open('done.txt', 'w').write('actual execution')\n",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -1112,6 +1158,7 @@ for index in range(8):
         handle.write(b"x" * 150000)
 `,
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -1146,6 +1193,7 @@ except OSError:
     pass
 `,
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -1174,6 +1222,7 @@ print("completed candidate artifacts")
         runtime: "python",
         source,
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       const details = detailsOf(result);
@@ -1225,6 +1274,7 @@ describe("owner authority changes during a run", () => {
         runtime: "python",
         source: LONG,
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       await Bun.sleep(150);
@@ -1241,6 +1291,7 @@ describe("owner authority changes during a run", () => {
         runtime: "python",
         source: "print('no')",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       expect(after.isError).toBe(true);
@@ -1258,6 +1309,7 @@ describe("owner authority changes during a run", () => {
         runtime: "python",
         source: LONG,
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       await Bun.sleep(150);
@@ -1303,6 +1355,7 @@ describe("owner authority changes during a run", () => {
         runtime: "python",
         source: LONG,
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       await Bun.sleep(150);
@@ -1341,6 +1394,7 @@ describe("owner authority changes during a run", () => {
         runtime: "python",
         source: "print('visible-before-detach')\nopen('secret.txt', 'w', encoding='utf-8').write('secret-output')\n",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       expect(writes).toBe(3);
@@ -1380,6 +1434,7 @@ describe("owner authority changes during a run", () => {
         runtime: "python",
         source: "import os\nprint('AUDIT_PRIVATE_STDOUT')\nopen('audit-private-artifact.txt', 'w', encoding='utf-8').write('ok')\nos.mkdir('audit-private-rejection')\n",
         inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
         expectedTaskRevision: 1,
       });
       expect(detachedInAudit).toBe(true);
@@ -1763,7 +1818,7 @@ safe_control_write(control_fd, e)
       const faulty = await fixture({ launcherPath });
       try {
         const result = await faulty.adapter.run(faulty.ctx, {
-          action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskRevision: 1,
+          action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskId: currentTaskId(faulty.owner), expectedTaskRevision: 1,
         });
         const details = detailsOf(result);
         expect(result.isError).toBe(true);
@@ -1797,7 +1852,7 @@ for _ in range(20):
       const faulty = await fixture({ launcherPath });
       try {
         const result = await faulty.adapter.run(faulty.ctx, {
-          action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskRevision: 1,
+          action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskId: currentTaskId(faulty.owner), expectedTaskRevision: 1,
         });
         const details = detailsOf(result);
         expect(result.isError).toBe(true);
@@ -1833,7 +1888,7 @@ os._exit(0)
       const faulty = await fixture({ launcherPath });
       try {
         const result = await faulty.adapter.run(faulty.ctx, {
-          action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskRevision: 1,
+          action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskId: currentTaskId(faulty.owner), expectedTaskRevision: 1,
         });
         const details = detailsOf(result);
         expect(result.isError).toBe(true);
@@ -1866,7 +1921,7 @@ os._exit(0)
       const faulty = await fixture({ launcherPath });
       try {
         const result = await faulty.adapter.run(faulty.ctx, {
-          action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskRevision: 1,
+          action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskId: currentTaskId(faulty.owner), expectedTaskRevision: 1,
         });
         const details = detailsOf(result);
         expect(result.isError).toBe(true);
@@ -1903,7 +1958,7 @@ os._exit(0)
       const faulty = await fixture({ launcherPath });
       try {
         const result = await faulty.adapter.run(faulty.ctx, {
-          action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskRevision: 1,
+          action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskId: currentTaskId(faulty.owner), expectedTaskRevision: 1,
         });
         const details = detailsOf(result);
         expect(result.isError).toBe(true);
@@ -1938,7 +1993,7 @@ ${line}
         const faulty = await fixture({ launcherPath });
         try {
           const result = await faulty.adapter.run(faulty.ctx, {
-            action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskRevision: 1,
+            action: "run", runtime: "python", source: COMPLETES_AT_500MS, inputIds: [], expectedTaskId: currentTaskId(faulty.owner), expectedTaskRevision: 1,
           });
           const details = detailsOf(result);
           expect(result.isError).toBe(true);
@@ -1965,7 +2020,8 @@ ${line}
           runtime,
           source: runtime === "python" ? "print('normal python')" : "console.log('normal bun')",
           inputIds: [],
-          expectedTaskRevision: 1,
+          expectedTaskId: currentTaskId(f.owner),
+        expectedTaskRevision: 1,
         });
         const details = detailsOf(result);
         expect(result.isError).toBeUndefined();
