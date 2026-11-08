@@ -154,6 +154,12 @@ def process_alive(pid: int, group: bool = False) -> bool:
         return True
 
 
+def within_or_equal(parent: Path, child: Path) -> bool:
+    parent_text = os.path.realpath(str(parent))
+    child_text = os.path.realpath(str(child))
+    return child_text == parent_text or child_text.startswith(parent_text + os.sep)
+
+
 def child_identity_message() -> bytes:
     identity = {
         "pid": os.getpid(),
@@ -474,9 +480,16 @@ class Driver:
         self.audit_path = Path(self.plan["paths"]["audit"]).resolve()
         self.provider_audit_path = Path(self.plan["paths"]["providerAudit"]).resolve()
         self.host_audit_path = Path(self.plan["paths"].get("hostAudit") or "/nonexistent").resolve()
-        self.owner_state_path = Path(self.plan["paths"]["ownerState"]).resolve()
-        self.execution_root = Path(self.plan["paths"]["executionRoot"]).resolve()
-        self.acceptance_root = Path(self.plan["paths"]["acceptanceRoot"]).resolve()
+        self.owner_state_path = self.resolve_plan_path("ownerState")
+        self.execution_root = self.resolve_plan_path("executionRoot")
+        self.delivery_root = self.resolve_plan_path("deliveryRoot")
+        self.acceptance_root = self.resolve_plan_path("acceptanceRoot")
+        self.execution_audit_path = self.resolve_plan_path("executionAudit")
+        self.b1_audit_path = self.resolve_plan_path("b1Audit")
+        self.state_root = self.resolve_plan_path("stateRoot")
+        self.daily_audit_path = self.resolve_plan_path("dailyAudit")
+        self.daily = self.plan.get("expected", {}).get("daily") is True
+        self.path_discovery = None
         self.initial_columns, self.initial_rows = self.plan["initialSize"]
         self.resize = self.plan.get("resize")
         self.timeout_seconds = int(self.plan["timeoutSeconds"])
@@ -509,6 +522,12 @@ class Driver:
         self.manifest = None
         self.manifest_verified = {}
         self.manifest_sha_at_start = None
+
+    def resolve_plan_path(self, name: str):
+        value = self.plan.get("paths", {}).get(name)
+        if not isinstance(value, str) or not value:
+            return None
+        return Path(value).resolve()
 
     def note(self, message: str, stage: str, **extra):
         if self.failure is None:
@@ -644,6 +663,103 @@ class Driver:
                 return text
         return None
 
+    def discover_daily_paths(self):
+        unresolved = {
+            name: self.plan.get("paths", {}).get(name)
+            for name in ("stateRoot", "ownerState", "executionRoot", "deliveryRoot", "acceptanceRoot", "executionAudit")
+        }
+        try:
+            if self.state_root is None:
+                raise RuntimeError("daily plan has no stateRoot")
+            if not self.state_root.is_dir() or self.state_root.is_symlink():
+                raise RuntimeError(f"daily state root is not a real directory: {self.state_root}")
+            instances_root = self.state_root / "instances"
+            if not instances_root.is_dir() or instances_root.is_symlink():
+                raise RuntimeError(f"daily instances root is not a real directory: {instances_root}")
+            entries = sorted(instances_root.iterdir(), key=lambda item: item.name)
+            if len(entries) != 1 or not entries[0].is_dir() or entries[0].is_symlink():
+                raise RuntimeError(f"daily discovery requires exactly one real instance directory, saw {[item.name for item in entries]!r}")
+            root = entries[0].resolve()
+            if root.parent != instances_root.resolve():
+                raise RuntimeError("daily instance root is not a direct canonical child of instances")
+            execution = (root / "execution").resolve()
+            delivery = (root / "delivery").resolve()
+            acceptance = (root / "acceptance").resolve()
+            state_path = root / "task-state.json"
+            audit_path = root / "audit.jsonl"
+            for path in (execution, delivery, acceptance):
+                if not path.is_dir() or path.is_symlink() or not within_or_equal(root, path):
+                    raise RuntimeError(f"daily instance component is not a real directory under the instance: {path}")
+            if state_path.is_symlink() or not state_path.is_file():
+                raise RuntimeError("daily task-state.json is not a real file")
+            if audit_path.is_symlink() or not audit_path.is_file():
+                raise RuntimeError("daily audit.jsonl is not a real file")
+            for left, right in (
+                (execution, delivery), (execution, acceptance), (delivery, acceptance),
+                (execution, root / "task-state.json"), (execution, audit_path),
+                (delivery, root / "task-state.json"), (delivery, audit_path),
+                (acceptance, root / "task-state.json"), (acceptance, audit_path),
+            ):
+                if within_or_equal(left, right) or within_or_equal(right, left):
+                    raise RuntimeError(f"daily instance paths overlap: {left} and {right}")
+            for other in (Path(self.plan["cwd"]).resolve(), self.evidence_root):
+                if within_or_equal(root, other) or within_or_equal(other, root):
+                    raise RuntimeError(f"daily instance root overlaps a harness root: {other}")
+            snapshot = read_json(state_path)
+            if snapshot.get("schemaVersion") != 1:
+                raise RuntimeError("daily owner state schemaVersion is not 1")
+            if snapshot.get("tasksCreated") != 0 or snapshot.get("currentTask") is not None:
+                raise RuntimeError("daily owner state is not empty before the first prompt")
+            owner_id = snapshot.get("ownerId")
+            if not isinstance(owner_id, str) or not owner_id:
+                raise RuntimeError("daily owner state has no actual ownerId")
+            workspace_root = snapshot.get("workspaceRoot")
+            if not isinstance(workspace_root, str) or not workspace_root:
+                raise RuntimeError("daily owner state has no workspaceRoot")
+            if os.path.realpath(workspace_root) != os.path.realpath(self.plan["cwd"]):
+                raise RuntimeError("daily owner workspaceRoot differs from the actual launch workspace")
+            audit = audit_path.read_text(encoding="utf-8")
+            for marker in ('"type":"entry_started"', '"type":"execution_entry_started"', '"type":"daily_entry_ready"'):
+                if marker not in audit:
+                    raise RuntimeError(f"daily audit is missing readiness marker {marker}")
+            for marker in ('"type":"task_started"', '"type":"task_tool_attempt"'):
+                if marker in audit:
+                    raise RuntimeError(f"daily audit contains business activity before the first prompt: {marker}")
+            self.owner_state_path = state_path
+            self.execution_root = execution
+            self.delivery_root = delivery
+            self.acceptance_root = acceptance
+            self.execution_audit_path = audit_path
+            self.daily_audit_path = audit_path
+            self.b1_audit_path = None
+            self.path_discovery = {
+                "ok": True,
+                "unresolved": unresolved,
+                "engine": "read-only-directory-discovery",
+                "stateRoot": str(self.state_root),
+                "instanceId": root.name,
+                "instanceRoot": str(root),
+                "ownerId": owner_id,
+                "tasksCreated": 0,
+                "currentTask": None,
+                "resolved": {
+                    "ownerState": str(state_path),
+                    "executionRoot": str(execution),
+                    "deliveryRoot": str(delivery),
+                    "acceptanceRoot": str(acceptance),
+                    "dailyAudit": str(audit_path),
+                },
+                "nonoverlap": True,
+            }
+        except Exception as error:  # noqa: BLE001
+            self.path_discovery = {
+                "ok": False,
+                "unresolved": unresolved,
+                "stateRoot": str(self.state_root) if self.state_root is not None else None,
+                "error": str(error),
+            }
+            raise
+
     def wait_for_admission(self):
         events = self.wait(lambda values: any(event.get("type") == "session_start" for event in values), "startup admission", 15)
         admission = next(event for event in events if event.get("type") == "session_start")
@@ -655,8 +771,21 @@ class Driver:
         expected_model = self.expected["model"]
         if admission.get("model") != expected_model:
             raise RuntimeError(f"admission model mismatch: {admission.get('model')}")
-        if admission.get("tools") != self.expected["tools"]:
-            raise RuntimeError(f"admission tools mismatch: {admission.get('tools')} expected {self.expected['tools']}")
+        if self.daily:
+            tools = admission.get("tools")
+            if (not isinstance(tools, list)
+                    or any(not isinstance(name, str) or not name for name in tools)
+                    or len(tools) != len(set(tools))):
+                raise RuntimeError(f"admission daily tool catalog is malformed or duplicated: {tools!r}")
+            managed = list(self.expected.get("registeredNames") or [])
+            missing_managed = [name for name in managed if name not in tools]
+            if missing_managed:
+                raise RuntimeError(f"admission daily managed tools are missing: {missing_managed!r}")
+            if "read" not in tools:
+                raise RuntimeError("admission daily catalog has no genuine native read tool")
+        else:
+            if admission.get("tools") != self.expected["tools"]:
+                raise RuntimeError(f"admission tools mismatch: {admission.get('tools')} expected {self.expected['tools']}")
         registered = admission.get("registeredNames")
         expected_registered = self.expected.get("registeredNames")
         if not isinstance(registered, list) or any(not isinstance(name, str) or not name for name in registered):
@@ -677,6 +806,10 @@ class Driver:
             invocations = [event for event in events if event.get("type") == "default_invocation"]
             if len(invocations) != 1 or invocations[0].get("count") != 1:
                 raise RuntimeError("the real default execution entry was not invoked exactly once")
+        if self.daily:
+            returned = [event for event in events if event.get("type") == "default_factory_returned"]
+            if len(returned) != 1 or returned[0].get("count") != 1:
+                raise RuntimeError("the real daily default did not return through exactly one recorded invocation")
         if any(event.get("type") == "default_factory_error" for event in events):
             raise RuntimeError("the real default execution factory reported an error")
         if any(event.get("type") == "harness_error" for event in events):
@@ -748,6 +881,23 @@ class Driver:
         paint = self.latest_paint(events, self.initial_columns, self.initial_rows)
         if paint is None:
             raise RuntimeError("no completed fullscreen paint at the initial geometry")
+        if self.daily:
+            mounts = [event for event in events if event.get("type") == "custom_call"]
+            factories = [event for event in events if event.get("type") == "factory"]
+            if len(mounts) != 1 or len(factories) != 1:
+                raise RuntimeError(f"daily review mount is not unique: custom={len(mounts)} factory={len(factories)}")
+            if mounts[0].get("mountId") != factories[0].get("mountId") or paint.get("mountId") != factories[0].get("mountId"):
+                raise RuntimeError("daily review paint/factory mountId differs")
+            if paint.get("alt") is not True:
+                raise RuntimeError("daily review paint is not an alt-screen frame")
+            if paint.get("viewportTruncated") is not False:
+                raise RuntimeError("daily review paint viewport is truncated")
+            viewport = paint.get("plainViewport")
+            widths = paint.get("plainWidths")
+            if (not isinstance(viewport, list) or len(viewport) != self.initial_rows
+                    or not isinstance(widths, list) or len(widths) != self.initial_rows
+                    or any(not isinstance(width, int) or isinstance(width, bool) or width < 0 or width > self.initial_columns for width in widths)):
+                raise RuntimeError("daily review paint is not a complete 100x30 frame")
         return paint
 
     def wait_for_frame(self, columns, rows, predicate, label, timeout=15):
@@ -850,6 +1000,8 @@ class Driver:
 
     def business_case(self):
         self.wait_for_admission()
+        if self.daily:
+            self.discover_daily_paths()
         self.send_prompt(self.prompts["task"], "task-prompt-paste-enter")
         self.wait_for_first_turn()
         if self.revisions >= 2:
@@ -911,6 +1063,21 @@ class Driver:
                 raise RuntimeError(f"Escape did not close with a rejection: {settle}")
             result = self.wait_for_review_result()
             self.wait_for_agent_end(30, int(result.get("sequence", 0)))
+            self.finish_normally()
+            return
+        if self.case == "daily-escape":
+            self.send(b"\x1b", "daily-escape")
+            settle = self.wait_for_custom_settle()
+            if settle.get("type") != "custom_settled" or settle.get("result") != "reject":
+                raise RuntimeError(f"daily Escape did not close with a rejection: {settle}")
+            result = self.wait_for_review_result()
+            self.wait_for_agent_end(30, int(result.get("sequence", 0)))
+            time.sleep(0.1)
+            self.pump()
+            late = self.events()
+            self.check_health(late)
+            if any(event.get("type") == "factory" and int(event.get("sequence", 0)) > int(settle.get("sequence", 0)) for event in late):
+                raise RuntimeError("daily Escape reopened a custom review")
             self.finish_normally()
             return
         if self.case == "deadline-expiry":
@@ -1091,7 +1258,7 @@ class Driver:
         if len({row["runId"] for row in observed}) != len(observed):
             raise RuntimeError("duplicate observed runId in agent_execute results")
         records = {}
-        if self.execution_root.exists():
+        if self.execution_root is not None and self.execution_root.exists():
             for directory in sorted(self.execution_root.iterdir()):
                 if not directory.is_dir() or not directory.name.startswith("run-"):
                     continue
@@ -1106,8 +1273,8 @@ class Driver:
                     raise RuntimeError(f"duplicate run record for {run_id}")
                 records[run_id] = {"record": record, "directory": directory}
         audit_events = []
-        audit_path = Path(self.plan["paths"]["executionAudit"]).resolve()
-        if audit_path.exists():
+        audit_path = self.execution_audit_path
+        if audit_path is not None and audit_path.exists():
             audit_events = read_events(audit_path)
         by_run = {}
         for event in audit_events:
@@ -1245,8 +1412,9 @@ class Driver:
             (self.audit_path, "observer-audit.jsonl"),
             (self.provider_audit_path, "provider-audit.jsonl"),
             (self.host_audit_path if self.host_audit_path.exists() else None, "host-audit.jsonl"),
-            (Path(self.plan["paths"]["b1Audit"]).resolve(), "b1-audit.jsonl"),
-            (Path(self.plan["paths"]["executionAudit"]).resolve(), "execution-audit.jsonl"),
+            (self.b1_audit_path, "b1-audit.jsonl"),
+            (self.execution_audit_path if not self.daily else None, "execution-audit.jsonl"),
+            (self.daily_audit_path if self.daily else None, "daily-audit.jsonl"),
             (self.owner_state_path, "owner-state.json"),
         ]:
             if source is None or not Path(source).is_file():
@@ -1273,9 +1441,12 @@ class Driver:
             copies[name] = {"bytes": len(data), "sha256": sha_bytes(data)}
         trees = {}
         try:
-            trees["delivery"] = self.copy_tree(Path(self.plan["paths"]["deliveryRoot"]).resolve(), "delivery")
-            trees["acceptance"] = self.copy_tree(self.acceptance_root, "acceptance")
-            trees["execution"] = self.copy_tree(self.execution_root, "execution")
+            if self.delivery_root is not None:
+                trees["delivery"] = self.copy_tree(self.delivery_root, "delivery")
+            if self.acceptance_root is not None:
+                trees["acceptance"] = self.copy_tree(self.acceptance_root, "acceptance")
+            if self.execution_root is not None:
+                trees["execution"] = self.copy_tree(self.execution_root, "execution")
             input_root = self.plan["paths"].get("inputRoot")
             if input_root:
                 trees["inputs"] = self.copy_tree(Path(input_root).resolve(), "inputs")
@@ -1317,12 +1488,15 @@ class Driver:
             },
             "roots": {
                 "runtimeRoot": str(self.runtime_root),
-                "deliveryRoot": str(Path(self.plan["paths"]["deliveryRoot"]).resolve()),
-                "acceptanceRoot": str(self.acceptance_root),
-                "executionRoot": str(self.execution_root),
+                "stateRoot": str(self.state_root) if self.state_root is not None else None,
+                "deliveryRoot": str(self.delivery_root) if self.delivery_root is not None else None,
+                "acceptanceRoot": str(self.acceptance_root) if self.acceptance_root is not None else None,
+                "executionRoot": str(self.execution_root) if self.execution_root is not None else None,
+                "ownerState": str(self.owner_state_path) if self.owner_state_path is not None else None,
                 "inputRoot": str(Path(self.plan["paths"].get("inputRoot") or "").resolve()) if self.plan["paths"].get("inputRoot") else None,
                 "evidenceRoot": str(self.evidence_root),
             },
+            "pathDiscovery": self.path_discovery,
             "manifest": {
                 "path": str(self.manifest_path),
                 "sha256": sha_file(self.manifest_path),

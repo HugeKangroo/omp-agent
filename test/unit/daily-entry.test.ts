@@ -1,0 +1,646 @@
+import { afterEach, describe, expect, test } from "bun:test";
+import {
+  link,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import {
+  DailyConfigError,
+  loadDailyConfig,
+} from "../../src/daily-config.ts";
+import {
+  createDailyEntry,
+  type DailyEntryControls,
+  type DailyOmpApi,
+} from "../../src/daily-entry.ts";
+import { DELIVERY_TOOL } from "../../src/delivery-entry.ts";
+import { EXECUTION_TOOL } from "../../src/execution-adapter.ts";
+import {
+  clearPublishedTaskOwner,
+  currentTaskOwner,
+  publishTaskOwner,
+  type OmpToolContext,
+} from "../../src/task-entry-port.ts";
+import { TASK_CONTROL_TOOL } from "../../src/task-entry.ts";
+import { TaskOwner } from "../../src/task-owner.ts";
+import { VERIFICATION_TOOL } from "../../src/verification-entry.ts";
+
+const PYTHON = "/Library/Developer/CommandLineTools/usr/bin/python3";
+const BUN = process.execPath;
+const OWNER_ID = "owner-daily-fixture";
+
+interface ToolResult {
+  content: Array<{ type: string; text: string }>;
+  details?: unknown;
+  isError?: boolean;
+}
+
+interface RegisteredTool {
+  name: string;
+  label: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  execute(
+    toolCallId: string,
+    params: unknown,
+    signal: AbortSignal | undefined,
+    onUpdate: unknown,
+    context: OmpToolContext,
+  ): Promise<ToolResult>;
+}
+
+type Handler = (event: unknown, context: OmpToolContext) => unknown;
+
+interface FakeHost {
+  tools: Map<string, RegisteredTool>;
+  handlers: Map<string, Handler[]>;
+  pi: DailyOmpApi;
+}
+
+const roots: string[] = [];
+const entries: DailyEntryControls[] = [];
+
+afterEach(async () => {
+  for (const entry of entries.splice(0)) {
+    try {
+      entry.dispose();
+    } catch {
+      // The test asserts idempotence separately.
+    }
+  }
+  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+});
+
+interface Fixture {
+  root: string;
+  workspace: string;
+  configPath: string;
+  env: NodeJS.ProcessEnv;
+}
+
+async function fixture(overrides: Record<string, unknown> = {}): Promise<Fixture> {
+  const root = await realpath(await mkdtemp(path.join(tmpdir(), "omp-agent-b3b2-")));
+  roots.push(root);
+  const workspace = path.join(root, "workspace");
+  await mkdir(workspace, { mode: 0o700 });
+  const configDir = path.join(root, "config");
+  await mkdir(configDir, { mode: 0o700 });
+  const configPath = path.join(configDir, "agent.json");
+  const config = {
+    schemaVersion: 1,
+    workspaceRoot: workspace,
+    inputs: [],
+    pythonPath: PYTHON,
+    bunPath: BUN,
+    ...overrides,
+  };
+  await writeFile(configPath, JSON.stringify(config), { mode: 0o600 });
+  return { root, workspace, configPath, env: { OMP_AGENT_CONFIG: configPath } };
+}
+
+async function writeConfig(fx: Fixture, value: unknown): Promise<void> {
+  await writeFile(fx.configPath, JSON.stringify(value), { mode: 0o600 });
+}
+
+function baseConfig(fx: Fixture): Record<string, unknown> {
+  return {
+    schemaVersion: 1,
+    workspaceRoot: fx.workspace,
+    inputs: [],
+    pythonPath: PYTHON,
+    bunPath: BUN,
+  };
+}
+
+function fakeHost(options: {
+  failOnTool?: string;
+  failOnHandler?: string;
+  afterRegister?: (tool: RegisteredTool) => void;
+} = {}): FakeHost {
+  const tools = new Map<string, RegisteredTool>();
+  const handlers = new Map<string, Handler[]>();
+  const pi = {
+    on(event: string, handler: Handler) {
+      if (options.failOnHandler === event) {
+        throw new Error(`fixture handler registration failure: ${event}`);
+      }
+      const list = handlers.get(event) ?? [];
+      list.push(handler);
+      handlers.set(event, list);
+    },
+    registerTool(tool: RegisteredTool) {
+      if (options.failOnTool === tool.name) {
+        throw new Error(`fixture tool registration failure: ${tool.name}`);
+      }
+      tools.set(tool.name, tool);
+      options.afterRegister?.(tool);
+    },
+  } as DailyOmpApi;
+  return { tools, handlers, pi };
+}
+
+function context(workspace: string, branch: Array<Record<string, unknown>>): OmpToolContext {
+  return {
+    cwd: workspace,
+    agent: { kind: "main" },
+    sessionManager: {
+      getSessionId: () => "daily-session",
+      getLeafId: () => (branch[branch.length - 1]?.id as string | undefined) ?? null,
+      getBranch: () => branch,
+    },
+  };
+}
+
+function userEntry(id: string, parentId: string | null, text: string): Record<string, unknown> {
+  return {
+    id,
+    parentId,
+    type: "message",
+    message: { role: "user", content: [{ type: "text", text }], attribution: "user" },
+  };
+}
+
+function within(parent: string, child: string): boolean {
+  const relative = path.relative(parent, child);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+async function mode(filePath: string): Promise<number> {
+  return (await stat(filePath)).mode & 0o777;
+}
+
+describe("daily config", () => {
+  test("minimal valid config resolves canonical workspace, default state root and empty inputs", async () => {
+    const fx = await fixture();
+    const config = loadDailyConfig({ env: fx.env, launchWorkspace: fx.workspace });
+    expect(config.schemaVersion).toBe(1);
+    expect(config.workspaceRoot).toBe(await realpath(fx.workspace));
+    expect(config.stateRoot).toBe(path.join(config.workspaceRoot, ".omp-agent"));
+    expect(config.inputs).toEqual([]);
+    expect(config.humanReview).toBeUndefined();
+    expect(config.pythonPath).toBe(PYTHON);
+    expect(config.bunPath).toBe(BUN);
+  });
+
+  test("canonical workspace aliases match on either side of the comparison", async () => {
+    const fx = await fixture();
+    const alias = path.join(fx.root, "workspace-alias");
+    await symlink(fx.workspace, alias, "dir");
+    const first = loadDailyConfig({ env: fx.env, launchWorkspace: alias });
+    expect(first.workspaceRoot).toBe(await realpath(fx.workspace));
+
+    await writeConfig(fx, { ...baseConfig(fx), workspaceRoot: alias });
+    const second = loadDailyConfig({ env: fx.env, launchWorkspace: fx.workspace });
+    expect(second.workspaceRoot).toBe(await realpath(fx.workspace));
+  });
+
+  test("declared input whitelist uses canonical regular files outside managed state", async () => {
+    const fx = await fixture();
+    const inputPath = path.join(fx.root, "input.txt");
+    await writeFile(inputPath, "host input\n", { mode: 0o600 });
+    await writeConfig(fx, {
+      ...baseConfig(fx),
+      inputs: [{ id: "source", path: inputPath }],
+    });
+    const config = loadDailyConfig({ env: fx.env, launchWorkspace: fx.workspace });
+    expect(config.inputs).toEqual([{ id: "source", path: await realpath(inputPath) }]);
+  });
+
+  test("exact human-review opt-in maps to the existing local-main-tui component; false is off", async () => {
+    const fx = await fixture({ humanReview: "local-main-tui-v1" });
+    expect(loadDailyConfig({ env: fx.env, launchWorkspace: fx.workspace }).humanReview)
+      .toEqual({ kind: "local-main-tui", policyVersion: 1 });
+
+    await writeConfig(fx, { ...baseConfig(fx), humanReview: false });
+    expect(loadDailyConfig({ env: fx.env, launchWorkspace: fx.workspace }).humanReview).toBeUndefined();
+  });
+
+  test("missing or relative OMP_AGENT_CONFIG is refused", async () => {
+    expect(() => loadDailyConfig({ env: {}, launchWorkspace: process.cwd() }))
+      .toThrow(DailyConfigError);
+    expect(() => loadDailyConfig({
+      env: { OMP_AGENT_CONFIG: "relative.json" },
+      launchWorkspace: process.cwd(),
+    })).toThrow(/absolute path/);
+  });
+
+  const invalid: Array<{
+    name: string;
+    prepare: (fx: Fixture) => Promise<Record<string, unknown>>;
+    pattern: RegExp;
+  }> = [
+    {
+      name: "unknown top-level field",
+      prepare: async (fx) => ({ ...baseConfig(fx), endpoint: "https://not-allowed" }),
+      pattern: /unsupported field/,
+    },
+    {
+      name: "unknown humanReview value",
+      prepare: async (fx) => ({ ...baseConfig(fx), humanReview: "local-main-tui-v2" }),
+      pattern: /humanReview/,
+    },
+    {
+      name: "unknown input field",
+      prepare: async (fx) => {
+        const file = path.join(fx.root, "one.txt");
+        await writeFile(file, "x");
+        return { ...baseConfig(fx), inputs: [{ id: "one", path: file, credential: "no" }] };
+      },
+      pattern: /unsupported field/,
+    },
+    {
+      name: "wrong schema version",
+      prepare: async (fx) => ({ ...baseConfig(fx), schemaVersion: 2 }),
+      pattern: /schemaVersion/,
+    },
+    {
+      name: "missing inputs",
+      prepare: async (fx) => {
+        const config = baseConfig(fx);
+        delete config.inputs;
+        return config;
+      },
+      pattern: /inputs/,
+    },
+    {
+      name: "relative workspaceRoot",
+      prepare: async (fx) => ({ ...baseConfig(fx), workspaceRoot: "workspace" }),
+      pattern: /workspaceRoot/,
+    },
+    {
+      name: "workspaceRoot mismatch",
+      prepare: async (fx) => {
+        const other = path.join(fx.root, "other-workspace");
+        await mkdir(other, { mode: 0o700 });
+        return { ...baseConfig(fx), workspaceRoot: other };
+      },
+      pattern: /does not match/,
+    },
+    {
+      name: "relative stateRoot",
+      prepare: async (fx) => ({ ...baseConfig(fx), stateRoot: "state" }),
+      pattern: /stateRoot/,
+    },
+    {
+      name: "stateRoot equals workspace",
+      prepare: async (fx) => ({ ...baseConfig(fx), stateRoot: fx.workspace }),
+      pattern: /stateRoot/,
+    },
+    {
+      name: "relative pythonPath",
+      prepare: async (fx) => ({ ...baseConfig(fx), pythonPath: "python3" }),
+      pattern: /pythonPath/,
+    },
+    {
+      name: "input outside the whitelist form",
+      prepare: async (fx) => ({ ...baseConfig(fx), inputs: [{ id: "one", path: "relative.txt" }] }),
+      pattern: /absolute path/,
+    },
+    {
+      name: "duplicate input id",
+      prepare: async (fx) => {
+        const a = path.join(fx.root, "a.txt");
+        const b = path.join(fx.root, "b.txt");
+        await writeFile(a, "a");
+        await writeFile(b, "b");
+        return {
+          ...baseConfig(fx),
+          inputs: [{ id: "same", path: a }, { id: "same", path: b }],
+        };
+      },
+      pattern: /duplicates/,
+    },
+    {
+      name: "input directory",
+      prepare: async (fx) => {
+        const directory = path.join(fx.root, "inputs");
+        await mkdir(directory, { mode: 0o700 });
+        return { ...baseConfig(fx), inputs: [{ id: "one", path: directory }] };
+      },
+      pattern: /regular file/,
+    },
+    {
+      name: "input symbolic link",
+      prepare: async (fx) => {
+        const file = path.join(fx.root, "real.txt");
+        const alias = path.join(fx.root, "alias.txt");
+        await writeFile(file, "x");
+        await symlink(file, alias, "file");
+        return { ...baseConfig(fx), inputs: [{ id: "one", path: alias }] };
+      },
+      pattern: /symbolic link/,
+    },
+    {
+      name: "input with multiple hard links",
+      prepare: async (fx) => {
+        const file = path.join(fx.root, "linked.txt");
+        const second = path.join(fx.root, "linked-2.txt");
+        await writeFile(file, "x");
+        await link(file, second);
+        return { ...baseConfig(fx), inputs: [{ id: "one", path: file }] };
+      },
+      pattern: /hard link/,
+    },
+    {
+      name: "input inside managed state",
+      prepare: async (fx) => {
+        const stateRoot = path.join(fx.root, "state");
+        await mkdir(stateRoot, { mode: 0o700 });
+        const inside = path.join(stateRoot, "input.txt");
+        await writeFile(inside, "x");
+        return {
+          ...baseConfig(fx),
+          stateRoot,
+          inputs: [{ id: "one", path: inside }],
+        };
+      },
+      pattern: /managed internal state/,
+    },
+  ];
+
+  for (const item of invalid) {
+    test(`invalid config is refused: ${item.name}`, async () => {
+      const fx = await fixture();
+      await writeConfig(fx, await item.prepare(fx));
+      expect(() => loadDailyConfig({ env: fx.env, launchWorkspace: fx.workspace }))
+        .toThrow(item.pattern);
+    });
+  }
+});
+
+describe("daily composition", () => {
+  test("ready composition creates one owner, one fresh instance and all managed tools", async () => {
+    const fx = await fixture();
+    const fake = fakeHost();
+    const entry = createDailyEntry(fake.pi, { env: fx.env, launchWorkspace: fx.workspace });
+    entries.push(entry);
+
+    expect(entry.isReady()).toBe(true);
+    expect(currentTaskOwner()).toBe(entry.owner);
+    expect([...fake.tools.keys()].sort()).toEqual(
+      [TASK_CONTROL_TOOL, EXECUTION_TOOL, VERIFICATION_TOOL, DELIVERY_TOOL].sort(),
+    );
+    expect(entry.execution.delivery?.deliveryRootPath()).toBe(entry.instance.deliveryRoot);
+    expect(entry.execution.acceptance?.humanReviewConfigured()).toBe(false);
+    expect(entry.owner.snapshot().authorizedCapabilities).toEqual(["local-script"]);
+
+    const state = JSON.parse(await readFile(entry.instance.statePath, "utf8")) as Record<string, unknown>;
+    expect(state.schemaVersion).toBe(1);
+    expect(state.ownerId).toBe(entry.owner.ownerId);
+    expect(state.workspaceRoot).toBe(entry.config.workspaceRoot);
+    const audit = await readFile(entry.instance.auditPath, "utf8");
+    expect(audit).toContain('"type":"entry_started"');
+    expect(audit).toContain('"type":"execution_entry_started"');
+    expect(audit).toContain('"type":"daily_entry_ready"');
+
+    const roots = [entry.instance.executionRoot, entry.instance.deliveryRoot, entry.instance.acceptanceRoot];
+    for (let i = 0; i < roots.length; i += 1) {
+      for (let j = i + 1; j < roots.length; j += 1) {
+        expect(within(roots[i]!, roots[j]!)).toBe(false);
+        expect(within(roots[j]!, roots[i]!)).toBe(false);
+      }
+      expect(within(entry.instance.root, roots[i]!)).toBe(true);
+    }
+    expect(await mode(entry.instance.root)).toBe(0o700);
+    for (const root of roots) expect(await mode(root)).toBe(0o700);
+    expect(await mode(entry.instance.statePath)).toBe(0o600);
+    expect(await mode(entry.instance.auditPath)).toBe(0o600);
+  });
+
+  test("successive startups create fresh instances and preserve previous files", async () => {
+    const fx = await fixture();
+    const first = createDailyEntry(fakeHost().pi, { env: fx.env, launchWorkspace: fx.workspace });
+    entries.push(first);
+    const firstState = await readFile(first.instance.statePath, "utf8");
+    first.dispose();
+    expect(currentTaskOwner()).toBeUndefined();
+
+    const second = createDailyEntry(fakeHost().pi, { env: fx.env, launchWorkspace: fx.workspace });
+    entries.push(second);
+    expect(second.instance.root).not.toBe(first.instance.root);
+    expect(second.instance.instanceId).not.toBe(first.instance.instanceId);
+    expect(await readFile(first.instance.statePath, "utf8")).toBe(firstState);
+    const firstAudit = await readFile(first.instance.auditPath, "utf8");
+    expect(firstAudit).toContain('"type":"daily_entry_ready"');
+    expect(firstAudit).toContain('"instanceId":"' + first.instance.instanceId + '"');
+    expect(firstAudit).toContain('"type":"execution_adapter_disposed"');
+    expect((await stat(first.instance.root)).isDirectory()).toBe(true);
+    expect((await stat(second.instance.root)).isDirectory()).toBe(true);
+  });
+
+  test("an existing published owner is preserved and never replaced", async () => {
+    const fx = await fixture();
+    const foreign = new TaskOwner({ workspaceRoot: fx.workspace, ownerId: OWNER_ID });
+    publishTaskOwner(foreign);
+    const fake = fakeHost();
+    expect(() => createDailyEntry(fake.pi, { env: fx.env, launchWorkspace: fx.workspace }))
+      .toThrow(/already published/);
+    expect(currentTaskOwner()).toBe(foreign);
+    expect(fake.tools.size).toBe(0);
+    expect(fake.handlers.size).toBe(0);
+    clearPublishedTaskOwner(foreign);
+  });
+
+  test("a second composition in the same process refuses and leaves the ready owner intact", async () => {
+    const fx = await fixture();
+    const first = createDailyEntry(fakeHost().pi, { env: fx.env, launchWorkspace: fx.workspace });
+    entries.push(first);
+    const secondHost = fakeHost();
+    expect(() => createDailyEntry(secondHost.pi, { env: fx.env, launchWorkspace: fx.workspace }))
+      .toThrow(/already published/);
+    expect(currentTaskOwner()).toBe(first.owner);
+    expect(first.isReady()).toBe(true);
+    expect(secondHost.tools.size).toBe(0);
+  });
+
+  test("partial registration failure leaves installed handlers and tools inert", async () => {
+    const fx = await fixture();
+    const fake = fakeHost({ failOnTool: VERIFICATION_TOOL });
+    expect(() => createDailyEntry(fake.pi, { env: fx.env, launchWorkspace: fx.workspace }))
+      .toThrow(/fixture tool registration failure/);
+    expect(currentTaskOwner()).toBeUndefined();
+    expect(fake.tools.has(TASK_CONTROL_TOOL)).toBe(true);
+    expect(fake.tools.has(VERIFICATION_TOOL)).toBe(false);
+
+    const ctx = context(fx.workspace, []);
+    const result = await fake.tools.get(TASK_CONTROL_TOOL)!.execute(
+      "call-1",
+      { action: "inspect" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toContain("not active");
+    const input = fake.handlers.get("input")?.[0];
+    expect(input).toBeDefined();
+    expect(input!({ text: "do managed work", source: "rpc" }, ctx)).toBeUndefined();
+    expect(currentTaskOwner()).toBeUndefined();
+    const shutdown = fake.handlers.get("session_shutdown")?.[0];
+    expect(() => shutdown?.({}, ctx)).not.toThrow();
+    expect(() => shutdown?.({}, ctx)).not.toThrow();
+  });
+
+  test("a registration callback that publishes another owner is rejected without clearing it", async () => {
+    const fx = await fixture();
+    let foreign: TaskOwner | undefined;
+    const fake = fakeHost({
+      afterRegister(tool) {
+        if (tool.name !== EXECUTION_TOOL) return;
+        foreign = new TaskOwner({ workspaceRoot: fx.workspace, ownerId: "owner-daily-replacement" });
+        publishTaskOwner(foreign);
+      },
+    });
+    expect(() => createDailyEntry(fake.pi, { env: fx.env, launchWorkspace: fx.workspace }))
+      .toThrow(/owner changed/);
+    expect(foreign).toBeDefined();
+    expect(currentTaskOwner()).toBe(foreign!);
+    const result = await fake.tools.get(TASK_CONTROL_TOOL)!.execute(
+      "call-1",
+      { action: "inspect" },
+      undefined,
+      undefined,
+      context(fx.workspace, []),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toContain("not active");
+    clearPublishedTaskOwner(foreign!);
+  });
+
+  test("dispose and shutdown are idempotent, deactivate first and preserve records", async () => {
+    const fx = await fixture();
+    const fake = fakeHost();
+    const entry = createDailyEntry(fake.pi, { env: fx.env, launchWorkspace: fx.workspace });
+    entries.push(entry);
+    expect(entry.isReady()).toBe(true);
+
+    entry.dispose();
+    entry.dispose();
+    expect(entry.isReady()).toBe(false);
+    expect(currentTaskOwner()).toBeUndefined();
+    const result = await fake.tools.get(EXECUTION_TOOL)!.execute(
+      "call-1",
+      { action: "describe" },
+      undefined,
+      undefined,
+      context(fx.workspace, []),
+    );
+    expect(result.isError).toBe(true);
+    expect(result.content[0]!.text).toContain("not active");
+
+    const shutdown = fake.handlers.get("session_shutdown")![0]!;
+    expect(() => shutdown({}, context(fx.workspace, []))).not.toThrow();
+    expect(() => shutdown({}, context(fx.workspace, []))).not.toThrow();
+    expect(currentTaskOwner()).toBeUndefined();
+    expect((await stat(entry.instance.statePath)).isFile()).toBe(true);
+    expect(await readFile(entry.instance.auditPath, "utf8")).toContain('"type":"daily_entry_ready"');
+  });
+
+  test("the same owner and store survive ordinary successive turns", async () => {
+    const fx = await fixture();
+    const fake = fakeHost();
+    const entry = createDailyEntry(fake.pi, { env: fx.env, launchWorkspace: fx.workspace });
+    entries.push(entry);
+    const branch: Array<Record<string, unknown>> = [
+      { id: "leaf-1", parentId: null, type: "custom", customType: "fixture-base", data: {} },
+    ];
+    let leafId = "leaf-1";
+    const ctx: OmpToolContext = {
+      cwd: fx.workspace,
+      agent: { kind: "main" },
+      sessionManager: {
+        getSessionId: () => "daily-session",
+        getLeafId: () => leafId,
+        getBranch: () => branch,
+      },
+    };
+
+    branch.push(userEntry("user-1", "leaf-1", "Own the first managed turn."));
+    fake.handlers.get("input")![0]!({ text: "Own the first managed turn.", source: "rpc" }, ctx);
+    fake.handlers.get("before_agent_start")![0]!(
+      { prompt: "Own the first managed turn.", reason: "prompt" },
+      ctx,
+    );
+    const started = await fake.tools.get(TASK_CONTROL_TOOL)!.execute(
+      "call-start",
+      { action: "start" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(started.isError).toBeUndefined();
+    const task = entry.owner.snapshot().currentTask!;
+    expect(task.status).toBe("active");
+
+    branch.push({
+      id: "assistant-1",
+      parentId: "user-1",
+      type: "message",
+      message: { role: "assistant", content: [{ type: "text", text: "working" }], attribution: "agent" },
+    });
+    fake.handlers.get("agent_end")![0]!({
+      messages: [{
+        role: "user",
+        content: [{ type: "text", text: "Own the first managed turn." }],
+        attribution: "user",
+        id: "user-1",
+      }],
+    }, ctx);
+    leafId = "assistant-1";
+    expect(currentTaskOwner()).toBe(entry.owner);
+    expect(entry.isReady()).toBe(true);
+
+    branch.push(userEntry("user-2", "assistant-1", "A later ordinary turn."));
+    fake.handlers.get("input")![0]!({ text: "A later ordinary turn.", source: "rpc" }, ctx);
+    fake.handlers.get("before_agent_start")![0]!(
+      { prompt: "A later ordinary turn.", reason: "prompt" },
+      ctx,
+    );
+    const inspected = await fake.tools.get(TASK_CONTROL_TOOL)!.execute(
+      "call-inspect",
+      { action: "inspect" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(inspected.isError).toBeUndefined();
+    const details = inspected.details as { task: { taskId: string; taskRevision: number } };
+    expect(details.task.taskId).toBe(task.taskId);
+    expect(details.task.taskRevision).toBe(task.taskRevision);
+    expect(currentTaskOwner()).toBe(entry.owner);
+    expect(entry.owner.snapshot().currentTask!.taskId).toBe(task.taskId);
+  });
+
+  test("scattered legacy environment enables and roots do not override the host config", async () => {
+    const fx = await fixture();
+    const fake = fakeHost();
+    const env: NodeJS.ProcessEnv = {
+      ...fx.env,
+      OMP_AGENT_HUMAN_REVIEW: "local-main-tui-v1",
+      OMP_AGENT_EXECUTION_ROOT: "/definitely/not/execution",
+      OMP_AGENT_DELIVERY_ROOT: "/definitely/not/delivery",
+      OMP_AGENT_ACCEPTANCE_ROOT: "/definitely/not/acceptance",
+      OMP_AGENT_EXECUTION_INPUTS: "not-json",
+    };
+    const entry = createDailyEntry(fake.pi, { env, launchWorkspace: fx.workspace });
+    entries.push(entry);
+    expect(entry.execution.acceptance?.humanReviewConfigured()).toBe(false);
+    expect(entry.execution.delivery?.deliveryRootPath()).toBe(entry.instance.deliveryRoot);
+    expect(entry.isReady()).toBe(true);
+  });
+
+  test("explicit config opt-in enables the existing human review component", async () => {
+    const fx = await fixture({ humanReview: "local-main-tui-v1" });
+    const entry = createDailyEntry(fakeHost().pi, { env: fx.env, launchWorkspace: fx.workspace });
+    entries.push(entry);
+    expect(entry.execution.acceptance?.humanReviewConfigured()).toBe(true);
+  });
+});

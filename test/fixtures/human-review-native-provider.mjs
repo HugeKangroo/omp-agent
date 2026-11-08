@@ -12,6 +12,7 @@ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai";
 const mode = process.env.REVIEW_NATIVE_PROVIDER_MODE || "single";
 const auditPath = process.env.REVIEW_NATIVE_PROVIDER_AUDIT;
 const hybrid = process.env.REVIEW_NATIVE_HYBRID === "1";
+const verifyWithoutContract = process.env.REVIEW_NATIVE_VERIFY_WITHOUT_CONTRACT === "1";
 const maxRequests = Number(process.env.REVIEW_NATIVE_MAX_REQUESTS || "12");
 if (!["single", "revise", "forbidden"].includes(mode)) throw new Error("unsupported REVIEW_NATIVE_PROVIDER_MODE");
 if (typeof auditPath !== "string" || !auditPath.startsWith("/")) throw new Error("REVIEW_NATIVE_PROVIDER_AUDIT must be absolute");
@@ -129,8 +130,8 @@ export default function humanReviewNativeProvider(pi) {
           };
         } else {
           const runTurn = mode === "revise" ? 3 : 1;
-          const verifyTurn = hybrid ? runTurn + 1 : null;
-          const previewTurn = hybrid ? runTurn + 2 : runTurn + 1;
+          const verifyTurn = hybrid || verifyWithoutContract ? runTurn + 1 : null;
+          const previewTurn = hybrid ? runTurn + 2 : (verifyTurn === null ? runTurn + 1 : verifyTurn + 1);
           const reviewTurn = previewTurn + 1;
           const inspectTurn = reviewTurn + 1;
           const taskInspectTurn = inspectTurn + 1;
@@ -176,7 +177,7 @@ export default function humanReviewNativeProvider(pi) {
                 expectedTaskRevision: state.task.taskRevision,
                 runId: state.run.runId,
                 artifactIds: state.run.artifactIds,
-                ...(verifyTurn === null ? {} : { verificationReceiptId: state.receiptId }),
+                ...(hybrid ? { verificationReceiptId: state.receiptId } : {}),
               },
             };
           } else if (turn === reviewTurn) {

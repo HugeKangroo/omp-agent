@@ -35,10 +35,130 @@ const SPAWN_AUDIT_EVENTS = new Set([
   "execution_artifacts_exported",
 ]);
 
-interface OwnedProcessIdentity {
+export interface OwnedProcessIdentity {
   label: string;
   pid: number;
   group: boolean;
+}
+
+/**
+ * Reusable actual process identity evidence for a bounded execution root.
+ * Reads only retained run records and the execution audit; a run without
+ * complete identity evidence is refused rather than guessed.
+ */
+export async function executionProcessIdentities(
+  executionRoot: string,
+  executionAuditPath: string,
+): Promise<OwnedProcessIdentity[]> {
+  const identities: OwnedProcessIdentity[] = [];
+  const seen = new Set<string>();
+  const add = (label: string, pid: number, group: boolean): void => {
+    const key = `${group ? "group" : "pid"}:${pid}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    identities.push({ label, pid, group });
+  };
+
+  const entries = await readdir(executionRoot);
+  const runs = entries.filter((name) => name.startsWith("run-")).sort();
+  if (runs.length > MAX_EVIDENCE_RUNS) {
+    throw new Error(`execution run evidence exceeds ${MAX_EVIDENCE_RUNS} runs`);
+  }
+  const readEvidence = async (filePath: string, label: string): Promise<string> => {
+    const info = await lstat(filePath);
+    if (info.isSymbolicLink() || !info.isFile()) throw new Error(`${label} is not a regular file`);
+    if (info.size > MAX_EVIDENCE_BYTES) throw new Error(`${label} exceeds ${MAX_EVIDENCE_BYTES} bytes`);
+    return readFile(filePath, "utf8");
+  };
+  const auditText = await readEvidence(executionAuditPath, "execution audit");
+  const audit = auditText.split("\n").filter(Boolean).map((line, index) => {
+    let value: unknown;
+    try {
+      value = JSON.parse(line);
+    } catch {
+      throw new Error(`execution audit line ${index + 1} is not valid JSON`);
+    }
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      throw new Error(`execution audit line ${index + 1} is not an object`);
+    }
+    return value as Record<string, unknown>;
+  });
+  const runAudit = new Map<string, string[]>();
+  for (const event of audit) {
+    if (typeof event.runId !== "string") continue;
+    const types = runAudit.get(event.runId) ?? [];
+    types.push(String(event.type));
+    runAudit.set(event.runId, types);
+  }
+
+  const recordedRuns = new Set<string>();
+  for (const name of runs) {
+    const text = await readEvidence(path.join(executionRoot, name, "record.json"), `${name}/record.json`);
+    let record: Record<string, unknown>;
+    try {
+      record = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      throw new Error(`${name}/record.json is not valid JSON`);
+    }
+    if (typeof record.runId !== "string" || record.runId.length === 0) {
+      throw new Error(`${name}/record.json has no run identity`);
+    }
+    recordedRuns.add(record.runId);
+    const phase = String(record.phase);
+    const process = record.process;
+    if (process === null) {
+      if (phase === "not_dispatched") continue;
+      throw new Error(`${name} is ${phase} with no process evidence`);
+    }
+    if (typeof process !== "object" || process === null || Array.isArray(process)) {
+      throw new Error(`${name} has malformed process evidence`);
+    }
+    const dispatch = process as Record<string, unknown>;
+    if (dispatch.spawned === false) {
+      if (dispatch.pid !== null || dispatch.pgid !== null) {
+        throw new Error(`${name} has a pid without a spawn`);
+      }
+      continue;
+    }
+    if (dispatch.spawned !== true) {
+      throw new Error(`${name} has no spawn disposition`);
+    }
+    const pid = dispatch.pid;
+    const pgid = dispatch.pgid;
+    if (!Number.isSafeInteger(pid) || (pid as number) <= 1 || !Number.isSafeInteger(pgid) || pgid !== pid) {
+      throw new Error(`${name} has malformed script identity`);
+    }
+    add(`${name} script group`, pgid as number, true);
+    add(`${name} script`, pid as number, false);
+
+    const watchdog = dispatch.watchdog ?? record.watchdog;
+    if (typeof watchdog !== "object" || watchdog === null || Array.isArray(watchdog)) {
+      throw new Error(`${name} has malformed watchdog evidence`);
+    }
+    const facts = watchdog as Record<string, unknown>;
+    // A spawned execution may fork its watcher before the handshake lands.
+    // Unarmed or missing handshake evidence therefore does not prove that no
+    // watcher exists, so refuse to treat it as a no-watcher disposition.
+    if (facts.armed !== true) {
+      throw new Error(`${name} has no verified armed watchdog identity; evidence is insufficient to prove no watcher forked`);
+    }
+    const watchdogPid = facts.watchdogPid;
+    if (!Number.isSafeInteger(watchdogPid) || (watchdogPid as number) <= 1
+      || watchdogPid === pid || watchdogPid === pgid) {
+      throw new Error(`${name} has malformed watchdog identity`);
+    }
+    add(`${name} watchdog`, watchdogPid as number, false);
+  }
+
+  for (const [runId, types] of runAudit) {
+    if (recordedRuns.has(runId)) continue;
+    const provenNoSpawn = types.some((type) => PROVEN_NO_SPAWN_AUDIT_EVENTS.has(type));
+    const spawnEvidence = types.some((type) => SPAWN_AUDIT_EVENTS.has(type));
+    if (!provenNoSpawn || spawnEvidence) {
+      throw new Error(`execution audit references ${runId} without retained run evidence`);
+    }
+  }
+  return identities;
 }
 
 export const DELIVERY_PROMPT = "Generate answer.txt from the authorized input, verify its actual bytes, preview the host delivery, and submit only when the configured host contract is complete.";
@@ -544,97 +664,7 @@ export class DeliveryOmpSession {
   }
 
   private async testOwnedProcessIdentities(): Promise<OwnedProcessIdentity[]> {
-    const identities: OwnedProcessIdentity[] = [];
-    const seen = new Set<string>();
-    const add = (label: string, pid: number, group: boolean): void => {
-      const key = `${group ? "group" : "pid"}:${pid}`;
-      if (seen.has(key)) return;
-      seen.add(key);
-      identities.push({ label, pid, group });
-    };
-
-    const entries = await readdir(this.executionRoot);
-    const runs = entries.filter((name) => name.startsWith("run-")).sort();
-    if (runs.length > MAX_EVIDENCE_RUNS) {
-      throw new Error(`execution run evidence exceeds ${MAX_EVIDENCE_RUNS} runs`);
-    }
-    const audit = await this.executionAudit();
-    const runAudit = new Map<string, string[]>();
-    for (const event of audit) {
-      if (typeof event.runId !== "string") continue;
-      const types = runAudit.get(event.runId) ?? [];
-      types.push(String(event.type));
-      runAudit.set(event.runId, types);
-    }
-
-    const recordedRuns = new Set<string>();
-    for (const name of runs) {
-      const text = await this.readEvidence(path.join(this.executionRoot, name, "record.json"), `${name}/record.json`);
-      let record: Record<string, unknown>;
-      try {
-        record = JSON.parse(text) as Record<string, unknown>;
-      } catch {
-        throw new Error(`${name}/record.json is not valid JSON`);
-      }
-      if (typeof record.runId !== "string" || record.runId.length === 0) {
-        throw new Error(`${name}/record.json has no run identity`);
-      }
-      recordedRuns.add(record.runId);
-      const phase = String(record.phase);
-      const process = record.process;
-      if (process === null) {
-        if (phase === "not_dispatched") continue;
-        throw new Error(`${name} is ${phase} with no process evidence`);
-      }
-      if (typeof process !== "object" || process === null || Array.isArray(process)) {
-        throw new Error(`${name} has malformed process evidence`);
-      }
-      const dispatch = process as Record<string, unknown>;
-      if (dispatch.spawned === false) {
-        if (dispatch.pid !== null || dispatch.pgid !== null) {
-          throw new Error(`${name} has a pid without a spawn`);
-        }
-        continue;
-      }
-      if (dispatch.spawned !== true) {
-        throw new Error(`${name} has no spawn disposition`);
-      }
-      const pid = dispatch.pid;
-      const pgid = dispatch.pgid;
-      if (!Number.isSafeInteger(pid) || (pid as number) <= 1 || !Number.isSafeInteger(pgid) || pgid !== pid) {
-        throw new Error(`${name} has malformed script identity`);
-      }
-      add(`${name} script group`, pgid as number, true);
-      add(`${name} script`, pid as number, false);
-
-      const watchdog = dispatch.watchdog ?? record.watchdog;
-      if (typeof watchdog !== "object" || watchdog === null || Array.isArray(watchdog)) {
-        throw new Error(`${name} has malformed watchdog evidence`);
-      }
-      const facts = watchdog as Record<string, unknown>;
-      // A spawned execution may fork its watcher before the handshake lands.
-      // Unarmed or missing handshake evidence therefore does not prove that no
-      // watcher exists, so refuse to treat it as a no-watcher disposition.
-      if (facts.armed !== true) {
-        throw new Error(`${name} has no verified armed watchdog identity; evidence is insufficient to prove no watcher forked`);
-      }
-      const watchdogPid = facts.watchdogPid;
-      if (!Number.isSafeInteger(watchdogPid) || (watchdogPid as number) <= 1
-        || watchdogPid === pid || watchdogPid === pgid) {
-        throw new Error(`${name} has malformed watchdog identity`);
-      }
-      add(`${name} watchdog`, watchdogPid as number, false);
-    }
-
-    for (const [runId, types] of runAudit) {
-      if (recordedRuns.has(runId)) continue;
-      const provenNoSpawn = types.some((type) => PROVEN_NO_SPAWN_AUDIT_EVENTS.has(type));
-      const spawnEvidence = types.some((type) => SPAWN_AUDIT_EVENTS.has(type));
-      if (!provenNoSpawn || spawnEvidence) {
-        throw new Error(`execution audit references ${runId} without retained run evidence`);
-      }
-    }
-    return identities;
+    return await executionProcessIdentities(this.executionRoot, this.executionAuditPath);
   }
 
   private async executionAudit(): Promise<Array<Record<string, unknown>>> {

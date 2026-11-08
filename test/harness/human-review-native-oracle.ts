@@ -1431,6 +1431,294 @@ export function gradeAcceptance(evidence: NativeEvidence, document: ExpectedDocu
   return checks;
 }
 
+export function gradeDailyComposition(
+  evidence: NativeEvidence,
+  document: ExpectedDocument,
+): Array<{ id: string; ok: boolean; detail: string }> {
+  const checks: Array<{ id: string; ok: boolean; detail: string }> = [];
+  const check = (id: string, ok: boolean, detail: string): void => {
+    checks.push({ id, ok, detail });
+  };
+  const sequence = (event: Record<string, any> | undefined): number | null => {
+    const value = event?.sequence;
+    return Number.isSafeInteger(value) ? Number(value) : null;
+  };
+  const turns = evidence.provider
+    .filter((event) => event.type === "provider_turn")
+    .sort((left, right) => Number(left.step) - Number(right.step));
+  const callNames = turns.map((turn) => {
+    const call = turn.call;
+    if (call === null || typeof call !== "object") return "text";
+    if (call.name === "agent_deliver") return `agent_deliver:${String(call.arguments?.action)}`;
+    return String(call.name);
+  });
+  const expectedNames = [
+    "agent_task",
+    "agent_execute",
+    "agent_verify",
+    "agent_deliver:preview",
+    "agent_deliver:request_review",
+    "agent_deliver:inspect",
+    "agent_task",
+    "text",
+  ];
+  check("daily_provider_sequence", JSON.stringify(callNames) === JSON.stringify(expectedNames), `calls=${JSON.stringify(callNames)}`);
+
+  const verifyTurn = turns.find((turn) => turn.call?.name === "agent_verify");
+  const verifyArgs = verifyTurn?.call?.arguments as Record<string, any> | undefined;
+  const verifyResultTurn = verifyTurn === undefined
+    ? undefined
+    : turns.find((turn) => Number(turn.step) === Number(verifyTurn.step) + 1);
+  const verifyText = typeof verifyResultTurn?.lastToolResult === "string" ? verifyResultTurn.lastToolResult : "";
+  const verifyTask = (() => {
+    const line = verifyText.split("\n").find((row) => row.startsWith("task: "));
+    if (line === undefined) return null;
+    try {
+      return JSON.parse(line.slice("task: ".length)) as Record<string, any>;
+    } catch {
+      return null;
+    }
+  })();
+  const verifyCandidates = (() => {
+    const line = verifyText.split("\n").find((row) => row.startsWith("candidates: "));
+    if (line === undefined) return null;
+    try {
+      return JSON.parse(line.slice("candidates: ".length)) as Record<string, any>;
+    } catch {
+      return null;
+    }
+  })();
+  const expectedArtifactIds = document.provenance.artifacts.map((artifact) => artifact.artifactId);
+  check(
+    "daily_verify_selectors",
+    verifyArgs !== undefined
+      && verifyArgs.action === "verify"
+      && verifyArgs.expectedTaskId === document.preview.task.taskId
+      && verifyArgs.expectedTaskRevision === document.preview.task.taskRevision
+      && verifyArgs.runId === document.preview.runId
+      && JSON.stringify(verifyArgs.artifactIds) === JSON.stringify(expectedArtifactIds),
+    JSON.stringify(verifyArgs ?? null),
+  );
+  check(
+    "daily_verify_insufficient",
+    verifyText.includes("taskAccepted: false")
+      && verifyText.includes("outcome: insufficient")
+      && verifyText.includes("contract: none")
+      && /^receiptId: \S+$/m.test(verifyText)
+      && verifyText.includes("currentlyUsable: false")
+      && verifyText.includes("compatibility: current"),
+    verifyText.slice(0, 1200),
+  );
+  check(
+    "daily_verify_task_identity",
+    verifyTask !== null
+      && verifyTask.ownerId === document.preview.task.ownerId
+      && verifyTask.taskId === document.preview.task.taskId
+      && verifyTask.taskRevision === document.preview.task.taskRevision
+      && verifyTask.requirementsDigest === document.preview.task.requirementsDigest,
+    JSON.stringify(verifyTask ?? null),
+  );
+  check(
+    "daily_verify_run_identity",
+    verifyCandidates !== null && verifyCandidates.runId === document.preview.runId,
+    JSON.stringify(verifyCandidates ?? null),
+  );
+
+  const previewTurn = turns.find((turn) => turn.call?.name === "agent_deliver"
+    && turn.call?.arguments?.action === "preview");
+  check(
+    "daily_preview_no_unbound_receipt",
+    previewTurn?.call?.arguments?.verificationReceiptId === undefined,
+    JSON.stringify(previewTurn?.call?.arguments ?? null),
+  );
+
+  const reviewStarts = evidence.audit.filter((event) => event.type === "tool_call_start"
+    && event.toolName === "agent_deliver"
+    && event.params?.action === "request_review");
+  const reviewStart = reviewStarts.length === 1 ? reviewStarts[0]! : undefined;
+  const reviewEnd = reviewStart === undefined
+    ? undefined
+    : evidence.audit.find((event) => event.type === "tool_call_end"
+      && event.toolCallId === reviewStart.toolCallId);
+  let reviewJson: Record<string, any> | null = null;
+  try {
+    reviewJson = reviewEnd === undefined ? null : JSON.parse(String(reviewEnd.content)) as Record<string, any>;
+  } catch {
+    reviewJson = null;
+  }
+  check(
+    "daily_review_call_unique",
+    reviewStarts.length === 1 && reviewEnd !== undefined,
+    `starts=${reviewStarts.length} end=${reviewEnd === undefined ? "missing" : String(reviewEnd.toolCallId)}`,
+  );
+  check(
+    "daily_review_execute_context",
+    reviewStart?.context?.mode === "tui"
+      && reviewStart?.context?.agentKind === "main"
+      && reviewStart?.context?.hasUI === true
+      && reviewStart?.context?.customType === "function",
+    JSON.stringify(reviewStart?.context ?? null),
+  );
+  check(
+    "daily_review_selectors",
+    reviewStart?.params?.expectedTaskId === document.preview.task.taskId
+      && reviewStart?.params?.expectedTaskRevision === document.preview.task.taskRevision
+      && reviewStart?.params?.deliveryId === document.preview.deliveryId,
+    JSON.stringify(reviewStart?.params ?? null),
+  );
+  check(
+    "daily_review_rejected",
+    reviewJson !== null
+      && reviewJson.format === "agent-deliver-result-v1"
+      && reviewJson.action === "request_review"
+      && reviewJson.humanReviewConfigured === true
+      && reviewJson.review?.state === "rejected"
+      && reviewJson.operation?.outcome === "not_committed"
+      && reviewJson.operation?.operationCommitted === false
+      && reviewJson.taskAccepted === false,
+    JSON.stringify(reviewJson ?? null).slice(0, 2000),
+  );
+  check(
+    "daily_review_rejection_is_terminal",
+    reviewEnd?.isError === true,
+    `isError=${String(reviewEnd?.isError)}`,
+  );
+
+  const mounts = evidence.audit.filter((event) => event.type === "custom_call");
+  const factories = evidence.audit.filter((event) => event.type === "factory");
+  const mountsId = mounts.length === 1 ? String(mounts[0]!.mountId) : "";
+  const factory = factories.length === 1 && String(factories[0]!.mountId) === mountsId ? factories[0] : undefined;
+  check(
+    "daily_single_mount",
+    mounts.length === 1 && factory !== undefined && mounts[0]!.mountCount === 1 && factory.factoryCount === 1,
+    `mounts=${mounts.length} factories=${factories.length}`,
+  );
+  const paints = evidence.audit.filter((event) => event.type === "paint" && String(event.mountId) === mountsId);
+  const completed = paints.find((event) => event.alt === true
+    && event.columns === 100
+    && event.rows === 30
+    && event.viewportTruncated === false
+    && Array.isArray(event.plainViewport)
+    && event.plainViewport.length === 30
+    && Array.isArray(event.plainWidths)
+    && event.plainWidths.length === 30
+    && event.plainWidths.every((width: unknown) => Number.isSafeInteger(width) && Number(width) >= 0 && Number(width) <= 100));
+  check(
+    "daily_completed_paint",
+    completed !== undefined && factory !== undefined,
+    completed === undefined ? `paints=${paints.length}` : `paintSequence=${String(completed.paintSequence)}`,
+  );
+  const settles = evidence.audit.filter((event) => event.type === "custom_settled" && String(event.mountId) === mountsId);
+  const settle = settles.length === 1 ? settles[0]! : undefined;
+  check(
+    "daily_reject_settlement",
+    settle !== undefined
+      && settle.result === "reject"
+      && settle.settledCount === 1
+      && Number(settle.disposedInvocations) >= 1
+      && settle.subscriptions === 0
+      && settle.subscriptionState?.paint === "removed"
+      && settle.subscriptionState?.frame === "removed"
+      && settle.harnessFailures === 0
+      && Array.isArray(settle.evidenceTruncations)
+      && settle.evidenceTruncations.length === 0,
+    JSON.stringify(settle ?? null),
+  );
+  const disposes = evidence.audit.filter((event) => event.type === "dispose" && String(event.mountId) === mountsId);
+  check(
+    "daily_component_disposed",
+    disposes.some((event) => event.subscriptions === 0
+      && event.subscriptionState?.paint === "removed"
+      && event.subscriptionState?.frame === "removed"
+      && event.harnessFailures === 0),
+    JSON.stringify(disposes.at(-1) ?? null),
+  );
+  check(
+    "daily_no_post_dispose_activity",
+    !evidence.audit.some((event) => event.type === "post_dispose_call" && String(event.mountId) === mountsId),
+    "post_dispose_call events",
+  );
+  const escapeInputs = evidence.audit.filter((event) => event.type === "handle_input" && event.text === "\x1b");
+  check(
+    "daily_escape_after_paint",
+    escapeInputs.length === 1
+      && completed !== undefined
+      && sequence(escapeInputs[0]) !== null
+      && sequence(completed) !== null
+      && sequence(escapeInputs[0])! > sequence(completed)!
+      && settle !== undefined
+      && sequence(settle) !== null
+      && sequence(escapeInputs[0])! < sequence(settle)!,
+    `escape=${String(sequence(escapeInputs[0]))} paint=${String(sequence(completed))} settle=${String(sequence(settle))}`,
+  );
+
+  const agentEnd = evidence.audit.find((event) => event.type === "agent_end");
+  const editor = evidence.audit.find((event) => event.type === "editor_recovered");
+  const shutdown = evidence.audit.find((event) => event.type === "session_shutdown");
+  check(
+    "daily_chronology",
+    sequence(reviewStart) !== null
+      && sequence(factory) !== null
+      && sequence(completed) !== null
+      && sequence(settle) !== null
+      && sequence(reviewEnd) !== null
+      && sequence(agentEnd) !== null
+      && sequence(editor) !== null
+      && sequence(shutdown) !== null
+      && sequence(reviewStart)! < sequence(factory)!
+      && sequence(factory)! < sequence(completed)!
+      && sequence(completed)! < sequence(settle)!
+      && sequence(settle)! < sequence(reviewEnd)!
+      && sequence(reviewEnd)! < sequence(agentEnd)!
+      && sequence(agentEnd)! < sequence(editor)!
+      && sequence(editor)! < sequence(shutdown)!,
+    JSON.stringify({
+      start: sequence(reviewStart),
+      factory: sequence(factory),
+      paint: sequence(completed),
+      settle: sequence(settle),
+      result: sequence(reviewEnd),
+      agentEnd: sequence(agentEnd),
+      editor: sequence(editor),
+      shutdown: sequence(shutdown),
+    }),
+  );
+
+  const ownerTask = evidence.owner.currentTask as Record<string, any> | null;
+  check(
+    "daily_owner_not_accepted",
+    ownerTask !== null && ownerTask.status === "active" && ownerTask.acceptance === null
+      && evidence.acceptance.size === 0,
+    `owner=${JSON.stringify(ownerTask === null ? null : { status: ownerTask.status, acceptance: ownerTask.acceptance })} acceptanceFiles=${evidence.acceptance.size}`,
+  );
+  const deliveryRoot = String(evidence.driver.roots?.deliveryRoot ?? "");
+  const deliveryOk = path.isAbsolute(deliveryRoot) && document.preview.files.every((file: Record<string, any>) => {
+    const relative = path.relative(deliveryRoot, String(file.path));
+    if (relative.startsWith("..") || path.isAbsolute(relative)) return false;
+    const bytes = evidence.delivery.get(relative);
+    return bytes !== undefined
+      && bytes.length === Number(file.bytes)
+      && sha256Bytes(bytes) === String(file.sha256);
+  });
+  check("daily_delivery_bytes_intact", deliveryOk, `${document.model.delivery.files.length} selected file(s)`);
+  const finalTurn = turns.at(-1);
+  check(
+    "daily_final_statement",
+    finalTurn?.call === null
+      && typeof finalTurn?.text === "string"
+      && finalTurn.text.includes("DONE:")
+      && finalTurn.lastToolResult !== undefined,
+    JSON.stringify(finalTurn ?? null).slice(0, 400),
+  );
+  const driverInputs = Array.isArray(evidence.driver.inputs) ? evidence.driver.inputs as Array<Record<string, any>> : [];
+  check(
+    "daily_driver_escape_input",
+    driverInputs.some((input) => input.label === "daily-escape" && input.hex === "1b"),
+    JSON.stringify(driverInputs.filter((input) => String(input.label).includes("escape"))),
+  );
+  return checks;
+}
+
 export function gradeFrames(events: NativeEvent[], document: ExpectedDocument, caseName: string): { checks: Array<{ id: string; ok: boolean; detail: string }>; firstMismatch: Record<string, any> | null } {
   const checks: Array<{ id: string; ok: boolean; detail: string }> = [];
   const failures: Array<Record<string, any>> = [];
@@ -1635,7 +1923,7 @@ export function gradeFrames(events: NativeEvent[], document: ExpectedDocument, c
     checks.push({ id: "resize_rejected", ok: settled === "reject", detail: `observed settlement ${String(settled)}` });
   } else if (caseName === "deadline-expiry") {
     checks.push({ id: "deadline_no_approval", ok: settled !== "approve", detail: `observed settlement ${String(settled)}` });
-  } else if (caseName === "initial-enter" || caseName === "escape") {
+  } else if (caseName === "initial-enter" || caseName === "escape" || caseName === "daily-escape") {
     checks.push({ id: "negative_no_approval", ok: settled === "reject", detail: `observed settlement ${String(settled)}` });
   }
   return { checks, firstMismatch: failures[0] ?? null };

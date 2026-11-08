@@ -25,9 +25,29 @@ type Tool = {
 };
 
 const roots: string[] = [];
+const controls: Array<{ owner: TaskOwner; dispose(): void }> = [];
 
 afterEach(async () => {
-  for (const root of roots.splice(0)) await rm(root, { recursive: true, force: true });
+  const failures: string[] = [];
+  // Clear only the owners this fixture actually published, newest first, before
+  // deleting their roots. A later test must never inherit a published owner.
+  for (const control of controls.splice(0).reverse()) {
+    try {
+      control.dispose();
+    } catch (error) {
+      failures.push(`dispose ${control.owner.ownerId}: ${(error as Error).message}`);
+    }
+  }
+  for (const root of roots.splice(0)) {
+    try {
+      await rm(root, { recursive: true, force: true });
+    } catch (error) {
+      failures.push(`remove ${root}: ${(error as Error).message}`);
+    }
+  }
+  if (failures.length > 0) {
+    throw new Error(`task-entry fixture cleanup failed: ${failures.join("; ")}`);
+  }
 });
 
 function baseEntry() {
@@ -55,6 +75,7 @@ async function setup(options: { id?: () => string } = {}): Promise<{
   status(): string | null;
   guard(): { expectedTaskId: string; expectedTaskRevision: number };
   snapshot(): TaskOwnerSnapshot;
+  adopt(owner: TaskOwner): TaskOwner;
 }> {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "omp-agent-b1-entry-")));
   roots.push(root);
@@ -66,13 +87,15 @@ async function setup(options: { id?: () => string } = {}): Promise<{
     on(event: string, handler: (event: unknown, context: OmpToolContext) => unknown) { handlers.set(event, handler); },
     registerTool(value: Tool) { tool = value; },
   } as unknown as Api;
-  const { owner } = createTaskEntry(pi, {
+  const entry = createTaskEntry(pi, {
     workspaceRoot: workspace,
     statePath: path.join(root, "state.json"),
     auditPath: path.join(root, "audit.jsonl"),
     capabilities: ["test-progress"],
     ...(options.id === undefined ? {} : { id: options.id }),
   });
+  const { owner } = entry;
+  controls.push({ owner, dispose: entry.dispose });
   let currentText = "";
   let leafId = "leaf-1";
   let currentUserId = "";
@@ -127,6 +150,10 @@ async function setup(options: { id?: () => string } = {}): Promise<{
       return { expectedTaskId: task.taskId, expectedTaskRevision: task.taskRevision };
     },
     snapshot: () => owner.snapshot(),
+    adopt(value: TaskOwner) {
+      controls.push({ owner: value, dispose: () => clearPublishedTaskOwner(value) });
+      return value;
+    },
   };
 }
 
@@ -669,10 +696,10 @@ describe("B3-A repair: entry owner binding and final admission usability", () =>
     const original = currentTaskOwner()!;
     expect(original.snapshot().tasksCreated).toBe(1);
     const branch = harness.context.sessionManager!.getBranch();
-    const replacement = new TaskOwner({
+    const replacement = harness.adopt(new TaskOwner({
       workspaceRoot: original.workspaceRoot,
       ownerId: "owner-b3a-replacement",
-    });
+    }));
     const context: OmpToolContext = {
       ...harness.context,
       sessionManager: {
@@ -712,10 +739,10 @@ describe("B3-A repair: entry owner binding and final admission usability", () =>
       },
     });
     const original = currentTaskOwner()!;
-    replacement = new TaskOwner({
+    replacement = harness.adopt(new TaskOwner({
       workspaceRoot: original.workspaceRoot,
       ownerId: "owner-b3a-preflight-replacement",
-    });
+    }));
     const request = "Please own the stale preflight checklist.";
     harness.input(request);
     harness.beforeStart(request);

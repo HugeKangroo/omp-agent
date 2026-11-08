@@ -6,6 +6,7 @@ import path from "node:path";
 import {
   buildExpectedDocument,
   gradeAcceptance,
+  gradeDailyComposition,
   gradeFrames,
   loadNativeEvidence,
   semanticMutationChecks,
@@ -27,6 +28,7 @@ const EXPECTED_PATH = path.join(REPO_ROOT, "test/fixtures/human-review-native-ex
 const DRIVER_PATH = path.join(REPO_ROOT, "test/harness/native-pty-driver.py");
 const PROVIDER_PATH = path.join(REPO_ROOT, "test/fixtures/human-review-native-provider.mjs");
 const OBSERVER_PATH = path.join(REPO_ROOT, "test/fixtures/human-review-native-observer.mjs");
+const DAILY_OBSERVER_PATH = path.join(REPO_ROOT, "test/fixtures/daily-human-review-native-observer.mjs");
 const HYBRID_PATH = path.join(REPO_ROOT, "test/fixtures/human-review-native-hybrid-host.mjs");
 const TASK_ENTRY_PATH = path.join(REPO_ROOT, "src/task-entry.ts");
 
@@ -36,8 +38,8 @@ const MODEL = "scripted";
 const API = "native-review-fixture-api";
 
 type CaseMode = "admission" | "business";
-type ExtensionMode = "default-env" | "hybrid";
-type EnvMode = "enabled" | "absent" | "invalid";
+type ExtensionMode = "default-env" | "hybrid" | "daily";
+type EnvMode = "enabled" | "absent" | "invalid" | "daily";
 
 interface CaseSpec {
   mode: CaseMode;
@@ -53,6 +55,7 @@ interface CaseSpec {
   requestReview: boolean;
   defaultInvocation: number;
   hybridHost: boolean;
+  daily?: boolean;
 }
 
 export const CASE_SPECS: Record<string, CaseSpec> = {
@@ -115,6 +118,22 @@ export const CASE_SPECS: Record<string, CaseSpec> = {
     requestReview: true,
     defaultInvocation: 1,
     hybridHost: false,
+  },
+  "daily-escape": {
+    mode: "business",
+    extension: "daily",
+    env: "daily",
+    providerMode: "single",
+    revisions: 1,
+    initialSize: [100, 30],
+    resize: null,
+    timeoutSeconds: 60,
+    tools: ["read", "agent_deliver", "agent_execute", "agent_task", "agent_verify"],
+    registeredNames: ["agent_deliver", "agent_execute", "agent_task", "agent_verify"],
+    requestReview: true,
+    defaultInvocation: 1,
+    hybridHost: false,
+    daily: true,
   },
   "resize-reject": {
     mode: "business",
@@ -188,6 +207,7 @@ const REQUIRED_EXTRA = [
   "test/fixtures/human-review-native-provider.mjs",
   "test/fixtures/human-review-native-observe.mjs",
   "test/fixtures/human-review-native-observer.mjs",
+  "test/fixtures/daily-human-review-native-observer.mjs",
   "test/fixtures/human-review-native-hybrid-host.mjs",
   "package.json",
   "bun.lock",
@@ -306,8 +326,9 @@ export interface CasePlan {
     requestReview: boolean;
     defaultInvocation: number;
     hybridHost: boolean;
+    daily?: boolean;
   };
-  paths: Record<string, string>;
+  paths: Record<string, string | null>;
 }
 
 function privateEnv(runtimeRoot: string): Record<string, string> {
@@ -330,6 +351,44 @@ function privateEnv(runtimeRoot: string): Record<string, string> {
   return env;
 }
 
+function ompIsolationConfig(): Record<string, unknown> {
+  return {
+    startup: { setupWizard: false, checkUpdate: false },
+    enabledProviders: [],
+    disabledProviders: [
+      "native", "claude", "claude-plugins", "codex", "gemini", "github", "opencode",
+      "cursor", "windsurf", "agents-md", "agents", "omp-plugins", "agent-plugins",
+      "omp-managed", "mcp-json", "skillshare",
+    ],
+    extensions: [],
+    autoResume: false,
+    retry: { enabled: false, modelFallback: false },
+    mcp: { enableProjectConfig: false, notifications: false },
+    providers: { cacheWarming: "off" },
+    compaction: { enabled: false, keepRecentTokens: 64, reserveTokens: 64 },
+    advisor: { enabled: false },
+    autolearn: { enabled: false },
+    contextPromotion: { enabled: false },
+    memory: { backend: "off" },
+    tools: { approvalMode: "yolo", approval: {} },
+    extensionHandlers: { toolCallTimeoutMs: 340_000 },
+  };
+}
+
+/** The product sandbox admits the real CommandLineTools interpreter, not the xcrun shim. */
+function acceptedPythonPath(): string {
+  for (const candidate of [
+    "/Library/Developer/CommandLineTools/usr/bin/python3",
+    "/opt/homebrew/bin/python3",
+    "/usr/local/bin/python3",
+  ]) {
+    if (existsSync(candidate)) return candidate;
+  }
+  const which = Bun.which("python3");
+  if (which !== null && which !== "/usr/bin/python3") return which;
+  throw new Error("an accepted host Python interpreter is required for the daily case");
+}
+
 async function createPlan(
   caseName: string,
   spec: CaseSpec,
@@ -337,6 +396,7 @@ async function createPlan(
   manifest: NativeManifest,
   corpus: NativeCorpus,
 ): Promise<{ plan: CasePlan; runtimeRoot: string; evidenceRoot: string; caseDir: string }> {
+  if (spec.daily) return createDailyPlan(caseName, spec, manifestPath, manifest, corpus);
   const base = process.env.REVIEW_NATIVE_EVIDENCE_BASE || path.join(tmpdir(), "omp-agent-native-review");
   await mkdir(base, { recursive: true, mode: 0o700 });
   const createdCaseDir = await mkdtemp(path.join(base, `native-review-${caseName}-`));
@@ -361,27 +421,7 @@ async function createPlan(
     await writeFile(path.join(inputRoot, file.name), Buffer.from(file.rawText, "utf8"), { mode: 0o600 });
   }
   const configPath = path.join(runtimeRoot, "config.json");
-  await writeFile(configPath, JSON.stringify({
-    startup: { setupWizard: false, checkUpdate: false },
-    enabledProviders: [],
-    disabledProviders: [
-      "native", "claude", "claude-plugins", "codex", "gemini", "github", "opencode",
-      "cursor", "windsurf", "agents-md", "agents", "omp-plugins", "agent-plugins",
-      "omp-managed", "mcp-json", "skillshare",
-    ],
-    extensions: [],
-    autoResume: false,
-    retry: { enabled: false, modelFallback: false },
-    mcp: { enableProjectConfig: false, notifications: false },
-    providers: { cacheWarming: "off" },
-    compaction: { enabled: false, keepRecentTokens: 64, reserveTokens: 64 },
-    advisor: { enabled: false },
-    autolearn: { enabled: false },
-    contextPromotion: { enabled: false },
-    memory: { backend: "off" },
-    tools: { approvalMode: "yolo", approval: {} },
-    extensionHandlers: { toolCallTimeoutMs: 340_000 },
-  }, null, 2), { mode: 0o600 });
+  await writeFile(configPath, JSON.stringify(ompIsolationConfig(), null, 2), { mode: 0o600 });
 
   const env = privateEnv(runtimeRoot);
   env.OMP_AGENT_B1_STATE_PATH = path.join(runtimeRoot, "task-state.json");
@@ -472,6 +512,127 @@ async function createPlan(
   };
   const planPath = path.join(caseDir, "plan.json");
   await writeFile(planPath, JSON.stringify(plan, null, 2), { mode: 0o600 });
+  return { plan, runtimeRoot, evidenceRoot, caseDir };
+}
+
+async function createDailyPlan(
+  caseName: string,
+  spec: CaseSpec,
+  manifestPath: string,
+  manifest: NativeManifest,
+  corpus: NativeCorpus,
+): Promise<{ plan: CasePlan; runtimeRoot: string; evidenceRoot: string; caseDir: string }> {
+  const base = process.env.REVIEW_NATIVE_EVIDENCE_BASE || path.join(tmpdir(), "omp-agent-native-review");
+  await mkdir(base, { recursive: true, mode: 0o700 });
+  const caseDir = await realpath(await mkdtemp(path.join(base, `native-review-${caseName}-`)));
+  const runtimeRoot = path.join(caseDir, "runtime");
+  const evidenceRoot = path.join(caseDir, "evidence");
+  const workspace = path.join(runtimeRoot, "workspace");
+  const agentDir = path.join(runtimeRoot, "agent");
+  const homeDir = path.join(runtimeRoot, "home");
+  const configHome = path.join(runtimeRoot, "config-home");
+  const cacheDir = path.join(runtimeRoot, "cache");
+  const dataDir = path.join(runtimeRoot, "data");
+  const stateHome = path.join(runtimeRoot, "state-home");
+  const inputRoot = path.join(runtimeRoot, "inputs");
+  const dailyStateRoot = path.join(runtimeRoot, "daily-state");
+  for (const directory of [runtimeRoot, evidenceRoot, workspace, agentDir, homeDir, configHome, cacheDir, dataDir, stateHome, inputRoot]) {
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+  }
+  const inputs: Array<{ id: string; path: string }> = [];
+  for (const id of ["alpha", "beta"]) {
+    const file = corpus.files.find((candidate) => candidate.name === `${id}.txt`);
+    if (!file) throw new Error(`the frozen corpus has no ${id}.txt input`);
+    const inputPath = path.join(inputRoot, file.name);
+    await writeFile(inputPath, Buffer.from(file.rawText, "utf8"), { mode: 0o600 });
+    inputs.push({ id, path: await realpath(inputPath) });
+  }
+
+  const configPath = path.join(runtimeRoot, "config.json");
+  await writeFile(configPath, JSON.stringify(ompIsolationConfig(), null, 2), { mode: 0o600 });
+  const dailyConfigPath = path.join(runtimeRoot, "daily-config.json");
+  await writeFile(dailyConfigPath, JSON.stringify({
+    schemaVersion: 1,
+    workspaceRoot: await realpath(workspace),
+    stateRoot: dailyStateRoot,
+    inputs,
+    pythonPath: acceptedPythonPath(),
+    bunPath: process.execPath,
+    humanReview: "local-main-tui-v1",
+  }, null, 2), { mode: 0o600 });
+
+  const observerAudit = path.join(runtimeRoot, "observer-audit.jsonl");
+  const providerAudit = path.join(runtimeRoot, "provider-audit.jsonl");
+  await writeFile(observerAudit, "", { mode: 0o600 });
+  await writeFile(providerAudit, "", { mode: 0o600 });
+
+  const env = privateEnv(runtimeRoot);
+  env.OMP_AGENT_CONFIG = dailyConfigPath;
+  env.REVIEW_NATIVE_AUDIT = observerAudit;
+  env.REVIEW_NATIVE_PROVIDER_AUDIT = providerAudit;
+  env.REVIEW_NATIVE_PROVIDER_MODE = spec.providerMode;
+  env.REVIEW_NATIVE_MAX_REQUESTS = "12";
+  env.REVIEW_NATIVE_HYBRID = "0";
+  env.REVIEW_NATIVE_VERIFY_WITHOUT_CONTRACT = "1";
+  env.REVIEW_NATIVE_ROOT = runtimeRoot;
+  env.REVIEW_NATIVE_INPUT_ROOT = inputRoot;
+
+  const argv = [
+    manifest.omp.path,
+    "--no-extensions", "--no-skills", "--no-rules", "--no-context-files", "--no-lsp",
+    "--no-session", "--no-title", "--no-prewalk",
+    "--approval-mode", "yolo",
+    "--config", configPath,
+    "--model", `${PROVIDER}/${MODEL}`,
+    "--thinking", "off",
+    "--max-time", String(spec.timeoutSeconds - 5),
+    "--max-cost", "0.1",
+    "--cwd", workspace,
+    "--extension", PROVIDER_PATH,
+    "--extension", DAILY_OBSERVER_PATH,
+  ];
+  const plan: CasePlan = {
+    schemaVersion: 1,
+    case: caseName,
+    repoRoot: REPO_ROOT,
+    manifestPath: path.resolve(manifestPath),
+    runtimeRoot,
+    evidenceRoot,
+    omp: { path: manifest.omp.path, expectedVersion: EXPECTED_VERSION },
+    argv,
+    env,
+    cwd: workspace,
+    initialSize: spec.initialSize,
+    resize: spec.resize,
+    timeoutSeconds: spec.timeoutSeconds,
+    mode: spec.mode,
+    revisions: spec.revisions,
+    prompts: { task: corpus.prompts.task, revision: corpus.prompts.revision },
+    expected: {
+      model: { provider: PROVIDER, id: MODEL, api: API },
+      tools: [...spec.tools],
+      registeredNames: spec.registeredNames,
+      requestReview: spec.requestReview,
+      defaultInvocation: spec.defaultInvocation,
+      hybridHost: false,
+      daily: true,
+    },
+    paths: {
+      audit: observerAudit,
+      providerAudit,
+      hostAudit: null,
+      ownerState: null,
+      b1Audit: null,
+      executionAudit: null,
+      executionRoot: null,
+      deliveryRoot: null,
+      acceptanceRoot: null,
+      stateRoot: dailyStateRoot,
+      dailyAudit: null,
+      inputRoot,
+    },
+  };
+  await writeFile(path.join(caseDir, "plan.json"), JSON.stringify(plan, null, 2), { mode: 0o600 });
   return { plan, runtimeRoot, evidenceRoot, caseDir };
 }
 
@@ -610,7 +771,7 @@ async function runCase(caseName: string, manifestPath: string): Promise<{ result
   let firstMismatch: Record<string, any> | null = null;
   let expectedDocument: ExpectedDocument | null = null;
   let driverResult: Record<string, any> = {};
-  let pythonPath = process.env.REVIEW_NATIVE_PYTHON;
+  let pythonPath = spec.daily ? acceptedPythonPath() : process.env.REVIEW_NATIVE_PYTHON;
   if (!pythonPath) pythonPath = Bun.which("python3") ?? undefined;
   if (!pythonPath) throw new Error("python3 is required for the PTY driver");
   const startedAt = new Date().toISOString();
@@ -656,6 +817,14 @@ async function runCase(caseName: string, manifestPath: string): Promise<{ result
   checks.push(driverCheck("omp_group_gone", exit.groupGone === true, `groupGone=${String(exit.groupGone)}`));
   checks.push(driverCheck("driver_fallback", Array.isArray(exit.fallback) && exit.fallback.length === 0, JSON.stringify(exit.fallback ?? [])));
   checks.push(driverCheck("cleanup_failure_absent", driverResult.cleanupFailure === null || driverResult.cleanupFailure === undefined, JSON.stringify(driverResult.cleanupFailure ?? null)));
+  if (spec.daily) {
+    const discovery = driverResult.pathDiscovery;
+    checks.push(driverCheck(
+      "daily_path_discovery",
+      discovery?.ok === true,
+      JSON.stringify(discovery ?? null),
+    ));
+  }
   const runFacts = Array.isArray(driverResult.runFacts) ? driverResult.runFacts as Array<Record<string, any>> : [];
   const identities = Array.isArray(driverResult.processIdentities) ? driverResult.processIdentities as Array<Record<string, any>> : [];
   checks.push(driverCheck("run_fact_count", spec.mode === "admission" ? runFacts.length === 0 : runFacts.length === 1, `${runFacts.length} run fact(s)`));
@@ -693,6 +862,7 @@ async function runCase(caseName: string, manifestPath: string): Promise<{ result
       if (frames.firstMismatch !== null) firstMismatch = frames.firstMismatch;
       const acceptance = gradeAcceptance(evidence, expectedDocument, caseName);
       checks.push(...acceptance);
+      if (spec.daily) checks.push(...gradeDailyComposition(evidence, expectedDocument));
       if (caseName === "positive-no-contract" || caseName === "positive-partial-hybrid") {
         const baselineOk = acceptance.every((check) => check.ok)
           && frames.checks.every((check) => check.ok)
@@ -778,7 +948,7 @@ async function runCase(caseName: string, manifestPath: string): Promise<{ result
 
 export async function runSelectedCases(caseName: string, manifestPath: string, includeDeadline: boolean): Promise<{ status: string; results: Array<{ case: string; status: string; resultPath: string }> }> {
   const cases = caseName === "all"
-    ? Object.keys(CASE_SPECS).filter((name) => includeDeadline || name !== "deadline-expiry")
+    ? Object.keys(CASE_SPECS).filter((name) => name !== "daily-escape" && (includeDeadline || name !== "deadline-expiry"))
     : [caseName];
   const results: Array<{ case: string; status: string; resultPath: string }> = [];
   for (const name of cases) {

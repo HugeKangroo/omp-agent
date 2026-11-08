@@ -1,5 +1,13 @@
 # Release notes
 
+## Explicit personal entry
+
+Added `src/daily-entry.ts` for explicit source-checkout loading with one strict `OMP_AGENT_CONFIG` JSON file. It composes task management, local execution, verification and delivery around one owner, preserves ordinary OMP tools and model configuration, and refuses to replace an existing managed owner.
+
+Configuration fixes the workspace, authorized input files, private state root and optional runtime paths. Human review remains off by default and uses the existing mechanism only with the exact `local-main-tui-v1` option. No automatic semantic verification contract is installed; candidate generation and insufficient coverage are not task acceptance.
+
+Each startup creates a fresh instance. Successive tasks can share it, while prior instance files are preserved without restoring task authority or history. Failed initialization leaves managed handlers inactive. This change does not switch the package's default entry, publish an installation package, add cross-process recovery, or expand guarantees to unrelated native tool calls. Genuine human-use acceptance remains separate.
+
 ## Historical accepted inspection (B3-B1)
 
 `agent_deliver inspect` now reads an exact retained accepted target independently of the current task. After a later genuine message starts a new current task, selecting the earlier accepted task by exact task id, revision and delivery returns that target's accepted reference, record integrity and intact delivered files; the existing top-level current task fields and `visibility` continue to describe the actual current task. Target and current facts are reported separately, so a current change, refusal, record damage or unavailable final branch cannot substitute the current task for the requested history or relabel accepted history as unaccepted.
