@@ -13,7 +13,7 @@ import {
   type LoadDailyConfigOptions,
 } from "./daily-config.ts";
 import { DELIVERY_TOOL } from "./delivery-entry.ts";
-import { EXECUTION_TOOL } from "./execution-adapter.ts";
+import { EXECUTION_TOOL, type ExecutionRunReference } from "./execution-adapter.ts";
 import {
   createExecutionEntry,
   type ExecutionEntryControls,
@@ -449,8 +449,17 @@ export function createDailyEntry(pi: DailyOmpApi, options: DailyEntryOptions = {
     // staged its handlers first. Only this actual main-agent context may
     // publish pending locators.
     staging.api.on("agent_end", async (event, context) => {
+      // Collect the adapter's completed-record references before the real
+      // main agent_end publication. The snapshot is synchronous and performs
+      // no host callback, I/O or owner read.
+      let runReferences: readonly ExecutionRunReference[] = [];
       try {
-        await createdHistory.handleAgentEnd(event, context);
+        runReferences = execution?.adapter.runReferenceSnapshot().references ?? [];
+      } catch (error) {
+        stderr("history_run_snapshot_failed", { error: errorMessage(error) });
+      }
+      try {
+        await createdHistory.handleAgentEnd(event, context, runReferences);
       } catch (error) {
         stderr("history_agent_end_failed", { error: errorMessage(error) });
       }

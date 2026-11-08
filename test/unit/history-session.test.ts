@@ -11,10 +11,13 @@ import {
 import {
   createHistorySession,
   HISTORY_LOCATOR_CUSTOM_TYPE,
+  HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+  HISTORY_SESSION_QUEUE_BYTES_LIMIT,
   HISTORY_SESSION_QUEUE_LIMIT,
   type HistorySessionControls,
   type HistorySessionReport,
 } from "../../src/history-session.ts";
+import type { ExecutionRunReference } from "../../src/execution-adapter.ts";
 import type { OmpSessionManager, OmpToolContext } from "../../src/task-entry-port.ts";
 import {
   TaskOwner,
@@ -62,6 +65,8 @@ interface Fixture {
 
 interface SetupOptions {
   append?: "native" | "noop" | "throw" | "none" | "duplicate-id" | "rewrite-prefix" | "session-switch";
+  runAppend?: "native" | "noop" | "throw";
+  duringRunAppend?: () => void;
   beforeHistory?: (owner: TaskOwner, state: HostState) => void;
   ensureOnDisk?: () => Promise<void>;
   sessionFile?: string | undefined;
@@ -143,6 +148,14 @@ function setup(options: SetupOptions = {}): Fixture {
   if (options.append === "native" || options.append === "session-switch") {
     state.appendEntry = (customType, data) => {
       state.appendCalls.push({ customType, data });
+      if (customType === HISTORY_RUN_LOCATOR_CUSTOM_TYPE && options.runAppend !== undefined) {
+        if (options.runAppend === "noop") {
+          state.afterAppend?.();
+          return;
+        }
+        if (options.runAppend === "throw") throw new Error("fixture run append failure");
+      }
+      if (customType === HISTORY_RUN_LOCATOR_CUSTOM_TYPE) options.duringRunAppend?.();
       appendNative(customType, data);
       if (options.append === "session-switch") state.sessionId = "switched-session";
       state.afterAppend?.();
@@ -358,6 +371,40 @@ function locatorEntry(fixture: Fixture): Entry {
   expect(entry.type).toBe("custom");
   expect(entry.customType).toBe(HISTORY_LOCATOR_CUSTOM_TYPE);
   return entry;
+}
+
+function projectedRow(fixture: Fixture, taskId: string, taskRevision: number) {
+  const item = fixture.reader().list({ limit: 16 }).items.find(
+    (row) => row.taskId === taskId && row.taskRevision === taskRevision,
+  );
+  if (item === undefined) throw new Error("test fixture: projected row not found");
+  return item;
+}
+
+let runSequence = 0;
+
+function runReference(
+  fixture: Fixture,
+  taskId: string,
+  taskRevision: number,
+  overrides: Partial<ExecutionRunReference> = {},
+): ExecutionRunReference {
+  const item = projectedRow(fixture, taskId, taskRevision);
+  runSequence += 1;
+  return {
+    ownerId: fixture.owner.ownerId,
+    taskId: item.taskId,
+    taskRevision: item.taskRevision,
+    requirementsDigest: item.requirementsDigest,
+    runId: `run-${runSequence}`,
+    callId: `call-${runSequence}`,
+    runDirectory: `run-dir-${runSequence}`,
+    artifactIds: [],
+    recordWriteReturned: true,
+    byteIntegrity: "not_checked",
+    authorityRestored: false,
+    ...overrides,
+  };
 }
 
 describe("B1 history capture and native locators", () => {
@@ -975,5 +1022,363 @@ describe("B1 history capture and native locators", () => {
       pending: 0,
       incomplete: HISTORY_SESSION_QUEUE_LIMIT + 1,
     });
+  });
+});
+
+describe("B1 host run locator linkage", () => {
+  test("an already-published ACTIVE task row links one exact run locator without new task capture", async () => {
+    const fixture = setup({ append: "native" });
+    const task = startTask(fixture, "user-1", "Original request.");
+    const item = projectedRow(fixture, task.taskId, 1);
+    await fixture.history.handleAgentEnd({}, fixture.context());
+    expect(fixture.history.status()).toMatchObject({ visible: 1, captured: 1 });
+    const ownerBefore = fixture.owner.snapshot();
+    const reference = runReference(fixture, task.taskId, 1, {
+      artifactIds: ["artifact-1", "artifact-2"],
+    });
+
+    await fixture.history.handleAgentEnd({}, fixture.context(), [reference]);
+
+    expect(fixture.owner.snapshot()).toEqual(ownerBefore);
+    expect(fixture.history.status()).toMatchObject({
+      captured: 1,
+      pending: 0,
+      visible: 1,
+      incomplete: 0,
+      unknown: 0,
+      run: {
+        observed: 1,
+        visible: 1,
+        incomplete: 0,
+        unknown: 0,
+        conflicts: 0,
+      },
+    });
+    expect(fixture.state.appendCalls).toHaveLength(2);
+    expect(fixture.state.appendCalls[0]!.customType).toBe(HISTORY_LOCATOR_CUSTOM_TYPE);
+    expect(fixture.state.appendCalls[1]!.customType).toBe(HISTORY_RUN_LOCATOR_CUSTOM_TYPE);
+    const entry = fixture.state.branch.at(-1)!;
+    expect(entry.customType).toBe(HISTORY_RUN_LOCATOR_CUSTOM_TYPE);
+    expect(entry.data).toEqual({
+      version: 1,
+      instanceId: INSTANCE_ID,
+      ownerId: OWNER_ID,
+      historyId: item.historyId,
+      digest: item.digest,
+      taskId: task.taskId,
+      taskRevision: 1,
+      requirementsDigest: item.requirementsDigest,
+      originSessionId: SESSION,
+      runId: reference.runId,
+      callId: reference.callId,
+      runDirectory: reference.runDirectory,
+      artifactIds: ["artifact-1", "artifact-2"],
+      recordWriteReturned: true,
+      byteIntegrity: "not_checked",
+      authorityRestored: false,
+    });
+    expect(fixture.reader().list({ limit: 16 }).total).toBe(1);
+  });
+
+  test("a task locator captured in the same agent_end is published before its run locator", async () => {
+    const fixture = setup({ append: "native" });
+    const task = startTask(fixture, "user-1", "Original request.");
+    const reference = runReference(fixture, task.taskId, 1);
+    await fixture.history.handleAgentEnd({}, fixture.context(), [reference]);
+    expect(fixture.state.appendCalls.map((call) => call.customType)).toEqual([
+      HISTORY_LOCATOR_CUSTOM_TYPE,
+      HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+    ]);
+    expect(fixture.state.ensureCalls).toBe(1);
+    expect(fixture.history.status()).toMatchObject({
+      pending: 0,
+      visible: 1,
+      run: { observed: 1, visible: 1, incomplete: 0, unknown: 0 },
+    });
+    const runData = fixture.state.appendCalls[1]!.data as Record<string, unknown>;
+    expect(runData.taskId).toBe(task.taskId);
+    expect(runData.taskRevision).toBe(1);
+    expect(runData.runId).toBe(reference.runId);
+  });
+
+  test("an old active row remains linkable after a later revision only at its original identity", async () => {
+    const fixture = setup({ append: "native" });
+    const first = startTask(fixture, "user-1", "Original request.");
+    const firstItem = projectedRow(fixture, first.taskId, 1);
+    await fixture.history.handleAgentEnd({}, fixture.context());
+    const reference = runReference(fixture, first.taskId, 1);
+    const revised = reviseTask(fixture, "user-2", "Amendment.");
+    await fixture.history.handleAgentEnd({}, fixture.context());
+    expect(revised.taskRevision).toBe(2);
+    expect(fixture.reader().list({ limit: 16 }).total).toBe(2);
+
+    await fixture.history.handleAgentEnd({}, fixture.context(), [reference]);
+    expect(fixture.state.appendCalls).toHaveLength(3);
+    expect(fixture.state.appendCalls[2]!.customType).toBe(HISTORY_RUN_LOCATOR_CUSTOM_TYPE);
+    const data = fixture.state.appendCalls[2]!.data as Record<string, unknown>;
+    expect(data.historyId).toBe(firstItem.historyId);
+    expect(data.taskRevision).toBe(1);
+    expect(fixture.history.status().run).toMatchObject({ visible: 1, incomplete: 0 });
+  });
+
+  test("a confirmed task row without its locator on the actual path cannot link a run", async () => {
+    const fixture = setup({ append: "native" });
+    const task = startTask(fixture, "user-1", "Original request.");
+    await fixture.history.handleAgentEnd({}, fixture.context());
+    const reference = runReference(fixture, task.taskId, 1);
+    fixture.state.branch = fixture.state.branch.filter(
+      (entry) => entry.customType !== HISTORY_LOCATOR_CUSTOM_TYPE,
+    );
+    fixture.state.leafId = fixture.state.branch.at(-1)!.id;
+
+    await fixture.history.handleAgentEnd({}, fixture.context(), [reference]);
+    expect(fixture.state.appendCalls).toHaveLength(1);
+    expect(fixture.history.status().run).toMatchObject({
+      observed: 1,
+      visible: 0,
+      incomplete: 1,
+      unknown: 0,
+    });
+    expect(fixture.history.status().run.lastReason?.code).toBe("task_history_unconfirmed");
+  });
+
+  test("mutating the confirmed task locator during run append is unknown and never retried", async () => {
+    let fired = 0;
+    let fixture: Fixture;
+    fixture = setup({
+      append: "native",
+      duringRunAppend() {
+        fired += 1;
+        const locator = fixture.state.branch.find(
+          (entry) => entry.customType === HISTORY_LOCATOR_CUSTOM_TYPE,
+        );
+        (locator!.data as Record<string, unknown>).digest = `sha256:${"0".repeat(64)}`;
+      },
+    });
+    const task = startTask(fixture, "user-1", "Original request.");
+    await fixture.history.handleAgentEnd({}, fixture.context());
+    const reference = runReference(fixture, task.taskId, 1);
+
+    await fixture.history.handleAgentEnd({}, fixture.context(), [reference]);
+    expect(fired).toBe(1);
+    expect(fixture.state.appendCalls).toHaveLength(2);
+    expect(fixture.history.status().run).toMatchObject({
+      observed: 1,
+      visible: 0,
+      incomplete: 0,
+      unknown: 1,
+    });
+    expect(fixture.history.status().run.lastReason?.code).toBe("append_ambiguous");
+
+    await fixture.history.handleAgentEnd({}, fixture.context(), [reference]);
+    expect(fired).toBe(1);
+    expect(fixture.state.appendCalls).toHaveLength(2);
+    expect(fixture.history.status().run).toMatchObject({ observed: 1, unknown: 1 });
+  });
+
+  test("navigation changes the capture generation and a late run is never relabeled or retried", async () => {
+    const fixture = setup({ append: "native" });
+    const task = startTask(fixture, "user-1", "Original request.");
+    await fixture.history.handleAgentEnd({}, fixture.context());
+    const reference = runReference(fixture, task.taskId, 1);
+    fixture.history.navigate("session_switch");
+    fixture.history.navigate("session_tree");
+
+    await fixture.history.handleAgentEnd({}, fixture.context(), [reference]);
+    expect(fixture.state.appendCalls).toHaveLength(1);
+    expect(fixture.history.status().run).toMatchObject({
+      observed: 1,
+      visible: 0,
+      incomplete: 1,
+      unknown: 0,
+    });
+    expect(fixture.history.status().run.lastReason?.code).toBe("generation_changed");
+
+    await fixture.history.handleAgentEnd({}, fixture.context(), [reference]);
+    expect(fixture.state.appendCalls).toHaveLength(1);
+    expect(fixture.history.status().run).toMatchObject({ observed: 1, incomplete: 1 });
+  });
+
+  test("missing rows, wrong sessions and missing amendments refuse linkage without an orphan append", async () => {
+    const fixture = setup({ append: "native" });
+    const task = startTask(fixture, "user-1", "Original request.");
+    await fixture.history.handleAgentEnd({}, fixture.context());
+    const base = runReference(fixture, task.taskId, 1);
+    const ensureBefore = fixture.state.ensureCalls;
+
+    const missingRevision = { ...base, taskId: "task-absent", taskRevision: 2 };
+    await fixture.history.handleAgentEnd({}, fixture.context(), [missingRevision]);
+    expect(fixture.state.ensureCalls).toBe(ensureBefore);
+    expect(fixture.state.appendCalls).toHaveLength(1);
+    expect(fixture.history.status().run.lastReason?.code).toBe("task_history_missing");
+
+    const wrongSession = { ...base, runId: "run-wrong-session", callId: "call-wrong-session" };
+    await fixture.history.handleAgentEnd({}, fixture.context({ sessionId: "other-session" }), [wrongSession]);
+    expect(fixture.state.appendCalls).toHaveLength(1);
+    expect(fixture.history.status().run.lastReason?.code).toBe("session_changed");
+
+    const revised = reviseTask(fixture, "user-2", "Amendment.");
+    await fixture.history.handleAgentEnd({}, fixture.context());
+    const revisionTwo = runReference(fixture, revised.taskId, 2, {
+      runId: "run-missing-amendment",
+      callId: "call-missing-amendment",
+    });
+    fixture.state.branch = fixture.state.branch.filter((entry) => entry.id !== "user-2");
+    fixture.state.leafId = fixture.state.branch.at(-1)!.id;
+    await fixture.history.handleAgentEnd({}, fixture.context(), [revisionTwo]);
+    expect(fixture.state.appendCalls).toHaveLength(2);
+    expect(fixture.history.status().run.lastReason?.code).toBe("source_mismatch");
+    expect(fixture.history.status().run.visible).toBe(0);
+  });
+
+  test("duplicate references are idempotent and a conflicting identity is reported without overwrite", async () => {
+    const fixture = setup({ append: "native" });
+    const task = startTask(fixture, "user-1", "Original request.");
+    await fixture.history.handleAgentEnd({}, fixture.context());
+    const reference = runReference(fixture, task.taskId, 1, { artifactIds: ["artifact-1"] });
+
+    await fixture.history.handleAgentEnd({}, fixture.context(), [reference, reference]);
+    expect(fixture.state.appendCalls).toHaveLength(2);
+    expect(fixture.history.status().run).toMatchObject({ visible: 1, conflicts: 0 });
+
+    const conflicting = { ...reference, artifactIds: ["artifact-2"] };
+    await fixture.history.handleAgentEnd({}, fixture.context(), [conflicting]);
+    expect(fixture.state.appendCalls).toHaveLength(2);
+    expect(fixture.history.status().run).toMatchObject({
+      observed: 1,
+      visible: 1,
+      conflicts: 1,
+    });
+    expect((fixture.state.appendCalls[1]!.data as Record<string, unknown>).artifactIds)
+      .toEqual(["artifact-1"]);
+  });
+
+  test("an ambiguous run append is unknown, consumes the key and is never retried", async () => {
+    const fixture = setup({ append: "native", runAppend: "noop" });
+    const task = startTask(fixture, "user-1", "Original request.");
+    await fixture.history.handleAgentEnd({}, fixture.context());
+    const reference = runReference(fixture, task.taskId, 1);
+
+    await fixture.history.handleAgentEnd({}, fixture.context(), [reference]);
+    expect(fixture.state.appendCalls).toHaveLength(2);
+    expect(fixture.history.status().run).toMatchObject({
+      observed: 1,
+      visible: 0,
+      unknown: 1,
+      incomplete: 0,
+    });
+    expect(fixture.history.status().run.lastReason?.code).toBe("append_ambiguous");
+
+    await fixture.history.handleAgentEnd({}, fixture.context(), [reference]);
+    expect(fixture.state.appendCalls).toHaveLength(2);
+    expect(fixture.history.status().run).toMatchObject({ observed: 1, unknown: 1 });
+  });
+
+  test("ensure timeout refuses a same-batch run and a late resolution never appends", async () => {
+    let resolveEnsure: (() => void) | undefined;
+    const fixture = setup({
+      append: "native",
+      ensureOnDiskTimeoutMs: 20,
+      ensureOnDisk: () => new Promise<void>((resolve) => {
+        resolveEnsure = resolve;
+      }),
+    });
+    const task = startTask(fixture, "user-1", "Original request.");
+    const reference = runReference(fixture, task.taskId, 1);
+    await fixture.history.handleAgentEnd({}, fixture.context(), [reference]);
+    expect(fixture.state.appendCalls).toHaveLength(0);
+    expect(fixture.history.status()).toMatchObject({
+      pending: 0,
+      visible: 0,
+      incomplete: 1,
+      run: { observed: 1, visible: 0, incomplete: 1, unknown: 0 },
+    });
+    expect(fixture.history.status().run.lastReason?.code).toBe("timeout");
+
+    resolveEnsure!();
+    await Promise.resolve();
+    await Promise.resolve();
+    await fixture.history.handleAgentEnd({}, fixture.context(), [reference]);
+    expect(fixture.state.appendCalls).toHaveLength(0);
+    expect(fixture.history.status().run).toMatchObject({ observed: 1, incomplete: 1 });
+  });
+
+  test("shared task/run count and bytes stay bounded under reentrant capture and repeated offers", async () => {
+    let fixture!: Fixture;
+    let maxTotal = 0;
+    let maxBytes = 0;
+    let reentrantStarted = false;
+    fixture = setup({
+      append: "native",
+      report(type) {
+        const status = fixture.history.status();
+        maxTotal = Math.max(maxTotal, status.pendingTotal);
+        maxBytes = Math.max(maxBytes, status.pendingTotalBytes);
+        if (type === "run_visible" && !reentrantStarted) {
+          reentrantStarted = true;
+          reviseTask(fixture, "user-reentrant", "Reentrant amendment during run publication.");
+        }
+      },
+    });
+    const task = startTask(fixture, "user-1", "Original request.");
+    await fixture.history.handleAgentEnd({}, fixture.context());
+    const references = Array.from(
+      { length: HISTORY_SESSION_QUEUE_LIMIT + 1 },
+      () => runReference(fixture, task.taskId, 1),
+    );
+    await fixture.history.handleAgentEnd({}, fixture.context(), references);
+
+    expect(reentrantStarted).toBe(true);
+    expect(maxTotal).toBeLessThanOrEqual(HISTORY_SESSION_QUEUE_LIMIT);
+    expect(maxBytes).toBeLessThanOrEqual(HISTORY_SESSION_QUEUE_BYTES_LIMIT);
+    expect(fixture.state.appendCalls).toHaveLength(1 + HISTORY_SESSION_QUEUE_LIMIT);
+    expect(fixture.history.status()).toMatchObject({
+      pending: 1,
+      run: {
+        observed: HISTORY_SESSION_QUEUE_LIMIT,
+        visible: HISTORY_SESSION_QUEUE_LIMIT,
+        keyLimitLatched: true,
+        reserved: 0,
+        reservedBytes: 0,
+      },
+    });
+    expect(fixture.history.status().pendingTotal).toBe(1);
+    expect(fixture.history.status().pendingTotalBytes).toBeLessThanOrEqual(
+      HISTORY_SESSION_QUEUE_BYTES_LIMIT,
+    );
+
+    // Drain the reentrant task row, then re-offer the unretainable 129th key.
+    await fixture.history.handleAgentEnd({}, fixture.context());
+    const appendCount = fixture.state.appendCalls.length;
+    const incomplete = fixture.history.status().run.incomplete;
+    await fixture.history.handleAgentEnd({}, fixture.context(), [references[HISTORY_SESSION_QUEUE_LIMIT]!]);
+    expect(fixture.state.appendCalls).toHaveLength(appendCount);
+    expect(fixture.history.status().run).toMatchObject({
+      observed: HISTORY_SESSION_QUEUE_LIMIT,
+      visible: HISTORY_SESSION_QUEUE_LIMIT,
+      keyLimitLatched: true,
+      reserved: 0,
+    });
+    expect(fixture.history.status().run.incomplete).toBeGreaterThanOrEqual(incomplete);
+  });
+
+  test("invalid adapter reference shapes are refused without host callbacks", async () => {
+    const fixture = setup({ append: "native" });
+    const task = startTask(fixture, "user-1", "Original request.");
+    await fixture.history.handleAgentEnd({}, fixture.context());
+    const ensureBefore = fixture.state.ensureCalls;
+    const invalid = runReference(fixture, task.taskId, 1, {
+      artifactIds: ["a1", "a2", "a3", "a4", "a5", "a6", "a7", "a8", "a9"],
+    });
+    await fixture.history.handleAgentEnd({}, fixture.context(), [invalid]);
+    expect(fixture.state.ensureCalls).toBe(ensureBefore);
+    expect(fixture.state.appendCalls).toHaveLength(1);
+    expect(fixture.history.status().run).toMatchObject({
+      observed: 0,
+      visible: 0,
+      incomplete: 1,
+      unknown: 0,
+    });
+    expect(fixture.history.status().run.lastReason?.code).toBe("invalid");
   });
 });

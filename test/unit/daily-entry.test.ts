@@ -17,7 +17,10 @@ import {
   loadDailyConfig,
 } from "../../src/daily-config.ts";
 import { createHistoryProjectionReader } from "../../src/history-projection.ts";
-import { HISTORY_LOCATOR_CUSTOM_TYPE } from "../../src/history-session.ts";
+import {
+  HISTORY_LOCATOR_CUSTOM_TYPE,
+  HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+} from "../../src/history-session.ts";
 import {
   createDailyEntry,
   DAILY_GUIDANCE_TYPE,
@@ -964,5 +967,150 @@ describe("daily composition", () => {
     expect(entry.historyQuery.status()).toMatchObject({ disposed: true, view: "none", selectors: 0 });
     expect(entry.history.status().pending).toBe(0);
     expect(entry.history.status().visible).toBe(1);
+  });
+
+  test("daily publishes the task locator before a real execution run locator from the same main agent_end", async () => {
+    const fx = await fixture();
+    const branch: Array<Record<string, unknown>> = [
+      { id: "leaf-1", parentId: null, type: "custom", customType: "fixture-base", data: {} },
+    ];
+    let leafId = "leaf-1";
+    let ensureCalls = 0;
+    const appendCalls: Array<{ customType: string; data: unknown }> = [];
+    const appendEntry = <T = unknown>(customType: string, data?: T): void => {
+      appendCalls.push({ customType, data });
+      const id = `entry-${appendCalls.length}`;
+      branch.push({ id, parentId: leafId, type: "custom", customType, data });
+      leafId = id;
+    };
+    const fake = fakeHost({ appendEntry });
+    const entry = createDailyEntry(fake.pi, { env: fx.env, launchWorkspace: fx.workspace });
+    entries.push(entry);
+    const sessionFile = path.join(fx.root, "daily-run-session.jsonl");
+    const ctx: OmpToolContext = {
+      cwd: fx.workspace,
+      agent: { kind: "main" },
+      sessionManager: {
+        getSessionId: () => "daily-run-session",
+        getLeafId: () => leafId,
+        getBranch: () => branch.slice(),
+        getSessionFile: () => sessionFile,
+        ensureOnDisk: async () => { ensureCalls += 1; },
+      },
+    };
+
+    branch.push(userEntry("user-1", "leaf-1", "Generate the daily artifact."));
+    fake.handlers.get("input")![0]!({ text: "Generate the daily artifact.", source: "rpc" }, ctx);
+    startMessages(fake, ctx, "Generate the daily artifact.");
+    const started = await fake.tools.get(TASK_CONTROL_TOOL)!.execute(
+      "call-start",
+      { action: "start" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(started.isError).toBeUndefined();
+    const task = entry.owner.snapshot().currentTask!;
+    expect(entry.history.status()).toMatchObject({ captured: 1, pending: 1, visible: 0 });
+
+    const executed = await fake.tools.get(EXECUTION_TOOL)!.execute(
+      "call-execute",
+      {
+        action: "run",
+        runtime: "python",
+        source: "open('daily-run.txt', 'wb').write(b'daily artifact bytes\\n')\n",
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: 1,
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(executed.isError).toBeUndefined();
+    const executionDetails = executed.details as Record<string, any>;
+    expect(executionDetails.artifacts).toHaveLength(1);
+    expect(executionDetails.taskId).toBe(task.taskId);
+    expect(entry.history.status()).toMatchObject({ captured: 1, pending: 1, visible: 0, run: { visible: 0 } });
+
+    branch.push({
+      id: "assistant-1",
+      parentId: "user-1",
+      type: "message",
+      message: { role: "assistant", content: [{ type: "text", text: "working" }] },
+    });
+    leafId = "assistant-1";
+    const taskEnd = fake.handlers.get("agent_end")![0]!;
+    const historyEnd = fake.handlers.get("agent_end")![1]!;
+    taskEnd({
+      messages: [{
+        role: "user",
+        content: [{ type: "text", text: "Generate the daily artifact." }],
+        attribution: "user",
+        id: "user-1",
+      }],
+    }, ctx);
+    await historyEnd({}, ctx);
+
+    expect(ensureCalls).toBe(1);
+    expect(appendCalls.map((call) => call.customType)).toEqual([
+      HISTORY_LOCATOR_CUSTOM_TYPE,
+      HISTORY_RUN_LOCATOR_CUSTOM_TYPE,
+    ]);
+    const reader = createHistoryProjectionReader({
+      instanceRoot: entry.instance.root,
+      instanceId: entry.instance.instanceId,
+      ownerId: entry.owner.ownerId,
+      workspaceRoot: entry.config.workspaceRoot,
+    });
+    const page = reader.list({ limit: 16 });
+    expect(page.total).toBe(1);
+    const runData = appendCalls[1]!.data as Record<string, unknown>;
+    const runDirectory = String(executionDetails.hostRecordRef).split("/")[0]!;
+    expect(runData).toEqual({
+      version: 1,
+      instanceId: entry.instance.instanceId,
+      ownerId: entry.owner.ownerId,
+      historyId: page.items[0]!.historyId,
+      digest: page.items[0]!.digest,
+      taskId: task.taskId,
+      taskRevision: 1,
+      requirementsDigest: page.items[0]!.requirementsDigest,
+      originSessionId: "daily-run-session",
+      runId: executionDetails.runId,
+      callId: executionDetails.callId,
+      runDirectory,
+      artifactIds: executionDetails.artifacts.map((artifact: any) => artifact.artifactId),
+      recordWriteReturned: true,
+      byteIntegrity: "not_checked",
+      authorityRestored: false,
+    });
+    const record = JSON.parse(await readFile(
+      path.join(entry.instance.executionRoot, runDirectory, "record.json"),
+      "utf8",
+    ));
+    expect(record.phase).toBe("completed");
+    expect(record.runId).toBe(executionDetails.runId);
+    expect(record.callId).toBe(executionDetails.callId);
+    expect(record.taskId).toBe(task.taskId);
+    expect(record.taskRevision).toBe(1);
+    expect(record.artifacts.map((artifact: any) => artifact.artifactId))
+      .toEqual(runData.artifactIds);
+    const artifact = record.artifacts[0];
+    expect(await readFile(path.join(entry.instance.executionRoot, artifact.archiveRef), "utf8"))
+      .toBe("daily artifact bytes\n");
+    expect(entry.history.status()).toMatchObject({
+      pending: 0,
+      visible: 1,
+      run: { observed: 1, visible: 1, incomplete: 0, unknown: 0 },
+    });
+
+    await historyEnd({}, ctx);
+    expect(appendCalls).toHaveLength(2);
+    expect(ensureCalls).toBe(1);
+    expect(entry.owner.snapshot().currentTask).toMatchObject({
+      taskId: task.taskId,
+      taskRevision: 1,
+      status: "active",
+    });
   });
 });

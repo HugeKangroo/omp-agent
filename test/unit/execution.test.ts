@@ -14,6 +14,7 @@ import {
   sandboxProfile,
   type ExecutionToolContext,
 } from "../../src/execution-adapter.ts";
+import { requirementsDigest } from "../../src/task-requirements.ts";
 import { TaskOwner, type TaskSubject } from "../../src/task-owner.ts";
 
 const WORKSPACE = path.join(tmpdir(), "omp-agent-g2a1-unit-workspace");
@@ -94,6 +95,7 @@ async function fixture(options: {
   badInputs?: boolean;
   launcherPath?: string;
   recordWriter?: (filePath: string, value: unknown) => void;
+  now?: () => string;
 } = {}): Promise<Fixture> {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "omp-agent-g2a1-unit-")));
   const fixtures = path.join(root, "fixtures");
@@ -134,6 +136,7 @@ async function fixture(options: {
     inputs: [{ id: "alpha", path: alphaPath }, ...extraInputs],
     capabilityId: "local-script",
     id: () => `run-${++sequence}`,
+    ...(options.now === undefined ? {} : { now: options.now }),
     ...(options.dispatchWallMs === undefined ? {} : { dispatchWallMs: options.dispatchWallMs }),
     ...(options.terminationGraceMs === undefined ? {} : { terminationGraceMs: options.terminationGraceMs }),
     ...(options.launcherPath === undefined ? {} : { launcherPath: options.launcherPath }),
@@ -1301,8 +1304,12 @@ describe("owner authority changes during a run", () => {
   const LONG = "import time\ntime.sleep(0.6)\nopen('late.txt','w').write('late output')\n";
 
   test("a genuine cancel stops the running child and keeps the result at revision 1 with no restored authority", async () => {
+    // Real adapter/launcher execution with an artificial OMP context; this is
+    // not actual OMP TUI evidence.
     const f = await fixture({ dispatchWallMs: 5000, terminationGraceMs: 100 });
     try {
+      const original = f.owner.snapshot().currentTask!;
+      const originalDigest = requirementsDigest(original.requirementSources);
       const running = f.adapter.run(f.ctx, {
         action: "run",
         runtime: "python",
@@ -1318,6 +1325,25 @@ describe("owner authority changes during a run", () => {
       expect(details.taskRevision).toBe(1);
       expect(details.dispatch.reason).toBe("owner_cancelled");
       expect(details.dispatch.processGroupVerifiedGone).toBe(true);
+      const snapshot = f.adapter.runReferenceSnapshot();
+      expect(snapshot.references).toHaveLength(1);
+      const reference = snapshot.references[0]!;
+      expect(reference).toMatchObject({
+        taskId: original.taskId,
+        taskRevision: 1,
+        requirementsDigest: originalDigest,
+        recordWriteReturned: true,
+        byteIntegrity: "not_checked",
+        authorityRestored: false,
+      });
+      const record = JSON.parse(await readFile(
+        path.join(f.root, reference.runDirectory, "record.json"),
+        "utf8",
+      ));
+      expect(record.taskId).toBe(original.taskId);
+      expect(record.taskRevision).toBe(1);
+      expect(record.requirementsDigest).toBe(originalDigest);
+      expect(reference.artifactIds).toEqual(record.artifacts.map((artifact: any) => artifact.artifactId));
       expect(f.owner.snapshot().currentTask?.status).toBe("cancelled");
       const admissions = f.owner.snapshot().currentTask?.admissions;
       const after = await f.adapter.run(f.ctx, {
@@ -1336,8 +1362,12 @@ describe("owner authority changes during a run", () => {
   }, 20_000);
 
   test("a genuine revision conservatively stops the old run and withholds its output", async () => {
+    // Real adapter/launcher execution with an artificial OMP context; this is
+    // not actual OMP TUI evidence.
     const f = await fixture({ dispatchWallMs: 5000, terminationGraceMs: 100 });
     try {
+      const original = f.owner.snapshot().currentTask!;
+      const originalDigest = requirementsDigest(original.requirementSources);
       const running = f.adapter.run(f.ctx, {
         action: "run",
         runtime: "python",
@@ -1376,6 +1406,25 @@ describe("owner authority changes during a run", () => {
       expect(content).not.toContain("late output");
       expect(content).toContain("taskAccepted=false");
       expect(f.owner.snapshot().currentTask?.taskRevision).toBe(2);
+      const snapshot = f.adapter.runReferenceSnapshot();
+      expect(snapshot.references).toHaveLength(1);
+      const reference = snapshot.references[0]!;
+      expect(reference).toMatchObject({
+        taskId: original.taskId,
+        taskRevision: 1,
+        requirementsDigest: originalDigest,
+        recordWriteReturned: true,
+        byteIntegrity: "not_checked",
+        authorityRestored: false,
+      });
+      const record = JSON.parse(await readFile(
+        path.join(f.root, reference.runDirectory, "record.json"),
+        "utf8",
+      ));
+      expect(record.taskId).toBe(original.taskId);
+      expect(record.taskRevision).toBe(1);
+      expect(record.requirementsDigest).toBe(originalDigest);
+      expect(reference.artifactIds).toEqual(record.artifacts.map((artifact: any) => artifact.artifactId));
     } finally {
       await f.cleanup();
     }
@@ -2079,3 +2128,272 @@ ${line}
     }
   }, 20_000);
 });
+
+describe("host run references from actual execution facts", () => {
+  test("a real completed run exposes one immutable reference matching record identity and archived artifact ids", async () => {
+    const f = await fixture({ dispatchWallMs: 5000 });
+    try {
+      const knownBytes = Buffer.from("known artifact bytes\n", "utf8");
+      const result = await f.adapter.run(f.ctx, {
+        action: "run",
+        runtime: "python",
+        source: "open('known.txt', 'wb').write(b'known artifact bytes\\n')\nprint('reference fixture')\n",
+        inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
+        expectedTaskRevision: 1,
+      });
+      const details = detailsOf(result);
+      expect(result.isError).toBeUndefined();
+      const runDirs = await f.runDirs();
+      expect(runDirs).toHaveLength(1);
+      const snapshot = f.adapter.runReferenceSnapshot();
+      expect(snapshot.ownerId).toBe(f.owner.ownerId);
+      expect(snapshot.references).toHaveLength(1);
+      expect(snapshot.diagnostics).toMatchObject({
+        retained: 1,
+        limit: 128,
+        bytesLimit: 512 * 1024,
+        rejectedByCount: 0,
+        rejectedByBytes: 0,
+        conflicts: 0,
+        invalid: 0,
+        finalRecordWriteUnconfirmed: 0,
+        possiblyDispatchedWithoutConfirmedFinalRecord: 0,
+        limitReached: false,
+      });
+      const reference = snapshot.references[0]!;
+      const record = JSON.parse(await readFile(path.join(f.root, reference.runDirectory, "record.json"), "utf8"));
+      expect(reference).toMatchObject({
+        ownerId: f.owner.ownerId,
+        taskId: details.taskId,
+        taskRevision: 1,
+        requirementsDigest: record.requirementsDigest,
+        runId: record.runId,
+        callId: record.callId,
+        runDirectory: runDirs[0],
+        recordWriteReturned: true,
+        byteIntegrity: "not_checked",
+        authorityRestored: false,
+      });
+      expect(record.phase).toBe("completed");
+      expect(record.process.exitCode).toBe(0);
+      expect(reference.artifactIds).toEqual(details.artifacts.map((artifact: any) => artifact.artifactId));
+      expect(record.artifacts.map((artifact: any) => artifact.artifactId)).toEqual(reference.artifactIds);
+      const archived = details.artifacts.find((artifact: any) => artifact.relativePath === "known.txt");
+      expect(await readFile(path.join(f.root, archived.archiveRef))).toEqual(knownBytes);
+      expect(Object.isFrozen(reference)).toBe(true);
+      expect(Object.isFrozen(reference.artifactIds)).toBe(true);
+      const second = f.adapter.runReferenceSnapshot();
+      expect(second.references).toEqual(snapshot.references);
+      expect(second.references).not.toBe(snapshot.references);
+      expect(() => (snapshot.references as unknown as ExecutionRunReferenceLike[]).push({} as any)).toThrow();
+      expect(() => (reference.artifactIds as string[]).push("artifact-9")).toThrow();
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("nonzero exit with no artifacts is referenced without success labels or byte claims", async () => {
+    const f = await fixture({ dispatchWallMs: 5000 });
+    try {
+      const result = await f.adapter.run(f.ctx, {
+        action: "run",
+        runtime: "python",
+        source: "import sys\nsys.exit(3)\n",
+        inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
+        expectedTaskRevision: 1,
+      });
+      const details = detailsOf(result);
+      expect(result.isError).toBe(true);
+      expect(details.dispatch.exitCode).toBe(3);
+      expect(details.artifacts).toEqual([]);
+      const snapshot = f.adapter.runReferenceSnapshot();
+      expect(snapshot.references).toHaveLength(1);
+      const reference = snapshot.references[0]!;
+      expect(reference.artifactIds).toEqual([]);
+      expect(reference.recordWriteReturned).toBe(true);
+      expect(reference.byteIntegrity).toBe("not_checked");
+      expect(reference.authorityRestored).toBe(false);
+      expect(reference).not.toHaveProperty("settled");
+      expect(reference).not.toHaveProperty("success");
+      const record = JSON.parse(await readFile(path.join(f.root, reference.runDirectory, "record.json"), "utf8"));
+      expect(record.phase).toBe("completed");
+      expect(record.process.exitCode).toBe(3);
+      expect(record.artifacts).toEqual([]);
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("no reference is claimable during any writer callback and a normal void return is not a disk claim", async () => {
+    let adapter: ExecutionAdapter | undefined;
+    const callbackFacts: Array<{ phase: unknown; refs: number }> = [];
+    let writes = 0;
+    const f = await fixture({
+      dispatchWallMs: 5000,
+      recordWriter: (_filePath, value) => {
+        writes += 1;
+        callbackFacts.push({
+          phase: (value as { phase?: unknown }).phase,
+          refs: adapter?.runReferenceSnapshot().references.length ?? -1,
+        });
+      },
+    });
+    adapter = f.adapter;
+    try {
+      const result = await f.adapter.run(f.ctx, {
+        action: "run",
+        runtime: "python",
+        source: "print('void writer')\n",
+        inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
+        expectedTaskRevision: 1,
+      });
+      expect(result.isError).toBeUndefined();
+      expect(writes).toBe(3);
+      expect(callbackFacts).toEqual([
+        { phase: "prepared", refs: 0 },
+        { phase: "running", refs: 0 },
+        { phase: "completed", refs: 0 },
+      ]);
+      const snapshot = f.adapter.runReferenceSnapshot();
+      expect(snapshot.references).toHaveLength(1);
+      expect(snapshot.references[0]!.recordWriteReturned).toBe(true);
+      expect(snapshot.references[0]!.byteIntegrity).toBe("not_checked");
+      const recordExists = await readFile(path.join(f.root, snapshot.references[0]!.runDirectory, "record.json"))
+        .then(() => true, () => false);
+      expect(recordExists).toBe(false);
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("mutating the completed record passed to the writer cannot relabel the frozen reference", async () => {
+    const f = await fixture({
+      dispatchWallMs: 5000,
+      recordWriter: (filePath, value) => {
+        const record = value as Record<string, unknown>;
+        if (record.phase === "completed") {
+          record.taskId = "tampered-task";
+          record.runId = "run-tampered";
+          record.ownerId = "tampered-owner";
+          (record.artifacts as Array<Record<string, unknown>>)[0]!.artifactId = "artifact-tampered";
+        }
+        writeFileSync(filePath, JSON.stringify(value));
+      },
+    });
+    try {
+      const result = await f.adapter.run(f.ctx, {
+        action: "run",
+        runtime: "python",
+        source: "open('tamper.txt', 'w').write('actual')\n",
+        inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
+        expectedTaskRevision: 1,
+      });
+      const details = detailsOf(result);
+      const snapshot = f.adapter.runReferenceSnapshot();
+      const reference = snapshot.references[0]!;
+      expect(reference.ownerId).toBe(f.owner.ownerId);
+      expect(reference.taskId).toBe(details.taskId);
+      expect(reference.runId).toBe(details.runId);
+      expect(reference.artifactIds).toEqual(details.artifacts.map((artifact: any) => artifact.artifactId));
+      expect(reference.artifactIds).not.toContain("artifact-tampered");
+      expect(reference.recordWriteReturned).toBe(true);
+      expect(reference.byteIntegrity).toBe("not_checked");
+      expect(reference.authorityRestored).toBe(false);
+      const tampered = JSON.parse(await readFile(path.join(f.root, reference.runDirectory, "record.json"), "utf8"));
+      expect(tampered.taskId).toBe("tampered-task");
+      expect(tampered.runId).toBe("run-tampered");
+      expect(tampered.artifacts[0].artifactId).toBe("artifact-tampered");
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("a final writer throw cannot upgrade the run to a retained reference", async () => {
+    let writes = 0;
+    const f = await fixture({
+      dispatchWallMs: 5000,
+      recordWriter: (filePath, value) => {
+        writes += 1;
+        if (writes >= 3) throw new Error("injected final reference fault");
+        writeFileSync(filePath, JSON.stringify(value));
+      },
+    });
+    try {
+      expect(f.adapter.runReferenceSnapshot().diagnostics).toMatchObject({
+        retained: 0,
+        finalRecordWriteUnconfirmed: 0,
+        possiblyDispatchedWithoutConfirmedFinalRecord: 0,
+      });
+      const result = await f.adapter.run(f.ctx, {
+        action: "run",
+        runtime: "python",
+        source: "open('thrown.txt', 'w').write('ran')\n",
+        inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
+        expectedTaskRevision: 1,
+      });
+      expect(result.isError).toBe(true);
+      expect(writes).toBe(3);
+      expect(detailsOf(result).hostRecordErrors.finalRecord).toContain("injected final reference fault");
+      const snapshot = f.adapter.runReferenceSnapshot();
+      expect(snapshot.references).toEqual([]);
+      expect(snapshot.diagnostics).toMatchObject({
+        retained: 0,
+        finalRecordWriteUnconfirmed: 1,
+        possiblyDispatchedWithoutConfirmedFinalRecord: 1,
+        rejectedByCount: 0,
+        rejectedByBytes: 0,
+        invalid: 0,
+      });
+      expect(f.adapter.activitySnapshot().unresolvedCompletions).toContainEqual(expect.objectContaining({
+        runId: detailsOf(result).runId,
+        reasonCodes: ["final_host_record_unconfirmed"],
+      }));
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+
+  test("a dispatched run that never reaches the final writer is counted as missing, not no-effect", async () => {
+    let clockCalls = 0;
+    const f = await fixture({
+      dispatchWallMs: 5000,
+      now: () => {
+        clockCalls += 1;
+        if (clockCalls === 3) throw new Error("injected completed-record clock fault");
+        return NOW;
+      },
+    });
+    try {
+      const result = await f.adapter.run(f.ctx, {
+        action: "run",
+        runtime: "python",
+        source: "open('clock.txt', 'w').write('ran')\n",
+        inputIds: [],
+        expectedTaskId: currentTaskId(f.owner),
+        expectedTaskRevision: 1,
+      });
+      expect(result.isError).toBe(true);
+      expect(clockCalls).toBe(3);
+      const snapshot = f.adapter.runReferenceSnapshot();
+      expect(snapshot.references).toEqual([]);
+      expect(snapshot.diagnostics).toMatchObject({
+        retained: 0,
+        finalRecordWriteUnconfirmed: 0,
+        possiblyDispatchedWithoutConfirmedFinalRecord: 1,
+        invalid: 0,
+      });
+      const unresolved = f.adapter.activitySnapshot().unresolvedCompletions;
+      expect(unresolved).toHaveLength(1);
+      expect(unresolved[0]!.reasonCodes).toContain("final_host_record_unconfirmed");
+    } finally {
+      await f.cleanup();
+    }
+  }, 20_000);
+});
+
+type ExecutionRunReferenceLike = ReturnType<ExecutionAdapter["runReferenceSnapshot"]>["references"][number];

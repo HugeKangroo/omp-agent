@@ -73,7 +73,12 @@ export const EXECUTION_LIMITS = {
   maxToolResponseBytes: 128 * 1024,
 } as const;
 
+/** Retained run-record references for the later read-only query package. */
+export const EXECUTION_RUN_REFERENCE_LIMIT = 128;
+export const EXECUTION_RUN_REFERENCE_TOTAL_BYTES_LIMIT = 512 * 1024;
+
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+const SAFE_RUN_COMPONENT = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const RESPONSE_LOG_PREVIEW_BYTES = 4096;
 const MAX_SCAN_ENTRIES = 256;
 const WATCHDOG_PROTOCOL = "g2a2-watchdog-v1" as const;
@@ -333,6 +338,83 @@ export interface ExecutionActivitySnapshot {
   unresolvedCompletions: ExecutionUnresolvedCompletion[];
   /** Oldest completions dropped from the bounded latch, if any. */
   unresolvedOmitted: number;
+}
+
+/**
+ * A host-observed reference to one prepared run directory whose final
+ * completed-format record write returned normally.
+ *
+ * This is a lookup clue, not current-byte verification, settlement, candidate
+ * registration, acceptance or restored authority. A void writer return proves
+ * only that the host write call returned; it does not prove the bytes on disk.
+ */
+export interface ExecutionRunReference {
+  readonly ownerId: string;
+  readonly taskId: string;
+  readonly taskRevision: number;
+  readonly requirementsDigest: string;
+  readonly runId: string;
+  readonly callId: string;
+  /** Single safe path component; `record.json` is derived by the consumer. */
+  readonly runDirectory: string;
+  readonly artifactIds: readonly string[];
+  readonly recordWriteReturned: true;
+  readonly byteIntegrity: "not_checked";
+  readonly authorityRestored: false;
+}
+
+export interface ExecutionRunReferenceDiagnostics {
+  readonly retained: number;
+  readonly totalBytes: number;
+  readonly limit: number;
+  readonly bytesLimit: number;
+  readonly rejectedByCount: number;
+  readonly rejectedByBytes: number;
+  readonly conflicts: number;
+  readonly invalid: number;
+  /** Observed completed-format final writer throws, whether or not spawn was proven. */
+  readonly finalRecordWriteUnconfirmed: number;
+  /** Possibly or actually dispatched runs that ended with no normally-returned final record. */
+  readonly possiblyDispatchedWithoutConfirmedFinalRecord: number;
+  readonly limitReached: boolean;
+}
+
+/** Synchronous defensive copy; no host callbacks, I/O or owner reads. */
+export interface ExecutionRunReferenceSnapshot {
+  readonly ownerId: string;
+  readonly references: readonly ExecutionRunReference[];
+  readonly diagnostics: ExecutionRunReferenceDiagnostics;
+}
+
+function copyRunReference(reference: ExecutionRunReference): ExecutionRunReference {
+  return Object.freeze({
+    ...reference,
+    artifactIds: Object.freeze([...reference.artifactIds]),
+  });
+}
+
+function sameRunReference(left: ExecutionRunReference, right: ExecutionRunReference): boolean {
+  if (left.ownerId !== right.ownerId
+    || left.taskId !== right.taskId
+    || left.taskRevision !== right.taskRevision
+    || left.requirementsDigest !== right.requirementsDigest
+    || left.runId !== right.runId
+    || left.callId !== right.callId
+    || left.runDirectory !== right.runDirectory
+    || left.recordWriteReturned !== right.recordWriteReturned
+    || left.byteIntegrity !== right.byteIntegrity
+    || left.authorityRestored !== right.authorityRestored
+    || left.artifactIds.length !== right.artifactIds.length) {
+    return false;
+  }
+  for (let index = 0; index < left.artifactIds.length; index += 1) {
+    if (left.artifactIds[index] !== right.artifactIds[index]) return false;
+  }
+  return true;
+}
+
+function runReferenceKey(reference: ExecutionRunReference): string {
+  return [reference.ownerId, reference.taskId, reference.taskRevision, reference.runId, reference.callId].join("\u0000");
 }
 
 interface ArtifactRecord {
@@ -1504,6 +1586,15 @@ export class ExecutionAdapter {
   private readonly ownerId: string;
   private readonly budgets = new Map<string, RunBudget>();
   private readonly unresolved = new Map<string, ExecutionUnresolvedCompletion>();
+  private readonly runReferences = new Map<string, ExecutionRunReference>();
+  private runReferenceBytes = 0;
+  private runReferenceRejectedByCount = 0;
+  private runReferenceRejectedByBytes = 0;
+  private runReferenceConflicts = 0;
+  private runReferenceInvalid = 0;
+  private runReferenceFinalWriteUnconfirmed = 0;
+  private runReferencePossiblyDispatchedWithoutConfirmedFinalRecord = 0;
+  private runReferenceLimitReached = false;
   private unresolvedOmitted = 0;
   private readonly unsubscribe: () => void;
   private active: ActiveRun | undefined;
@@ -1630,6 +1721,98 @@ export class ExecutionAdapter {
       })),
       unresolvedOmitted: this.unresolvedOmitted,
     };
+  }
+
+  /**
+   * Synchronous defensive snapshot of references whose completed-format final
+   * record write had returned before this call. It performs no host callback,
+   * I/O or owner read and never upgrades a write return into byte integrity,
+   * settlement, candidate registration or task acceptance.
+   */
+  runReferenceSnapshot(): ExecutionRunReferenceSnapshot {
+    const references = [...this.runReferences.values()].map(copyRunReference);
+    return Object.freeze({
+      ownerId: this.ownerId,
+      references: Object.freeze(references),
+      diagnostics: Object.freeze({
+        retained: references.length,
+        totalBytes: this.runReferenceBytes,
+        limit: EXECUTION_RUN_REFERENCE_LIMIT,
+        bytesLimit: EXECUTION_RUN_REFERENCE_TOTAL_BYTES_LIMIT,
+        rejectedByCount: this.runReferenceRejectedByCount,
+        rejectedByBytes: this.runReferenceRejectedByBytes,
+        conflicts: this.runReferenceConflicts,
+        invalid: this.runReferenceInvalid,
+        finalRecordWriteUnconfirmed: this.runReferenceFinalWriteUnconfirmed,
+        possiblyDispatchedWithoutConfirmedFinalRecord: this.runReferencePossiblyDispatchedWithoutConfirmedFinalRecord,
+        limitReached: this.runReferenceLimitReached,
+      }),
+    });
+  }
+
+  /**
+   * Build only from admission-frozen identity, prepared run facts and actual
+   * archived artifact ids. The mutable object later passed to recordWriter is
+   * never read here.
+   */
+  private buildRunReference(
+    frozenTask: FrozenTaskRef,
+    prepared: PreparedRun,
+    artifacts: readonly ArtifactRecord[],
+  ): ExecutionRunReference | undefined {
+    const runDirectory = path.basename(prepared.runRoot);
+    if (path.dirname(prepared.runRoot) !== this.root
+      || path.basename(runDirectory) !== runDirectory
+      || !SAFE_RUN_COMPONENT.test(runDirectory)
+      || !SAFE_RUN_COMPONENT.test(prepared.runId)
+      || !SAFE_RUN_COMPONENT.test(prepared.callId)
+      || artifacts.length > EXECUTION_LIMITS.maxArtifacts) {
+      this.runReferenceInvalid += 1;
+      return undefined;
+    }
+    const artifactIds: string[] = [];
+    for (const artifact of artifacts) {
+      if (!SAFE_RUN_COMPONENT.test(artifact.artifactId) || artifactIds.includes(artifact.artifactId)) {
+        this.runReferenceInvalid += 1;
+        return undefined;
+      }
+      artifactIds.push(artifact.artifactId);
+    }
+    return Object.freeze({
+      ownerId: frozenTask.ownerId,
+      taskId: frozenTask.taskId,
+      taskRevision: frozenTask.taskRevision,
+      requirementsDigest: frozenTask.requirementsDigest,
+      runId: prepared.runId,
+      callId: prepared.callId,
+      runDirectory,
+      artifactIds: Object.freeze(artifactIds),
+      recordWriteReturned: true,
+      byteIntegrity: "not_checked",
+      authorityRestored: false,
+    }) satisfies ExecutionRunReference;
+  }
+
+  private retainRunReference(reference: ExecutionRunReference): void {
+    const key = runReferenceKey(reference);
+    const existing = this.runReferences.get(key);
+    if (existing !== undefined) {
+      if (!sameRunReference(existing, reference)) this.runReferenceConflicts += 1;
+      return;
+    }
+    if (this.runReferences.size >= EXECUTION_RUN_REFERENCE_LIMIT) {
+      this.runReferenceRejectedByCount += 1;
+      this.runReferenceLimitReached = true;
+      return;
+    }
+    const bytes = Buffer.byteLength(JSON.stringify(reference), "utf8");
+    if (this.runReferenceBytes + bytes > EXECUTION_RUN_REFERENCE_TOTAL_BYTES_LIMIT) {
+      this.runReferenceRejectedByBytes += 1;
+      this.runReferenceLimitReached = true;
+      return;
+    }
+    this.runReferences.set(key, copyRunReference(reference));
+    this.runReferenceBytes += bytes;
   }
 
   /**
@@ -1923,6 +2106,8 @@ export class ExecutionAdapter {
     let finalAuditSent = false;
     let runId: string | undefined;
     let preparedRoot: string | undefined;
+    let runReferenceCandidate: ExecutionRunReference | undefined;
+    let finalRecordWriteUnconfirmed = false;
     let dispatchTaskId: string | undefined;
     let dispatchTaskRevision: number | undefined;
     let possiblyDispatched = false;
@@ -2149,6 +2334,13 @@ export class ExecutionAdapter {
       } else {
         rejections = [{ relativePath: ".", reason: "process group not verified gone; no artifact export" }];
       }
+      // Freeze the bounded reference before the remaining host callbacks. It
+      // becomes claimable only after the final write return and outer cleanup.
+      try {
+        runReferenceCandidate = this.buildRunReference(frozenTask, prepared, artifacts);
+      } catch {
+        this.runReferenceInvalid += 1;
+      }
       const bindingAtRecord = this.owner.bindingStatus();
       let taskAtRecord: ManagedTask | undefined;
       try {
@@ -2212,6 +2404,7 @@ export class ExecutionAdapter {
         this.recordWriter(recordPath, record);
         finalHostRecordConfirmed = true;
       } catch (error) {
+        finalRecordWriteUnconfirmed = true;
         finalRecordError = `final host record write failed: ${errorMessage(error)}`;
         safeAudit(this.audit, { type: "execution_record_write_failed", runId, error: finalRecordError });
         // A missing final record means the durable completion account is
@@ -2510,6 +2703,24 @@ export class ExecutionAdapter {
       } finally {
         this.busy = false;
         this.busyTask = null;
+      }
+      // A possibly or actually dispatched run without a normally-returned
+      // final record is counted once, separately from invalid/limit rejections.
+      // Zero references must not be read as proof that no external side effect
+      // occurred.
+      if (attemptedDispatch && possiblyDispatched && !finalHostRecordConfirmed) {
+        this.runReferencePossiblyDispatchedWithoutConfirmedFinalRecord += 1;
+      }
+      if (finalRecordWriteUnconfirmed) this.runReferenceFinalWriteUnconfirmed += 1;
+      // The reference enters the claimable snapshot only after busy and the
+      // reservation were released. A final writer throw never reaches here
+      // with finalHostRecordConfirmed, so no write return is invented.
+      if (runReferenceCandidate !== undefined && finalHostRecordConfirmed) {
+        try {
+          this.retainRunReference(runReferenceCandidate);
+        } catch {
+          this.runReferenceInvalid += 1;
+        }
       }
     }
   }
