@@ -16,10 +16,10 @@ bun run test:daily
 bun run test:package-entry
 ```
 
-Focused G3-A local history checks:
+Focused G3-A/B1 local history checks:
 
 ```sh
-bun test test/unit/history-projection.test.ts test/unit/history-evidence.test.ts
+bun test test/unit/history-session.test.ts test/unit/daily-entry.test.ts test/unit/history-projection.test.ts test/unit/history-evidence.test.ts
 ```
 
 `check` runs TypeScript checks, unit tests, and `test:human-review` in a separate Bun process. The isolated human-review suite substitutes review transport while exercising actual execution, verification, delivery, and record installation. Component checks separately exercise display logic and context guards. It is an engineering simulation, not evidence of real user approval.
@@ -31,6 +31,7 @@ For entry/job native failures, set `OMP_AGENT_B1_EVIDENCE_ROOT` to an absolute t
 ## What the tests establish
 
 - Task ownership, requirement changes, session binding, and capability admission.
+- B1 host capture and native-locator lifecycle: committed-event-only capture, bounded pending queues, exact main-context publication, complete requirement-source validation, native custom-entry and branch/leaf checks, unknown append outcomes, and navigation/disposal invalidation.
 - Bounded local execution, watchdog behavior, cancellation, and completion accounting.
 - Candidate provenance, immutable verification contracts, and honest coverage reporting.
 - Delivery file identity, exact byte checks, bounded previews, and idempotent reads.
@@ -88,9 +89,15 @@ For daily RPC failures, set `OMP_AGENT_DAILY_EVIDENCE_ROOT` to an absolute test-
 
 The focused checks use real `TaskOwner` creation, revision, cancellation and snapshots. They cover complete requirement ledgers, stable selectors, defensive copies, conflicting revisions, schema and identity mismatches, bounded retention without eviction, and refusal to adopt an unknown pre-existing index. Archived-run checks use independent fixed source, input and artifact bytes and the existing run layout. They cover exact identity binding, selected artifact subsets, missing or changed files, unsafe paths, unknown versions and incomplete process-control records. An accepted reference remains recorded data only.
 
-The current focused invocation passes 10 tests and 364 assertions; type checking passes. Two fault tests spawn isolated Bun children so filesystem interception does not affect the parent test process. They confirm that a first publication followed by a read failure reports `unknown`, leaves the expected bytes installed and refuses adoption on retry. Partial writes complete through the write loop; a partial write followed by EIO or a zero-byte return before replacement preserves the previous index. Each injected fault must actually fire, and the parent checks real file bytes, link count, cleanup and retry outcomes. Separate independent probes also reject observable same-inode mutations and changes to a source or history item while a later input is being read; these supplementary probes are not permanent unit-test coverage.
+The B1 checks use real `TaskOwner` start, revision and cancellation commits with actual-shaped branches and narrow host session fixtures. Positive checks confirm immediate capture of start, revise, cancel and a second task; exact allowlisted native locators published once from a main `agent_end`; old rows retained after the current task moves; unchanged owner grants and no new tool-catalog entry. Negative checks cover reentrant or mismatched events, false or missing genuine sources, wrong session/workspace/agent kind, missing host APIs, ordinary projection failures versus a projection error coded `unknown` classified as possibly applied with future capture disabled, failed or ambiguous appends, repeated events, pre-append branch rewrites, duplicate ids, navigation or disposal during `ensureOnDisk`, timeouts with late resolution, bounded queue overflow without eviction, and disposal invalidation. Ordinary `agent_end` with no pending item performs no persistence call or append.
 
-These checks use temporary test-owned files and do not invoke OMP or a model. G3-A is not yet wired into daily entry or model-visible tools. Checks before and after bounded reads detect observable changes; they do not provide a filesystem transaction, protection against arbitrary hostile concurrent replacement, or a guarantee against later mutation. No result here establishes session recovery, branch visibility, current process liveness, restored authority or task acceptance.
+The combined focused invocation passes 61 tests and 970 assertions; type checking passes. The B1 unknown-capture regression stubs the public `HistoryProjectionWriter.capture` method to inject its real error class; it is failure-injection mapping evidence only, not disk-publication evidence, and the scoped spy is restored in `finally`. Two A fault tests spawn isolated Bun children so filesystem interception does not affect the parent test process. They confirm that a first publication followed by a read failure reports `unknown`, leaves the expected bytes installed and refuses adoption on retry. Partial writes complete through the write loop; a partial write followed by EIO or a zero-byte return before replacement preserves the previous index. Each injected fault must actually fire, and the parent checks real file bytes, link count, cleanup and retry outcomes. Separate independent probes also reject observable same-inode mutations and changes to a source or history item while a later input is being read; these supplementary probes are not permanent unit-test coverage.
+
+The unit checks use temporary test-owned files and do not invoke OMP, a model or a PTY. The existing daily suite also passes three actual OMP RPC scenarios with 383 assertions; its `--no-session` mode does not establish persistent-session behavior.
+
+A separate, locally retained integration probe passes 21 checks on OMP 18.18.0 using one actual main TUI process, the default daily composition, one task prompt and a local deterministic provider. It binds the genuine user entry to the committed task and complete original requirement source, independently recomputes history digests, and requires one confirmed capture and one confirmed visible native locator without an unknown or incomplete outcome. After a normal shutdown command and exit, the physical session file retains the same locator and the history index bytes are unchanged. It uses an isolated four-tool profile and performs no managed script, verification, delivery or acceptance; it is not a language-model quality sample or a full native-tool catalog test. Two earlier fixture failures are retained: missing explicit Bun configuration and an incorrect assumption about the native reminder prefix in model-visible text. Only the private fixtures changed between these attempts.
+
+The `task_accepted` event is field-checked against the current snapshot and recorded reference (`acceptanceId`, `deliveryId`, `recordDigest`, `acceptedAt`), but no real accepted-task installation is exercised in this focused set; an accepted reference remains recorded data only. B1 has no query, resume, replay, authority-restoration or model-visible history feature. Normal-exit file retention does not establish crash durability or branch visibility across processes. Checks before and after bounded reads detect observable changes; they do not provide a filesystem transaction, protection against arbitrary hostile concurrent replacement, or a guarantee against later mutation. No result here establishes session recovery, current process liveness, restored authority or task acceptance.
 
 ## Package directory and artifact checks
 

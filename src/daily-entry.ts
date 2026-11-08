@@ -19,6 +19,10 @@ import {
   type ExecutionEntryControls,
 } from "./execution-entry.ts";
 import {
+  createHistorySession,
+  type HistorySessionControls,
+} from "./history-session.ts";
+import {
   clearPublishedTaskOwner,
   currentTaskOwner,
   type OmpToolContext,
@@ -78,6 +82,8 @@ export interface DailyEntryControls {
   instance: DailyInstance;
   owner: TaskOwner;
   execution: ExecutionEntryControls;
+  /** B1 capture and native-locator diagnostics; no query/resume surface exists. */
+  history: HistorySessionControls;
   isReady(): boolean;
   dispose(): void;
 }
@@ -109,6 +115,8 @@ interface DailyTool {
 export interface DailyOmpApi {
   on(event: string, handler: (event: unknown, context: OmpToolContext) => unknown): void;
   registerTool(tool: DailyTool): void;
+  /** Public OMP session custom-entry append; absent on older/minimal hosts. */
+  appendEntry?<T = unknown>(customType: string, data?: T): void;
   logger?: { warn(message: string, details?: unknown): void };
 }
 
@@ -305,12 +313,18 @@ export function createDailyEntry(pi: DailyOmpApi, options: DailyEntryOptions = {
   let disposed = false;
   let taskEntry: TaskEntryControls | undefined;
   let execution: ExecutionEntryControls | undefined;
+  let history: HistorySessionControls | undefined;
   let orphanOwner: TaskOwner | undefined;
 
   const disposeServices = (): void => {
     if (disposed) return;
     disposed = true;
     active = false;
+    try {
+      history?.dispose();
+    } catch (error) {
+      stderr("history_dispose_failed", { error: errorMessage(error) });
+    }
     try {
       execution?.dispose();
     } catch (error) {
@@ -360,6 +374,62 @@ export function createDailyEntry(pi: DailyOmpApi, options: DailyEntryOptions = {
         "The published managed task owner changed during task composition; refusing to let execution capture a replacement.",
       );
     }
+
+    // The history component subscribes synchronously to this owner before the
+    // composition is active. It captures only the four committed task events
+    // and publishes from the real main-agent end handler staged below.
+    const historyAudit = createFileAudit(instance.auditPath);
+    const createdHistory = createHistorySession({
+      owner: taskEntry.owner,
+      instanceRoot: instance.root,
+      instanceId: instance.instanceId,
+      workspaceRoot: config.workspaceRoot,
+      ...(pi.appendEntry === undefined ? {} : {
+        appendEntry: (customType: string, data?: unknown) => pi.appendEntry?.(customType, data),
+      }),
+      report: (type, details) => {
+        try {
+          historyAudit({ type: `history_${type}`, ...details });
+        } catch {
+          // The existing audit channel may be unavailable; capture continues.
+        }
+        if (type === "unknown" || type === "unavailable") {
+          try {
+            pi.logger?.warn(`history ${type}`, details);
+          } catch {
+            // Host logging is optional.
+          }
+        }
+      },
+    });
+    history = createdHistory;
+    if (currentTaskOwner() !== taskEntry.owner) {
+      throw new Error(
+        "The published managed task owner changed during history composition; refusing mixed services.",
+      );
+    }
+
+    // Navigation invalidates old pending locator eligibility before any later
+    // turn can look like a similar source. Subagent lifecycle events cannot
+    // consume the main composition's pending batch.
+    for (const eventName of ["session_start", "session_switch", "session_branch", "session_tree"] as const) {
+      staging.api.on(eventName, (_event, context) => {
+        if (context.agent?.kind === "sub") return undefined;
+        createdHistory.navigate(eventName);
+        return undefined;
+      });
+    }
+    // Registered after the task-entry agent_end handler because task entry
+    // staged its handlers first. Only this actual main-agent context may
+    // publish pending locators.
+    staging.api.on("agent_end", async (event, context) => {
+      try {
+        await createdHistory.handleAgentEnd(event, context);
+      } catch (error) {
+        stderr("history_agent_end_failed", { error: errorMessage(error) });
+      }
+      return undefined;
+    });
 
     const executionControls = createExecutionEntry(
       staging.api as unknown as Parameters<typeof createExecutionEntry>[0],
@@ -475,6 +545,7 @@ export function createDailyEntry(pi: DailyOmpApi, options: DailyEntryOptions = {
       instance,
       owner: taskEntry.owner,
       execution,
+      history: createdHistory,
       isReady: () => active,
       dispose: disposeServices,
     };

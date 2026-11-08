@@ -16,6 +16,8 @@ import {
   DailyConfigError,
   loadDailyConfig,
 } from "../../src/daily-config.ts";
+import { createHistoryProjectionReader } from "../../src/history-projection.ts";
+import { HISTORY_LOCATOR_CUSTOM_TYPE } from "../../src/history-session.ts";
 import {
   createDailyEntry,
   DAILY_GUIDANCE_TYPE,
@@ -125,6 +127,7 @@ function fakeHost(options: {
   failOnTool?: string;
   failOnHandler?: string;
   afterRegister?: (tool: RegisteredTool) => void;
+  appendEntry?: <T = unknown>(customType: string, data?: T) => void;
 } = {}): FakeHost {
   const tools = new Map<string, RegisteredTool>();
   const handlers = new Map<string, Handler[]>();
@@ -144,6 +147,7 @@ function fakeHost(options: {
       tools.set(tool.name, tool);
       options.afterRegister?.(tool);
     },
+    ...(options.appendEntry === undefined ? {} : { appendEntry: options.appendEntry }),
   } as DailyOmpApi;
   return { tools, handlers, pi };
 }
@@ -407,6 +411,15 @@ describe("daily composition", () => {
     expect(entry.execution.delivery?.deliveryRootPath()).toBe(entry.instance.deliveryRoot);
     expect(entry.execution.acceptance?.humanReviewConfigured()).toBe(false);
     expect(entry.owner.snapshot().authorizedCapabilities).toEqual(["local-script"]);
+    expect(entry.history.status()).toMatchObject({
+      capture: "ready",
+      locator: "unavailable",
+      captured: 0,
+      pending: 0,
+      visible: 0,
+      incomplete: 0,
+      unknown: 0,
+    });
 
     const state = JSON.parse(await readFile(entry.instance.statePath, "utf8")) as Record<string, unknown>;
     expect(state.schemaVersion).toBe(1);
@@ -707,5 +720,130 @@ describe("daily composition", () => {
     const entry = createDailyEntry(fakeHost().pi, { env: fx.env, launchWorkspace: fx.workspace });
     entries.push(entry);
     expect(entry.execution.acceptance?.humanReviewConfigured()).toBe(true);
+  });
+
+  test("daily history captures a real task commit and publishes one exact native locator from main agent_end", async () => {
+    const fx = await fixture();
+    const branch: Array<Record<string, unknown>> = [
+      { id: "leaf-1", parentId: null, type: "custom", customType: "fixture-base", data: {} },
+    ];
+    let leafId = "leaf-1";
+    let ensureCalls = 0;
+    const appendCalls: Array<{ customType: string; data: unknown }> = [];
+    const appendEntry = <T = unknown>(customType: string, data?: T): void => {
+      appendCalls.push({ customType, data });
+      const id = `locator-${appendCalls.length}`;
+      branch.push({ id, parentId: leafId, type: "custom", customType, data });
+      leafId = id;
+    };
+    const fake = fakeHost({ appendEntry });
+    const entry = createDailyEntry(fake.pi, { env: fx.env, launchWorkspace: fx.workspace });
+    entries.push(entry);
+    const sessionFile = path.join(fx.root, "history-session.jsonl");
+    const ctx: OmpToolContext = {
+      cwd: fx.workspace,
+      agent: { kind: "main" },
+      sessionManager: {
+        getSessionId: () => "daily-history-session",
+        getLeafId: () => leafId,
+        getBranch: () => branch.slice(),
+        getSessionFile: () => sessionFile,
+        ensureOnDisk: async () => { ensureCalls += 1; },
+      },
+    };
+
+    branch.push(userEntry("user-1", "leaf-1", "Own this history task."));
+    fake.handlers.get("input")![0]!({ text: "Own this history task.", source: "rpc" }, ctx);
+    startMessages(fake, ctx, "Own this history task.");
+    const started = await fake.tools.get(TASK_CONTROL_TOOL)!.execute(
+      "call-start",
+      { action: "start" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(started.isError).toBeUndefined();
+    const task = entry.owner.snapshot().currentTask!;
+    expect(entry.history.status()).toMatchObject({ captured: 1, pending: 1, visible: 0 });
+    expect(appendCalls).toHaveLength(0);
+
+    branch.push({
+      id: "assistant-1",
+      parentId: "user-1",
+      type: "message",
+      message: { role: "assistant", content: [{ type: "text", text: "working" }] },
+    });
+    leafId = "assistant-1";
+    const taskEnd = fake.handlers.get("agent_end")![0]!;
+    const historyEnd = fake.handlers.get("agent_end")![1]!;
+    expect(taskEnd).toBeDefined();
+    expect(historyEnd).toBeDefined();
+    taskEnd({
+      messages: [{
+        role: "user",
+        content: [{ type: "text", text: "Own this history task." }],
+        attribution: "user",
+        id: "user-1",
+      }],
+    }, ctx);
+    await historyEnd({}, ctx);
+
+    expect(ensureCalls).toBe(1);
+    expect(appendCalls).toHaveLength(1);
+    expect(appendCalls[0]!.customType).toBe(HISTORY_LOCATOR_CUSTOM_TYPE);
+    const locator = branch.at(-1)!;
+    expect(locator).toMatchObject({
+      type: "custom",
+      customType: HISTORY_LOCATOR_CUSTOM_TYPE,
+      parentId: "assistant-1",
+    });
+    expect(leafId).toBe(locator.id as string);
+    const reader = createHistoryProjectionReader({
+      instanceRoot: entry.instance.root,
+      instanceId: entry.instance.instanceId,
+      ownerId: entry.owner.ownerId,
+      workspaceRoot: entry.config.workspaceRoot,
+    });
+    const page = reader.list({ limit: 16 });
+    expect(page.total).toBe(1);
+    const data = locator.data as Record<string, unknown>;
+    expect(Object.keys(data).sort()).toEqual([
+      "digest",
+      "historyId",
+      "instanceId",
+      "originSessionId",
+      "ownerId",
+      "taskId",
+      "taskRevision",
+      "version",
+    ]);
+    expect(data).toEqual({
+      version: 1,
+      instanceId: entry.instance.instanceId,
+      ownerId: entry.owner.ownerId,
+      historyId: page.items[0]!.historyId,
+      digest: page.items[0]!.digest,
+      taskId: task.taskId,
+      taskRevision: 1,
+      originSessionId: "daily-history-session",
+    });
+    expect(entry.history.status()).toMatchObject({
+      pending: 0,
+      visible: 1,
+      incomplete: 0,
+      unknown: 0,
+    });
+    expect(entry.owner.snapshot().currentTask).toMatchObject({
+      taskId: task.taskId,
+      taskRevision: 1,
+      status: "active",
+    });
+    expect([...fake.tools.keys()].sort()).toEqual(
+      [TASK_CONTROL_TOOL, EXECUTION_TOOL, VERIFICATION_TOOL, DELIVERY_TOOL].sort(),
+    );
+
+    entry.dispose();
+    expect(entry.history.status().pending).toBe(0);
+    expect(entry.history.status().visible).toBe(1);
   });
 });

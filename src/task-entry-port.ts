@@ -11,6 +11,10 @@ export interface OmpSessionManager {
   getSessionId(): string;
   getLeafId(): string | null;
   getBranch(): readonly unknown[];
+  /** Public OMP 18.18 session-file path; absent when the host does not expose it. */
+  getSessionFile?(): string | undefined;
+  /** Public OMP 18.18 persistence request; a no-op for nonpersistent sessions. */
+  ensureOnDisk?(): Promise<void>;
 }
 
 export interface OmpCustomTerminal {
