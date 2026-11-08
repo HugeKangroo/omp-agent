@@ -325,7 +325,13 @@ export class AcceptanceContractStore {
     }
     const live = this.currentTask();
     if (!live) throw new AcceptanceContractError("No current owner task exists to bind a contract.");
-    if (live.status !== "active") throw new AcceptanceContractError("A cancelled task cannot bind an acceptance contract.");
+    if (live.status !== "active") {
+      throw new AcceptanceContractError(
+        live.status === "accepted"
+          ? "An accepted task is terminal and cannot bind another acceptance contract."
+          : "A cancelled task cannot bind an acceptance contract.",
+      );
+    }
     const liveTask: FrozenTaskRef = {
       ownerId: live.ownerId,
       taskId: live.taskId,

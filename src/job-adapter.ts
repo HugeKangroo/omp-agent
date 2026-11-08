@@ -691,7 +691,11 @@ export class JobAdapter {
         );
       }
       if (scope.taskStatus !== "active") {
-        throw new JobAdapterError("New job submission is denied: the task is cancelled.");
+        throw new JobAdapterError(
+          scope.taskStatus === "accepted"
+            ? "New job submission is denied: the task is already accepted."
+            : "New job submission is denied: the task is cancelled.",
+        );
       }
       if (existing.taskRevision !== scope.taskRevision) {
         throw new JobAdapterError(

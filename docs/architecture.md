@@ -12,6 +12,7 @@
 | Candidate registry | Registers execution artifacts and checks their origin, identity, size, and digest |
 | Verification service | Applies host-configured contracts and trusted checks to registered candidates |
 | Delivery service | Creates read-only artifact copies, requirement records, and a manifest; checks files before returning a preview |
+| Acceptance service and record store | Rechecks complete host evidence, reserves task acceptance, installs a record once, and separates commit facts from current visibility and file integrity |
 | Job adapter | Exercises submission, reconciliation, and cancellation semantics against an explicitly configured service |
 
 The default package entry is a managed integration probe. The task, execution, and job entries are loaded explicitly in isolated test environments.
@@ -30,7 +31,9 @@ A verification contract is bound by the host. The model cannot select a weaker v
 
 Delivery selects registered candidates from a particular run. The service checks the original evidence, creates separate read-only files, and checks the copied bytes. A delivery includes the requirement sources and a manifest. Repeated requests check the existing files before returning the same bundle.
 
-Delivery preview and final task acceptance are distinct. The published experimental interface currently exposes verification and preview; a successful preview does not imply final acceptance.
+Delivery preview and final task acceptance are distinct. The experimental model interface currently exposes verification and preview. An explicitly configured host acceptance API rechecks complete semantic coverage, a matching current pass receipt, task revision, and actual file identities. It installs a record without replacing an existing target before transitioning the owner to accepted. Late notification or maintenance failures cannot reverse a completed commit; an uncertain outcome remains unknown and blocks further mutation.
+
+Accepted records and delivery integrity are separate facts. Later damage does not erase historical acceptance. Model submission and accepted-file inspection are the next interface increment; a successful preview alone does not imply acceptance.
 
 ## Current limits
 

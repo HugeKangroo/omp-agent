@@ -37,6 +37,7 @@ export type VerificationCompatibility =
   | "other-owner"
   | "detached"
   | "cancelled"
+  | "accepted"
   | "requirements-changed"
   | "candidate-changed"
   | "contract-changed"
@@ -496,6 +497,7 @@ export class VerificationService {
     if (live.task.ownerId !== receiptTask.ownerId) return "other-owner";
     if (live.task.taskId !== receiptTask.taskId) return "other-task";
     if (live.task.taskRevision !== receiptTask.taskRevision) return "stale-revision";
+    if (live.task.status === "accepted") return "accepted";
     if (live.task.status !== "active") return "cancelled";
     if (live.branchError !== null) return "detached";
     if (requirementsDigest(live.task.requirementSources) !== receiptTask.requirementsDigest) return "requirements-changed";
@@ -643,7 +645,11 @@ export class VerificationService {
       return this.rejection("expectedTaskRevision does not match the current task revision");
     }
     if (live.task.status !== "active") {
-      return this.rejection("the current task is cancelled");
+      return this.rejection(
+        live.task.status === "accepted"
+          ? "the current task is accepted and terminal"
+          : "the current task is cancelled",
+      );
     }
     if (live.branchError !== null) {
       return this.rejection(live.branchError);

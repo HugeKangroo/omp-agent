@@ -14,7 +14,7 @@ export const MAX_TASK_CONTEXT_BYTES = 128 * 1024;
 export interface TaskContextTask {
   taskId: string;
   taskRevision: number;
-  status: "active" | "cancelled";
+  status: "active" | "cancelled" | "accepted";
   createdAt: string;
   cancelledAt: string | null;
   anchor: {
@@ -54,7 +54,7 @@ export interface TaskContextUnavailable {
   task: {
     taskId: string;
     taskRevision: number;
-    status: "active" | "cancelled";
+    status: "active" | "cancelled" | "accepted";
   };
   binding: {
     state: BindingStatus["state"];
@@ -139,7 +139,7 @@ export function buildTaskContextMessage(input: TaskContextInput, timestamp: numb
  */
 export function buildUnavailableTaskContextMessage(input: {
   reason: string;
-  task?: { taskId: string; taskRevision: number; status: "active" | "cancelled" };
+  task?: { taskId: string; taskRevision: number; status: "active" | "cancelled" | "accepted" };
   binding?: { state: BindingStatus["state"]; reason: string | null };
 }, timestamp: number): TaskContextEnvelope {
   const marker: TaskContextUnavailable = {

@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { constants, existsSync, realpathSync } from "node:fs";
+import { accessSync, constants, existsSync, realpathSync } from "node:fs";
 import type { Duplex } from "node:stream";
 import {
   lstat,
@@ -388,6 +388,28 @@ function withheldRegistrationError(error: unknown): string {
 function absolute(value: string, label: string): string {
   if (!path.isAbsolute(value)) throw new ExecutionAdapterError(`${label} must be absolute.`);
   return value;
+}
+
+/** Host-local Bun discovery used only when no explicit bunPath is configured. */
+export function discoverBunPath(): string {
+  const runtime = process.execPath;
+  if (runtime && /^bun(?:\.exe)?$/i.test(path.basename(runtime))) return runtime;
+  const bun = (globalThis as { Bun?: { which?: (name: string) => string | null } }).Bun;
+  if (bun !== undefined && typeof bun.which === "function") {
+    const found = bun.which("bun");
+    if (found !== null && found !== "") return found;
+  }
+  for (const directory of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (!directory) continue;
+    const candidate = path.join(directory, process.platform === "win32" ? "bun.exe" : "bun");
+    try {
+      accessSync(candidate, constants.X_OK);
+      return candidate;
+    } catch {
+      // Keep searching; absence is reported below, never replaced by a personal path.
+    }
+  }
+  throw new ExecutionAdapterError("No host Bun executable was found; configure bunPath explicitly.");
 }
 
 function positiveInteger(value: unknown, label: string): number {
@@ -1490,7 +1512,7 @@ export class ExecutionAdapter {
       config.pythonPath ?? "/Library/Developer/CommandLineTools/usr/bin/python3",
       "Host Python path",
     );
-    this.bunPath = absolute(config.bunPath ?? "/Users/joey/.bun/bin/bun", "Host Bun path");
+    this.bunPath = absolute(config.bunPath ?? discoverBunPath(), "Host Bun path");
     this.launcherPath = absolute(
       config.launcherPath ?? path.resolve(import.meta.dir, "../scripts/isolated-exec.py"),
       "Trusted launcher path",

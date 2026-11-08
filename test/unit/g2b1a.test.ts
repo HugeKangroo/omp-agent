@@ -24,7 +24,7 @@ import {
 const SESSION = "g2b1a-session";
 const NOW = "2026-11-08T00:00:00.000Z";
 const PYTHON = "/Library/Developer/CommandLineTools/usr/bin/python3";
-const BUN = "/Users/joey/.bun/bin/bun";
+const BUN = process.execPath;
 const LAUNCHER = path.resolve(import.meta.dir, "../../scripts/isolated-exec.py");
 
 type Entry = Record<string, unknown> & { id: string; parentId: string | null };

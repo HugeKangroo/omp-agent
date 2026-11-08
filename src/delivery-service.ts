@@ -1,12 +1,26 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants, existsSync, lstatSync, mkdirSync, realpathSync, statSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  existsSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { lstat, mkdir, open, readdir, realpath, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import type { AcceptanceContract } from "./acceptance-contract.ts";
 import {
   CandidateError,
+  checkCandidateSnapshotSealSync,
   type CandidateReadPort,
   type CandidateSnapshot,
+  type CandidateSnapshotSealToken,
   type FileIdentity,
   type FrozenTaskRef,
 } from "./execution-candidates.ts";
@@ -121,6 +135,88 @@ export interface DeliveryRecheckOutcome {
   receiptId: string | null;
   receiptOutcome: string | null;
   checkedAt: string;
+}
+
+/** Contract evidence without verifier parameters or functions. */
+export interface AcceptanceContractEvidence {
+  contractId: string;
+  digest: string;
+  task: FrozenTaskRef;
+  hostConfig: { id: string; version: string };
+  verifier: { id: string; version: string; parametersDigest: string };
+  conditions: Array<{
+    conditionId: string;
+    description: string;
+    kind: "semantic" | "integrity";
+    coveredRevisions: number[];
+  }>;
+  coverage: {
+    kind: "semantic" | "integrity";
+    complete: boolean;
+    coveredRevisions: number[];
+    statement: string;
+  };
+  boundAt: string;
+}
+
+export interface AcceptanceCandidateEvidence {
+  snapshotId: string;
+  runId: string;
+  callId: string;
+  source: { bytes: number; sha256: string };
+  inputs: Array<{ id: string; bytes: number; sha256: string }>;
+  artifacts: Array<{ artifactId: string; relativePath: string; bytes: number; sha256: string }>;
+  provenance: CandidateSnapshot["provenance"];
+}
+
+export interface AcceptanceEvidence {
+  deliveryId: string;
+  task: FrozenTaskRef;
+  runId: string;
+  artifactIds: string[];
+  deliverySnapshotId: string;
+  receiptSnapshotId: string | null;
+  contract: AcceptanceContractEvidence | null;
+  receipt: VerificationReceipt | null;
+  receiptDigest: string | null;
+  receiptCompatibility: string | null;
+  receiptUsable: boolean;
+  candidate: AcceptanceCandidateEvidence;
+  files: DeliveryFileRow[];
+  manifest: { name: string; bytes: number; sha256: string };
+  requirements: { name: string; bytes: number; sha256: string };
+  previewDigest: string;
+  checkedAt: string;
+}
+
+export interface AcceptanceEvidenceSelector {
+  expectedTaskId: string;
+  expectedTaskRevision: number;
+  deliveryId: string;
+}
+
+export interface AcceptedDeliveryInspection {
+  state: "intact" | "changed" | "unavailable";
+  reason: string | null;
+  files: DeliveryFileRow[] | null;
+}
+
+/** Opaque host-only evidence token; only the issuing service can seal it. */
+export interface AcceptanceEvidenceToken {
+  readonly kind: "delivery-acceptance-evidence";
+}
+
+const evidenceSeals = new WeakMap<object, () => string | null>();
+
+/** Fixed synchronous seal of actual delivered files plus candidate originals. */
+export function sealAcceptanceEvidenceTokenSync(token: AcceptanceEvidenceToken): string | null {
+  const seal = typeof token === "object" && token !== null ? evidenceSeals.get(token) : undefined;
+  if (seal === undefined) return "the acceptance evidence token was not issued by the delivery service";
+  try {
+    return seal();
+  } catch (error) {
+    return errorMessage(error);
+  }
 }
 
 export interface DeliveryServiceOptions {
@@ -425,6 +521,33 @@ function contractSummary(contract: AcceptanceContract, limits: SummaryTextLimits
         descriptionTruncated: description.truncated,
       };
     }),
+  };
+}
+
+function acceptanceContractEvidence(contract: AcceptanceContract): AcceptanceContractEvidence {
+  return {
+    contractId: contract.contractId,
+    digest: contract.digest,
+    task: copyTask(contract.task),
+    hostConfig: { ...contract.hostConfig },
+    verifier: {
+      id: contract.verifier.id,
+      version: contract.verifier.version,
+      parametersDigest: contract.verifier.parametersDigest,
+    },
+    conditions: contract.conditions.map((condition) => ({
+      conditionId: condition.conditionId,
+      description: condition.description,
+      kind: condition.kind,
+      coveredRevisions: [...condition.coveredRevisions],
+    })),
+    coverage: {
+      kind: contract.coverage.kind,
+      complete: contract.coverage.complete,
+      coveredRevisions: [...contract.coverage.coveredRevisions],
+      statement: contract.coverage.statement,
+    },
+    boundAt: contract.boundAt,
   };
 }
 
@@ -870,6 +993,111 @@ async function readBundleFile(
   }
 }
 
+function directoryChainSync(
+  root: DeliveryRoot,
+  target: string,
+  expected?: readonly DirectoryIdentity[],
+): DirectoryIdentity[] {
+  const relative = path.relative(root.path, target);
+  if (relative.startsWith("..") || path.isAbsolute(relative)) {
+    throw new DeliveryError("A delivery path is outside the host-configured root.");
+  }
+  for (const component of root.chain) {
+    const info = lstatSync(component.path);
+    if (info.isSymbolicLink()
+      || !info.isDirectory()
+      || info.dev !== component.dev
+      || info.ino !== component.ino) {
+      throw new DeliveryError("A canonical delivery root ancestor was replaced after configuration.");
+    }
+  }
+  const chain: DirectoryIdentity[] = [];
+  const rootInfo = lstatSync(root.path);
+  if (rootInfo.isSymbolicLink()
+    || !rootInfo.isDirectory()
+    || rootInfo.dev !== root.dev
+    || rootInfo.ino !== root.ino) {
+    throw new DeliveryError("The delivery root was replaced after configuration.");
+  }
+  chain.push({ path: root.path, dev: rootInfo.dev, ino: rootInfo.ino });
+  if (relative !== "") {
+    let current = root.path;
+    for (const segment of relative.split(path.sep)) {
+      if (segment.length === 0 || segment === "." || segment === "..") {
+        throw new DeliveryError("A delivery path chain is invalid.");
+      }
+      current = path.join(current, segment);
+      const info = lstatSync(current);
+      if (info.isSymbolicLink() || !info.isDirectory()) {
+        throw new DeliveryError("A delivery path chain contains a link or non-directory.");
+      }
+      chain.push({ path: current, dev: info.dev, ino: info.ino });
+    }
+  }
+  if (expected !== undefined) {
+    if (expected.length !== chain.length) throw new DeliveryError("A delivery directory chain changed after publication.");
+    for (let index = 0; index < chain.length; index += 1) {
+      const actual = chain[index]!;
+      const recorded = expected[index]!;
+      if (actual.path !== recorded.path || actual.dev !== recorded.dev || actual.ino !== recorded.ino) {
+        throw new DeliveryError("A delivery directory was replaced after publication.");
+      }
+    }
+  }
+  return chain;
+}
+
+function readBundleFileSync(
+  root: DeliveryRoot,
+  filePath: string,
+  expectedDirectories: readonly DirectoryIdentity[],
+  maxBytes: number,
+): { record: BundleFileRecord; data: Buffer } {
+  directoryChainSync(root, path.dirname(filePath), expectedDirectories);
+  const before = lstatSync(filePath);
+  if (before.isSymbolicLink()) throw new DeliveryError("A delivery file is a symbolic link.");
+  if (!before.isFile()) throw new DeliveryError("A delivery file is not an ordinary file.");
+  if (before.nlink !== 1) throw new DeliveryError("A delivery file has multiple hard links.");
+  if (before.size > maxBytes) throw new DeliveryError("A delivery file exceeds its byte budget.");
+  const handle = openSync(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = fstatSync(handle);
+    if (!opened.isFile()
+      || opened.nlink !== 1
+      || opened.dev !== before.dev
+      || opened.ino !== before.ino
+      || opened.size !== before.size) {
+      throw new DeliveryError("A delivery file changed before it was opened.");
+    }
+    const buffer = Buffer.alloc(opened.size + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const read = readSync(handle, buffer, offset, buffer.length - offset, offset);
+      if (read === 0) break;
+      offset += read;
+    }
+    if (offset !== opened.size) throw new DeliveryError("A delivery file changed while it was read.");
+    const after = lstatSync(filePath);
+    if (after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size || after.nlink !== 1) {
+      throw new DeliveryError("A delivery file changed during the read.");
+    }
+    const data = Buffer.from(buffer.subarray(0, offset));
+    const digest = sha256(data);
+    return {
+      record: {
+        name: path.basename(filePath),
+        path: filePath,
+        bytes: data.length,
+        sha256: digest,
+        identity: { dev: opened.dev, ino: opened.ino, size: opened.size, sha256: digest },
+      },
+      data,
+    };
+  } finally {
+    closeSync(handle);
+  }
+}
+
 async function writeBundleFile(
   root: DeliveryRoot,
   directory: string,
@@ -1001,6 +1229,7 @@ export class DeliveryService {
     } catch {
       return "no managed task is reachable from the current main-session branch";
     }
+    if (task.status === "accepted") return "the current managed task is accepted and terminal";
     if (task.status !== "active") return "the current managed task is cancelled";
     return null;
   }
@@ -1271,13 +1500,12 @@ export class DeliveryService {
     return summary;
   }
 
-  private validateReceipt(
+  private validateReceiptFacts(
     found: VerificationLookup,
     expected: FrozenTaskRef,
     runId: string,
     snapshot: CandidateSnapshot,
-    limits: SummaryTextLimits,
-  ): ReceiptSummary {
+  ): VerificationReceipt {
     if (found.compatibility === "unavailable") {
       throw new DeliveryError("the referenced verification receipt was withheld because the live context changed.");
     }
@@ -1327,6 +1555,17 @@ export class DeliveryService {
         throw new DeliveryError("the referenced verification receipt's input digests do not match this run.");
       }
     }
+    return receipt;
+  }
+
+  private validateReceipt(
+    found: VerificationLookup,
+    expected: FrozenTaskRef,
+    runId: string,
+    snapshot: CandidateSnapshot,
+    limits: SummaryTextLimits,
+  ): ReceiptSummary {
+    const receipt = this.validateReceiptFacts(found, expected, runId, snapshot);
     return receiptSummary(receipt, found.compatibility, found.usable, limits);
   }
 
@@ -2159,6 +2398,240 @@ export class DeliveryService {
       return { result: rejection(safe, { action: "preview" }) };
     } finally {
       this.release();
+    }
+  }
+
+  /** Host-only path used to prove the acceptance root is a distinct sibling. */
+  deliveryRootPath(): string {
+    return this.root.path;
+  }
+
+  /**
+   * Host-only acceptance evidence read. It returns complete actual contract,
+   * receipt and candidate facts plus an opaque token whose synchronous seal
+   * re-reads originals, manifest, requirements and delivered files.
+   */
+  async readAcceptanceEvidence(
+    context: OmpToolContext,
+    selector: AcceptanceEvidenceSelector,
+    signal?: AbortSignal,
+  ): Promise<{ evidence: AcceptanceEvidence; token: AcceptanceEvidenceToken }> {
+    if (this.disposed) throw new DeliveryError("the delivery service is disposed.");
+    if (signal?.aborted) throw new DeliveryError("the acceptance evidence read was aborted before admission.");
+    const expectedTaskId = identifier(selector.expectedTaskId, "expectedTaskId");
+    const expectedTaskRevision = positiveRevision(selector.expectedTaskRevision);
+    const deliveryId = identifier(selector.deliveryId, "deliveryId");
+    const reason = this.readReason(context);
+    if (reason !== null) throw new DeliveryError(`${reason}.`);
+    const task = this.readTask(context, true);
+    if (task === null) throw new DeliveryError("the current managed task is not reachable and active.");
+    if (task.taskId !== expectedTaskId) throw new DeliveryError("expectedTaskId does not match the current task.");
+    if (task.taskRevision !== expectedTaskRevision) {
+      throw new DeliveryError(`stale expectedTaskRevision ${expectedTaskRevision}; the owner is at ${task.taskRevision}.`);
+    }
+    const expected = frozenOf(task);
+    const record = this.records.get(deliveryId);
+    if (record === undefined) throw new DeliveryError("The delivery id is not registered by this service instance.");
+    if (!sameFrozen(record.task, expected)) {
+      throw new DeliveryError("The registered delivery belongs to a different task identity.");
+    }
+    const snapshot = await this.candidates.recheckSnapshot(record.snapshotId, expected);
+    this.abortCheckpoint(signal, "the acceptance evidence read was aborted while the frozen candidate was rechecked.");
+    if (this.finalGuard(context, expected) !== null) throw new DeliveryError("The live task changed during the acceptance evidence read.");
+    const bundle = await this.verifyBundle(record);
+    this.abortCheckpoint(signal, "the acceptance evidence read was aborted while the delivered files were verified.");
+    if (this.finalGuard(context, expected) !== null) throw new DeliveryError("The live task changed during the acceptance evidence read.");
+
+    let current: { task: FrozenTaskRef; contract: AcceptanceContract | null };
+    try {
+      current = this.currentContractPort(context);
+    } catch (error) {
+      throw isBusyError(error)
+        ? new DeliveryError("verification is busy; the acceptance evidence read was rejected without queueing.", true)
+        : new DeliveryError("the current host contract is unavailable.");
+    }
+    if (!sameFrozen(current.task, expected)) {
+      throw new DeliveryError("the current task identity changed during the acceptance evidence read.");
+    }
+    const contractDigest = current.contract?.digest ?? null;
+    if (contractDigest !== record.contractDigest) {
+      throw new DeliveryError("The current host contract changed after delivery registration.");
+    }
+    let receipt: VerificationReceipt | null = null;
+    let receiptCompatibility: string | null = null;
+    let receiptUsable = false;
+    if (record.receiptId !== null) {
+      let found: VerificationLookup | null;
+      try {
+        found = await this.lookupPort(context, record.receiptId);
+      } catch (error) {
+        throw isBusyError(error)
+          ? new DeliveryError("verification is busy; the acceptance evidence read was rejected without queueing.", true)
+          : new DeliveryError("the referenced verification receipt is unavailable.");
+      }
+      if (found === null) throw new DeliveryError("the referenced verification receipt is unknown.");
+      receipt = this.validateReceiptFacts(found, expected, record.runId, snapshot);
+      receiptCompatibility = found.compatibility;
+      receiptUsable = found.usable;
+      this.abortCheckpoint(signal, "the acceptance evidence read was aborted while the verification receipt was read.");
+      if (this.finalGuard(context, expected) !== null) throw new DeliveryError("The live task changed during the acceptance evidence read.");
+    } else if (record.receiptDigest !== null) {
+      throw new DeliveryError("The delivery's referenced receipt identity changed.");
+    }
+    const artifactIds = [...record.artifactIds];
+    const evidence: AcceptanceEvidence = {
+      deliveryId,
+      task: copyTask(expected),
+      runId: record.runId,
+      artifactIds,
+      deliverySnapshotId: record.snapshotId,
+      receiptSnapshotId: receipt?.candidates.snapshotId ?? null,
+      contract: current.contract === null ? null : acceptanceContractEvidence(current.contract),
+      receipt,
+      receiptDigest: receipt === null ? null : sha256(JSON.stringify(receipt)),
+      receiptCompatibility,
+      receiptUsable,
+      candidate: {
+        snapshotId: snapshot.snapshotId,
+        runId: snapshot.runId,
+        callId: snapshot.callId,
+        source: { bytes: snapshot.source.bytes, sha256: snapshot.source.sha256 },
+        inputs: snapshot.inputs.map((input) => ({ id: input.id, bytes: input.bytes, sha256: input.sha256 })),
+        artifacts: snapshot.artifacts.map((artifact) => ({
+          artifactId: artifact.artifactId,
+          relativePath: artifact.relativePath,
+          bytes: artifact.bytes,
+          sha256: artifact.sha256,
+        })),
+        provenance: { ...snapshot.provenance },
+      },
+      files: this.renderFileRows(record),
+      manifest: {
+        name: DELIVERY_MANIFEST_NAME,
+        bytes: bundle.manifest.bytes,
+        sha256: bundle.manifest.sha256,
+      },
+      requirements: {
+        name: DELIVERY_REQUIREMENTS_NAME,
+        bytes: bundle.requirements.bytes,
+        sha256: bundle.requirements.sha256,
+      },
+      previewDigest: record.previewDigest,
+      checkedAt: this.now(),
+    };
+    if (evidence.receipt !== null && evidence.receipt.candidates.snapshotId !== record.snapshotId) {
+      // Verification and preview legitimately resolve separate snapshots;
+      // evidence is compared by bytes/digests, not required snapshot id equality.
+      evidence.receiptSnapshotId = evidence.receipt.candidates.snapshotId;
+    }
+    if (typeof this.candidates.sealSnapshot !== "function") {
+      throw new DeliveryError("the candidate registry cannot issue a synchronous acceptance seal.");
+    }
+    const candidateSeal = this.candidates.sealSnapshot(record.snapshotId, expected);
+    const rootEntry = { path: this.root.path, dev: this.root.dev, ino: this.root.ino };
+    const token: AcceptanceEvidenceToken = Object.freeze({ kind: "delivery-acceptance-evidence" as const });
+    evidenceSeals.set(token, (): string | null => {
+      try {
+        if (this.disposed) return "the issuing delivery service is disposed";
+        directoryChainSync(this.root, record.bundleDir, [rootEntry, record.bundleIdentity]);
+        const entries = readdirSync(record.bundleDir);
+        const expectedNames = new Set([
+          DELIVERY_MANIFEST_NAME,
+          DELIVERY_REQUIREMENTS_NAME,
+          ...record.files.map((file) => file.name),
+        ]);
+        if (entries.length !== expectedNames.size || entries.some((entry) => !expectedNames.has(entry))) {
+          return "the published delivery directory contains an unexpected entry";
+        }
+        const directories = [rootEntry, record.bundleIdentity];
+        for (const file of record.files) {
+          const read = readBundleFileSync(
+            this.root,
+            path.join(record.bundleDir, file.name),
+            directories,
+            MAX_DELIVERY_ARTIFACT_BYTES,
+          );
+          const recorded = record.fileIdentities.get(file.name);
+          if (recorded === undefined
+            || recorded.dev !== read.record.identity.dev
+            || recorded.ino !== read.record.identity.ino
+            || recorded.size !== read.record.identity.size
+            || recorded.sha256 !== read.record.identity.sha256
+            || file.bytes !== read.record.bytes
+            || file.sha256 !== read.record.sha256) {
+            return "a published delivery file changed after registration";
+          }
+        }
+        const manifest = readBundleFileSync(
+          this.root,
+          record.manifest.path,
+          directories,
+          MAX_DELIVERY_MANIFEST_BYTES,
+        );
+        if (manifest.record.bytes !== record.manifest.bytes
+          || manifest.record.sha256 !== record.manifest.sha256
+          || manifest.record.identity.dev !== record.manifest.identity.dev
+          || manifest.record.identity.ino !== record.manifest.identity.ino
+          || manifest.record.identity.size !== record.manifest.identity.size
+          || manifest.record.identity.sha256 !== record.manifest.identity.sha256) {
+          return "the published delivery manifest changed after registration";
+        }
+        const requirements = readBundleFileSync(
+          this.root,
+          record.requirements.path,
+          directories,
+          MAX_DELIVERY_REQUIREMENTS_BYTES,
+        );
+        if (requirements.record.bytes !== record.requirements.bytes
+          || requirements.record.sha256 !== record.requirements.sha256
+          || requirements.record.identity.dev !== record.requirements.identity.dev
+          || requirements.record.identity.ino !== record.requirements.identity.ino
+          || requirements.record.identity.size !== record.requirements.identity.size
+          || requirements.record.identity.sha256 !== record.requirements.identity.sha256) {
+          return "the published delivery requirements changed after registration";
+        }
+        let manifestValue: unknown;
+        try {
+          manifestValue = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(manifest.data));
+        } catch {
+          return "the published delivery manifest is not valid UTF-8 JSON";
+        }
+        if (typeof manifestValue !== "object" || manifestValue === null || Array.isArray(manifestValue)) {
+          return "the published delivery manifest is not an object";
+        }
+        const value = manifestValue as Record<string, unknown>;
+        if (value.deliveryId !== record.deliveryId
+          || value.previewDigest !== record.previewDigest
+          || JSON.stringify(value.previewPayload) !== JSON.stringify(record.previewPayload)
+          || sha256(JSON.stringify(value.previewPayload)) !== record.previewDigest) {
+          return "the published delivery preview payload or digest changed";
+        }
+        return checkCandidateSnapshotSealSync(candidateSeal);
+      } catch (error) {
+        return errorMessage(error);
+      }
+    });
+    return { evidence, token };
+  }
+
+  /** Read-only bundle check used by accepted history inspection. */
+  async inspectAcceptedDelivery(
+    expected: FrozenTaskRef,
+    deliveryId: string,
+  ): Promise<AcceptedDeliveryInspection> {
+    if (this.disposed) return { state: "unavailable", reason: "the delivery service is disposed", files: null };
+    const record = this.records.get(deliveryId);
+    if (record === undefined) {
+      return { state: "unavailable", reason: "the delivery id is not registered by this service instance", files: null };
+    }
+    if (!sameFrozen(record.task, expected)) {
+      return { state: "unavailable", reason: "the registered delivery belongs to a different task identity", files: null };
+    }
+    try {
+      await this.verifyBundle(record);
+      return { state: "intact", reason: null, files: this.renderFileRows(record) };
+    } catch (error) {
+      return { state: "changed", reason: errorMessage(error), files: null };
     }
   }
 

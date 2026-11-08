@@ -12,6 +12,7 @@ import {
 import { currentTaskOwner, type OmpToolContext } from "./task-entry-port.ts";
 import { createDeliveryEntry, type DeliveryEntryControls } from "./delivery-entry.ts";
 import { DeliveryService } from "./delivery-service.ts";
+import { AcceptanceService } from "./acceptance-service.ts";
 import {
   createVerificationEntry,
   type VerificationCurrentContract,
@@ -133,6 +134,11 @@ export interface ExecutionEntryOptions {
    * registered and no delivery files can be created.
    */
   deliveryRoot?: string;
+  /**
+   * Explicit absolute private host root for acceptance records. Available only
+   * together with deliveryRoot; no model tool is exposed in B2-B1.
+   */
+  acceptanceRoot?: string;
 }
 
 export interface ExecutionEntryControls {
@@ -142,6 +148,8 @@ export interface ExecutionEntryControls {
   currentContract(context: OmpToolContext): VerificationCurrentContract;
   /** Present only when the host explicitly configured a delivery root. */
   delivery?: DeliveryService;
+  /** Present only when both deliveryRoot and acceptanceRoot are configured. */
+  acceptance?: AcceptanceService;
   dispose(): void;
 }
 
@@ -200,7 +208,31 @@ export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions)
       deliveryEntry = createDeliveryEntry(pi, { owner, service: deliveryService });
     } catch (error) {
       deliveryEntry?.dispose();
-      deliveryService?.dispose();
+      verification.dispose();
+      adapter.dispose();
+      throw error;
+    }
+  }
+
+  let acceptanceService: AcceptanceService | undefined;
+  if (options.acceptanceRoot !== undefined) {
+    if (deliveryService === undefined) {
+      deliveryEntry?.dispose();
+      verification.dispose();
+      adapter.dispose();
+      throw new ExecutionAdapterError("acceptanceRoot requires an explicit deliveryRoot.");
+    }
+    try {
+      acceptanceService = new AcceptanceService({
+        owner,
+        delivery: deliveryService,
+        activity: () => adapter.activitySnapshot(),
+        acceptanceRoot: options.acceptanceRoot,
+        executionRoot: options.root,
+      });
+    } catch (error) {
+      deliveryEntry?.dispose();
+      deliveryService.dispose();
       verification.dispose();
       adapter.dispose();
       throw error;
@@ -210,6 +242,7 @@ export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions)
   const dispose = (): void => {
     if (disposed) return;
     disposed = true;
+    acceptanceService?.dispose();
     deliveryEntry?.dispose();
     verification.dispose();
     adapter.dispose();
@@ -277,6 +310,7 @@ export function createExecutionEntry(pi: OmpApi, options: ExecutionEntryOptions)
     lookup: verification.lookup,
     currentContract: verification.currentContract,
     ...(deliveryService === undefined ? {} : { delivery: deliveryService }),
+    ...(acceptanceService === undefined ? {} : { acceptance: acceptanceService }),
     dispose,
   };
 }
@@ -352,6 +386,9 @@ export default function g2a1ExecutionEntry(pi: OmpApi): void {
       ...(optionalEnv("OMP_AGENT_DELIVERY_ROOT") === undefined
         ? {}
         : { deliveryRoot: optionalEnv("OMP_AGENT_DELIVERY_ROOT")! }),
+      ...(optionalEnv("OMP_AGENT_ACCEPTANCE_ROOT") === undefined
+        ? {}
+        : { acceptanceRoot: optionalEnv("OMP_AGENT_ACCEPTANCE_ROOT")! }),
     });
   } catch (error) {
     stderr("entry_disabled", { reason: errorMessage(error) });

@@ -1,5 +1,13 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  realpathSync,
+} from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
 
@@ -157,9 +165,32 @@ export interface CandidateSnapshot {
   createdAt: string;
 }
 
+export interface CandidateSnapshotSealToken {
+  readonly kind: "candidate-snapshot-seal";
+}
+
+/** Only this module can check a token it issued; copies are refused. */
+const candidateSeals = new WeakMap<object, () => string | null>();
+
+export function checkCandidateSnapshotSealSync(token: CandidateSnapshotSealToken): string | null {
+  const seal = typeof token === "object" && token !== null ? candidateSeals.get(token) : undefined;
+  if (seal === undefined) return "the candidate snapshot seal token was not issued by the registry";
+  try {
+    return seal();
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  }
+}
+
 export interface CandidateReadPort {
   resolveSnapshot(expectedTask: FrozenTaskRef, selector: CandidateSelector): Promise<CandidateSnapshot>;
   recheckSnapshot(snapshotId: string, expectedTask: FrozenTaskRef): Promise<CandidateSnapshot>;
+  /**
+   * Host-only synchronous seal. Originals are re-read at commit time with no
+   * await or business callback. Optional only for narrow test doubles that do
+   * not exercise acceptance.
+   */
+  sealSnapshot?(snapshotId: string, expectedTask: FrozenTaskRef): CandidateSnapshotSealToken;
 }
 
 interface DirectoryIdentity {
@@ -412,6 +443,81 @@ function sameIdentity(left: FileIdentity, right: FileIdentity): boolean {
   return left.dev === right.dev && left.ino === right.ino && left.size === right.size && left.sha256 === right.sha256;
 }
 
+function pathChainSync(privateRoot: string, filePath: string, label: string): DirectoryIdentity[] {
+  contained(privateRoot, filePath, label);
+  const rootInfo = lstatSync(privateRoot);
+  if (rootInfo.isSymbolicLink() || !rootInfo.isDirectory()) {
+    throw new CandidateError(`Host-private root for ${label} is not a real directory.`, "unsafe-path");
+  }
+  if (realpathSync(privateRoot) !== privateRoot) {
+    throw new CandidateError(`Host-private root for ${label} was replaced or is reached through a link.`, "unsafe-path");
+  }
+  const directories: DirectoryIdentity[] = [{ path: privateRoot, dev: rootInfo.dev, ino: rootInfo.ino }];
+  let current = privateRoot;
+  const segments = path.relative(privateRoot, filePath).split(path.sep);
+  for (const segment of segments.slice(0, -1)) {
+    if (segment.length === 0) throw new CandidateError(`Path chain for ${label} is invalid.`, "unsafe-path");
+    current = path.join(current, segment);
+    const info = lstatSync(current);
+    if (info.isSymbolicLink() || !info.isDirectory()) {
+      throw new CandidateError(`Path chain for ${label} contains a link or non-directory.`, "unsafe-path");
+    }
+    directories.push({ path: current, dev: info.dev, ino: info.ino });
+  }
+  return directories;
+}
+
+function readPrivateFileSync(
+  filePath: string,
+  privateRoot: string,
+  maxBytes: number,
+  label: string,
+  expectedDirectories: readonly DirectoryIdentity[],
+): ReadFileResult {
+  const directories = pathChainSync(privateRoot, filePath, label);
+  const expected = new Map(expectedDirectories.map((directory) => [directory.path, directory]));
+  for (const directory of directories) {
+    const recorded = expected.get(directory.path);
+    if (!recorded || recorded.dev !== directory.dev || recorded.ino !== directory.ino) {
+      throw new CandidateError(`A parent directory for ${label} was replaced after registration.`, "changed");
+    }
+  }
+  const before = lstatSync(filePath);
+  if (before.isSymbolicLink()) throw new CandidateError(`${label} is a symbolic link.`, "unsafe-path");
+  if (!before.isFile()) throw new CandidateError(`${label} is not an ordinary file.`, "unsafe-path");
+  if (before.nlink !== 1) throw new CandidateError(`${label} has multiple hard links.`, "unsafe-path");
+  if (before.size > maxBytes) throw new CandidateError(`${label} exceeds its byte limit.`, "limit");
+  const handle = openSync(filePath, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const opened = fstatSync(handle);
+    if (!opened.isFile() || opened.nlink !== 1
+      || opened.dev !== before.dev || opened.ino !== before.ino || opened.size !== before.size) {
+      throw new CandidateError(`${label} changed before it was opened.`, "changed");
+    }
+    const buffer = Buffer.alloc(opened.size + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const read = readSync(handle, buffer, offset, buffer.length - offset, offset);
+      if (read === 0) break;
+      offset += read;
+    }
+    if (offset !== opened.size) throw new CandidateError(`${label} changed while it was read.`, "changed");
+    const after = lstatSync(filePath);
+    if (after.dev !== opened.dev || after.ino !== opened.ino || after.size !== opened.size || after.nlink !== 1) {
+      throw new CandidateError(`${label} changed during the read.`, "changed");
+    }
+    const data = Buffer.from(buffer.subarray(0, offset));
+    return {
+      data,
+      sha256: sha256(data),
+      identity: { dev: opened.dev, ino: opened.ino, size: opened.size, sha256: sha256(data) },
+      directories,
+    };
+  } finally {
+    closeSync(handle);
+  }
+}
+
 function registrationDigest(candidate: Omit<StoredCandidate, "key" | "registrationDigest">): string {
   // Explicit field order; registeredAt is excluded so an idempotent retry with
   // a later host timestamp still matches the original real registration.
@@ -451,7 +557,96 @@ export class CandidateRegistry {
     return Object.freeze({
       resolveSnapshot: (expectedTask: FrozenTaskRef, selector: CandidateSelector) => this.resolveSnapshot(expectedTask, selector),
       recheckSnapshot: (snapshotId: string, expectedTask: FrozenTaskRef) => this.recheckSnapshot(snapshotId, expectedTask),
+      sealSnapshot: (snapshotId: string, expectedTask: FrozenTaskRef) => this.sealSnapshot(snapshotId, expectedTask),
     });
+  }
+
+  /**
+   * Issue an opaque synchronous seal for the exact recorded candidate bytes.
+   * The token retains private paths internally; callers never receive them.
+   */
+  sealSnapshot(snapshotId: string, expectedTask: FrozenTaskRef): CandidateSnapshotSealToken {
+    if (typeof snapshotId !== "string" || snapshotId.length < 1 || snapshotId.length > 256) {
+      throw new CandidateError("Snapshot id is invalid.", "invalid");
+    }
+    const task = normalizeTask(expectedTask);
+    const snapshot = this.snapshots.get(snapshotId);
+    if (!snapshot) throw new CandidateError("Snapshot is not a host-issued candidate snapshot.", "unknown-snapshot");
+    if (!sameTask(snapshot.task, task)) {
+      throw new CandidateError("Snapshot belongs to a different owner/task/revision/requirements identity.", "unknown-snapshot");
+    }
+    const records: StoredCandidate[] = [];
+    for (const key of snapshot.keys) {
+      const candidate = this.candidates.get(key);
+      if (!candidate) throw new CandidateError("A registered candidate is no longer present.", "unknown-candidate");
+      if (!sameTask(candidate.task, snapshot.task)) {
+        throw new CandidateError("Registered candidate identity changed.", "changed");
+      }
+      records.push(candidate);
+    }
+    if (records.length < 1 || records.length !== snapshot.artifacts.length) {
+      throw new CandidateError("Candidate snapshot rows are inconsistent.", "changed");
+    }
+    const first = records[0]!;
+    const seal = (): string | null => {
+      try {
+        const source = readPrivateFileSync(
+          first.source.path,
+          first.privateRoot,
+          MAX_CANDIDATE_SOURCE_BYTES,
+          "staged source",
+          first.directories,
+        );
+        if (!sameIdentity(source.identity, snapshot.source)
+          || source.data.length !== first.source.bytes
+          || source.sha256 !== first.source.sha256) {
+          return "the staged source changed after the snapshot";
+        }
+        if (first.inputs.length !== snapshot.inputs.length) return "the input set changed after the snapshot";
+        for (let index = 0; index < first.inputs.length; index += 1) {
+          const input = first.inputs[index]!;
+          const recorded = snapshot.inputs[index];
+          if (!recorded || recorded.id !== input.id) return `the input set changed after the snapshot (${input.id})`;
+          const result = readPrivateFileSync(
+            input.path,
+            first.privateRoot,
+            MAX_CANDIDATE_INPUT_BYTES,
+            `staged input ${input.id}`,
+            first.directories,
+          );
+          if (!sameIdentity(result.identity, recorded.identity)
+            || result.data.length !== input.bytes
+            || result.sha256 !== input.sha256) {
+            return `staged input ${input.id} changed after the snapshot`;
+          }
+        }
+        for (let index = 0; index < records.length; index += 1) {
+          const record = records[index]!;
+          const recorded = snapshot.artifacts[index];
+          if (!recorded || recorded.artifactId !== record.artifact.artifactId) {
+            return "the selected artifact set changed after the snapshot";
+          }
+          const result = readPrivateFileSync(
+            record.artifact.archivePath,
+            record.privateRoot,
+            MAX_CANDIDATE_ARTIFACT_BYTES,
+            `archived artifact ${record.artifact.artifactId}`,
+            record.directories,
+          );
+          if (!sameIdentity(result.identity, recorded.identity)
+            || result.data.length !== record.artifact.bytes
+            || result.sha256 !== record.artifact.sha256) {
+            return `archived artifact ${record.artifact.artifactId} changed after the snapshot`;
+          }
+        }
+        return null;
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
+    };
+    const token = Object.freeze({ kind: "candidate-snapshot-seal" as const });
+    candidateSeals.set(token, seal);
+    return token;
   }
 
   async register(registration: CandidateRegistration): Promise<{ registered: number; idempotent: number }> {

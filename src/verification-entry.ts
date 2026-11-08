@@ -382,6 +382,7 @@ export function createVerificationEntry(pi: VerificationApi, options: Verificati
     } catch {
       return "no managed task is reachable from the current main-session branch";
     }
+    if (task.status === "accepted") return "the current managed task is accepted and terminal";
     if (task.status !== "active") return "the current managed task is cancelled";
     return null;
   }

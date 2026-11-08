@@ -6,7 +6,7 @@
   "private": true,
   "engines": { "bun": ">=1.4.0" },
   "omp": { "extensions": ["./src/extension.ts"] },
-  "files": ["src", "policy", "docs", "README.md"],
+  "files": ["src", "policy", "docs/architecture.md", "docs/testing.md", "docs/release-notes.md", "README.md"],
   "scripts": {
     "check": "bun run typecheck && bun test test/unit",
     "test": "bun test test/unit",

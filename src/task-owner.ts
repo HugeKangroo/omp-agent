@@ -10,10 +10,18 @@ import {
   assertRequirementCommitBounds,
   hasRequirementSource,
   requirementProjection,
+  requirementsDigest,
   revisionBaselineMatches,
   type RequirementSource,
   type RequirementsProjection,
 } from "./task-requirements.ts";
+import type { FrozenTaskRef } from "./execution-candidates.ts";
+import {
+  installPreparedAcceptanceRecordSync,
+  maintainInstalledAcceptanceRecordSync,
+  preparedAcceptanceBinding,
+  type AcceptanceInstallResult,
+} from "./acceptance-record-store.ts";
 
 /**
  * Generic conversational task ownership for G1-B1/B2a.
@@ -29,7 +37,55 @@ export const TASK_OWNER_SCHEMA_VERSION = 1 as const;
 export const TASK_REVISION_START = 1 as const;
 export const TASK_CONTROL_ACTIONS = ["start", "inspect", "revise", "cancel"] as const;
 export type TaskControlAction = (typeof TASK_CONTROL_ACTIONS)[number];
-export type TaskStatus = "active" | "cancelled";
+export type TaskStatus = "active" | "cancelled" | "accepted";
+
+export interface AcceptanceReference {
+  acceptanceId: string;
+  deliveryId: string;
+  recordDigest: string;
+  acceptedAt: string;
+}
+
+export type AcceptanceReservationToken = object;
+
+export interface AcceptanceCommitResult {
+  status: AcceptanceInstallStatus;
+  reason: string | null;
+  warnings: string[];
+  acceptance: AcceptanceReference | null;
+  operationCommitted: boolean | null;
+}
+
+type AcceptanceInstallStatus = AcceptanceInstallResult["status"];
+
+interface AcceptanceReservationState {
+  token: object;
+  task: FrozenTaskRef;
+  epoch: number;
+  released: boolean;
+  committed: boolean;
+}
+
+/** Bounded defensive unknown-installation facts. No recovery engine exists. */
+export interface AcceptanceHazardFacts {
+  task: FrozenTaskRef;
+  acceptanceId: string;
+  deliveryId: string;
+  recordDigest: string;
+  reason: string;
+}
+
+function boundedHazardReason(value: string): string {
+  return value.length <= 512 ? value : `${value.slice(0, 509)}...`;
+}
+
+interface AcceptanceHazard {
+  task: FrozenTaskRef;
+  reason: string;
+  acceptanceId: string;
+  deliveryId: string;
+  recordDigest: string;
+}
 export type GenuineInputSource = "interactive" | "rpc";
 
 export class TaskOwnerError extends Error {
@@ -82,6 +138,8 @@ export interface ManagedTask {
   understandingStale: boolean;
   createdAt: string;
   cancelledAt: string | null;
+  /** Set exactly once when the host record installation commits. */
+  acceptance: AcceptanceReference | null;
   admissions: number;
 }
 
@@ -124,6 +182,8 @@ export interface TaskOwnerSnapshot {
   /** Navigation binding for mutations/admissions; task history is retained. */
   binding: BindingStatus;
   authorizedCapabilities: string[];
+  /** Durable in-process unknown acceptance installation facts, if any. */
+  acceptanceHazard: AcceptanceHazardFacts | null;
 }
 
 export interface TaskStartResult {
@@ -211,7 +271,24 @@ function copyTask(task: ManagedTask): ManagedTask {
     ...task,
     anchor: { ...task.anchor },
     requirementSources: task.requirementSources.map((source) => ({ ...source })),
+    acceptance: task.acceptance === null ? null : { ...task.acceptance },
   };
+}
+
+function frozenOf(task: ManagedTask): FrozenTaskRef {
+  return {
+    ownerId: task.ownerId,
+    taskId: task.taskId,
+    taskRevision: task.taskRevision,
+    requirementsDigest: requirementsDigest(task.requirementSources),
+  };
+}
+
+function sameFrozen(left: FrozenTaskRef, right: FrozenTaskRef): boolean {
+  return left.ownerId === right.ownerId
+    && left.taskId === right.taskId
+    && left.taskRevision === right.taskRevision
+    && left.requirementsDigest === right.requirementsDigest;
 }
 
 function copyGrant(grant: UserTurnGrant): UserTurnGrant {
@@ -333,6 +410,10 @@ export class TaskOwner {
   private lastSessionId: string | undefined;
   private turnSequence = 0;
   private readonly closedInputs = new Set<string>();
+  private acceptanceReservation: AcceptanceReservationState | undefined;
+  private readonly acceptanceTokens = new WeakMap<object, AcceptanceReservationState>();
+  private acceptanceEpoch = 0;
+  private acceptanceHazard: AcceptanceHazard | undefined;
 
   private inputKey(sessionId: string, baseLeafId: string, text: string): string {
     return `${sessionId}\0${baseLeafId}\0${text}`;
@@ -389,6 +470,15 @@ export class TaskOwner {
       suspended: this.suspended ? { ...this.suspended } : null,
       binding: this.bindingStatus(),
       authorizedCapabilities: [...this.capabilities].sort(),
+      acceptanceHazard: this.acceptanceHazard === undefined
+        ? null
+        : {
+            task: { ...this.acceptanceHazard.task },
+            acceptanceId: this.acceptanceHazard.acceptanceId,
+            deliveryId: this.acceptanceHazard.deliveryId,
+            recordDigest: this.acceptanceHazard.recordDigest,
+            reason: this.acceptanceHazard.reason,
+          },
     };
   }
 
@@ -730,6 +820,7 @@ export class TaskOwner {
 
   /** Soft turn-state reset; it does not detach an established task. */
   sessionChanged(sessionId?: string): void {
+    this.invalidateAcceptanceReservation("session changed");
     this.resetTurnState(sessionId);
   }
 
@@ -741,6 +832,7 @@ export class TaskOwner {
    * owner remains able to create its first task.
    */
   sessionStarted(sessionId?: string): void {
+    this.invalidateAcceptanceReservation("session started");
     const previous = this.grant?.sessionId ?? this.task?.anchor.sessionId ?? this.lastSessionId;
     const hadManagedTask = this.task !== undefined;
     const changedSession = sessionId !== undefined && previous !== undefined && sessionId !== previous;
@@ -760,6 +852,7 @@ export class TaskOwner {
    * turn observation belongs to no task and is merely reset.
    */
   navigate(event: "session_switch" | "session_branch" | "session_tree", sessionId?: string): void {
+    this.invalidateAcceptanceReservation(`conversation navigation (${event})`);
     const hadManagedTask = this.task !== undefined;
     this.resetTurnState(sessionId);
     if (hadManagedTask) {
@@ -880,6 +973,191 @@ export class TaskOwner {
     }
   }
 
+  /**
+   * Synchronous acceptance reservation. It blocks new admissions but does not
+   * change task status and never suppresses real user cancellation, revision
+   * or navigation. Only an exact owner/task/revision/requirements binding is
+   * reserved, and the opaque token is instance-bound.
+   */
+  reserveAcceptance(subject: TaskSubject, expected: FrozenTaskRef): AcceptanceReservationToken {
+    this.assertSubject(subject);
+    if (subject.agentKind !== "main") throw new TaskOwnerError("Only the main OMP session may reserve task acceptance.");
+    this.assertAttached("Task acceptance");
+    if (this.suspended) throw new TaskOwnerError(`Task acceptance is unavailable: ${this.suspended.reason}.`);
+    if (this.acceptanceHazard) throw new TaskOwnerError(`Task acceptance outcome is unknown: ${this.acceptanceHazard.reason}.`);
+    if (this.acceptanceReservation) throw new TaskOwnerError("Another acceptance reservation is active.");
+    const task = this.task;
+    if (!task) throw new TaskOwnerError("No managed task exists for this owner.");
+    if (task.status !== "active") throw new TaskOwnerError(`The task status is ${task.status}; only an active task may reserve acceptance.`);
+    if (task.acceptance !== null) throw new TaskOwnerError("The task already has an acceptance reference.");
+    this.assertTaskReachable(subject, task);
+    const frozen = frozenOf(task);
+    if (!sameFrozen(frozen, expected)) {
+      throw new TaskOwnerError("The acceptance reservation does not match the current owner task identity.");
+    }
+    const token = Object.freeze({});
+    const state: AcceptanceReservationState = {
+      token,
+      task: { ...frozen },
+      epoch: this.acceptanceEpoch,
+      released: false,
+      committed: false,
+    };
+    this.acceptanceTokens.set(token, state);
+    this.acceptanceReservation = state;
+    return token;
+  }
+
+  /** Pure synchronous reservation check; no host callback is invoked. */
+  reservationCurrent(token: AcceptanceReservationToken): boolean {
+    const state = typeof token === "object" && token !== null
+      ? this.acceptanceTokens.get(token)
+      : undefined;
+    if (state === undefined
+      || state.token !== token
+      || state.released
+      || state.committed
+      || state.epoch !== this.acceptanceEpoch
+      || this.acceptanceReservation !== state
+      || this.acceptanceHazard !== undefined
+      || this.detached !== undefined
+      || this.suspended !== undefined) {
+      return false;
+    }
+    const task = this.task;
+    return task !== undefined
+      && task.status === "active"
+      && task.acceptance === null
+      && sameFrozen(frozenOf(task), state.task);
+  }
+
+  /** Release only this caller's current reservation; stale tokens are no-ops. */
+  releaseAcceptance(token: AcceptanceReservationToken): void {
+    const state = typeof token === "object" && token !== null
+      ? this.acceptanceTokens.get(token)
+      : undefined;
+    if (state === undefined || state.committed) return;
+    if (this.acceptanceReservation !== state) return;
+    state.released = true;
+    this.acceptanceReservation = undefined;
+  }
+
+  private invalidateAcceptanceReservation(reason: string): void {
+    const state = this.acceptanceReservation;
+    if (state === undefined) return;
+    state.released = true;
+    this.acceptanceReservation = undefined;
+    this.acceptanceEpoch += 1;
+    this.acceptanceHazard = undefined;
+    void reason;
+  }
+
+  /**
+   * Final synchronous acceptance commit. The prepared record has already been
+   * bounded and sealed by the host store; this method only rechecks its own
+   * pure reservation/task identity, calls the fixed built-in install primitive,
+   * and sets the accepted terminal fact before any notification.
+   */
+  commitAccepted(token: AcceptanceReservationToken, preparedRecord: object): AcceptanceCommitResult {
+    const state = typeof token === "object" && token !== null
+      ? this.acceptanceTokens.get(token)
+      : undefined;
+    if (state === undefined || !this.reservationCurrent(token)) {
+      return {
+        status: "not_installed",
+        reason: "The acceptance reservation is stale, released or belongs to another operation.",
+        warnings: [],
+        acceptance: null,
+        operationCommitted: false,
+      };
+    }
+    const binding = preparedAcceptanceBinding(preparedRecord);
+    if (!sameFrozen(binding.task, state.task)) {
+      throw new TaskOwnerError("The prepared acceptance record belongs to a different task identity.");
+    }
+    const install = installPreparedAcceptanceRecordSync(preparedRecord);
+    if (install.status === "unknown") {
+      state.released = true;
+      this.acceptanceReservation = undefined;
+      this.acceptanceEpoch += 1;
+      this.acceptanceHazard = {
+        task: { ...binding.task },
+        reason: boundedHazardReason(install.reason ?? "the acceptance record installation could not be classified"),
+        acceptanceId: binding.acceptanceId,
+        deliveryId: binding.deliveryId,
+        recordDigest: binding.recordDigest,
+      };
+      return {
+        status: "unknown",
+        reason: install.reason,
+        warnings: [...install.warnings],
+        acceptance: null,
+        operationCommitted: null,
+      };
+    }
+    if (install.status !== "installed") {
+      return {
+        status: install.status,
+        reason: install.reason,
+        warnings: [...install.warnings],
+        acceptance: null,
+        operationCommitted: false,
+      };
+    }
+    const acceptance: AcceptanceReference = {
+      acceptanceId: binding.acceptanceId,
+      deliveryId: binding.deliveryId,
+      recordDigest: binding.recordDigest,
+      acceptedAt: binding.acceptedAt,
+    };
+    const task = this.task;
+    if (!task) throw new TaskOwnerError("The owner task disappeared during acceptance installation.");
+    state.committed = true;
+    state.released = true;
+    this.acceptanceReservation = undefined;
+    this.acceptanceEpoch += 1;
+    // The fixed record installation succeeded: this is an irreversible commit
+    // fact. Set the terminal task state before notifications or diagnostics.
+    task.status = "accepted";
+    task.acceptance = acceptance;
+    const warnings = [...install.warnings];
+    // Only now may postcommit cleanup/fsync run. Their failure is a warning,
+    // never a rollback or a different installation fact.
+    try {
+      warnings.push(...maintainInstalledAcceptanceRecordSync(preparedRecord));
+    } catch (error) {
+      warnings.push(`postcommit_maintenance_failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    try {
+      this.changed({
+        type: "task_accepted",
+        taskId: task.taskId,
+        ownerId: task.ownerId,
+        taskRevision: task.taskRevision,
+        acceptanceId: acceptance.acceptanceId,
+        deliveryId: acceptance.deliveryId,
+        recordDigest: acceptance.recordDigest,
+        acceptedAt: acceptance.acceptedAt,
+      });
+    } catch (error) {
+      warnings.push(`postcommit_notification_failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    return {
+      status: "installed",
+      reason: null,
+      warnings,
+      acceptance: { ...acceptance },
+      operationCommitted: true,
+    };
+  }
+
+  /** Read-only accepted terminal fact; never uses active-only verification. */
+  acceptedReference(taskId: string): AcceptanceReference | null {
+    const task = this.task;
+    if (!task || task.taskId !== taskId || task.status !== "accepted" || task.acceptance === null) return null;
+    return { ...task.acceptance };
+  }
+
   start(
     subject: TaskSubject,
     understanding?: string,
@@ -904,8 +1182,12 @@ export class TaskOwner {
           taskId: this.task.taskId,
           taskRevision: this.task.taskRevision,
           messageId: anchor.messageId,
+          status: this.task.status,
         });
         return { created: false, task: copyTask(this.task) };
+      }
+      if (this.task.status === "accepted") {
+        throw new TaskOwnerError("The task is already accepted and terminal; it cannot be restarted or re-anchored.");
       }
       throw new TaskOwnerError("A task already belongs to a different user message; B1 does not merge or rebind tasks.");
     }
@@ -948,6 +1230,7 @@ export class TaskOwner {
       understandingStale: false,
       createdAt,
       cancelledAt: null,
+      acceptance: null,
       admissions: 0,
     };
     // Transactional response preflight: the caller builds the exact response
@@ -981,7 +1264,11 @@ export class TaskOwner {
     if (subject.agentKind !== "main") throw new TaskOwnerError("Only the main OMP session may revise a managed task.");
     this.assertAttached("Task revision");
     if (this.suspended) throw new TaskOwnerError(`Task revision is unavailable: ${this.suspended.reason}.`);
+    if (this.acceptanceHazard) {
+      throw new TaskOwnerError("Task acceptance installation outcome is unknown; revision cannot rewrite a possibly accepted task.");
+    }
     if (!this.task) throw new TaskOwnerError("No managed task exists for this owner.");
+    if (this.task.status === "accepted") throw new TaskOwnerError("An accepted task is terminal and cannot be revised.");
     if (this.task.status !== "active") throw new TaskOwnerError("A cancelled task cannot be revised.");
     // Independent of any navigation hook: the creation session and anchor
     // must still be reachable on the actual current branch.
@@ -1044,6 +1331,7 @@ export class TaskOwner {
     // Transactional response preflight: validate the exact response built
     // from the candidate before this owner accepts the new revision.
     validateCandidate?.(candidate);
+    this.invalidateAcceptanceReservation("task revision committed");
     this.task = candidate;
     this.changed({
       type: "task_revised",
@@ -1096,7 +1384,13 @@ export class TaskOwner {
     if (subject.agentKind !== "main") throw new TaskOwnerError("Only the main OMP session may cancel a managed task.");
     this.assertAttached("Task cancellation");
     if (this.suspended) throw new TaskOwnerError(`Task control is unavailable: ${this.suspended.reason}.`);
+    if (this.acceptanceHazard) {
+      throw new TaskOwnerError("Task acceptance installation outcome is unknown; cancellation cannot rewrite a possibly accepted task.");
+    }
     if (!this.task) throw new TaskOwnerError("No managed task exists for this owner.");
+    if (this.task.status === "accepted") {
+      throw new TaskOwnerError("An accepted task is terminal and cannot be cancelled.");
+    }
     this.assertTaskReachable(subject, this.task);
     const grant = this.grant;
     if (!grant || !grant.started || grant.sessionId !== subject.sessionId) {
@@ -1112,6 +1406,7 @@ export class TaskOwner {
       this.changed({ type: "task_cancel_duplicate", taskId: this.task.taskId, taskRevision: this.task.taskRevision });
       return copyTask(this.task);
     }
+    this.invalidateAcceptanceReservation("task cancellation committed");
     this.task.status = "cancelled";
     this.task.cancelledAt = this.now();
     this.changed({ type: "task_cancelled", taskId: this.task.taskId, taskRevision: this.task.taskRevision });
@@ -1160,12 +1455,23 @@ export class TaskOwner {
     if (this.detached) return deny(`conversation binding is detached: ${this.detached.reason}`, this.task?.status ?? null);
     if (this.suspended) return deny(`task admissions are suspended: ${this.suspended.reason}`, this.task?.status ?? null);
     if (!this.task) return deny("no managed task exists", null);
+    if (this.acceptanceHazard) {
+      return deny("the acceptance commit outcome is unknown; no new side effect is admitted", this.task.status);
+    }
+    if (this.acceptanceReservation) {
+      return deny("an acceptance reservation is active; no new side effect is admitted", this.task.status);
+    }
     try {
       this.assertTaskReachable(subject, this.task);
     } catch (error) {
       return deny(error instanceof Error ? error.message : String(error), this.task.status);
     }
-    if (this.task.status !== "active") return deny("task is cancelled", this.task.status);
+    if (this.task.status !== "active") {
+      return deny(
+        this.task.status === "accepted" ? "task is accepted and terminal" : "task is cancelled",
+        this.task.status,
+      );
+    }
     // Optimistic, non-authoritative guard compared immediately before the
     // owned counter changes. The host mints the actual revision; the caller
     // cannot authorize or acquire a revision by naming it.
