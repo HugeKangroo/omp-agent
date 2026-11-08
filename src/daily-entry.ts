@@ -19,6 +19,10 @@ import {
   type ExecutionEntryControls,
 } from "./execution-entry.ts";
 import {
+  createHistoryEntry,
+  type HistoryEntryControls,
+} from "./history-entry.ts";
+import {
   createHistorySession,
   type HistorySessionControls,
 } from "./history-session.ts";
@@ -82,8 +86,10 @@ export interface DailyEntryControls {
   instance: DailyInstance;
   owner: TaskOwner;
   execution: ExecutionEntryControls;
-  /** B1 capture and native-locator diagnostics; no query/resume surface exists. */
+  /** B1 capture and native-locator diagnostics; no resume surface exists. */
   history: HistorySessionControls;
+  /** B2a main-only read-only query over actual branch locators. */
+  historyQuery: HistoryEntryControls;
   isReady(): boolean;
   dispose(): void;
 }
@@ -314,12 +320,18 @@ export function createDailyEntry(pi: DailyOmpApi, options: DailyEntryOptions = {
   let taskEntry: TaskEntryControls | undefined;
   let execution: ExecutionEntryControls | undefined;
   let history: HistorySessionControls | undefined;
+  let historyQuery: HistoryEntryControls | undefined;
   let orphanOwner: TaskOwner | undefined;
 
   const disposeServices = (): void => {
     if (disposed) return;
     disposed = true;
     active = false;
+    try {
+      historyQuery?.dispose();
+    } catch (error) {
+      stderr("history_query_dispose_failed", { error: errorMessage(error) });
+    }
     try {
       history?.dispose();
     } catch (error) {
@@ -409,13 +421,27 @@ export function createDailyEntry(pi: DailyOmpApi, options: DailyEntryOptions = {
       );
     }
 
-    // Navigation invalidates old pending locator eligibility before any later
-    // turn can look like a similar source. Subagent lifecycle events cannot
-    // consume the main composition's pending batch.
+    // The query is a separate read-only view over B1 locators. It never reads
+    // the owner, creates a task or restores authority.
+    const publishedOwner = taskEntry.owner;
+    const createdHistoryQuery = createHistoryEntry(
+      { registerTool: (tool) => staging.api.registerTool(tool) },
+      {
+        stateRoot: config.stateRoot,
+        workspaceRoot: config.workspaceRoot,
+        isCurrentComposition: () => !disposed && active && currentTaskOwner() === publishedOwner,
+      },
+    );
+    historyQuery = createdHistoryQuery;
+
+    // Navigation invalidates old pending locator eligibility and every issued
+    // query selector/cursor before any later turn can look like a similar
+    // source. Subagent lifecycle events cannot consume the main composition.
     for (const eventName of ["session_start", "session_switch", "session_branch", "session_tree"] as const) {
       staging.api.on(eventName, (_event, context) => {
         if (context.agent?.kind === "sub") return undefined;
         createdHistory.navigate(eventName);
+        createdHistoryQuery.navigate(eventName);
         return undefined;
       });
     }
@@ -546,6 +572,7 @@ export function createDailyEntry(pi: DailyOmpApi, options: DailyEntryOptions = {
       owner: taskEntry.owner,
       execution,
       history: createdHistory,
+      historyQuery: createdHistoryQuery,
       isReady: () => active,
       dispose: disposeServices,
     };

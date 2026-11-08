@@ -26,6 +26,7 @@ import {
 } from "../../src/daily-entry.ts";
 import { DELIVERY_TOOL } from "../../src/delivery-entry.ts";
 import { EXECUTION_TOOL } from "../../src/execution-adapter.ts";
+import { HISTORY_TOOL } from "../../src/history-entry.ts";
 import {
   clearPublishedTaskOwner,
   currentTaskOwner,
@@ -406,7 +407,7 @@ describe("daily composition", () => {
     expect(entry.isReady()).toBe(true);
     expect(currentTaskOwner()).toBe(entry.owner);
     expect([...fake.tools.keys()].sort()).toEqual(
-      [TASK_CONTROL_TOOL, EXECUTION_TOOL, VERIFICATION_TOOL, DELIVERY_TOOL].sort(),
+      [TASK_CONTROL_TOOL, EXECUTION_TOOL, VERIFICATION_TOOL, DELIVERY_TOOL, HISTORY_TOOL].sort(),
     );
     expect(entry.execution.delivery?.deliveryRootPath()).toBe(entry.instance.deliveryRoot);
     expect(entry.execution.acceptance?.humanReviewConfigured()).toBe(false);
@@ -533,9 +534,19 @@ describe("daily composition", () => {
       .toThrow(/fixture tool registration failure/);
     expect(currentTaskOwner()).toBeUndefined();
     expect(fake.tools.has(TASK_CONTROL_TOOL)).toBe(true);
+    expect(fake.tools.has(HISTORY_TOOL)).toBe(true);
     expect(fake.tools.has(VERIFICATION_TOOL)).toBe(false);
 
     const ctx = context(fx.workspace, []);
+    const history = await fake.tools.get(HISTORY_TOOL)!.execute(
+      "call-history",
+      { action: "list" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(history.isError).toBe(true);
+    expect(history.content[0]!.text).toContain("not active");
     const result = await fake.tools.get(TASK_CONTROL_TOOL)!.execute(
       "call-1",
       { action: "inspect" },
@@ -592,6 +603,16 @@ describe("daily composition", () => {
     entry.dispose();
     expect(entry.isReady()).toBe(false);
     expect(currentTaskOwner()).toBeUndefined();
+    expect(entry.historyQuery.status()).toMatchObject({ disposed: true, view: "none", selectors: 0 });
+    const historyResult = await fake.tools.get(HISTORY_TOOL)!.execute(
+      "call-history",
+      { action: "list" },
+      undefined,
+      undefined,
+      context(fx.workspace, []),
+    );
+    expect(historyResult.isError).toBe(true);
+    expect(historyResult.content[0]!.text).toContain("not active");
     const result = await fake.tools.get(EXECUTION_TOOL)!.execute(
       "call-1",
       { action: "describe" },
@@ -838,11 +859,109 @@ describe("daily composition", () => {
       taskRevision: 1,
       status: "active",
     });
+
+    const ownerBeforeQuery = entry.owner.snapshot();
+    const indexBeforeQuery = await readFile(path.join(entry.instance.root, "history-index.json"));
+    const branchLengthBeforeQuery = branch.length;
+    const ensureBeforeQuery = ensureCalls;
+    const appendBeforeQuery = appendCalls.length;
+    const listed = await fake.tools.get(HISTORY_TOOL)!.execute(
+      "call-history-list",
+      { action: "list" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(listed.isError).toBeUndefined();
+    expect(listed.details).toBeUndefined();
+    const listBody = JSON.parse(listed.content[0]!.text) as Record<string, unknown>;
+    expect(listBody).toMatchObject({
+      schemaVersion: "agent-history-view-v1",
+      action: "list",
+      scope: "selected_branch",
+      result: "visible_history",
+    });
+    const listItems = listBody.items as Array<Record<string, unknown>>;
+    expect(listItems).toHaveLength(1);
+    expect(listItems[0]).toMatchObject({
+      taskId: task.taskId,
+      taskRevision: 1,
+      recordedStatus: "active",
+      sourceCount: 1,
+      amendmentCount: 0,
+    });
+    expect(listItems[0]!.selector).toMatch(/^hsel_[0-9a-f]{32}$/);
+    const inspectedHistory = await fake.tools.get(HISTORY_TOOL)!.execute(
+      "call-history-inspect",
+      { action: "inspect", selector: listItems[0]!.selector },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(inspectedHistory.isError).toBeUndefined();
+    const inspectBody = JSON.parse(inspectedHistory.content[0]!.text) as Record<string, unknown>;
+    expect(inspectBody).toMatchObject({
+      schemaVersion: "agent-history-view-v1",
+      action: "inspect",
+      scope: "selected_branch",
+    });
+    const inspection = inspectBody.item as {
+      taskId: string;
+      taskRevision: number;
+      recordedStatus: string;
+      anchor: { sessionId: string };
+      requirementSources: Array<{ text: string; kind: string }>;
+    };
+    expect(inspection).toMatchObject({
+      taskId: task.taskId,
+      taskRevision: 1,
+      recordedStatus: "active",
+      anchor: { sessionId: "daily-history-session" },
+    });
+    expect(inspection.requirementSources).toHaveLength(1);
+    expect(inspection.requirementSources[0]).toMatchObject({
+      kind: "original",
+      text: "Own this history task.",
+    });
+
+    branch.push({
+      id: "assistant-after-list",
+      parentId: leafId,
+      type: "message",
+      message: { role: "assistant", content: [{ type: "text", text: "later" }] },
+    });
+    leafId = "assistant-after-list";
+    branch.push({
+      id: "tool-result-after-list",
+      parentId: leafId,
+      type: "toolResult",
+      toolName: "read",
+      data: {},
+    });
+    leafId = "tool-result-after-list";
+    const inspectedAfterAppend = await fake.tools.get(HISTORY_TOOL)!.execute(
+      "call-history-inspect-again",
+      { action: "inspect", selector: listItems[0]!.selector },
+      undefined,
+      undefined,
+      ctx,
+    );
+    expect(inspectedAfterAppend.isError).toBeUndefined();
+    expect(JSON.parse(inspectedAfterAppend.content[0]!.text).item).toEqual(inspection);
+
+    expect(entry.owner.snapshot()).toEqual(ownerBeforeQuery);
+    expect(await readFile(path.join(entry.instance.root, "history-index.json"))).toEqual(indexBeforeQuery);
+    expect(branch).toHaveLength(branchLengthBeforeQuery + 2);
+    expect(ensureCalls).toBe(ensureBeforeQuery);
+    expect(appendCalls).toHaveLength(appendBeforeQuery);
+    expect(entry.history.status()).toMatchObject({ pending: 0, visible: 1, incomplete: 0, unknown: 0 });
+
     expect([...fake.tools.keys()].sort()).toEqual(
-      [TASK_CONTROL_TOOL, EXECUTION_TOOL, VERIFICATION_TOOL, DELIVERY_TOOL].sort(),
+      [TASK_CONTROL_TOOL, EXECUTION_TOOL, VERIFICATION_TOOL, DELIVERY_TOOL, HISTORY_TOOL].sort(),
     );
 
     entry.dispose();
+    expect(entry.historyQuery.status()).toMatchObject({ disposed: true, view: "none", selectors: 0 });
     expect(entry.history.status().pending).toBe(0);
     expect(entry.history.status().visible).toBe(1);
   });

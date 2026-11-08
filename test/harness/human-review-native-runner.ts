@@ -129,7 +129,7 @@ export const CASE_SPECS: Record<string, CaseSpec> = {
     resize: null,
     timeoutSeconds: 60,
     tools: ["read", "agent_deliver", "agent_execute", "agent_task", "agent_verify"],
-    registeredNames: ["agent_deliver", "agent_execute", "agent_task", "agent_verify"],
+    registeredNames: ["agent_deliver", "agent_execute", "agent_history", "agent_task", "agent_verify"],
     requestReview: true,
     defaultInvocation: 1,
     hybridHost: false,

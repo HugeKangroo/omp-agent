@@ -47,6 +47,7 @@ function fixturePythonPath(): string {
 export const DAILY_MANAGED_TOOLS = [
   "agent_deliver",
   "agent_execute",
+  "agent_history",
   "agent_task",
   "agent_verify",
 ] as const;
