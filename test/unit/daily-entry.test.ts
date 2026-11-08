@@ -18,6 +18,7 @@ import {
 } from "../../src/daily-config.ts";
 import {
   createDailyEntry,
+  DAILY_GUIDANCE_TYPE,
   type DailyEntryControls,
   type DailyOmpApi,
 } from "../../src/daily-entry.ts";
@@ -29,7 +30,7 @@ import {
   publishTaskOwner,
   type OmpToolContext,
 } from "../../src/task-entry-port.ts";
-import { TASK_CONTROL_TOOL } from "../../src/task-entry.ts";
+import { B1_GUIDANCE_TYPE, TASK_CONTROL_TOOL } from "../../src/task-entry.ts";
 import { TaskOwner } from "../../src/task-owner.ts";
 import { VERIFICATION_TOOL } from "../../src/verification-entry.ts";
 
@@ -166,6 +167,21 @@ function userEntry(id: string, parentId: string | null, text: string): Record<st
     type: "message",
     message: { role: "user", content: [{ type: "text", text }], attribution: "user" },
   };
+}
+
+function startMessages(
+  fake: FakeHost,
+  ctx: OmpToolContext,
+  prompt = "An ordinary prompt.",
+): Array<Record<string, unknown>> {
+  const messages: Array<Record<string, unknown>> = [];
+  for (const handler of fake.handlers.get("before_agent_start") ?? []) {
+    const result = handler({ prompt, reason: "prompt" }, ctx) as
+      | { message?: Record<string, unknown> }
+      | undefined;
+    if (result?.message) messages.push(result.message);
+  }
+  return messages;
 }
 
 function within(parent: string, child: string): boolean {
@@ -415,6 +431,42 @@ describe("daily composition", () => {
     expect(await mode(entry.instance.auditPath)).toBe(0o600);
   });
 
+  test("active main composition adds fixed workflow guidance beside task guidance", async () => {
+    const fx = await fixture();
+    const fake = fakeHost();
+    const entry = createDailyEntry(fake.pi, { env: fx.env, launchWorkspace: fx.workspace });
+    entries.push(entry);
+
+    const messages = startMessages(fake, context(fx.workspace, []));
+    const daily = messages.filter((message) => message.customType === DAILY_GUIDANCE_TYPE);
+    expect(daily).toHaveLength(1);
+    expect(daily[0]).toMatchObject({ display: false, attribution: "agent" });
+    const content = daily[0]!.content;
+    expect(typeof content).toBe("string");
+    expect(content).toContain(EXECUTION_TOOL);
+    expect(content).toContain(VERIFICATION_TOOL);
+    expect(content).toContain(DELIVERY_TOOL);
+    expect(content).toContain("Native workspace writes and shell self-tests do not create managed candidates or receipts");
+    expect(messages.filter((message) => message.customType === B1_GUIDANCE_TYPE)).toHaveLength(1);
+  });
+
+  test("workflow guidance is main-only and disappears when disposed", async () => {
+    const fx = await fixture();
+    const fake = fakeHost();
+    const entry = createDailyEntry(fake.pi, { env: fx.env, launchWorkspace: fx.workspace });
+    entries.push(entry);
+    const main = context(fx.workspace, []);
+    const hasDailyGuidance = (ctx: OmpToolContext): boolean =>
+      startMessages(fake, ctx).some((message) => message.customType === DAILY_GUIDANCE_TYPE);
+    expect(hasDailyGuidance(main)).toBe(true);
+
+    const sub = { ...main, agent: { kind: "sub" as const } };
+    expect(hasDailyGuidance(sub)).toBe(false);
+
+    entry.dispose();
+    expect(hasDailyGuidance(main)).toBe(false);
+  });
+
   test("successive startups create fresh instances and preserve previous files", async () => {
     const fx = await fixture();
     const first = createDailyEntry(fakeHost().pi, { env: fx.env, launchWorkspace: fx.workspace });
@@ -483,6 +535,7 @@ describe("daily composition", () => {
     const input = fake.handlers.get("input")?.[0];
     expect(input).toBeDefined();
     expect(input!({ text: "do managed work", source: "rpc" }, ctx)).toBeUndefined();
+    expect(startMessages(fake, ctx)).toEqual([]);
     expect(currentTaskOwner()).toBeUndefined();
     const shutdown = fake.handlers.get("session_shutdown")?.[0];
     expect(() => shutdown?.({}, ctx)).not.toThrow();
@@ -565,10 +618,22 @@ describe("daily composition", () => {
 
     branch.push(userEntry("user-1", "leaf-1", "Own the first managed turn."));
     fake.handlers.get("input")![0]!({ text: "Own the first managed turn.", source: "rpc" }, ctx);
-    fake.handlers.get("before_agent_start")![0]!(
-      { prompt: "Own the first managed turn.", reason: "prompt" },
-      ctx,
-    );
+    const guidance = startMessages(fake, ctx, "Own the first managed turn.");
+    expect(guidance.some((message) => message.customType === DAILY_GUIDANCE_TYPE)).toBe(true);
+    let guidanceParent = "user-1";
+    for (const [index, message] of guidance.entries()) {
+      const id = `guidance-${index + 1}`;
+      branch.push({
+        id,
+        parentId: guidanceParent,
+        type: "custom_message",
+        customType: message.customType,
+        content: message.content,
+        display: message.display,
+        attribution: message.attribution,
+      });
+      guidanceParent = id;
+    }
     const started = await fake.tools.get(TASK_CONTROL_TOOL)!.execute(
       "call-start",
       { action: "start" },
@@ -582,7 +647,7 @@ describe("daily composition", () => {
 
     branch.push({
       id: "assistant-1",
-      parentId: "user-1",
+      parentId: guidanceParent,
       type: "message",
       message: { role: "assistant", content: [{ type: "text", text: "working" }], attribution: "agent" },
     });

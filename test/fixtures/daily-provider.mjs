@@ -23,6 +23,61 @@ const audit = (value) => {
   if (auditPath) appendFileSync(auditPath, `${JSON.stringify({ timestamp: new Date().toISOString(), ...value })}\n`);
 };
 
+/**
+ * Provider-visible guidance, recorded verbatim from context.messages.
+ *
+ * OMP converts session custom messages to role "developer" before the provider
+ * call, dropping customType and display, so the converted messages cannot be
+ * selected by type. Matching therefore uses each guidance's own stable content
+ * anchor; the recorded content, byte count and digest are the actual converted
+ * provider text, never a test-local reconstruction. Only these two anchor
+ * matches are recorded.
+ */
+const GUIDANCE_ANCHORS = [
+  {
+    kind: "daily",
+    anchor: "Native workspace writes and shell self-tests do not create managed candidates or receipts",
+  },
+  {
+    kind: "task",
+    anchor: "Managed task control is available through agent_task",
+  },
+];
+
+const guidanceFactsOf = (context) => {
+  const messages = Array.isArray(context?.messages) ? context.messages : [];
+  const latestUserIndex = messages.reduce(
+    (latest, message, index) => message?.role === "user" ? index : latest,
+    -1,
+  );
+  const matching = [];
+  for (const [index, message] of messages.entries()) {
+    if (message?.role !== "developer") continue;
+    const content = textOf(message.content);
+    const matched = GUIDANCE_ANCHORS.find((candidate) => content.includes(candidate.anchor));
+    if (matched === undefined) continue;
+    matching.push({
+      source: "context.messages",
+      index,
+      afterLatestUser: index > latestUserIndex,
+      role: message.role,
+      customType: typeof message.customType === "string" ? message.customType : null,
+      attribution: typeof message.attribution === "string" ? message.attribution : null,
+      display: message.display === undefined ? null : message.display,
+      match: "content-anchor",
+      kind: matched.kind,
+      content,
+      bytes: Buffer.byteLength(content, "utf8"),
+      sha256: `sha256:${createHash("sha256").update(content, "utf8").digest("hex")}`,
+    });
+  }
+  return {
+    source: "context.messages",
+    latestUserIndex,
+    messages: matching,
+  };
+};
+
 const MAX_SCHEMA_BYTES = 32 * 1024;
 
 /**
@@ -395,6 +450,7 @@ export default function dailyFixtureProvider(pi) {
             model: { provider: model.provider, api: model.api, id: model.id },
             tools: context.tools.map((tool) => tool.name).sort(),
             agentDeliverSchema: toolSchemaOf(context, "agent_deliver"),
+            guidance: guidanceFactsOf(context),
             call: call ?? null,
             lastToolCallId: lastToolMessage?.toolCallId ?? null,
             lastToolName: lastToolMessage?.toolName ?? null,

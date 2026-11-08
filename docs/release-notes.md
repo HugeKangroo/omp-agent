@@ -1,5 +1,13 @@
 # Release notes
 
+## Advisory daily workflow guidance
+
+The real daily composition now adds one fixed, model-visible advisory message during ordinary main-agent prompt preparation. It describes the existing workflow: establish a managed task before dependent calls, generate deliverable files through `agent_execute` as registered candidates (including prose written by a task-local Python or Bun script), use only authorized input handles, verify the exact returned selection, preview delivery for a readable path, and report generated, verified and accepted coverage honestly. Native workspace writes and shell self-tests are stated not to be managed candidates or receipts.
+
+This is advisory only. It does not create tasks automatically, grant authority, force managed tools, change verification or acceptance semantics, or alter human-review, policy, budget, native-tool or shutdown defaults. It is absent for subagents and after disposal. The new custom type is trusted as a host-owned control artifact so its own persisted message does not close the current user-turn authority window; the content remains advisory.
+
+Validation passed 50 focused unit tests and 3 actual OMP daily cases with 383 assertions, including provider-visible guidance and task creation after its persisted message. A bounded real-model document task reached managed generation, exact candidate selection, insufficient verification and a readable delivery preview. Four recovered tool errors and unsupported assumptions in the report remain recorded: the execution chain passed, while full content-quality acceptance did not. A separate unsupported-runtime sample honestly reported non-execution, but its original automated attribution failure also remains. Guidance does not guarantee model compliance or overall task correctness.
+
 ## Real-model journey validation
 
 Recorded a bounded three-message file-task, cancellation and new-task journey through the configured entry. Independent checks confirmed actual artifact bytes, delivery paths, preserved previous files and truthful insufficient/active/cancelled reporting. Original automated attribution failures and recovered tool errors remain recorded; this is not a strict zero-error pass, semantic host acceptance or full Alpha validation.

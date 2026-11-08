@@ -470,6 +470,8 @@ export interface TaskEntryOptions {
   statePath: string;
   auditPath?: string;
   capabilities?: readonly string[];
+  /** Extra host-owned custom types that must not close the authority window. */
+  additionalTrustedControlTypes?: readonly string[];
   now?: () => string;
   id?: () => string;
 }
@@ -494,7 +496,10 @@ export function createTaskEntry(pi: OmpApi, options: TaskEntryOptions): { owner:
   const owner = new TaskOwner({
     workspaceRoot,
     ...(options.capabilities === undefined ? {} : { authorizedCapabilities: options.capabilities }),
-    trustedControlTypes: [B1_GUIDANCE_TYPE],
+    trustedControlTypes: [
+      B1_GUIDANCE_TYPE,
+      ...(options.additionalTrustedControlTypes ?? []),
+    ],
     ...(options.now === undefined ? {} : { now: options.now }),
     ...(options.id === undefined ? {} : { id: options.id }),
     onStateChange: persist,

@@ -114,6 +114,56 @@ function deliverSchema(turn: Event): Event {
   return JSON.parse(String(schema!.parametersJson)) as Event;
 }
 
+function guidanceMessages(turn: Event): Event[] {
+  const guidance = turn.guidance as Event | undefined;
+  expect(guidance).toBeTruthy();
+  expect(guidance!.source).toBe("context.messages");
+  expect(Number.isSafeInteger(guidance!.latestUserIndex)).toBe(true);
+  const messages = guidance!.messages as Event[];
+  expect(Array.isArray(messages)).toBe(true);
+  return messages;
+}
+
+/**
+ * The current prompt batch is the set of matching guidance messages after the
+ * latest user message. Historical guidance from earlier prompts stays in the
+ * transcript and is excluded, so this asserts what the current real prompt saw.
+ * OMP converts the session custom messages to role "developer" before the
+ * provider call and drops customType/display; kind comes from the recorded
+ * content anchor, while content/bytes/digest are the actual converted text.
+ */
+function currentGuidance(turn: Event): { daily: Event; task: Event } {
+  const current = guidanceMessages(turn).filter((message) => message.afterLatestUser === true);
+  const daily = current.filter((message) => message.kind === "daily");
+  const task = current.filter((message) => message.kind === "task");
+  expect(current).toHaveLength(2);
+  expect(daily).toHaveLength(1);
+  expect(task).toHaveLength(1);
+  for (const message of [
+    { item: daily[0]!, kind: "daily" },
+    { item: task[0]!, kind: "task" },
+  ]) {
+    expect(message.item.source).toBe("context.messages");
+    expect(message.item.role).toBe("developer");
+    expect(message.item.customType).toBeNull();
+    expect(message.item.attribution).toBe("agent");
+    expect(message.item.display).toBeNull();
+    expect(message.item.match).toBe("content-anchor");
+    expect(message.item.kind).toBe(message.kind);
+    expect(message.item.afterLatestUser).toBe(true);
+    expect(typeof message.item.content).toBe("string");
+    expect(Buffer.byteLength(String(message.item.content), "utf8")).toBe(message.item.bytes);
+    expect(sha256(String(message.item.content))).toBe(message.item.sha256);
+  }
+  expect(String(daily[0]!.content)).not.toBe(String(task[0]!.content));
+  expect(String(daily[0]!.content)).toContain("agent_execute");
+  expect(String(daily[0]!.content)).toContain("agent_verify");
+  expect(String(daily[0]!.content)).toContain("agent_deliver");
+  expect(String(daily[0]!.content)).toContain("Native workspace writes and shell self-tests do not create managed candidates or receipts");
+  expect(String(task[0]!.content)).toContain("agent_task");
+  return { daily: daily[0]!, task: task[0]! };
+}
+
 function comparable(files: DeliveryFileSnapshot[]): Array<Record<string, unknown>> {
   return files.map(({ relativePath, bytes, sha256: digest, ino, dev, mtimeMs, nlink, mode }) => ({
     relativePath, bytes, sha256: digest, ino, dev, mtimeMs, nlink, mode,
@@ -233,6 +283,11 @@ integration("case 1: one daily load preserves native tools and executes A cancel
     expect(nativeTurns[0]!.tools).toContain("read");
     expect(nativeTurns[0]!.call.name).toBe("read");
     expect(nativeTurns[0]!.call.arguments.path).toBe(session.nativeFilePath);
+    // The first actual main prompt sees the fixed daily workflow guidance
+    // beside the existing task-control guidance, both copied from the real
+    // provider context rather than a test-local construction.
+    expect(guidanceMessages(nativeTurns[0]!)).toHaveLength(2);
+    currentGuidance(nativeTurns[0]!);
 
     await session.prompt(DAILY_PROMPTS.taskA);
     const stateA = await session.state();
@@ -244,6 +299,7 @@ integration("case 1: one daily load preserves native tools and executes A cancel
     provider = await session.providerEvents();
     const aTurns = turns(provider, "DAILY_TASK_A");
     expect(aTurns.map((turn) => turn.step)).toEqual([0, 1, 2, 3, 4, 5, 6]);
+    currentGuidance(aTurns[0]!);
     expect(aTurns[0]!.call).toMatchObject({ name: "agent_task", arguments: { action: "start" } });
     expect(aTurns[1]!.call).toMatchObject({
       name: "agent_execute",

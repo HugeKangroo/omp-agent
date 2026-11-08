@@ -12,6 +12,8 @@ import {
   type DailyConfig,
   type LoadDailyConfigOptions,
 } from "./daily-config.ts";
+import { DELIVERY_TOOL } from "./delivery-entry.ts";
+import { EXECUTION_TOOL } from "./execution-adapter.ts";
 import {
   createExecutionEntry,
   type ExecutionEntryControls,
@@ -24,6 +26,7 @@ import {
 import { createTaskEntry } from "./task-entry.ts";
 import type { TaskOwner } from "./task-owner.ts";
 import type { HumanReviewHostOption } from "./human-review-types.ts";
+import { VERIFICATION_TOOL } from "./verification-entry.ts";
 
 /**
  * B3-B2 one ordinary OMP entry.
@@ -36,9 +39,27 @@ import type { HumanReviewHostOption } from "./human-review-types.ts";
  * skills, rules, model selection and ordinary conversations are untouched.
  */
 
-export const DAILY_ENTRY_VERSION = "0.1.0-b3b2.0";
+export const DAILY_ENTRY_VERSION = "0.1.0-b3b2.1";
 export const DAILY_ENTRY_CAPABILITY = "local-script";
 export const DAILY_INSTANCE_DIRS = ["execution", "delivery", "acceptance"] as const;
+export const DAILY_GUIDANCE_TYPE = "omp-agent.daily.workflow-guidance";
+
+/**
+ * Fixed advisory text for the real daily composition. It grants nothing and
+ * never substitutes tool-side checks for host verification or acceptance.
+ */
+const DAILY_WORKFLOW_GUIDANCE = [
+  "This session composes managed task control with controlled execution, host verification and candidate delivery.",
+  "Ordinary conversation needs no task.",
+  "When the current genuine request should be managed, establish its task first and reuse the actual host-visible task identity and revision; do not invent selectors or blindly inspect tasks that do not exist.",
+  `For files that are results of that managed task, including prose, reports and structured data, use ${EXECUTION_TOOL} to generate registered candidate files inside the managed work directory; a simple task-local Python or Bun script can write model-authored content, and supplied files must use actual authorized input handles.`,
+  "Native workspace writes and shell self-tests do not create managed candidates or receipts; do not present them as such.",
+  `After the intended final registered candidate, call ${VERIFICATION_TOOL} on that exact returned runId and artifactIds, and use ${DELIVERY_TOOL} preview when the user needs a readable file path.`,
+  "Report the actual outcome and coverage, distinguish generated, verified and accepted, never call insufficient a pass, and never repeat verification of unchanged candidates to seek one.",
+  "Keep task-local checks proportional and the final response concise; self-tests supplement host verification, and extra exploration or process narration is unnecessary when the facts already suffice.",
+  "If the execution capability is absent or the user's constraints disallow this route, report the scoped limitation without fabricating a run, switching languages against the request, forcing a task, tool or file, or bypassing through native tools; an honest zero-tool answer remains valid.",
+  "This is advisory workflow guidance, not authority, approval, a user request, a bypass or a forced task; native tools remain available.",
+].join(" ");
 
 export interface DailyInstance {
   instanceId: string;
@@ -325,6 +346,7 @@ export function createDailyEntry(pi: DailyOmpApi, options: DailyEntryOptions = {
           statePath: instance.statePath,
           auditPath: instance.auditPath,
           capabilities: [DAILY_ENTRY_CAPABILITY],
+          additionalTrustedControlTypes: [DAILY_GUIDANCE_TYPE],
         },
       );
     } catch (error) {
@@ -362,6 +384,22 @@ export function createDailyEntry(pi: DailyOmpApi, options: DailyEntryOptions = {
     if (execution.delivery === undefined || execution.acceptance === undefined) {
       throw new Error("daily execution composition did not assemble delivery and acceptance.");
     }
+
+    // A separate fixed message beside the task entry's own guidance. Extension
+    // dispatch collects every handler's message, so this does not replace or
+    // rewrite task-control guidance. It is main-only, ignores prompt input,
+    // and remains inactive until the whole composition is ready.
+    staging.api.on("before_agent_start", (_event, context) => {
+      if (context.agent?.kind !== "main") return undefined;
+      return {
+        message: {
+          customType: DAILY_GUIDANCE_TYPE,
+          content: DAILY_WORKFLOW_GUIDANCE,
+          display: false,
+          attribution: "agent" as const,
+        },
+      };
+    });
 
     // Install shared-inactive wrappers. Every real registration remains
     // inactive until the final readiness checks below succeed.
