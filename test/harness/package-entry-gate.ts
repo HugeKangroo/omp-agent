@@ -75,7 +75,41 @@ function walkFiles(root: string): string[] {
   return files;
 }
 
-/** Exact allowlist: package.json, the public docs, policy, launcher and all src. */
+/** Exact vendor allowlist: wrapper, provenance and the fixed controller closure. */
+const VENDOR_PACKAGE_PATHS = [
+  "package/vendor/harness2/index.ts",
+  "package/vendor/harness2/SOURCE.json",
+  "package/vendor/harness2/upstream/LICENSE",
+  "package/vendor/harness2/upstream/NOTICE",
+  "package/vendor/harness2/upstream/src/adaptation.ts",
+  "package/vendor/harness2/upstream/src/approval-channel.ts",
+  "package/vendor/harness2/upstream/src/capabilities.ts",
+  "package/vendor/harness2/upstream/src/commands.ts",
+  "package/vendor/harness2/upstream/src/controller.ts",
+  "package/vendor/harness2/upstream/src/conversation.ts",
+  "package/vendor/harness2/upstream/src/diff.ts",
+  "package/vendor/harness2/upstream/src/evolution-completion.ts",
+  "package/vendor/harness2/upstream/src/evolution.ts",
+  "package/vendor/harness2/upstream/src/exploration-prompts.ts",
+  "package/vendor/harness2/upstream/src/exploration.ts",
+  "package/vendor/harness2/upstream/src/generated-extension.ts",
+  "package/vendor/harness2/upstream/src/host-tools.ts",
+  "package/vendor/harness2/upstream/src/method-authoring.ts",
+  "package/vendor/harness2/upstream/src/omp-profile.ts",
+  "package/vendor/harness2/upstream/src/planner-catalog.ts",
+  "package/vendor/harness2/upstream/src/planner-methods.ts",
+  "package/vendor/harness2/upstream/src/prompts.ts",
+  "package/vendor/harness2/upstream/src/runner.ts",
+  "package/vendor/harness2/upstream/src/runtime-policy.ts",
+  "package/vendor/harness2/upstream/src/store.ts",
+  "package/vendor/harness2/upstream/src/surface.ts",
+  "package/vendor/harness2/upstream/src/task-graph.ts",
+  "package/vendor/harness2/upstream/src/types.ts",
+  "package/vendor/harness2/upstream/src/workflows.ts",
+  "package/vendor/harness2/upstream/src/workspace.ts",
+] as const;
+
+/** Exact allowlist: package.json, the public docs, policy, launcher, all src and the fixed vendor closure. */
 export function expectedPackagePaths(repoRoot: string): string[] {
   const paths = [
     "package/package.json",
@@ -85,6 +119,7 @@ export function expectedPackagePaths(repoRoot: string): string[] {
     "package/docs/release-notes.md",
     "package/policy/development-fixture.v1.json",
     "package/scripts/isolated-exec.py",
+    ...VENDOR_PACKAGE_PATHS,
   ];
   for (const absolute of walkFiles(path.join(repoRoot, "src"))) {
     paths.push(`package/src/${path.relative(path.join(repoRoot, "src"), absolute).split(path.sep).join("/")}`);
@@ -140,7 +175,8 @@ function extract(tarball: string, destination: string): void {
   );
 }
 
-async function validateExtracted(
+/** Exported only so package-source tests can exercise real extraction mutations. */
+export async function validateExtracted(
   packageRoot: string,
   repoRoot: string,
   expectedPaths: string[],

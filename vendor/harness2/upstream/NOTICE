@@ -1,0 +1,10 @@
+omp-harness2 is an independent implementation inspired by:
+Harness²: Recursive Agent Harnessing for an Open World, Ruiyao Xu et al. (2026).
+Paper: https://arxiv.org/abs/2610.14224 (CC BY 4.0)
+Reference implementation: https://github.com/google-research/harness2 (Apache-2.0)
+
+Oh My Pi is a separate MIT-licensed project:
+https://github.com/can1357/oh-my-pi
+
+This distribution does not bundle the OMP executable, provider credentials,
+benchmark data, or third-party runtime dependencies.

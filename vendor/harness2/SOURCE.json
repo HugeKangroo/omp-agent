@@ -1,0 +1,326 @@
+{
+  "schemaVersion": 1,
+  "format": "omp-agent-vendored-source",
+  "upstream": {
+    "repository": "https://github.com/HugeKangroo/omp-harness2",
+    "baseCommit": "6d5cd6386c8a085d0070cfb660ddbc5c7f76b92e",
+    "contentKind": "derived snapshot of the upstream dirty worktree at baseCommit",
+    "publishedUpstreamTag": false,
+    "note": "The distributed files are a fixed derived snapshot, not an upstream release artifact. The base commit identifies the source baseline only."
+  },
+  "pathBase": {
+    "distributionPath": "relative to the omp-agent package root",
+    "upstreamPath": "relative to the upstream repository root"
+  },
+  "sourceId": "1edfaf2a5b39f15adaf53e9d351b43c29a62853b6dd27cf52b028a77d656b031",
+  "sourceIdAlgorithm": "sha256 over UTF-8 canonical JSON with object keys sorted recursively, arrays in stored order, and no insignificant whitespace, of {schemaVersion, upstreamRepository, baseCommit, files:[{distributionPath, bundledSha256}]}; files are every distributed content file except vendor/harness2/SOURCE.json, sorted by distributionPath; SOURCE.json is excluded to avoid self-referential metadata hashing.",
+  "license": {
+    "upstreamLicensePath": "LICENSE",
+    "upstreamNoticePath": "NOTICE",
+    "distributionLicensePath": "vendor/harness2/upstream/LICENSE",
+    "distributionNoticePath": "vendor/harness2/upstream/NOTICE",
+    "note": "Original MIT LICENSE and NOTICE text retained verbatim; no upstream copyright text was rewritten."
+  },
+  "files": [
+    {
+      "distributionPath": "vendor/harness2/SOURCE.json",
+      "upstreamPath": null,
+      "kind": "provenance",
+      "originalSha256": null,
+      "bundledSha256": null,
+      "bytes": null,
+      "modified": false,
+      "note": "This provenance manifest. Excluded from sourceId because it is self-referential metadata."
+    },
+    {
+      "distributionPath": "vendor/harness2/index.ts",
+      "upstreamPath": null,
+      "kind": "wrapper",
+      "originalSha256": null,
+      "bundledSha256": "4e3b5251ab00c74f65f2d9a70dc9866b393577c51af9168a098a364d3a13f68c",
+      "bytes": 670,
+      "modified": false,
+      "note": "Authored host-only library entry. Re-exports HarnessController and the minimal public types; no OMP extension, CLI, bin, or HTTP entry."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/LICENSE",
+      "upstreamPath": "LICENSE",
+      "kind": "license",
+      "originalSha256": "d3aefacd95401542806b21fdb77d45f4261eddc45a04328df2f4e91d99cfde8d",
+      "bundledSha256": "d3aefacd95401542806b21fdb77d45f4261eddc45a04328df2f4e91d99cfde8d",
+      "bytes": 1082,
+      "modified": false,
+      "note": "Upstream MIT license, copied verbatim."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/NOTICE",
+      "upstreamPath": "NOTICE",
+      "kind": "license",
+      "originalSha256": "5769c82725b523a5cd76bde5354157db15a433bbeb4be62a62f8b15e3fc9b505",
+      "bundledSha256": "5769c82725b523a5cd76bde5354157db15a433bbeb4be62a62f8b15e3fc9b505",
+      "bytes": 488,
+      "modified": false,
+      "note": "Upstream NOTICE, copied verbatim."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/adaptation.ts",
+      "upstreamPath": "src/adaptation.ts",
+      "kind": "upstream-source",
+      "originalSha256": "b3c991992a581c40b419fe31124cffbb14ae66cfab8028174c063d21edabda9e",
+      "bundledSha256": "b3c991992a581c40b419fe31124cffbb14ae66cfab8028174c063d21edabda9e",
+      "bytes": 494,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/approval-channel.ts",
+      "upstreamPath": "src/approval-channel.ts",
+      "kind": "upstream-source",
+      "originalSha256": "9cfe54fe053d48742d85aee5746263d21d045cc100173b016e9381b82e237a04",
+      "bundledSha256": "9cfe54fe053d48742d85aee5746263d21d045cc100173b016e9381b82e237a04",
+      "bytes": 3340,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/capabilities.ts",
+      "upstreamPath": "src/capabilities.ts",
+      "kind": "upstream-source",
+      "originalSha256": "f3608ddddf929fbc7f151d980fa4be83b8b0554cbfb4f2e17c6b64e6c46fe98a",
+      "bundledSha256": "f3608ddddf929fbc7f151d980fa4be83b8b0554cbfb4f2e17c6b64e6c46fe98a",
+      "bytes": 10132,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/commands.ts",
+      "upstreamPath": "src/commands.ts",
+      "kind": "upstream-source",
+      "originalSha256": "ea7c646d64de6876c2764b0a1b66cbd3ed6a87bbcc0c19075466bde1dc753979",
+      "bundledSha256": "ea7c646d64de6876c2764b0a1b66cbd3ed6a87bbcc0c19075466bde1dc753979",
+      "bytes": 14097,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/controller.ts",
+      "upstreamPath": "src/controller.ts",
+      "kind": "upstream-source",
+      "originalSha256": "711967e2e61220953e00412dbfcf3dac623202f0cd01d9e1fcfd002113582d92",
+      "bundledSha256": "3151027dbb8e782347b25d636837fa1c1ef9bbd0d7e1b9bb3d0e5b62cce29f7f",
+      "bytes": 35925,
+      "modified": true,
+      "note": "Strict optional-property adaptation: approval uses an explicit undefined union; undefined evolution execution, worker auth and missing lesson properties are omitted or deleted. Existing default consumers read equivalent values and JSON serialization is unchanged; own-property reflection is observably different and is not promised equivalent for custom consumers."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/conversation.ts",
+      "upstreamPath": "src/conversation.ts",
+      "kind": "upstream-source",
+      "originalSha256": "4e7b7e4c74deae96f4aef75416d05c440b0a51f076efc2a91b7f117f37de1e54",
+      "bundledSha256": "4e7b7e4c74deae96f4aef75416d05c440b0a51f076efc2a91b7f117f37de1e54",
+      "bytes": 12428,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/diff.ts",
+      "upstreamPath": "src/diff.ts",
+      "kind": "upstream-source",
+      "originalSha256": "1e75a699d9c4e87ccdcca127f14291490e30e5b274550277201d55ce7dea96d5",
+      "bundledSha256": "1e75a699d9c4e87ccdcca127f14291490e30e5b274550277201d55ce7dea96d5",
+      "bytes": 4013,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/evolution-completion.ts",
+      "upstreamPath": "src/evolution-completion.ts",
+      "kind": "upstream-source",
+      "originalSha256": "ca1c3f3f45e6003de2329b72068897fff7d880c4833d07eb5239c4df470a6f08",
+      "bundledSha256": "ca1c3f3f45e6003de2329b72068897fff7d880c4833d07eb5239c4df470a6f08",
+      "bytes": 4981,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/evolution.ts",
+      "upstreamPath": "src/evolution.ts",
+      "kind": "upstream-source",
+      "originalSha256": "706d229570950eb074844472ada15237477ed9d86ffb8b4443f9601861f16985",
+      "bundledSha256": "6b90f7da4003af912ea00d017add723812d58bcf386502cceeb65f7c29a2efe0",
+      "bytes": 41832,
+      "modified": true,
+      "note": "Strict optional-property adaptation: undefined worker auth and baseline artifactHash properties are omitted. Existing default consumers read equivalent values and JSON serialization is unchanged; custom consumers that inspect own-property presence can observe the difference."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/exploration-prompts.ts",
+      "upstreamPath": "src/exploration-prompts.ts",
+      "kind": "upstream-source",
+      "originalSha256": "0a7c2a1f8896581aeb3f337d6ebb6f5cfc1699cdb2c56d98872ea0512724748a",
+      "bundledSha256": "0a7c2a1f8896581aeb3f337d6ebb6f5cfc1699cdb2c56d98872ea0512724748a",
+      "bytes": 6782,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/exploration.ts",
+      "upstreamPath": "src/exploration.ts",
+      "kind": "upstream-source",
+      "originalSha256": "1bf123c80d7870f8db6b5071e9813a94190e4bf2ccbc626968cba537d2e66d3e",
+      "bundledSha256": "1bf123c80d7870f8db6b5071e9813a94190e4bf2ccbc626968cba537d2e66d3e",
+      "bytes": 11308,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/generated-extension.ts",
+      "upstreamPath": "src/generated-extension.ts",
+      "kind": "upstream-source",
+      "originalSha256": "eb07a9ba151de6d8be00f1a4f71d63d3d7f92fc62ac68b6cbcdc76ff19210709",
+      "bundledSha256": "eb07a9ba151de6d8be00f1a4f71d63d3d7f92fc62ac68b6cbcdc76ff19210709",
+      "bytes": 4263,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/host-tools.ts",
+      "upstreamPath": "src/host-tools.ts",
+      "kind": "upstream-source",
+      "originalSha256": "ee161d5eb4c22d970b0ee4725e74489c0878e3faa6459bc2979f4996f76c0b3b",
+      "bundledSha256": "ee161d5eb4c22d970b0ee4725e74489c0878e3faa6459bc2979f4996f76c0b3b",
+      "bytes": 21062,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/method-authoring.ts",
+      "upstreamPath": "src/method-authoring.ts",
+      "kind": "upstream-source",
+      "originalSha256": "673e8591476441f013642d60f2c1b7b49da6afb40e12e9b9c7693856666f4734",
+      "bundledSha256": "673e8591476441f013642d60f2c1b7b49da6afb40e12e9b9c7693856666f4734",
+      "bytes": 1597,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/omp-profile.ts",
+      "upstreamPath": "src/omp-profile.ts",
+      "kind": "upstream-source",
+      "originalSha256": "bd283f99bb6fcfe6b02c7929c2db7dd10425c41cfc928d7ded7b20808e195708",
+      "bundledSha256": "bd283f99bb6fcfe6b02c7929c2db7dd10425c41cfc928d7ded7b20808e195708",
+      "bytes": 2088,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/planner-catalog.ts",
+      "upstreamPath": "src/planner-catalog.ts",
+      "kind": "upstream-source",
+      "originalSha256": "12055fe8a007d7c241d3d6e1b1815de92a2b817bfa11957a22b52eb770fe108e",
+      "bundledSha256": "12055fe8a007d7c241d3d6e1b1815de92a2b817bfa11957a22b52eb770fe108e",
+      "bytes": 3811,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/planner-methods.ts",
+      "upstreamPath": "src/planner-methods.ts",
+      "kind": "upstream-source",
+      "originalSha256": "bd0ee9e657c2d430f5e08da9885708b4bf73633ee72e6d934e4a97fde5b863d1",
+      "bundledSha256": "bd0ee9e657c2d430f5e08da9885708b4bf73633ee72e6d934e4a97fde5b863d1",
+      "bytes": 6295,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/prompts.ts",
+      "upstreamPath": "src/prompts.ts",
+      "kind": "upstream-source",
+      "originalSha256": "d85f982db1e7a0405cc1c089ba73497d1972421ed147162c51a45025eb9b3b3d",
+      "bundledSha256": "d85f982db1e7a0405cc1c089ba73497d1972421ed147162c51a45025eb9b3b3d",
+      "bytes": 5572,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/runner.ts",
+      "upstreamPath": "src/runner.ts",
+      "kind": "upstream-source",
+      "originalSha256": "589cde36411bcb71ea06a2c628b4fa28dbbc36f44d1431043452e98d9f829f24",
+      "bundledSha256": "cef2792d9cc8bb40efbe455111c8836c39f1dbe8947f481ebad2503de28d9b76",
+      "bytes": 37611,
+      "modified": true,
+      "note": "Strict optional-property adaptation: completed RPC chunk state is deleted instead of assigned undefined. Existing decoder value checks retain their meaning, while own-property reflection can observe absence. This adaptation does not itself establish runtime protocol compatibility."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/runtime-policy.ts",
+      "upstreamPath": "src/runtime-policy.ts",
+      "kind": "upstream-source",
+      "originalSha256": "f1c32ccd2a7b55896c706cca19b40bfac3ed89b0085ef89dd04c9a4522994fb0",
+      "bundledSha256": "f1c32ccd2a7b55896c706cca19b40bfac3ed89b0085ef89dd04c9a4522994fb0",
+      "bytes": 3599,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/store.ts",
+      "upstreamPath": "src/store.ts",
+      "kind": "upstream-source",
+      "originalSha256": "d3cc63d6a8a5dd10e073987927febac1fa69f076b9beeba9e08c2e198df472c8",
+      "bundledSha256": "d3cc63d6a8a5dd10e073987927febac1fa69f076b9beeba9e08c2e198df472c8",
+      "bytes": 26486,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/surface.ts",
+      "upstreamPath": "src/surface.ts",
+      "kind": "upstream-source",
+      "originalSha256": "3697077bfdfad5aadbf764813c84e8ac926b500f12f66673dd41de3b3dc5cec7",
+      "bundledSha256": "3697077bfdfad5aadbf764813c84e8ac926b500f12f66673dd41de3b3dc5cec7",
+      "bytes": 5062,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/task-graph.ts",
+      "upstreamPath": "src/task-graph.ts",
+      "kind": "upstream-source",
+      "originalSha256": "4aa2c6afc16c8f1ab67ce92aade61fdedfe0edf962e6183273f3dc0bb77855e2",
+      "bundledSha256": "4aa2c6afc16c8f1ab67ce92aade61fdedfe0edf962e6183273f3dc0bb77855e2",
+      "bytes": 9526,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/types.ts",
+      "upstreamPath": "src/types.ts",
+      "kind": "upstream-source",
+      "originalSha256": "b3e0f123e816beb0ea1bb29522a3bc9aa7c9afde29bce02aa11548508cde7842",
+      "bundledSha256": "b3e0f123e816beb0ea1bb29522a3bc9aa7c9afde29bce02aa11548508cde7842",
+      "bytes": 5868,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/workflows.ts",
+      "upstreamPath": "src/workflows.ts",
+      "kind": "upstream-source",
+      "originalSha256": "7e0f78e07b231165b92bca8da2046e85866d951807bf8166bb6b0095ab178ef5",
+      "bundledSha256": "7e0f78e07b231165b92bca8da2046e85866d951807bf8166bb6b0095ab178ef5",
+      "bytes": 4231,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    },
+    {
+      "distributionPath": "vendor/harness2/upstream/src/workspace.ts",
+      "upstreamPath": "src/workspace.ts",
+      "kind": "upstream-source",
+      "originalSha256": "9b7404274d7fc281ebbee67adc0457953c457047243b5f9904a82be397659182",
+      "bundledSha256": "9b7404274d7fc281ebbee67adc0457953c457047243b5f9904a82be397659182",
+      "bytes": 26056,
+      "modified": false,
+      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+    }
+  ]
+}

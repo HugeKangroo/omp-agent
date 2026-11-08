@@ -41,6 +41,12 @@ A requirement amendment increments the task revision. Capabilities check that th
 
 Local execution uses host-selected paths, runtimes, input handles, time limits, and output limits. Candidates retain the source, input, and output identities needed for later checks. A process exit code alone does not establish that a task meets its requirements.
 
+## Fixed composite-backend source
+
+`vendor/harness2/index.ts` exposes a host-only `HarnessController` library entry and its supporting types. The package includes an explicit 30-file set: the entry, portable provenance, 26 backend modules and the original MIT license and notice. `vendor/harness2/SOURCE.json` identifies the upstream baseline and the actual derived content independently; its content digest excludes the provenance file itself to avoid self-reference. The package has no runtime dependency on a local upstream checkout.
+
+Three copied modules adapt optional properties to this project's strict TypeScript configuration. Undefined optional fields are omitted or deleted: existing default consumers read equivalent values and serialize equivalent JSON, while custom consumers can observe different own-property presence. This is a source and distribution foundation. The daily entry does not yet expose the backend as a managed capability; parent-task admission, budget allocation, cancellation coordination, trusted candidate import and backend runtime compatibility remain separate integration work. The existing default strategy is unchanged.
+
 ## Local history projection and archived-run evidence
 
 Host-only modules provide bounded local history and archived-run inspection. B1 composes the history writer into the ordinary daily instance through `history-session.ts`. `agent_history` provides main-only read-only task and run queries over the current selected branch, including after OMP resumes the same session. These queries read historical associations and bounded file evidence without restoring task authority or replaying execution.
