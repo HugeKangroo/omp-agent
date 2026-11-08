@@ -8,9 +8,9 @@ OMP 负责模型与工具调用循环；插件维护任务身份、要求版本�
 
 ## 当前状态
 
-项目处于实验阶段，提供完整源码检出中的显式单入口配置，尚未发布正式安装包。当前已验证的本地环境为 macOS、OMP 18.18.0 和 Bun 1.4.0；其他平台与版本需要单独验证。真人使用验收尚未完成。
+项目处于实验阶段，提供基于宿主 JSON 配置的插件入口，尚未正式发布版本。当前已验证的本地环境为 macOS、OMP 18.18.0 和 Bun 1.4.0；其他平台与版本需要单独验证。真人使用验收尚未完成。
 
-包的默认入口仍为 `src/extension.ts` 受管接入测试扩展。`src/daily-entry.ts` 需要按下文显式加载；配置和命令只影响本次启动，不会自动安装到现有 OMP profile。
+包的默认入口为 `src/daily-entry.ts`。可以从源码检出目录或本地打包后的解包目录加载；下文配置和命令只影响本次启动，不会自动安装到现有 OMP profile。
 
 ## 已实现能力
 
@@ -26,9 +26,9 @@ OMP 负责模型与工具调用循环；插件维护任务身份、要求版本�
 
 验证通过与任务最终接收是不同状态。实验模型工具支持验证、交付预览、提交及已接收文件查询；提交只在宿主证据完整且再次检查通过后生效。本地审阅组件已实现，真人使用验收尚未完成。同一进程内已支持连续任务；跨进程恢复仍未提供。
 
-### 显式加载单入口
+### 显式加载插件
 
-从完整源码检出加载 `src/daily-entry.ts`，可在同一实例组合 `agent_task`、`agent_execute`、`agent_verify` 和 `agent_deliver`。先准备一个宿主 JSON 文件，例如 `/absolute/path/to/agent.json`：
+从插件目录加载默认入口，可在同一实例组合 `agent_task`、`agent_execute`、`agent_verify` 和 `agent_deliver`。先准备一个宿主 JSON 文件，例如 `/absolute/path/to/agent.json`：
 
 ```json
 {
@@ -45,10 +45,10 @@ OMP 负责模型与工具调用循环；插件维护任务身份、要求版本�
 ```sh
 OMP_AGENT_CONFIG="/absolute/path/to/agent.json" \
   omp --cwd "/absolute/path/to/workspace" \
-  --extension "/absolute/path/to/omp-agent/src/daily-entry.ts"
+  --extension "/absolute/path/to/omp-agent"
 ```
 
-本次只加载这一组合入口，不要再同时加载 `task-entry.ts` 或 `execution-entry.ts`。已有受管任务 owner 时，新入口会拒绝覆盖它。
+OMP 根据目录中的 `package.json` 加载这一组合入口，不要再同时加载 `task-entry.ts` 或 `execution-entry.ts`。已有受管任务 owner 时，新入口会拒绝覆盖它。未配置 `OMP_AGENT_CONFIG` 时，入口报告配置缺失并保持受管工具关闭，OMP 原生工具仍可使用。
 
 | 配置项 | 含义 |
 | --- | --- |
@@ -88,17 +88,26 @@ bun run test:entry
 bun run test:jobs
 bun run scripts/test-execution.ts
 bun run test:delivery
-bun run scripts/test-daily.ts
+bun run test:daily
+bun run test:package-entry
 ```
 
 这些命令使用确定性本地测试模型，不调用付费模型。`OMP_COMMAND` 可指定 OMP 可执行文件。
+
+`test:package-entry` 会真实打包、检查分发清单，并从源码目录及解包目录运行插件。创建本地包时，先准备输出目录，再运行：
+
+```sh
+bun pm pack --destination "/absolute/path/to/package-output" --ignore-scripts
+```
+
+将生成的 `.tgz` 解包后，把启动命令中的插件目录指向解包得到的 `package/`。配置仍放在包外；打包文件不包含个人输入、状态、测试夹具或内部文档。
 
 ## 实验接口
 
 | 入口 | 工具 | 用途 |
 | --- | --- | --- |
 | `src/daily-entry.ts` | `agent_task`、`agent_execute`、`agent_verify`、`agent_deliver` | 通过 `OMP_AGENT_CONFIG` 显式配置的组合入口 |
-| `src/extension.ts` | `agent_status` 及受管测试工具 | 默认接入与权限边界测试 |
+| `src/extension.ts` | `agent_status` 及受管测试工具 | 显式加载的接入与权限边界测试 |
 | `src/task-entry.ts` | `agent_task` | 建立、检查、修订、取消当前任务，并读取有界历史；终态任务后可继续新任务 |
 | `src/execution-entry.ts` | `agent_execute`、`agent_verify` | 受控执行及宿主验证，需先加载任务入口 |
 | 显式配置交付目录 | `agent_deliver` | 查看能力、生成与预览交付文件；配置接收目录后可提交及查询 |
@@ -122,7 +131,7 @@ bun run scripts/test-daily.ts
 
 ## 使用边界
 
-- 当前显式入口仍用于有界试用；未提供正式安装包或自动安装到日常 profile。
+- 当前插件用于有界本地试用；尚未正式发布版本，也不会自动安装到日常 profile。
 - 本地执行只支持已验证范围内的运行时与授权输入，不提供任意命令或任意工作区访问。
 - 验证结果会区分通过、失败和覆盖不足；模型自测不能代替宿主验证。
 - 候选登记和交付索引目前保存在进程内，不承诺重启后自动恢复。

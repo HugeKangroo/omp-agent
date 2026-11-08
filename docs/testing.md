@@ -12,7 +12,8 @@ bun run test:entry
 bun run test:jobs
 bun run scripts/test-execution.ts
 bun run test:delivery
-bun run scripts/test-daily.ts
+bun run test:daily
+bun run test:package-entry
 ```
 
 `check` runs TypeScript checks, unit tests, and `test:human-review` in a separate Bun process. The isolated human-review suite substitutes review transport while exercising actual execution, verification, delivery, and record installation. Component checks separately exercise display logic and context guards. It is an engineering simulation, not evidence of real user approval.
@@ -72,3 +73,9 @@ bun run test:human-review-native --case daily-escape --manifest /absolute/test-m
 ```
 
 For daily RPC failures, set `OMP_AGENT_DAILY_EVIDENCE_ROOT` to an absolute test-owned directory. The harness preserves the first cause and later diagnostics by attempt, checks execution identities for every instance before deleting shared roots, and reports incomplete export or uncertain cleanup as failure. Successful RPC runs remove their runtime roots; their console results and frozen source are distinct from retained raw TUI captures. No result here establishes real-model task quality or human approval.
+
+## Package directory and artifact checks
+
+`test:package-entry` creates a real Bun package archive and checks its exact path/byte/hash inventory before extracting it outside the checkout. A missing-launcher mutation must be rejected. It separately checks the checkout package directory, the extracted artifact running a task through execution/insufficient verification/preview, and the artifact without host configuration. A provider-only baseline identifies the native tool set; it is not an additional product scenario.
+
+The artifact observer imports the selected artifact's task-owner port, and the actual execution record identifies the packaged launcher. The suite preserves source/binary and archive manifests, actual calls/content, run records and file evidence outside runtime cleanup. These are deterministic package wiring checks; they do not install into a personal profile, publish a release, call a paid model, or establish human approval.

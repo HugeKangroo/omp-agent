@@ -1,12 +1,12 @@
 {
   "name": "omp-agent",
   "version": "0.1.0-g1a.0",
-  "description": "Minimal managed OMP plugin and acceptance harness for work package G1-A",
+  "description": "Personal OMP plugin for managed tasks, verified execution, and checked delivery",
   "type": "module",
   "private": true,
   "engines": { "bun": ">=1.4.0" },
-  "omp": { "extensions": ["./src/extension.ts"] },
-  "files": ["src", "policy", "docs/architecture.md", "docs/testing.md", "docs/release-notes.md", "README.md"],
+  "omp": { "extensions": ["./src/daily-entry.ts"] },
+  "files": ["src", "policy", "scripts/isolated-exec.py", "docs/architecture.md", "docs/testing.md", "docs/release-notes.md", "README.md"],
   "scripts": {
     "check": "bun run typecheck && bun test test/unit && bun run test:human-review",
     "test": "bun test test/unit",
@@ -14,6 +14,8 @@
     "test:entry": "bun run scripts/test-entry.ts",
     "test:jobs": "bun run scripts/test-jobs.ts",
     "test:delivery": "bun run scripts/test-delivery.ts",
+    "test:daily": "bun run scripts/test-daily.ts",
+    "test:package-entry": "bun run scripts/test-package-entry.ts",
     "test:human-review": "bun test test/human-review",
     "test:human-review-native": "bun run scripts/test-human-review-native.ts",
     "typecheck": "bun x tsc --noEmit"

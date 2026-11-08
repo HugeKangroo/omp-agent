@@ -1,5 +1,11 @@
 # Release notes
 
+## Default package entry
+
+The package now selects `src/daily-entry.ts` and includes `scripts/isolated-exec.py` alongside all runtime source files. It can be explicitly loaded by directory from a checkout or a locally packed and extracted archive. Missing `OMP_AGENT_CONFIG` leaves managed tools disabled without falling back to the old probe.
+
+Added a package inventory gate and actual OMP checks for checkout loading, artifact execution and missing configuration. The artifact uses its own task-owner module and packaged launcher. The package remains private and retains its prerelease version; this change does not install a profile, publish a release, add recovery, or establish human acceptance.
+
 ## Explicit personal entry
 
 Added `src/daily-entry.ts` for explicit source-checkout loading with one strict `OMP_AGENT_CONFIG` JSON file. It composes task management, local execution, verification and delivery around one owner, preserves ordinary OMP tools and model configuration, and refuses to replace an existing managed owner.

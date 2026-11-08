@@ -19,11 +19,13 @@
 
 ### Explicit configured entry
 
-The default package entry remains `src/extension.ts`, the managed integration probe. A source checkout can explicitly load `src/daily-entry.ts` using the absolute JSON path in `OMP_AGENT_CONFIG`. The JSON is the source of this entry's workspace, input whitelist, state root, optional runtime paths and human-review setting. It does not accept credentials, endpoints, model-selected paths or per-task policy overrides. Separately loaded experimental entry environment variables do not configure this composition.
+The default package entry is `src/daily-entry.ts`. OMP reads `package.json#omp.extensions` when a source checkout or an extracted package directory is explicitly loaded. `src/extension.ts` remains an explicitly selected integration probe. The daily entry uses the absolute JSON path in `OMP_AGENT_CONFIG`. The JSON is the source of this entry's workspace, input whitelist, state root, optional runtime paths and human-review setting. It does not accept credentials, endpoints, model-selected paths or per-task policy overrides. Separately loaded experimental entry environment variables do not configure this composition.
 
 The canonical workspace must match the actual OMP launch workspace. Inputs are explicit regular files outside managed internal state. Initialization validates configuration, composes one owner and one execution factory, and checks the actual persisted state and readiness audit before enabling managed calls. An existing owner is preserved rather than replaced. Partially registered handlers and tools remain inactive if initialization fails; OMP event registration is not described as reversible unregistration.
 
 Each start creates a fresh private instance beneath the configured state root, with distinct execution, delivery and acceptance directories. Successive tasks share that instance. Prior files remain intact, but the entry does not scan them to restore task authority, candidates or history after restart.
+
+The distribution includes the isolated execution launcher and the lazy human-review runtime files. Host configuration and runtime state remain outside the package. Missing configuration leaves managed handlers disabled while ordinary OMP tools remain available.
 
 Human review is off unless the JSON explicitly contains `"humanReview": "local-main-tui-v1"`. No automatic semantic contract is installed by this entry. Insufficient verification coverage stays insufficient; final acceptance still requires the existing acceptance mechanism and its evidence. The entry preserves ordinary OMP capabilities and model selection. Its guarantees apply to managed calls, not to every native or third-party tool side effect.
 
@@ -63,4 +65,4 @@ The documented native integration scenarios passed using automated terminal inpu
 
 ## Current limits
 
-Candidate and delivery registries are process-local. The project does not yet provide cross-process task recovery, a production job backend, or a published installation package. Filesystem checks describe the observed local state and do not claim transaction isolation against arbitrary external processes.
+Candidate and delivery registries are process-local. The project does not yet provide cross-process task recovery, a production job backend, or a formally released version. Filesystem checks describe the observed local state and do not claim transaction isolation against arbitrary external processes.

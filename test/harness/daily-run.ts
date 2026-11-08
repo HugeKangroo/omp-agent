@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { EXPECTED_OMP_VERSION, parseOmpVersion } from "./admission.ts";
@@ -68,13 +68,23 @@ export const DAILY_PROMPTS = {
   adversarial: "DAILY_ADVERSARIAL_OLD_SELECTOR: Explicit adversarial step. Replay task A's previously observed old selector against the current owner. It must not mutate or dispatch for task B.",
 } as const;
 
-export type DailyMode = "daily" | "baseline" | "invalid";
+export type DailyMode = "daily" | "baseline" | "invalid" | "missing-config";
 
 export interface DailyRunOptions {
   mode: DailyMode;
   timeoutMs?: number;
   /** Native tool names from one zero-prompt provider-only baseline launch. */
   baselineTools?: string[];
+  /** Absolute package/product directory; OMP reads package.json#omp.extensions. */
+  entryDirectory?: string;
+  /** Absolute product directory observed by the read-only port fixture. */
+  productDirectory?: string;
+  /** Absolute observer fixture path; defaults to the checkout daily observer. */
+  observerPath?: string;
+  /** Absolute selected-product task-entry-port.ts imported by the observer. */
+  observerPortPath?: string;
+  /** Isolated OMP profile name; defaults to "default" for legacy suites. */
+  profile?: string;
 }
 
 export interface DailyInstance {
@@ -93,13 +103,78 @@ export interface DailyStartResult {
   instance?: DailyInstance;
 }
 
-interface DailyFailureRecord {
+export interface DailyFailureRecord {
   sequence: number;
   attempt: string;
   instanceId: string | null;
   at: string;
   source: "process" | "test" | "cleanup";
   message: string;
+}
+
+export interface DailyShutdownFacts {
+  observedAt: string;
+  fallback: string[];
+  processGroupGone: boolean;
+  exitCode: number | null;
+  exitSignal: NodeJS.Signals | null;
+  observerShutdown: boolean;
+}
+
+export interface DailyProcessCheck {
+  instanceId: string;
+  executionRoot: string;
+  identities: Array<{ label: string; pid: number; group: boolean }>;
+  alive: string[];
+  error: string | null;
+}
+
+export interface DailyExportFacts {
+  requestedRoot: string | null;
+  attempted: boolean;
+  target: string | null;
+  complete: boolean | null;
+  copied: string[];
+  skipped: string[];
+  error: string | null;
+  ledgerError: string | null;
+}
+
+export interface DailyCleanupFacts {
+  attemptId: string;
+  mode: DailyMode;
+  runtimeRoot: string;
+  startedAt: string;
+  finishedAt: string;
+  completed: boolean;
+  error: string | null;
+  firstCause: string | null;
+  failures: DailyFailureRecord[];
+  process: {
+    childPid: number | null;
+    stdinClosed: boolean;
+    signalsSent: string[];
+    exitCode: number | null;
+    exitSignal: NodeJS.Signals | null;
+    processGroupGone: boolean;
+    observerShutdown: boolean | null;
+  };
+  shutdown: DailyShutdownFacts | null;
+  checks: DailyProcessCheck[];
+  export: DailyExportFacts;
+  /** Actual post-cleanup postcheck; null when the check itself failed. */
+  runtimeExistsAfter: boolean | null;
+  runtimeRetained: boolean | null;
+  runtimeDeleted: boolean | null;
+}
+
+export interface DailyLifecycleFacts {
+  attemptId: string;
+  mode: DailyMode;
+  runtimeRoot: string;
+  cleanup: DailyCleanupFacts | null;
+  failures: DailyFailureRecord[];
+  firstCause: string | null;
 }
 
 interface DailyAttemptRecord {
@@ -174,6 +249,8 @@ export class DailyOmpSession {
   private exitSignal: NodeJS.Signals | null = null;
   private cleanupDone = false;
   private superseded = false;
+  private lastShutdownFacts: DailyShutdownFacts | undefined;
+  private cleanupFacts: DailyCleanupFacts | undefined;
 
   private constructor(values: DailySessionValues, options: DailyRunOptions) {
     this.values = values;
@@ -267,8 +344,9 @@ export class DailyOmpSession {
       startup: { setupWizard: false, checkUpdate: false },
     }, null, 2), { mode: 0o600 });
 
-    const dailyConfigPath = options.mode === "baseline" ? null : path.join(root, "daily-config.json");
-    const dailyStateRoot = options.mode === "baseline" ? null : path.join(root, "daily-state");
+    const absentConfig = options.mode === "baseline" || options.mode === "missing-config";
+    const dailyConfigPath = absentConfig ? null : path.join(root, "daily-config.json");
+    const dailyStateRoot = absentConfig ? null : path.join(root, "daily-state");
     if (options.mode === "daily") {
       const pythonPath = fixturePythonPath();
       await writeFile(dailyConfigPath!, JSON.stringify({
@@ -419,10 +497,17 @@ export class DailyOmpSession {
     env.PI_CODING_AGENT_DIR = this.values.agentDir;
     env.PI_NO_TITLE = "1";
     env.PI_NO_PTY = "1";
-    env.OMP_PROFILE = "default";
+    env.OMP_PROFILE = this.options.profile ?? "default";
     env.DAILY_PROVIDER_AUDIT = this.providerAuditPath;
     env.DAILY_PROVIDER_MODE = this.mode;
     env.DAILY_OBSERVER_AUDIT = this.observerAuditPath;
+    env.PACKAGE_ENTRY_OBSERVER_AUDIT = this.observerAuditPath;
+    if (this.options.observerPortPath !== undefined) {
+      env.PACKAGE_ENTRY_PORT_PATH = this.options.observerPortPath;
+    }
+    if (this.options.productDirectory !== undefined) {
+      env.PACKAGE_ENTRY_PRODUCT_DIR = this.options.productDirectory;
+    }
     if (this.dailyConfigPath !== null) env.OMP_AGENT_CONFIG = this.dailyConfigPath;
     return env;
   }
@@ -440,8 +525,10 @@ export class DailyOmpSession {
       "--cwd", this.workspace,
       "--extension", PROVIDER_PATH,
     ];
-    if (this.mode !== "baseline") args.push("--extension", ENTRY_PATH);
-    args.push("--extension", OBSERVER_PATH);
+    if (this.mode !== "baseline") {
+      args.push("--extension", this.options.entryDirectory ?? ENTRY_PATH);
+    }
+    args.push("--extension", this.options.observerPath ?? OBSERVER_PATH);
     return args;
   }
 
@@ -607,6 +694,26 @@ export class DailyOmpSession {
     return this.readState(this.instance);
   }
 
+  /** Actual argv and environment key names used for this launch, without values. */
+  launchDescriptor(): Record<string, unknown> {
+    return {
+      argv: this.args(),
+      cwd: this.launchDir,
+      environmentKeys: Object.keys(this.env()).sort(),
+      model: `${PROVIDER}/${MODEL}`,
+      api: API,
+      mode: this.mode,
+      profile: this.options.profile ?? "default",
+      entryDirectory: this.options.entryDirectory ?? ENTRY_PATH,
+      observerPath: this.options.observerPath ?? OBSERVER_PATH,
+      observerPortPath: this.options.observerPortPath ?? null,
+      productDirectory: this.options.productDirectory ?? null,
+      dailyConfigPath: this.dailyConfigPath,
+      workspace: this.workspace,
+      timeoutMs: this.timeoutMs,
+    };
+  }
+
   async providerEvents(): Promise<Array<Record<string, any>>> {
     return this.jsonl(this.providerAuditPath);
   }
@@ -735,12 +842,26 @@ export class DailyOmpSession {
       }
     }
     if (!this.exited) throw new Error("OMP did not exit after SIGKILL.");
-    return {
+    const result = {
       fallback,
       processGroupGone: !this.groupExists(),
       exitCode: this.exitCode,
       exitSignal: this.exitSignal,
       observerShutdown: (await this.observerEvents()).some((event) => event.type === "session_shutdown"),
+    };
+    this.lastShutdownFacts = { observedAt: new Date().toISOString(), ...result };
+    return result;
+  }
+
+  /** Actual final lifecycle facts; the cleanup block is null until cleanup ran. */
+  finalFacts(): DailyLifecycleFacts {
+    return {
+      attemptId: this.attemptId,
+      mode: this.mode,
+      runtimeRoot: this.root,
+      cleanup: this.cleanupFacts ?? null,
+      failures: this.allFailures(),
+      firstCause: this.firstCause() ?? null,
     };
   }
 
@@ -748,15 +869,21 @@ export class DailyOmpSession {
     if (this.cleanupDone || this.superseded) return;
     this.cleanupDone = true;
     this.stopping = true;
+    const startedAt = new Date().toISOString();
     const child = this.child;
     const failures: string[] = [];
+    const signalsSent: string[] = [];
+    let stdinClosed = false;
     if (child) {
       try {
-        try { child.stdin.end(); } catch { /* closed */ }
+        try { child.stdin.end(); stdinClosed = true; } catch { /* closed */ }
         if (this.exitPromise) await Promise.race([this.exitPromise, Bun.sleep(1000)]);
         for (const signal of ["SIGTERM", "SIGKILL"] as const) {
           if (!this.groupExists()) break;
-          try { process.kill(-child.pid!, signal); } catch (error) {
+          try {
+            process.kill(-child.pid!, signal);
+            signalsSent.push(signal);
+          } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
           }
           const deadline = Date.now() + 1000;
@@ -767,6 +894,7 @@ export class DailyOmpSession {
         failures.push(`OMP shutdown failed: ${(error as Error).message}`);
       }
     }
+    const checks: DailyProcessCheck[] = [];
     if (this.mode === "daily") {
       // Every instance this owned chain actually created, including instances
       // from a superseded attempt, must provide real execution/watchdog
@@ -778,36 +906,80 @@ export class DailyOmpSession {
             instance.auditPath,
           );
           const alive = await this.waitForIdentitiesGone(identities);
+          checks.push({
+            instanceId: instance.instanceId,
+            executionRoot: instance.executionRoot,
+            identities,
+            alive,
+            error: null,
+          });
           if (alive.length > 0) {
             failures.push(`test-owned processes still alive in ${instance.instanceId}: ${alive.join(", ")}`);
           }
         } catch (error) {
+          checks.push({
+            instanceId: instance.instanceId,
+            executionRoot: instance.executionRoot,
+            identities: [],
+            alive: [],
+            error: (error as Error).message,
+          });
           failures.push(`process evidence unavailable for ${instance.instanceId}: ${(error as Error).message}`);
         }
       }
     }
+    let observerShutdown: boolean | null = null;
+    try {
+      observerShutdown = (await this.observerEvents()).some((event) => event.type === "session_shutdown");
+    } catch {
+      observerShutdown = null;
+    }
     for (const failure of failures) this.recordFailure("cleanup", failure);
     const reason = this.failureSummary();
     let removeRoot = reason === undefined && failures.length === 0;
+    const requestedRoot = process.env.OMP_AGENT_DAILY_EVIDENCE_ROOT ?? null;
+    const exportFacts: DailyExportFacts = {
+      requestedRoot,
+      attempted: false,
+      target: null,
+      complete: null,
+      copied: [],
+      skipped: [],
+      error: null,
+      ledgerError: null,
+    };
+    let exportTarget: string | null = null;
     if (reason !== undefined) {
-      const requested = process.env.OMP_AGENT_DAILY_EVIDENCE_ROOT;
-      if (requested === undefined || !path.isAbsolute(requested)) {
+      if (requestedRoot === null || !path.isAbsolute(requestedRoot)) {
         removeRoot = false;
-        this.appendStderr(`\n[daily-evidence] no absolute OMP_AGENT_DAILY_EVIDENCE_ROOT; preserving ${this.root}\n`);
+        const message = "no absolute OMP_AGENT_DAILY_EVIDENCE_ROOT";
+        exportFacts.error = message;
+        this.appendStderr(`\n[daily-evidence] ${message}; preserving ${this.root}\n`);
       } else {
+        exportFacts.attempted = true;
         try {
-          const exported = await this.exportEvidence(requested, reason);
+          const exported = await this.exportEvidence(requestedRoot, reason);
+          exportTarget = exported.target;
+          exportFacts.target = exported.target;
+          exportFacts.complete = exported.complete;
+          exportFacts.copied = exported.copied;
+          exportFacts.skipped = exported.skipped;
           if (!exported.complete) {
             removeRoot = false;
             const message = `incomplete export; preserving ${this.root}`;
             failures.push(message);
+            exportFacts.error = message;
             this.recordFailure("cleanup", message);
             this.appendStderr(`\n[daily-evidence] ${message}\n`);
           }
         } catch (error) {
           removeRoot = false;
+          const attached = (error as { exportTarget?: unknown }).exportTarget;
+          if (typeof attached === "string") exportTarget = attached;
+          exportFacts.target = exportTarget;
           const message = `export failed (${(error as Error).message}); preserving ${this.root}`;
           failures.push(message);
+          exportFacts.error = message;
           this.recordFailure("cleanup", message);
           this.appendStderr(`\n[daily-evidence] ${message}\n`);
         }
@@ -816,8 +988,79 @@ export class DailyOmpSession {
     if (!removeRoot) {
       console.error(`[daily-evidence] preserved ${this.root}; causes: ${(reason ?? "").slice(0, 4000)}`);
     } else {
-      await rm(this.root, { recursive: true, force: true });
+      try {
+        await rm(this.root, { recursive: true, force: true });
+      } catch (error) {
+        removeRoot = false;
+        const message = `runtime removal failed (${(error as Error).message}); retaining ${this.root}`;
+        failures.push(message);
+        this.recordFailure("cleanup", message);
+        this.appendStderr(`\n[daily-evidence] ${message}\n`);
+      }
     }
+    let runtimeExistsAfter: boolean | null = null;
+    try {
+      await stat(this.root);
+      runtimeExistsAfter = true;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        runtimeExistsAfter = false;
+      } else {
+        const message = `runtime postcheck failed: ${(error as Error).message}`;
+        failures.push(message);
+        this.recordFailure("cleanup", message);
+        this.appendStderr(`\n[daily-evidence] ${message}\n`);
+      }
+    }
+    const facts: DailyCleanupFacts = {
+      attemptId: this.attemptId,
+      mode: this.mode,
+      runtimeRoot: this.root,
+      startedAt,
+      finishedAt: new Date().toISOString(),
+      completed: failures.length === 0,
+      error: failures.length > 0 ? failures.join("; ") : null,
+      firstCause: this.firstCause() ?? null,
+      failures: [],
+      process: {
+        childPid: child?.pid ?? null,
+        stdinClosed,
+        signalsSent,
+        exitCode: this.exitCode,
+        exitSignal: this.exitSignal,
+        processGroupGone: !this.groupExists(),
+        observerShutdown,
+      },
+      shutdown: this.lastShutdownFacts ?? null,
+      checks,
+      export: exportFacts,
+      runtimeExistsAfter,
+      runtimeRetained: runtimeExistsAfter,
+      runtimeDeleted: runtimeExistsAfter === null ? null : !runtimeExistsAfter,
+    };
+    facts.failures = this.allFailures();
+    facts.firstCause = this.firstCause() ?? null;
+    facts.completed = failures.length === 0;
+    facts.error = failures.length > 0 ? failures.join("; ") : null;
+    this.cleanupFacts = facts;
+    if (exportTarget !== null) {
+      try {
+        await this.writeFinalExportLedger(exportTarget);
+      } catch (error) {
+        const message = `final export ledger write failed (${(error as Error).message})`;
+        failures.push(message);
+        exportFacts.ledgerError = message;
+        this.recordFailure("cleanup", message);
+        this.appendStderr(`\n[daily-evidence] ${message}\n`);
+      }
+    }
+    // Refresh after any late cleanup diagnostic so the in-memory final facts
+    // never lose the last cause.
+    facts.failures = this.allFailures();
+    facts.firstCause = this.firstCause() ?? null;
+    facts.completed = failures.length === 0;
+    facts.error = failures.length > 0 ? failures.join("; ") : null;
+    this.cleanupFacts = facts;
     if (failures.length > 0) {
       throw new Error(
         `Daily cleanup failed; retaining ${this.root}: ${failures.join("; ")}`
@@ -831,7 +1074,7 @@ export class DailyOmpSession {
     this.attemptRecord.stderr = `${this.attemptRecord.stderr}${text}`.slice(-65536);
   }
 
-  private async exportEvidence(evidenceRoot: string, reason: string): Promise<{ complete: boolean; target: string }> {
+  private async exportEvidence(evidenceRoot: string, reason: string): Promise<{ complete: boolean; target: string; copied: string[]; skipped: string[] }> {
     const exported = await exportB1Evidence({
       sourceRoot: this.root,
       evidenceRoot,
@@ -841,46 +1084,97 @@ export class DailyOmpSession {
       stderr: this.combinedStderr(),
       pid: this.child?.pid ?? null,
     });
+    try {
+      await writeFile(
+        path.join(exported.target, "attempts.json"),
+        JSON.stringify({
+          phase: "export-attempt",
+          capturedAt: new Date().toISOString(),
+          firstCause: this.firstCause() ?? null,
+          attempts: this.allAttempts(),
+          instances: this.allInstances(),
+        }, null, 2),
+        { mode: 0o600 },
+      );
+      await writeFile(path.join(exported.target, "requests.json"), JSON.stringify(
+        [...this.priorRequests, ...this.requests],
+        null,
+        2,
+      ), { mode: 0o600 });
+      await writeFile(path.join(exported.target, "launch.json"), JSON.stringify({
+        argv: this.args(),
+        cwd: this.launchDir,
+        environmentKeys: Object.keys(this.env()).sort(),
+        isolation: {
+          home: this.values.homeDir,
+          agentDir: this.values.agentDir,
+          xdgConfig: this.values.configHome,
+          xdgCache: this.values.cacheHome,
+          xdgData: this.values.dataHome,
+          xdgState: this.values.stateHome,
+          tmp: this.values.tempDir,
+        },
+        model: `${PROVIDER}/${MODEL}`,
+        api: API,
+        timeoutMs: this.timeoutMs,
+        dailyConfigPath: this.dailyConfigPath,
+        toolNames: this.toolNames,
+        instance: this.instance ?? null,
+      }, null, 2), { mode: 0o600 });
+      await writeFile(
+        path.join(exported.target, "fixture-manifest.json"),
+        JSON.stringify(await dailyFixtureManifest(), null, 2),
+        { mode: 0o600 },
+      );
+      return exported;
+    } catch (error) {
+      if (typeof error === "object" && error !== null) {
+        Object.defineProperty(error, "exportTarget", {
+          value: exported.target,
+          configurable: true,
+          enumerable: false,
+        });
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Rewrite the exported attempts ledger after cleanup/export attempts finish.
+   * The earlier export-attempt ledger remains embedded so the pre-cleanup
+   * snapshot stays identifiable.
+   */
+  private async writeFinalExportLedger(target: string): Promise<void> {
+    const facts = this.cleanupFacts;
+    if (facts === undefined) throw new Error("final export ledger requested before cleanup facts were assembled");
+    let initialExportAttempts: unknown = null;
+    try {
+      initialExportAttempts = JSON.parse(await readFile(path.join(target, "attempts.json"), "utf8"));
+    } catch {
+      initialExportAttempts = null;
+    }
     await writeFile(
-      path.join(exported.target, "attempts.json"),
+      path.join(target, "attempts.json"),
       JSON.stringify({
-        firstCause: this.firstCause() ?? null,
+        phase: "post-cleanup",
+        firstCause: facts.firstCause,
         attempts: this.allAttempts(),
         instances: this.allInstances(),
+        cleanup: facts,
       }, null, 2),
       { mode: 0o600 },
     );
-    await writeFile(path.join(exported.target, "requests.json"), JSON.stringify(
-      [...this.priorRequests, ...this.requests],
-      null,
-      2,
-    ), { mode: 0o600 });
-    await writeFile(path.join(exported.target, "launch.json"), JSON.stringify({
-      argv: this.args(),
-      cwd: this.launchDir,
-      environmentKeys: Object.keys(this.env()).sort(),
-      isolation: {
-        home: this.values.homeDir,
-        agentDir: this.values.agentDir,
-        xdgConfig: this.values.configHome,
-        xdgCache: this.values.cacheHome,
-        xdgData: this.values.dataHome,
-        xdgState: this.values.stateHome,
-        tmp: this.values.tempDir,
-      },
-      model: `${PROVIDER}/${MODEL}`,
-      api: API,
-      timeoutMs: this.timeoutMs,
-      dailyConfigPath: this.dailyConfigPath,
-      toolNames: this.toolNames,
-      instance: this.instance ?? null,
-    }, null, 2), { mode: 0o600 });
     await writeFile(
-      path.join(exported.target, "fixture-manifest.json"),
-      JSON.stringify(await dailyFixtureManifest(), null, 2),
+      path.join(target, "final-ledger.json"),
+      JSON.stringify({
+        phase: "post-cleanup",
+        writtenAt: new Date().toISOString(),
+        runtimeRoot: this.root,
+        initialExportAttempts,
+        cleanup: facts,
+      }, null, 2),
       { mode: 0o600 },
     );
-    return exported;
   }
 
   private async waitForIdentitiesGone(
