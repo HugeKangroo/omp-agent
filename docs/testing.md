@@ -16,6 +16,12 @@ bun run test:daily
 bun run test:package-entry
 ```
 
+Focused G3-A local history checks:
+
+```sh
+bun test test/unit/history-projection.test.ts test/unit/history-evidence.test.ts
+```
+
 `check` runs TypeScript checks, unit tests, and `test:human-review` in a separate Bun process. The isolated human-review suite substitutes review transport while exercising actual execution, verification, delivery, and record installation. Component checks separately exercise display logic and context guards. It is an engineering simulation, not evidence of real user approval.
 
 The other commands above start actual OMP processes with temporary profiles and local deterministic test providers or services. They do not call a paid model. `OMP_COMMAND` can override the OMP executable.
@@ -77,6 +83,14 @@ bun run test:human-review-native --case daily-escape --manifest /absolute/test-m
 ```
 
 For daily RPC failures, set `OMP_AGENT_DAILY_EVIDENCE_ROOT` to an absolute test-owned directory. The harness preserves the first cause and later diagnostics by attempt, checks execution identities for every instance before deleting shared roots, and reports incomplete export or uncertain cleanup as failure. Successful RPC runs remove their runtime roots; their console results and frozen source are distinct from retained raw TUI captures. No result here establishes real-model task quality or human approval.
+
+## Local history and archived-run evidence
+
+The focused checks use real `TaskOwner` creation, revision, cancellation and snapshots. They cover complete requirement ledgers, stable selectors, defensive copies, conflicting revisions, schema and identity mismatches, bounded retention without eviction, and refusal to adopt an unknown pre-existing index. Archived-run checks use independent fixed source, input and artifact bytes and the existing run layout. They cover exact identity binding, selected artifact subsets, missing or changed files, unsafe paths, unknown versions and incomplete process-control records. An accepted reference remains recorded data only.
+
+The current focused invocation passes 10 tests and 364 assertions; type checking passes. Two fault tests spawn isolated Bun children so filesystem interception does not affect the parent test process. They confirm that a first publication followed by a read failure reports `unknown`, leaves the expected bytes installed and refuses adoption on retry. Partial writes complete through the write loop; a partial write followed by EIO or a zero-byte return before replacement preserves the previous index. Each injected fault must actually fire, and the parent checks real file bytes, link count, cleanup and retry outcomes. Separate independent probes also reject observable same-inode mutations and changes to a source or history item while a later input is being read; these supplementary probes are not permanent unit-test coverage.
+
+These checks use temporary test-owned files and do not invoke OMP or a model. G3-A is not yet wired into daily entry or model-visible tools. Checks before and after bounded reads detect observable changes; they do not provide a filesystem transaction, protection against arbitrary hostile concurrent replacement, or a guarantee against later mutation. No result here establishes session recovery, branch visibility, current process liveness, restored authority or task acceptance.
 
 ## Package directory and artifact checks
 
