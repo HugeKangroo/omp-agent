@@ -46,6 +46,12 @@ function subject(branch: readonly unknown[]): TaskSubject {
   return { sessionId: SESSION, workspaceRoot: WORKSPACE, agentKind: "main", branch };
 }
 
+function guard(owner: TaskOwner, taskRevision?: number) {
+  const task = owner.snapshot().currentTask;
+  if (!task) throw new Error("test setup: no current task");
+  return { taskId: task.taskId, taskRevision: taskRevision ?? task.taskRevision };
+}
+
 function context(branch: readonly unknown[], leafId: string): ExecutionToolContext {
   return {
     cwd: WORKSPACE,
@@ -1264,6 +1270,34 @@ print("completed candidate artifacts")
 });
 
 describe("owner authority changes during a run", () => {
+  test("task-specific owner events route by taskId; a stale A cancel does not stop B", async () => {
+    const f = await fixture();
+    try {
+      const adapter = f.adapter as unknown as {
+        active: { taskId: string; runId: string; taskRevision: number; stop(reason: string): void } | null;
+        ownerEvent(event: { type: string; ownerId: string; taskId: string }): void;
+      };
+      let stopped: string | null = null;
+      adapter.active = {
+        taskId: "task-b",
+        runId: "run-b",
+        taskRevision: 1,
+        stop(reason: string) {
+          stopped = reason;
+        },
+      };
+      adapter.ownerEvent({ type: "task_cancelled", ownerId: "owner-fixture", taskId: "task-a" });
+      expect(stopped).toBeNull();
+      adapter.ownerEvent({ type: "task_revised", ownerId: "owner-fixture", taskId: "task-a" });
+      expect(stopped).toBeNull();
+      adapter.ownerEvent({ type: "task_cancelled", ownerId: "owner-fixture", taskId: "task-b" });
+      expect(stopped as string | null).toBe("owner_cancelled");
+      adapter.active = null;
+    } finally {
+      await f.cleanup();
+    }
+  });
+
   const LONG = "import time\ntime.sleep(0.6)\nopen('late.txt','w').write('late output')\n";
 
   test("a genuine cancel stops the running child and keeps the result at revision 1 with no restored authority", async () => {
@@ -1278,7 +1312,7 @@ describe("owner authority changes during a run", () => {
         expectedTaskRevision: 1,
       });
       await Bun.sleep(150);
-      f.owner.cancel(subject(f.branch));
+      f.owner.cancel(subject(f.branch), guard(f.owner));
       const result = await running;
       const details = detailsOf(result);
       expect(details.taskRevision).toBe(1);
@@ -1325,7 +1359,7 @@ describe("owner authority changes during a run", () => {
       }).accepted).toBe(true);
       f.owner.observeAgentStart({ sessionId: SESSION, prompt: amended, reason: "prompt" });
       const branch2 = [...f.branch, user("user-2", "user-1", amended)];
-      expect(f.owner.revise(subject(branch2), "amended understanding").revised).toBe(true);
+      expect(f.owner.revise(subject(branch2), guard(f.owner), "amended understanding").revised).toBe(true);
       const result = await running;
       const details = detailsOf(result);
       expect(details.taskRevision).toBe(1);

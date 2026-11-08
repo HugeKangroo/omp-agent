@@ -10,7 +10,8 @@ import {
   parseJobToolArguments,
 } from "../../src/job-adapter.ts";
 import { TaskOwner, type TaskSubject } from "../../src/task-owner.ts";
-import type { OmpToolContext } from "../../src/task-entry-port.ts";
+import { requirementsDigest } from "../../src/task-requirements.ts";
+import { clearPublishedTaskOwner, publishTaskOwner, type OmpToolContext } from "../../src/task-entry-port.ts";
 import { MockJobService } from "../harness/job-service.ts";
 
 const WORKSPACE = "/tmp/omp-agent-b3a-unit-workspace";
@@ -45,6 +46,17 @@ function subject(branch: readonly unknown[]): TaskSubject {
   return { sessionId: SESSION, workspaceRoot: WORKSPACE, agentKind: "main", branch };
 }
 
+function taskRef(owner: TaskOwner) {
+  const task = owner.snapshot().currentTask;
+  if (!task) throw new Error("test setup: no current task");
+  return { taskId: task.taskId, taskRevision: task.taskRevision };
+}
+
+function jobGuard(owner: TaskOwner) {
+  const task = taskRef(owner);
+  return { expectedTaskId: task.taskId, expectedTaskRevision: task.taskRevision };
+}
+
 function contextFor(branch: readonly unknown[], sessionId = SESSION): OmpToolContext {
   return {
     cwd: WORKSPACE,
@@ -62,7 +74,7 @@ function ownerWith(callbacks: {
   onStateChange?: (snapshot: ReturnType<TaskOwner["snapshot"]>) => void;
 } = {}): TaskOwner {
   let sequence = 0;
-  return new TaskOwner({
+  const owner = new TaskOwner({
     workspaceRoot: WORKSPACE,
     ownerId: "owner-b3a-job-unit",
     authorizedCapabilities: ["job-submit"],
@@ -71,6 +83,9 @@ function ownerWith(callbacks: {
     ...(callbacks.onEvent === undefined ? {} : { onEvent: callbacks.onEvent }),
     ...(callbacks.onStateChange === undefined ? {} : { onStateChange: callbacks.onStateChange }),
   });
+  publishTaskOwner(owner);
+  publishedOwner = owner;
+  return owner;
 }
 
 function newOwner(): TaskOwner {
@@ -104,7 +119,7 @@ function cancelTask(owner: TaskOwner, firstBranch: readonly Entry[]): Entry[] {
     text: "Please cancel the managed task.", observedAt: NOW, baseLeafId: "assistant-1",
   });
   owner.observeAgentStart({ sessionId: SESSION, prompt: "Please cancel the managed task.", reason: "prompt" });
-  owner.cancel(subject(branch));
+  owner.cancel(subject(branch), taskRef(owner));
   return branch;
 }
 
@@ -119,8 +134,11 @@ async function waitFor<T>(label: string, predicate: () => Promise<T | undefined>
 }
 
 const cleanups: Array<() => Promise<void>> = [];
+let publishedOwner: TaskOwner | undefined;
 afterEach(async () => {
   while (cleanups.length) await cleanups.pop()!();
+  if (publishedOwner !== undefined) clearPublishedTaskOwner(publishedOwner);
+  publishedOwner = undefined;
 });
 
 async function setupWithOwnerCallbacks(callbacks: {
@@ -184,21 +202,24 @@ async function setup(): Promise<{
 }
 
 describe("agent_job argument surface", () => {
-  test("accepts only the narrow submit/query surface and rejects host authority", () => {
-    expect(parseJobToolArguments({ action: "submit", expectedTaskRevision: 1, payload: "alpha" }))
-      .toEqual({ action: "submit", expectedTaskRevision: 1, payload: "alpha" });
-    expect(parseJobToolArguments({ action: "query" })).toEqual({ action: "query" });
+  test("accepts only the narrow submit/query surface with exact task selectors", () => {
+    const expected = { expectedTaskId: "task-1", expectedTaskRevision: 1 };
+    expect(parseJobToolArguments({ action: "submit", ...expected, payload: "alpha" }))
+      .toEqual({ action: "submit", ...expected, payload: "alpha" });
+    expect(parseJobToolArguments({ action: "query", ...expected })).toEqual({ action: "query", ...expected });
+    expect(() => parseJobToolArguments({ action: "query" })).toThrow(/requires expectedTaskId/);
+    expect(() => parseJobToolArguments({ action: "query", expectedTaskId: "task-1" })).toThrow(/requires expectedTaskId/);
     for (const key of ["operationId", "jobId", "taskId", "ownerId", "endpoint", "cancelIntentId", "fault", "budget"]) {
-      expect(() => parseJobToolArguments({ action: "query", [key]: "x" })).toThrow(/never accepts host\/job authority/);
+      expect(() => parseJobToolArguments({ action: "query", ...expected, [key]: "x" })).toThrow(/never accepts host\/job authority/);
     }
     expect(() => parseJobToolArguments({ action: "cancel" })).toThrow(/submit or query/);
-    expect(() => parseJobToolArguments({ action: "submit", expectedTaskRevision: 1, payload: "x", extra: true }))
+    expect(() => parseJobToolArguments({ action: "submit", ...expected, payload: "x", extra: true }))
       .toThrow(/unsupported field/);
-    expect(() => parseJobToolArguments({ action: "submit", expectedTaskRevision: 0, payload: "x" }))
+    expect(() => parseJobToolArguments({ action: "submit", expectedTaskId: "task-1", expectedTaskRevision: 0, payload: "x" }))
       .toThrow(/positive integer/);
-    expect(() => parseJobToolArguments({ action: "submit", expectedTaskRevision: 1, payload: "x".repeat(4097) }))
+    expect(() => parseJobToolArguments({ action: "submit", ...expected, payload: "x".repeat(4097) }))
       .toThrow(/exceeds 4096 UTF-8 bytes/);
-    expect(() => parseJobToolArguments({ action: "submit", expectedTaskRevision: 1, payload: "x".repeat(4096) }))
+    expect(() => parseJobToolArguments({ action: "submit", ...expected, payload: "x".repeat(4096) }))
       .not.toThrow();
   });
 });
@@ -283,7 +304,7 @@ describe("JobAdapter prototype flow", () => {
   test("normal submit observes running then succeeded without accepting the task", async () => {
     const { service, owner, adapter, taskId, branch, recordPath } = await setup();
     const context = contextFor(branch);
-    const submitted = await adapter.submit(context, { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    const submitted = await adapter.submit(context, { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     const operation = submitted.details?.operation as Record<string, unknown>;
     expect(operation.externalState).toBe("running");
     expect(operation.accepted).toBe(true);
@@ -293,11 +314,11 @@ describe("JobAdapter prototype flow", () => {
     expect(operation.payloadDigest).toMatch(/^sha256:[0-9a-f]{64}$/);
     expect(owner.snapshot().currentTask).toMatchObject({ taskId, status: "active", taskRevision: 1 });
 
-    const running = await adapter.query(context);
+    const running = await adapter.query(context, jobGuard(owner));
     expect((running.details?.operation as Record<string, unknown>).externalState).toBe("running");
     const completed = await service.complete();
     expect(completed.job.state).toBe("succeeded");
-    const succeeded = await adapter.query(context);
+    const succeeded = await adapter.query(context, jobGuard(owner));
     const resultOperation = succeeded.details?.operation as Record<string, unknown>;
     expect(resultOperation.externalState).toBe("succeeded");
     expect(resultOperation.externalJobId).toBe(completed.job.jobId);
@@ -314,9 +335,9 @@ describe("JobAdapter prototype flow", () => {
   test("remote failure is reported as failed while the task stays active", async () => {
     const { service, adapter, owner, branch } = await setup();
     const context = contextFor(branch);
-    await adapter.submit(context, { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    await adapter.submit(context, { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     expect((await service.fail()).job.state).toBe("failed");
-    const queried = await adapter.query(context);
+    const queried = await adapter.query(context, jobGuard(owner));
     expect((queried.details?.operation as Record<string, unknown>).externalState).toBe("failed");
     expect((queried.details?.task as Record<string, unknown>).status).toBe("active");
     expect(owner.snapshot().currentTask?.status).toBe("active");
@@ -327,7 +348,7 @@ describe("JobAdapter prototype flow", () => {
     const { service, owner, adapter, branch, recordPath } = await setup();
     await service.configure({ dropSubmitAck: true });
     const context = contextFor(branch);
-    const first = await adapter.submit(context, { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    const first = await adapter.submit(context, { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     const lost = first.details?.operation as Record<string, unknown>;
     expect(lost.externalState).toBe("unknown");
     expect(lost.accepted).toBe(false);
@@ -342,7 +363,7 @@ describe("JobAdapter prototype flow", () => {
     expect(statsAfterDrop.counters.submitRequests).toBe(1);
 
     await service.configure({ dropSubmitAck: false });
-    const repeated = await adapter.submit(context, { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    const repeated = await adapter.submit(context, { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     const reconciled = repeated.details?.operation as Record<string, unknown>;
     expect(reconciled.operationId).toBe(operationId);
     expect(reconciled.payloadDigest).toBe(digest);
@@ -358,9 +379,9 @@ describe("JobAdapter prototype flow", () => {
     expect(stats.counters.actualCreates).toBe(1);
     expect(stats.counters.submitRequests).toBe(1);
 
-    await expect(adapter.submit(context, { expectedTaskRevision: 2, payload: "alpha-prototype-payload" }))
-      .rejects.toThrow(/Stale expected taskRevision 2/);
-    await expect(adapter.submit(context, { expectedTaskRevision: 1, payload: "changed-payload" }))
+    await expect(adapter.submit(context, { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 2, payload: "alpha-prototype-payload" }))
+      .rejects.toThrow(/stale expectedTaskRevision 2/);
+    await expect(adapter.submit(context, { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "changed-payload" }))
       .rejects.toThrow(/different payload/);
     const afterConflict = await service.stats();
     expect(afterConflict.counters.actualCreates).toBe(1);
@@ -379,9 +400,10 @@ describe("JobAdapter prototype flow", () => {
 
   test("dispatched HTTP errors after possible creation remain unknown and are never replayed", async () => {
     for (const status of [408, 409]) {
-      const { service, adapter, branch } = await setup();
+      const { service, owner, adapter, branch } = await setup();
       await service.configure({ submitHttpError: status });
       const first = await adapter.submit(contextFor(branch), {
+        expectedTaskId: taskRef(owner).taskId,
         expectedTaskRevision: 1,
         payload: "alpha-prototype-payload",
       });
@@ -398,6 +420,7 @@ describe("JobAdapter prototype flow", () => {
 
       await service.configure({ submitHttpError: null });
       const reconciled = await adapter.submit(contextFor(branch), {
+        expectedTaskId: taskRef(owner).taskId,
         expectedTaskRevision: 1,
         payload: "alpha-prototype-payload",
       });
@@ -413,10 +436,10 @@ describe("JobAdapter prototype flow", () => {
   });
 
   test("adversarial remote identity is rejected before accepted/jobId/state changes", async () => {
-    const { service, adapter, branch } = await setup();
+    const { service, owner, adapter, branch } = await setup();
     const context = contextFor(branch);
     await service.configure({ corruptResponse: "operationId" });
-    const first = await adapter.submit(context, { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    const first = await adapter.submit(context, { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     const lost = first.details?.operation as Record<string, unknown>;
     expect(lost.externalState).toBe("unknown");
     expect(lost.accepted).toBe(false);
@@ -425,7 +448,7 @@ describe("JobAdapter prototype flow", () => {
     expect(String(lost.operationId)).not.toContain("corrupt");
 
     await service.configure({ corruptResponse: "digest" });
-    const second = await adapter.submit(context, { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    const second = await adapter.submit(context, { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     const stillUnknown = second.details?.operation as Record<string, unknown>;
     expect(stillUnknown.externalState).toBe("unknown");
     expect(stillUnknown.externalJobId).toBeNull();
@@ -434,14 +457,14 @@ describe("JobAdapter prototype flow", () => {
     expect((await service.stats()).counters.submitRequests).toBe(1);
 
     await service.configure({ corruptResponse: null });
-    const third = await adapter.submit(context, { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    const third = await adapter.submit(context, { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     const running = third.details?.operation as Record<string, unknown>;
     expect(running.externalState).toBe("running");
     expect(typeof running.externalJobId).toBe("string");
     const verifiedJobId = running.externalJobId as string;
 
     await service.configure({ corruptResponse: "jobId" });
-    const badJob = await adapter.query(context);
+    const badJob = await adapter.query(context, jobGuard(owner));
     const badJobOperation = badJob.details?.operation as Record<string, unknown>;
     expect(badJobOperation.externalState).toBe("running");
     expect(badJobOperation.externalJobId).toBe(verifiedJobId);
@@ -450,7 +473,7 @@ describe("JobAdapter prototype flow", () => {
     expect((badJob.details?.query as Record<string, unknown>).fresh).toBe(false);
 
     await service.configure({ corruptResponse: "missingDigest" });
-    const missing = await adapter.query(context);
+    const missing = await adapter.query(context, jobGuard(owner));
     const missingOperation = missing.details?.operation as Record<string, unknown>;
     expect(missingOperation.externalState).toBe("running");
     expect(missingOperation.externalJobId).toBe(verifiedJobId);
@@ -458,7 +481,7 @@ describe("JobAdapter prototype flow", () => {
     expect(missing.isError).toBe(true);
 
     await service.configure({ corruptResponse: "overlongJobId" });
-    const overlong = await adapter.query(context);
+    const overlong = await adapter.query(context, jobGuard(owner));
     const overlongOperation = overlong.details?.operation as Record<string, unknown>;
     expect(overlongOperation.externalState).toBe("running");
     expect(overlongOperation.externalJobId).toBe(verifiedJobId);
@@ -470,7 +493,7 @@ describe("JobAdapter prototype flow", () => {
     const { service, owner, adapter, branch } = await setup();
     await service.configure({ holdSubmitAccept: true, delayedQueryMs: 300 });
     const context = contextFor(branch);
-    const pendingSubmit = adapter.submit(context, { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    const pendingSubmit = adapter.submit(context, { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     const operationId = adapter.operationIds[0]!;
     await waitFor("held submit request", async () => {
       const stats = await service.stats();
@@ -514,13 +537,13 @@ describe("JobAdapter prototype flow", () => {
   });
 
   test("history remains append-only while the complete response and display stay bounded", async () => {
-    const { service, adapter, branch, recordPath } = await setup();
+    const { service, owner, adapter, branch, recordPath } = await setup();
     const context = contextFor(branch);
     const escapedPayload = '"'.repeat(4096);
-    const first = await adapter.submit(context, { expectedTaskRevision: 1, payload: escapedPayload });
+    const first = await adapter.submit(context, { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: escapedPayload });
     const operationId = (first.details?.operation as Record<string, unknown>).operationId as string;
-    for (let index = 0; index < 60; index += 1) await adapter.query(context);
-    const result = await adapter.query(context);
+    for (let index = 0; index < 60; index += 1) await adapter.query(context, jobGuard(owner));
+    const result = await adapter.query(context, jobGuard(owner));
     const details = result.details as Record<string, unknown>;
     const history = details.history as Record<string, unknown>;
     const retained = history.retained as Record<string, number>;
@@ -554,7 +577,7 @@ describe("JobAdapter prototype flow", () => {
     const { service, owner, adapter, branch } = await setup();
     await service.configure({ holdCancel: true });
     const context = contextFor(branch);
-    const submitted = await adapter.submit(context, { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    const submitted = await adapter.submit(context, { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     const operationId = (submitted.details?.operation as Record<string, unknown>).operationId as string;
     expect((await service.stats()).counters.cancelRequests).toBe(0);
 
@@ -579,7 +602,7 @@ describe("JobAdapter prototype flow", () => {
     expect(statsWhileHeld.counters.cancelRequests).toBe(1);
 
     await service.confirmCancel();
-    const confirmed = await adapter.query(contextFor(cancelledBranch));
+    const confirmed = await adapter.query(contextFor(cancelledBranch), jobGuard(owner));
     const operation = confirmed.details?.operation as Record<string, unknown>;
     expect(operation.externalState).toBe("cancelled");
     expect(operation.cancelIntent).toMatchObject({ cancelIntentId: intentId, state: "confirmed" });
@@ -588,7 +611,7 @@ describe("JobAdapter prototype flow", () => {
     expect(stats.counters.cancelRequests).toBe(1);
     expect(stats.counters.actualCreates).toBe(1);
 
-    await expect(adapter.submit(contextFor(cancelledBranch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" }))
+    await expect(adapter.submit(contextFor(cancelledBranch), { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" }))
       .rejects.toThrow(/task is cancelled/);
     expect((await service.stats()).counters.submitRequests).toBe(1);
   });
@@ -596,7 +619,7 @@ describe("JobAdapter prototype flow", () => {
   test("corrupt cancel response stays unconfirmed until a valid query confirms the same intent", async () => {
     const { service, owner, adapter, branch } = await setup();
     const context = contextFor(branch);
-    const submitted = await adapter.submit(context, { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    const submitted = await adapter.submit(context, { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     const operationId = (submitted.details?.operation as Record<string, unknown>).operationId as string;
     const verifiedJobId = (submitted.details?.operation as Record<string, unknown>).externalJobId as string;
     await service.configure({ corruptResponse: "jobId" });
@@ -617,7 +640,7 @@ describe("JobAdapter prototype flow", () => {
     expect((await service.stats()).jobs[0]?.state).toBe("cancelled");
 
     await service.configure({ corruptResponse: null });
-    const queried = await adapter.query(contextFor(cancelledBranch));
+    const queried = await adapter.query(contextFor(cancelledBranch), jobGuard(owner));
     const operation = queried.details?.operation as Record<string, unknown>;
     expect(operation.externalState).toBe("cancelled");
     expect(operation.externalJobId).toBe(verifiedJobId);
@@ -628,7 +651,7 @@ describe("JobAdapter prototype flow", () => {
   test("completion wins cancellation and keeps the original revision binding", async () => {
     const { service, owner, adapter, branch } = await setup();
     const context = contextFor(branch);
-    const submitted = await adapter.submit(context, { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    const submitted = await adapter.submit(context, { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     const operationId = (submitted.details?.operation as Record<string, unknown>).operationId as string;
     const completed = await service.complete();
     expect(completed.job.state).toBe("succeeded");
@@ -642,7 +665,7 @@ describe("JobAdapter prototype flow", () => {
     expect(settled.externalState).toBe("succeeded");
     expect(settled.cancelIntent).not.toBeNull();
 
-    const queried = await adapter.query(contextFor(cancelledBranch));
+    const queried = await adapter.query(contextFor(cancelledBranch), jobGuard(owner));
     const operation = queried.details?.operation as Record<string, unknown>;
     expect(operation.externalState).toBe("succeeded");
     expect(operation.taskRevision).toBe(1);
@@ -650,18 +673,18 @@ describe("JobAdapter prototype flow", () => {
     expect((queried.details?.task as Record<string, unknown>).status).toBe("cancelled");
     expect((queried.details?.task as Record<string, unknown>).taskRevision).toBe(1);
 
-    await expect(adapter.submit(contextFor(cancelledBranch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" }))
+    await expect(adapter.submit(contextFor(cancelledBranch), { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" }))
       .rejects.toThrow(/task is cancelled/);
     expect((await service.stats()).counters.actualCreates).toBe(1);
   });
 
   test("authoritative admission audit failure aborts before host record or transport", async () => {
-    const { service, adapter, branch, recordPath } = await setupWithOwnerCallbacks({
+    const { service, owner, adapter, branch, recordPath } = await setupWithOwnerCallbacks({
       onEvent: (event) => {
         if (event.type === "capability_admission_allowed") throw new Error("authoritative audit failed");
       },
     });
-    await expect(adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha" }))
+    await expect(adapter.submit(contextFor(branch), { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha" }))
       .rejects.toThrow("authoritative audit failed");
     expect(adapter.operationIds).toHaveLength(0);
     const stats = await service.stats();
@@ -672,12 +695,12 @@ describe("JobAdapter prototype flow", () => {
   });
 
   test("authoritative admission persistence failure aborts before host record or transport", async () => {
-    const { service, adapter, branch, recordPath } = await setupWithOwnerCallbacks({
+    const { service, owner, adapter, branch, recordPath } = await setupWithOwnerCallbacks({
       onStateChange: (snapshot) => {
         if ((snapshot.currentTask?.admissions ?? 0) > 0) throw new Error("authoritative persist failed");
       },
     });
-    await expect(adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha" }))
+    await expect(adapter.submit(contextFor(branch), { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha" }))
       .rejects.toThrow("authoritative persist failed");
     expect(adapter.operationIds).toHaveLength(0);
     const stats = await service.stats();
@@ -694,6 +717,7 @@ describe("JobAdapter prototype flow", () => {
       },
     });
     const submitted = await adapter.submit(contextFor(branch), {
+      expectedTaskId: taskRef(owner).taskId,
       expectedTaskRevision: 1,
       payload: "alpha-prototype-payload",
     });
@@ -709,19 +733,103 @@ describe("JobAdapter prototype flow", () => {
   });
 
   test("query refuses a different conversation binding instead of exposing old results", async () => {
-    const { adapter, branch } = await setup();
+    const { owner, adapter, branch } = await setup();
     const context = contextFor(branch);
-    await adapter.submit(context, { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
-    await expect(adapter.query(contextFor(branch, "different-session")))
+    await adapter.submit(context, { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    await expect(adapter.query(contextFor(branch, "different-session"), jobGuard(owner)))
       .rejects.toThrow(/different OMP session/);
-    await expect(adapter.query(contextFor([base()])))
+    await expect(adapter.query(contextFor([base()]), jobGuard(owner)))
       .rejects.toThrow(/anchor is not in the current conversation branch/);
-    await expect(adapter.submit(contextFor([base()]), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" }))
+    await expect(adapter.submit(contextFor([base()]), { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" }))
       .rejects.toThrow(/anchor is not in the current conversation branch/);
   });
+  test("old task selectors never query or submit the next task's operation", async () => {
+    const { service, owner, adapter, branch } = await setup();
+    const oldRef = jobGuard(owner);
+    await adapter.submit(contextFor(branch), { ...oldRef, payload: "alpha-prototype-payload" });
+    const cancelledBranch = cancelTask(owner, branch);
+    owner.closeTurn({
+      sessionId: SESSION,
+      branch: cancelledBranch,
+      messages: [{
+        ...(user("user-2", "assistant-1", "Please cancel the managed task.").message as Record<string, unknown>),
+        id: "user-2",
+      }],
+    });
+    const nextBranch = [
+      ...cancelledBranch,
+      assistant("assistant-next", "user-2"),
+      user("user-next", "assistant-next", "Start the next job task."),
+    ];
+    expect(owner.observeInput({
+      sessionId: SESSION,
+      workspaceRoot: WORKSPACE,
+      source: "rpc",
+      text: "Start the next job task.",
+      observedAt: NOW,
+      baseLeafId: "assistant-next",
+    }).accepted).toBe(true);
+    owner.observeAgentStart({ sessionId: SESSION, prompt: "Start the next job task.", reason: "prompt" });
+    const next = owner.start(subject(nextBranch));
+    expect(next.created).toBe(true);
+    expect(next.task.taskId).not.toBe(oldRef.expectedTaskId);
+
+    const before = await service.stats();
+    await expect(adapter.query(contextFor(nextBranch), oldRef))
+      .rejects.toThrow(/expectedTaskId does not match the current task/);
+    await expect(adapter.submit(contextFor(nextBranch), { ...oldRef, payload: "alpha-prototype-payload" }))
+      .rejects.toThrow(/expectedTaskId does not match the current task/);
+    const after = await service.stats();
+    expect(after.counters.queryRequests).toBe(before.counters.queryRequests);
+    expect(after.counters.submitRequests).toBe(before.counters.submitRequests);
+    expect(after.counters.actualCreates).toBe(before.counters.actualCreates);
+    expect(adapter.operationIds).toHaveLength(1);
+  });
+
 });
 
 describe("JobAdapter failure visibility", () => {
+  test("a published-owner change during admission persistence keeps not_dispatched and sends no POST", async () => {
+    let ownerRef: TaskOwner | undefined;
+    let cleared = false;
+    const { service, owner, adapter, branch } = await setupWithOwnerCallbacks({
+      onStateChange: (snapshot) => {
+        if (!cleared && snapshot.currentTask?.admissions === 1 && ownerRef !== undefined) {
+          cleared = true;
+          clearPublishedTaskOwner(ownerRef);
+        }
+      },
+    });
+    ownerRef = owner;
+    const result = await adapter.submit(contextFor(branch), {
+      expectedTaskId: taskRef(owner).taskId,
+      expectedTaskRevision: 1,
+      payload: "alpha-prototype-payload",
+    });
+    expect(result.isError).toBe(true);
+    const operation = result.details?.operation as Record<string, unknown>;
+    expect(operation.dispatch).toBe("not_started");
+    expect(operation.externalState).toBe("not_dispatched");
+    expect(owner.snapshot().currentTask?.status).toBe("active");
+    expect((await service.stats()).counters.submitRequests).toBe(0);
+    expect((await service.stats()).counters.actualCreates).toBe(0);
+  });
+
+  test("a published-owner change before transport is refused with no request", async () => {
+    const { service, owner, adapter, branch } = await setup();
+    clearPublishedTaskOwner(owner);
+    const result = await adapter.submit(contextFor(branch), {
+      expectedTaskId: taskRef(owner).taskId,
+      expectedTaskRevision: 1,
+      payload: "alpha-prototype-payload",
+    });
+    expect(result.isError).toBe(true);
+    const operation = result.details?.operation as Record<string, unknown>;
+    expect(operation.dispatch).toBe("not_started");
+    expect(operation.externalState).toBe("not_dispatched");
+    expect((await service.stats()).counters.submitRequests).toBe(0);
+  });
+
   test("admission denial and invalid host endpoint are explicit errors", async () => {
     const owner = newOwner();
     const { branch } = startTask(owner);
@@ -739,9 +847,9 @@ describe("JobAdapter failure visibility", () => {
       timeoutMs: 200,
     });
     cleanups.push(async () => adapter.dispose());
-    await expect(adapter.submit(contextFor(branch), { expectedTaskRevision: 2, payload: "alpha" }))
-      .rejects.toThrow(/Job admission denied: stale expected taskRevision 2/);
-    const failed = await adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha" });
+    await expect(adapter.submit(contextFor(branch), { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 2, payload: "alpha" }))
+      .rejects.toThrow(/stale expectedTaskRevision 2/);
+    const failed = await adapter.submit(contextFor(branch), { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha" });
     const operation = failed.details?.operation as Record<string, unknown>;
     expect(operation.externalState).toBe("unknown");
     expect(failed.isError).toBeFalsy();
@@ -792,6 +900,7 @@ describe("B3b model-call abort and local wait lifecycle", () => {
     const controller = new AbortController();
     controller.abort("user interrupt");
     await expect(adapter.submit(contextFor(branch), {
+      expectedTaskId: taskRef(owner).taskId,
       expectedTaskRevision: 1,
       payload: "alpha-prototype-payload",
     }, controller.signal)).rejects.toThrow(/aborted before admission/);
@@ -803,13 +912,13 @@ describe("B3b model-call abort and local wait lifecycle", () => {
   });
 
   test("in-flight query abort ends the local wait and keeps the prior running fact", async () => {
-    const { service, adapter, branch } = await setup();
-    const submitted = await adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    const { service, owner, adapter, branch } = await setup();
+    const submitted = await adapter.submit(contextFor(branch), { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     const operationId = (submitted.details?.operation as Record<string, unknown>).operationId as string;
     await service.configure({ delayedQueryMs: 800 });
 
     const controller = new AbortController();
-    const pending = adapter.query(contextFor(branch), controller.signal);
+    const pending = adapter.query(contextFor(branch), jobGuard(owner), controller.signal);
     await waitFor("query reached service", async () => (await service.stats()).counters.queryRequests === 1 ? true : undefined);
     const abortedAt = Date.now();
     controller.abort("Interrupted by user");
@@ -831,17 +940,17 @@ describe("B3b model-call abort and local wait lifecycle", () => {
     expect(stats.counters.actualCreates).toBe(1);
 
     await service.configure({ delayedQueryMs: 0 });
-    const queried = await adapter.query(contextFor(branch));
+    const queried = await adapter.query(contextFor(branch), jobGuard(owner));
     expect(queried.isError).toBeFalsy();
     expect((queried.details?.operation as Record<string, unknown>).operationId).toBe(operationId);
     expect((queried.details?.operation as Record<string, unknown>).externalState).toBe("running");
   });
 
   test("submit abort after dispatch retains unknown under the original operation and reconciles later", async () => {
-    const { service, adapter, branch } = await setup();
+    const { service, owner, adapter, branch } = await setup();
     await service.configure({ holdSubmitAccept: true });
     const controller = new AbortController();
-    const pending = adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" }, controller.signal);
+    const pending = adapter.submit(contextFor(branch), { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" }, controller.signal);
     await waitFor("held submit reached service", async () => (await service.stats()).counters.submitRequests === 1 ? true : undefined);
     controller.abort("Interrupted by user");
     const aborted = await pending;
@@ -863,7 +972,7 @@ describe("B3b model-call abort and local wait lifecycle", () => {
     expect(afterRelease.counters.actualCreates).toBe(1);
     expect(afterRelease.counters.submitRequests).toBe(1);
 
-    const reconciled = await adapter.query(contextFor(branch));
+    const reconciled = await adapter.query(contextFor(branch), jobGuard(owner));
     expect(reconciled.isError).toBeFalsy();
     const operation = reconciled.details?.operation as Record<string, unknown>;
     expect(operation.operationId).toBe(operationId);
@@ -875,11 +984,11 @@ describe("B3b model-call abort and local wait lifecycle", () => {
 
   test("host cleanup does not inherit an aborted model query signal", async () => {
     const { service, owner, adapter, branch } = await setup();
-    await adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    await adapter.submit(contextFor(branch), { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     await service.configure({ delayedCancelMs: 500, delayedQueryMs: 700 });
     const cancelledBranch = cancelTask(owner, branch);
     const queryController = new AbortController();
-    const querying = adapter.query(contextFor(cancelledBranch), queryController.signal);
+    const querying = adapter.query(contextFor(cancelledBranch), jobGuard(owner), queryController.signal);
     await waitFor("model query reached service", async () => (await service.stats()).counters.queryRequests === 1 ? true : undefined);
     queryController.abort("user interrupt during query");
     const aborted = await querying;
@@ -899,7 +1008,7 @@ describe("B3b model-call abort and local wait lifecycle", () => {
 
   test("dispose aborts model waits but lets an already-issued cleanup settle within its deadline", async () => {
     const { service, owner, adapter, branch } = await setup();
-    await adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    await adapter.submit(contextFor(branch), { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     await service.configure({ holdCancelResponse: true });
     cancelTask(owner, branch);
     await waitFor("held cleanup request", async () => (await service.stats()).counters.cancelRequests === 1 ? true : undefined);
@@ -916,11 +1025,11 @@ describe("B3b model-call abort and local wait lifecycle", () => {
   });
 
   test("dispose aborts the local wait without claiming the remote job stopped", async () => {
-    const { service, adapter, branch } = await setup();
-    const submitted = await adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    const { service, owner, adapter, branch } = await setup();
+    const submitted = await adapter.submit(contextFor(branch), { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     const operationId = (submitted.details?.operation as Record<string, unknown>).operationId as string;
     await service.configure({ delayedQueryMs: 1_000 });
-    const pending = adapter.query(contextFor(branch));
+    const pending = adapter.query(contextFor(branch), jobGuard(owner));
     await waitFor("query reached service", async () => (await service.stats()).counters.queryRequests === 1 ? true : undefined);
     adapter.dispose();
     const result = await pending;
@@ -930,7 +1039,7 @@ describe("B3b model-call abort and local wait lifecycle", () => {
     expect(operation.externalState).toBe("running");
     expect(operation.lastError).toContain("disposed");
     expect(operation.externalJobId).not.toBeNull();
-    await expect(adapter.query(contextFor(branch))).rejects.toThrow(/disposed/);
+    await expect(adapter.query(contextFor(branch), jobGuard(owner))).rejects.toThrow(/disposed/);
     const stats = await service.stats();
     expect(stats.counters.cancelRequests).toBe(0);
     expect(stats.counters.actualCreates).toBe(1);
@@ -938,9 +1047,9 @@ describe("B3b model-call abort and local wait lifecycle", () => {
 
   test("a result is withheld after the conversation binding detaches during the await", async () => {
     const { service, owner, adapter, branch } = await setup();
-    await adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    await adapter.submit(contextFor(branch), { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     await service.configure({ delayedQueryMs: 400 });
-    const pending = adapter.query(contextFor(branch));
+    const pending = adapter.query(contextFor(branch), jobGuard(owner));
     await waitFor("query reached service", async () => (await service.stats()).counters.queryRequests === 1 ? true : undefined);
     owner.navigate("session_switch", "replacement-session");
     await expect(pending).rejects.toThrow(/result withheld/);
@@ -951,7 +1060,7 @@ describe("B3b model-call abort and local wait lifecycle", () => {
   test("withheld disclosure after a valid 201 is not mislabelled as a transport failure", async () => {
     const { service, owner, adapter, branch, recordPath } = await setup();
     await service.configure({ holdSubmitAccept: true });
-    const pending = adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
+    const pending = adapter.submit(contextFor(branch), { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha-prototype-payload" });
     await waitFor("held submit reached service", async () => (await service.stats()).counters.submitRequests === 1 ? true : undefined);
     owner.navigate("session_switch", "replacement-session");
     const withheld = pending.then(
@@ -987,8 +1096,8 @@ describe("B3b model-call abort and local wait lifecycle", () => {
     });
     const endpoint = await listen(server);
     cleanups.push(async () => { await new Promise<void>((resolve) => server.close(() => resolve())); });
-    const { adapter, branch } = await adapterForEndpoint(endpoint);
-    const result = await adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha" });
+    const { owner, adapter, branch } = await adapterForEndpoint(endpoint);
+    const result = await adapter.submit(contextFor(branch), { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha" });
     expect(result.isError).toBe(true);
     const operation = result.details?.operation as Record<string, unknown>;
     expect(operation.externalState).toBe("unknown");
@@ -1010,8 +1119,8 @@ describe("B3b model-call abort and local wait lifecycle", () => {
     });
     const endpoint = await listen(server);
     cleanups.push(async () => { await new Promise<void>((resolve) => server.close(() => resolve())); });
-    const { adapter, branch } = await adapterForEndpoint(endpoint);
-    const result = await adapter.submit(contextFor(branch), { expectedTaskRevision: 1, payload: "alpha" });
+    const { owner, adapter, branch } = await adapterForEndpoint(endpoint);
+    const result = await adapter.submit(contextFor(branch), { expectedTaskId: taskRef(owner).taskId, expectedTaskRevision: 1, payload: "alpha" });
     expect(result.isError).toBe(true);
     const operation = result.details?.operation as Record<string, unknown>;
     expect(operation.externalState).toBe("unknown");
@@ -1023,9 +1132,10 @@ describe("B3b model-call abort and local wait lifecycle", () => {
 
 describe("B3b pending submit state", () => {
   test("an actually created job with a held acknowledgement is unknown and unresolved before the answer", async () => {
-    const { service, adapter, branch, recordPath } = await setup();
+    const { service, owner, adapter, branch, recordPath } = await setup();
     await service.configure({ holdSubmitAck: true });
     const pending = adapter.submit(contextFor(branch), {
+      expectedTaskId: taskRef(owner).taskId,
       expectedTaskRevision: 1,
       payload: "alpha-prototype-payload",
     });
@@ -1072,9 +1182,10 @@ describe("B3b pending submit state", () => {
   });
 
   test("a held accept before creation is unknown and sent while no remote job exists", async () => {
-    const { service, adapter, branch, recordPath } = await setup();
+    const { service, owner, adapter, branch, recordPath } = await setup();
     await service.configure({ holdSubmitAccept: true });
     const pending = adapter.submit(contextFor(branch), {
+      expectedTaskId: taskRef(owner).taskId,
       expectedTaskRevision: 1,
       payload: "alpha-prototype-payload",
     });
@@ -1100,12 +1211,13 @@ describe("B3b pending submit state", () => {
 
   test("a refusal before transport keeps not_dispatched and sends no POST", async () => {
     const controller = new AbortController();
-    const { service, adapter, branch, recordPath } = await setupWithOwnerCallbacks({
+    const { service, owner, adapter, branch, recordPath } = await setupWithOwnerCallbacks({
       onEvent: (event) => {
         if (event.type === "capability_admission_allowed") controller.abort("revoked before transport");
       },
     });
     const result = await adapter.submit(contextFor(branch), {
+      expectedTaskId: taskRef(owner).taskId,
       expectedTaskRevision: 1,
       payload: "alpha-prototype-payload",
     }, controller.signal);
@@ -1126,5 +1238,407 @@ describe("B3b pending submit state", () => {
     const stats = await service.stats();
     expect(stats.counters.submitRequests).toBe(0);
     expect(stats.counters.actualCreates).toBe(0);
+  });
+});
+
+describe("B3-A repair: final job target boundary after host callbacks", () => {
+  test("a last-clock cancellation and new task swap before POST sends no request and keeps A's operation not_dispatched", async () => {
+    const service = await MockJobService.start();
+    const root = await mkdtemp(path.join(tmpdir(), "omp-agent-b3a-last-clock-"));
+    const recordPath = path.join(root, "record.json");
+    const owner = newOwner();
+    const started = startTask(owner);
+    const taskA = taskRef(owner);
+    const cancelBranch = [
+      ...started.branch,
+      assistant("assistant-1", "user-1"),
+      user("user-2", "assistant-1", "Please cancel the managed task."),
+    ];
+    const branchB = [
+      ...cancelBranch,
+      assistant("assistant-2", "user-2"),
+      user("user-3", "assistant-2", "Start independent task B."),
+    ];
+    await service.configure({ holdCancel: true });
+    let swapTask: (() => void) | undefined;
+    let replacementTaskId: string | undefined;
+    let inSubmit = false;
+    let clock = 0;
+    let fired = false;
+    const adapter = new JobAdapter(owner, {
+      endpoint: service.endpoint,
+      recordPath,
+      capabilityId: "job-submit",
+      timeoutMs: 1_000,
+      now: () => {
+        if (inSubmit && !fired) {
+          clock += 1;
+          // Fifth submit-owned clock call is the pre-POST `updatedAt` write.
+          if (clock === 5) {
+            fired = true;
+            swapTask!();
+          }
+        }
+        return NOW;
+      },
+      id: (() => { let n = 0; return () => `last-clock-${++n}`; })(),
+    });
+    cleanups.push(async () => {
+      adapter.dispose();
+      await service.cleanup();
+      await rm(root, { recursive: true, force: true });
+    });
+    swapTask = () => {
+      // Real genuine turns: close A's turn, cancel A, close that turn, start B.
+      owner.closeTurn({
+        sessionId: SESSION,
+        branch: started.branch,
+        messages: [{ ...(user("user-1", "leaf-1", "Please run the one job.").message as Record<string, unknown>), id: "user-1" }],
+      });
+      owner.observeInput({
+        sessionId: SESSION, workspaceRoot: WORKSPACE, source: "rpc",
+        text: "Please cancel the managed task.", observedAt: NOW, baseLeafId: "assistant-1",
+      });
+      owner.observeAgentStart({ sessionId: SESSION, prompt: "Please cancel the managed task.", reason: "prompt" });
+      owner.cancel(subject(cancelBranch), taskA);
+      owner.closeTurn({
+        sessionId: SESSION,
+        branch: cancelBranch,
+        messages: [{ ...(user("user-2", "assistant-1", "Please cancel the managed task.").message as Record<string, unknown>), id: "user-2" }],
+      });
+      owner.observeInput({
+        sessionId: SESSION, workspaceRoot: WORKSPACE, source: "rpc",
+        text: "Start independent task B.", observedAt: NOW, baseLeafId: "assistant-2",
+      });
+      owner.observeAgentStart({ sessionId: SESSION, prompt: "Start independent task B.", reason: "prompt" });
+      const next = owner.start(subject(branchB));
+      replacementTaskId = next.task.taskId;
+    };
+
+    inSubmit = true;
+    try {
+      await expect(adapter.submit(contextFor(started.branch), {
+        expectedTaskId: taskA.taskId,
+        expectedTaskRevision: 1,
+        payload: "alpha-prototype-payload",
+      })).rejects.toThrow(/result withheld/);
+    } finally {
+      inSubmit = false;
+    }
+    expect(fired).toBe(true);
+    expect(replacementTaskId).toBeDefined();
+    expect(replacementTaskId).not.toBe(taskA.taskId);
+    const operation = adapter.snapshot(adapter.operationIds[0]!)!;
+    expect(operation).toMatchObject({
+      taskId: taskA.taskId,
+      ownerId: owner.ownerId,
+      taskRevision: 1,
+      dispatch: "not_started",
+      externalState: "not_dispatched",
+    });
+    expect(operation.observations.some((observation) => observation.source === "preflight_guard")).toBe(true);
+    const retainedA = owner.inspectTarget(subject(branchB), { taskId: taskA.taskId, taskRevision: 1 });
+    expect(retainedA.target.status).toBe("cancelled");
+    expect(retainedA.target.admissions).toBe(1);
+    expect(owner.snapshot().currentTask).toMatchObject({ taskId: replacementTaskId, status: "active", admissions: 0 });
+    const stats = await service.stats();
+    expect(stats.counters.submitRequests).toBe(0);
+    expect(stats.counters.actualCreates).toBe(0);
+  });
+
+  test("a query clock callback that replaces the current task sends no GET and schedules no model query", async () => {
+    const service = await MockJobService.start();
+    const root = await mkdtemp(path.join(tmpdir(), "omp-agent-b3a-query-clock-"));
+    const recordPath = path.join(root, "record.json");
+    const owner = newOwner();
+    const started = startTask(owner);
+    const taskA = taskRef(owner);
+    const cancelBranch = [
+      ...started.branch,
+      assistant("assistant-1", "user-1"),
+      user("user-2", "assistant-1", "Please cancel the managed task."),
+    ];
+    const branchB = [
+      ...cancelBranch,
+      assistant("assistant-2", "user-2"),
+      user("user-3", "assistant-2", "Start independent task B."),
+    ];
+    await service.configure({ holdCancel: true });
+    let inQuery = false;
+    let swapTask: (() => void) | undefined;
+    const adapter = new JobAdapter(owner, {
+      endpoint: service.endpoint,
+      recordPath,
+      capabilityId: "job-submit",
+      timeoutMs: 1_000,
+      now: () => {
+        if (inQuery) {
+          inQuery = false;
+          swapTask!();
+        }
+        return NOW;
+      },
+      id: (() => { let n = 0; return () => `query-clock-${++n}`; })(),
+    });
+    cleanups.push(async () => {
+      adapter.dispose();
+      await service.cleanup();
+      await rm(root, { recursive: true, force: true });
+    });
+    swapTask = () => {
+      owner.closeTurn({
+        sessionId: SESSION,
+        branch: started.branch,
+        messages: [{ ...(user("user-1", "leaf-1", "Please run the one job.").message as Record<string, unknown>), id: "user-1" }],
+      });
+      owner.observeInput({
+        sessionId: SESSION, workspaceRoot: WORKSPACE, source: "rpc",
+        text: "Please cancel the managed task.", observedAt: NOW, baseLeafId: "assistant-1",
+      });
+      owner.observeAgentStart({ sessionId: SESSION, prompt: "Please cancel the managed task.", reason: "prompt" });
+      owner.cancel(subject(cancelBranch), taskA);
+      owner.closeTurn({
+        sessionId: SESSION,
+        branch: cancelBranch,
+        messages: [{ ...(user("user-2", "assistant-1", "Please cancel the managed task.").message as Record<string, unknown>), id: "user-2" }],
+      });
+      owner.observeInput({
+        sessionId: SESSION, workspaceRoot: WORKSPACE, source: "rpc",
+        text: "Start independent task B.", observedAt: NOW, baseLeafId: "assistant-2",
+      });
+      owner.observeAgentStart({ sessionId: SESSION, prompt: "Start independent task B.", reason: "prompt" });
+      owner.start(subject(branchB));
+    };
+
+    const submitted = await adapter.submit(contextFor(started.branch), {
+      expectedTaskId: taskA.taskId,
+      expectedTaskRevision: 1,
+      payload: "alpha-prototype-payload",
+    });
+    expect(submitted.isError).toBeFalsy();
+    const operationId = (submitted.details?.operation as Record<string, unknown>).operationId as string;
+    const before = await service.stats();
+    inQuery = true;
+    try {
+      await expect(adapter.query(contextFor(started.branch), {
+        expectedTaskId: taskA.taskId,
+        expectedTaskRevision: 1,
+      })).rejects.toThrow(/result withheld/);
+    } finally {
+      inQuery = false;
+    }
+    const after = await service.stats();
+    expect(after.counters.queryRequests).toBe(before.counters.queryRequests);
+    const operation = adapter.snapshot(operationId)!;
+    expect(operation).toMatchObject({ taskId: taskA.taskId, taskRevision: 1, dispatch: "sent" });
+    expect(operation.observations.some((observation) => observation.source === "query_preflight_guard")).toBe(true);
+    expect(owner.snapshot().currentTask?.taskId).not.toBe(taskA.taskId);
+  });
+
+  test("existing-operation submit reconciliation stops when the last clock callback creates an acceptance reservation", async () => {
+    const service = await MockJobService.start();
+    const root = await mkdtemp(path.join(tmpdir(), "omp-agent-b3a-reconcile-reservation-"));
+    const recordPath = path.join(root, "record.json");
+    const owner = newOwner();
+    const started = startTask(owner);
+    const task = taskRef(owner);
+    const taskSnapshot = owner.snapshot().currentTask!;
+    const frozen = {
+      ownerId: taskSnapshot.ownerId,
+      taskId: taskSnapshot.taskId,
+      taskRevision: taskSnapshot.taskRevision,
+      requirementsDigest: requirementsDigest(taskSnapshot.requirementSources),
+    };
+    let inSubmit = false;
+    let token: object | undefined;
+    const adapter = new JobAdapter(owner, {
+      endpoint: service.endpoint,
+      recordPath,
+      capabilityId: "job-submit",
+      timeoutMs: 1_000,
+      now: () => {
+        // Reconciling the same payload invokes startCall(now) before the
+        // query; this host callback creates a real acceptance reservation.
+        if (inSubmit && token === undefined) {
+          token = owner.reserveAcceptance(subject(started.branch), frozen);
+        }
+        return NOW;
+      },
+      id: (() => { let n = 0; return () => `reconcile-reservation-${++n}`; })(),
+    });
+    cleanups.push(async () => {
+      adapter.dispose();
+      await service.cleanup();
+      await rm(root, { recursive: true, force: true });
+    });
+    const first = await adapter.submit(contextFor(started.branch), {
+      expectedTaskId: task.taskId,
+      expectedTaskRevision: 1,
+      payload: "alpha-prototype-payload",
+    });
+    expect(first.isError).toBeFalsy();
+    const operationId = (first.details?.operation as Record<string, unknown>).operationId as string;
+    const before = await service.stats();
+    inSubmit = true;
+    let result;
+    try {
+      result = await adapter.submit(contextFor(started.branch), {
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: 1,
+        payload: "alpha-prototype-payload",
+      });
+    } finally {
+      inSubmit = false;
+    }
+    expect(token).toBeDefined();
+    expect(result.isError).toBe(true);
+    expect(result.details?.reconciled).toBe(false);
+    const operation = adapter.snapshot(operationId)!;
+    expect(String(operation.lastError)).toContain("acceptance reservation");
+    const after = await service.stats();
+    expect(after.counters.queryRequests).toBe(before.counters.queryRequests);
+    expect(after.counters.submitRequests).toBe(1);
+    owner.releaseAcceptance(token!);
+  });
+
+  test("a last-clock same-session branch without A's anchor refuses before POST and keeps not_dispatched", async () => {
+    const service = await MockJobService.start();
+    const root = await mkdtemp(path.join(tmpdir(), "omp-agent-b3a-final-branch-"));
+    const recordPath = path.join(root, "record.json");
+    const owner = newOwner();
+    const started = startTask(owner);
+    const taskA = taskRef(owner);
+    let liveBranch: Entry[] = started.branch;
+    const context: OmpToolContext = {
+      cwd: WORKSPACE,
+      agent: { kind: "main" },
+      sessionManager: {
+        getSessionId: () => SESSION,
+        getLeafId: () => (liveBranch.at(-1) as Entry | undefined)?.id ?? null,
+        getBranch: () => liveBranch,
+      },
+    };
+    let adapter: JobAdapter;
+    let armed = false;
+    let fired = false;
+    let sentClocks = 0;
+    adapter = new JobAdapter(owner, {
+      endpoint: service.endpoint,
+      recordPath,
+      capabilityId: "job-submit",
+      timeoutMs: 1_000,
+      now: () => {
+        // Real host clock callback after the record write: the same session
+        // moves to a branch that no longer reaches A's creation anchor. No
+        // navigation hook is involved, so only the actual context shows it.
+        if (armed && !fired && adapter.operationIds.length > 0
+          && adapter.snapshot(adapter.operationIds[0]!)?.dispatch === "sent") {
+          sentClocks += 1;
+          if (sentClocks === 2) {
+            fired = true;
+            liveBranch = [base("leaf-1")];
+          }
+        }
+        return NOW;
+      },
+      id: (() => { let n = 0; return () => `final-branch-${++n}`; })(),
+    });
+    cleanups.push(async () => {
+      adapter.dispose();
+      await service.cleanup();
+      await rm(root, { recursive: true, force: true });
+    });
+
+    armed = true;
+    try {
+      await expect(adapter.submit(context, {
+        expectedTaskId: taskA.taskId,
+        expectedTaskRevision: 1,
+        payload: "alpha-prototype-payload",
+      })).rejects.toThrow(/result withheld/);
+    } finally {
+      armed = false;
+    }
+    expect(fired).toBe(true);
+    const operation = adapter.snapshot(adapter.operationIds[0]!)!;
+    expect(operation).toMatchObject({
+      taskId: taskA.taskId,
+      ownerId: owner.ownerId,
+      taskRevision: 1,
+      dispatch: "not_started",
+      externalState: "not_dispatched",
+    });
+    expect(operation.observations.some((observation) => observation.source === "preflight_guard")).toBe(true);
+    expect(String(operation.lastError)).toContain("anchor is not in the current conversation branch");
+    expect(owner.snapshot().currentTask).toMatchObject({ taskId: taskA.taskId, status: "active", admissions: 1 });
+    const stats = await service.stats();
+    expect(stats.counters.submitRequests).toBe(0);
+    expect(stats.counters.actualCreates).toBe(0);
+  });
+
+  test("the same last-clock context read admits a branch that still reaches A's anchor", async () => {
+    const service = await MockJobService.start();
+    const root = await mkdtemp(path.join(tmpdir(), "omp-agent-b3a-final-branch-control-"));
+    const recordPath = path.join(root, "record.json");
+    const owner = newOwner();
+    const started = startTask(owner);
+    const taskA = taskRef(owner);
+    let liveBranch: Entry[] = started.branch;
+    const context: OmpToolContext = {
+      cwd: WORKSPACE,
+      agent: { kind: "main" },
+      sessionManager: {
+        getSessionId: () => SESSION,
+        getLeafId: () => (liveBranch.at(-1) as Entry | undefined)?.id ?? null,
+        getBranch: () => liveBranch,
+      },
+    };
+    let adapter: JobAdapter;
+    let armed = false;
+    let fired = false;
+    let sentClocks = 0;
+    adapter = new JobAdapter(owner, {
+      endpoint: service.endpoint,
+      recordPath,
+      capabilityId: "job-submit",
+      timeoutMs: 1_000,
+      now: () => {
+        if (armed && !fired && adapter.operationIds.length > 0
+          && adapter.snapshot(adapter.operationIds[0]!)?.dispatch === "sent") {
+          sentClocks += 1;
+          if (sentClocks === 2) {
+            fired = true;
+            // Actual same-session branch growth still containing the anchor.
+            liveBranch = [...started.branch, assistant("assistant-1", "user-1")];
+          }
+        }
+        return NOW;
+      },
+      id: (() => { let n = 0; return () => `final-branch-control-${++n}`; })(),
+    });
+    cleanups.push(async () => {
+      adapter.dispose();
+      await service.cleanup();
+      await rm(root, { recursive: true, force: true });
+    });
+
+    armed = true;
+    let result;
+    try {
+      result = await adapter.submit(context, {
+        expectedTaskId: taskA.taskId,
+        expectedTaskRevision: 1,
+        payload: "alpha-prototype-payload",
+      });
+    } finally {
+      armed = false;
+    }
+    expect(fired).toBe(true);
+    expect(result.isError).toBeFalsy();
+    expect((result.details?.operation as Record<string, unknown>).externalState).toBe("running");
+    expect(owner.snapshot().currentTask).toMatchObject({ taskId: taskA.taskId, status: "active", admissions: 1 });
+    const stats = await service.stats();
+    expect(stats.counters.submitRequests).toBe(1);
+    expect(stats.counters.actualCreates).toBe(1);
   });
 });

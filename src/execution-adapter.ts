@@ -1580,8 +1580,11 @@ export class ExecutionAdapter {
   private ownerEvent(event: TaskOwnerEvent): void {
     const active = this.active;
     if (!active) return;
-    if (event.type === "task_cancelled") this.stopActive(active, "owner_cancelled", event);
-    else if (event.type === "task_binding_detached") this.stopActive(active, "binding_detached", event);
+    // Task-specific control events only affect the run for that exact task.
+    // A late event for retained task A must never stop current task B.
+    if (event.type === "task_cancelled") {
+      if (event.taskId === active.taskId) this.stopActive(active, "owner_cancelled", event);
+    } else if (event.type === "task_binding_detached") this.stopActive(active, "binding_detached", event);
     else if (event.type === "task_revised" && event.taskId === active.taskId) this.stopActive(active, "task_revised", event);
   }
 
@@ -1932,7 +1935,10 @@ export class ExecutionAdapter {
           this.visibleTerminalFacts(context),
         );
       }
-      const decision = this.owner.admit(subject, this.capabilityId, args.expectedTaskRevision);
+      const decision = this.owner.admit(subject, this.capabilityId, {
+        taskId: args.expectedTaskId,
+        taskRevision: args.expectedTaskRevision,
+      });
       if (!decision.allowed) {
         safeAudit(this.audit, {
           type: "execution_admission_denied",

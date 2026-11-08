@@ -36,9 +36,54 @@ import {
 
 export const TASK_OWNER_SCHEMA_VERSION = 1 as const;
 export const TASK_REVISION_START = 1 as const;
-export const TASK_CONTROL_ACTIONS = ["start", "inspect", "revise", "cancel"] as const;
+export const TASK_CONTROL_ACTIONS = ["start", "inspect", "revise", "cancel", "history"] as const;
 export type TaskControlAction = (typeof TASK_CONTROL_ACTIONS)[number];
 export type TaskStatus = "active" | "cancelled" | "accepted";
+
+/** Retained tasks include the current task. History is never evicted silently. */
+export const TASK_HISTORY_LIMIT = 128 as const;
+/** Message anchors plus committed control replays retained per owner. */
+export const TASK_REPLAY_ENTRY_LIMIT = 4096 as const;
+/** History rows per read. The hard page bound also applies to cursors. */
+export const TASK_HISTORY_PAGE_LIMIT = 16 as const;
+
+/** Immutable optimistic selector. It never authorizes an action by itself. */
+export interface TaskGuard {
+  taskId: string;
+  taskRevision: number;
+}
+
+export interface TaskHistoryRow {
+  taskId: string;
+  taskRevision: number;
+  status: "accepted" | "cancelled";
+  createdAt: string;
+  terminalAt: string | null;
+  anchorMessageId: string;
+  anchorSessionId: string;
+  anchorSource: GenuineInputSource;
+  sourceCount: number;
+  amendmentCount: number;
+  acceptanceId: string | null;
+  acceptanceInstallUnknown: boolean;
+  current: boolean;
+}
+
+export interface TaskHistoryPage {
+  rows: TaskHistoryRow[];
+  /** Next numeric page offset, or null when the visible history is exhausted. */
+  nextCursor: number | null;
+  total: number;
+  retention: TaskRetentionFacts;
+}
+
+export interface TaskRetentionFacts {
+  tasksRetained: number;
+  tasksLimit: number;
+  terminalTasks: number;
+  replayEntries: number;
+  replayEntriesLimit: number;
+}
 
 export interface AcceptanceReference {
   acceptanceId: string;
@@ -152,6 +197,8 @@ export interface UserTurnGrant {
   text: string;
   observedAt: string;
   baseLeafId: string;
+  /** Owner task identity observed with this real input, before any commit. */
+  baselineTaskId: string | null;
   /** Owner taskRevision observed with this real input, before any commit. */
   baselineTaskRevision: number | null;
   started: boolean;
@@ -185,11 +232,15 @@ export interface TaskOwnerSnapshot {
   authorizedCapabilities: string[];
   /** Durable in-process unknown acceptance installation facts, if any. */
   acceptanceHazard: AcceptanceHazardFacts | null;
+  /** Bounded counts only; full historical ledgers require explicit inspection. */
+  retention: TaskRetentionFacts;
 }
 
 export interface TaskStartResult {
   created: boolean;
   task: ManagedTask;
+  /** True when the returned task is retained history, never the current task. */
+  historical: boolean;
 }
 
 export interface TaskRevisionResult {
@@ -198,12 +249,20 @@ export interface TaskRevisionResult {
   task: ManagedTask;
 }
 
+/** Bounded read-only final usability facts; never a capability token. */
+export interface TaskUsabilityFacts {
+  usable: boolean;
+  reason: string | null;
+}
+
 export interface AdmissionDecision {
   allowed: boolean;
   reason: string | null;
   taskId: string | null;
   ownerId: string;
   taskRevision: number | null;
+  /** Caller-supplied optimistic selector, never authority. */
+  expectedTaskId: string | null;
   /** Caller-supplied optimistic guard, never authority. */
   expectedTaskRevision: number | null;
   anchorMessageId: string | null;
@@ -215,11 +274,23 @@ export interface AdmissionDecision {
 export interface TaskControlArguments {
   action: TaskControlAction;
   understanding?: string;
+  expectedTaskId?: string;
+  expectedTaskRevision?: number;
+  cursor?: number;
+  limit?: number;
 }
 
 const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
 const MAX_UNDERSTANDING = 4000;
-const CONTROL_KEYS = new Set(["action", "understanding"]);
+const CONTROL_KEYS = new Set([
+  "action",
+  "understanding",
+  "expectedTaskId",
+  "expectedTaskRevision",
+  "cursor",
+  "limit",
+]);
+/** Authoritative identity fields stay forbidden; expected* are selectors only. */
 const MODEL_AUTHORITY_KEYS = new Set([
   "taskId",
   "taskRevision",
@@ -242,6 +313,7 @@ const MODEL_AUTHORITY_KEYS = new Set([
   "task",
   "goal",
 ]);
+const CURSOR = /^(?:0|[1-9][0-9]{0,6})$/;
 
 function object(value: unknown, label: string): Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -322,6 +394,25 @@ function freezeFacts<T>(value: T): T {
   return value;
 }
 
+/** Strict host-side selector normalization. It grants nothing by itself. */
+function taskSelector(value: unknown): TaskGuard {
+  const record = object(value, "Task selector");
+  const taskId = identifier(record.taskId, "expectedTaskId");
+  const taskRevision = record.taskRevision;
+  if (typeof taskRevision !== "number" || !Number.isSafeInteger(taskRevision) || taskRevision <= 0) {
+    throw new TaskOwnerError("expectedTaskRevision must be a positive integer copied from the host task view.");
+  }
+  return { taskId, taskRevision };
+}
+
+function messageKey(sessionId: string, messageId: string): string {
+  return `${sessionId}\0${messageId}`;
+}
+
+function controlKey(sessionId: string, messageId: string, action: "revise" | "cancel"): string {
+  return `${sessionId}\0${messageId}\0${action}`;
+}
+
 /**
  * A pending observation has never started an agent and never resolved a
  * branch anchor. Only this state may be expired/replaced by later genuine
@@ -332,9 +423,10 @@ function isUnresolvedPendingObservation(grant: UserTurnGrant): boolean {
 }
 
 /**
- * Strict model-facing argument parser. Identity, permissions, source and
- * anchor fields are rejected explicitly even though the tool schema also
- * filters unknown properties before execution.
+ * Strict model-facing argument parser. Authoritative identity, permissions,
+ * source and anchor fields are rejected explicitly. expectedTaskId and
+ * expectedTaskRevision are allowed only as selectors copied from the host's
+ * visible task facts; they never authorize an action.
  */
 export function parseTaskControlArguments(value: unknown): TaskControlArguments {
   const args = object(value, "Task control arguments");
@@ -342,21 +434,61 @@ export function parseTaskControlArguments(value: unknown): TaskControlArguments 
   const forbidden = keys.filter((key) => MODEL_AUTHORITY_KEYS.has(key));
   if (forbidden.length) {
     throw new TaskOwnerError(
-      `agent_task never accepts task authority from model parameters: ${forbidden.join(", ")}.`,
+      `agent_task never accepts task authority from model parameters: ${forbidden.join(", ")}. Selectors are expectedTaskId and expectedTaskRevision only, copied from host-visible task facts.`,
     );
   }
   const unknown = keys.filter((key) => !CONTROL_KEYS.has(key));
   if (unknown.length) throw new TaskOwnerError(`agent_task has unsupported field(s): ${unknown.join(", ")}.`);
   const action = args.action;
   if (typeof action !== "string" || !(TASK_CONTROL_ACTIONS as readonly string[]).includes(action)) {
-    throw new TaskOwnerError("agent_task action must be start, inspect, revise or cancel.");
+    throw new TaskOwnerError("agent_task action must be start, inspect, revise, cancel or history.");
   }
+  const selected = action as TaskControlAction;
   if (args.understanding !== undefined && action !== "start" && action !== "revise") {
     throw new TaskOwnerError("Agent understanding may be supplied only when starting or revising a task.");
   }
-  if (args.understanding === undefined) return { action: action as TaskControlAction };
-  const understanding = text(args.understanding, "Agent understanding", MAX_UNDERSTANDING).trim();
-  return { action: action as TaskControlAction, understanding };
+  const hasId = args.expectedTaskId !== undefined;
+  const hasRevision = args.expectedTaskRevision !== undefined;
+  if (hasId !== hasRevision) {
+    throw new TaskOwnerError("expectedTaskId and expectedTaskRevision must be supplied together as one selector.");
+  }
+  if (action === "revise" || action === "cancel") {
+    if (!hasId) {
+      throw new TaskOwnerError(`agent_task ${action} requires expectedTaskId and expectedTaskRevision copied from the current host task view.`);
+    }
+  } else if (action === "start" || action === "history") {
+    if (hasId) {
+      throw new TaskOwnerError(`agent_task ${action} does not accept task selectors; only revise and cancel require them, and inspect may use them for one explicit target.`);
+    }
+  }
+  if (args.cursor !== undefined || args.limit !== undefined) {
+    if (action !== "history") throw new TaskOwnerError("cursor and limit are supported only by the history action.");
+  }
+  const result: TaskControlArguments = { action: selected };
+  if (args.understanding !== undefined) {
+    result.understanding = text(args.understanding, "Agent understanding", MAX_UNDERSTANDING).trim();
+  }
+  if (hasId) {
+    result.expectedTaskId = identifier(args.expectedTaskId, "expectedTaskId");
+    const revision = args.expectedTaskRevision;
+    if (typeof revision !== "number" || !Number.isSafeInteger(revision) || revision <= 0) {
+      throw new TaskOwnerError("expectedTaskRevision must be a positive integer copied from the host task view.");
+    }
+    result.expectedTaskRevision = revision;
+  }
+  if (args.cursor !== undefined) {
+    if (typeof args.cursor !== "number" || !Number.isSafeInteger(args.cursor) || args.cursor < 0) {
+      throw new TaskOwnerError("history cursor must be a non-negative integer page offset.");
+    }
+    result.cursor = args.cursor;
+  }
+  if (args.limit !== undefined) {
+    if (typeof args.limit !== "number" || !Number.isSafeInteger(args.limit) || args.limit < 1 || args.limit > TASK_HISTORY_PAGE_LIMIT) {
+      throw new TaskOwnerError(`history limit must be an integer between 1 and ${TASK_HISTORY_PAGE_LIMIT}.`);
+    }
+    result.limit = args.limit;
+  }
+  return result;
 }
 
 export type TaskOwnerEvent = Readonly<Record<string, unknown> & { type: string; ownerId: string }>;
@@ -387,9 +519,9 @@ export interface TaskOwnerOptions {
 }
 
 /**
- * Single authoritative owner. At most one current task exists in B1; a new
- * user message may inspect/cancel it when authorized, but cannot silently
- * adopt or re-anchor it.
+ * Single authoritative owner. One current task is mutable at a time. A later
+ * genuine user turn may start a new task only after the current task is
+ * accepted or cancelled; retained history is read-only and replay-indexed.
  */
 export class TaskOwner {
   readonly workspaceRoot: string;
@@ -407,6 +539,13 @@ export class TaskOwner {
   private listenerSequence = 0;
   private tasksCreated = 0;
   private task: ManagedTask | undefined;
+  /** Retained tasks in creation order, including the current task. */
+  private readonly tasks = new Map<string, ManagedTask>();
+  /** Genuine creation-message anchors, retained for idempotent replay. */
+  private readonly anchorIndex = new Map<string, { taskId: string }>();
+  /** Committed revise/cancel control messages, retained for replay safety. */
+  private readonly controlIndex = new Map<string, { taskId: string; action: "revise" | "cancel" }>();
+  private stateEpoch = 0;
   private grant: UserTurnGrant | undefined;
   private suspended: { reason: string } | undefined;
   private detached: { reason: string; event: string; sessionId: string | null; since: string } | undefined;
@@ -492,6 +631,21 @@ export class TaskOwner {
             recordDigest: this.acceptanceHazard.recordDigest,
             reason: this.acceptanceHazard.reason,
           },
+      retention: this.retentionFacts(),
+    };
+  }
+
+  private terminalTasks(): ManagedTask[] {
+    return [...this.tasks.values()].filter((task) => task.status !== "active");
+  }
+
+  private retentionFacts(): TaskRetentionFacts {
+    return {
+      tasksRetained: this.tasks.size,
+      tasksLimit: TASK_HISTORY_LIMIT,
+      terminalTasks: this.terminalTasks().length,
+      replayEntries: this.anchorIndex.size + this.controlIndex.size,
+      replayEntriesLimit: TASK_REPLAY_ENTRY_LIMIT,
     };
   }
 
@@ -532,6 +686,49 @@ export class TaskOwner {
         `${action} is unavailable: the conversation binding is detached (${this.detached.reason}). Task history remains readable but no mutation, admission or transfer is available.`,
       );
     }
+  }
+
+  /**
+   * Pure, read-only final usability check for an already-authorized consumer.
+   * It invokes no host callback, emits no event, consumes no reservation and
+   * exposes no authority token. Callers run every host getter first, then this
+   * check immediately before the side effect. `taskRevision: null` checks only
+   * the immutable operation target (used for revision-old receipts), while
+   * `requireActive` distinguishes a mutating consumer from a read-only query
+   * of the current cancelled task.
+   */
+  targetUsability(
+    taskId: string,
+    taskRevision: number | null,
+    options: { requireActive: boolean; subject?: TaskSubject },
+  ): TaskUsabilityFacts {
+    const deny = (reason: string): TaskUsabilityFacts => ({ usable: false, reason });
+    if (this.detached) return deny(`conversation binding is detached: ${this.detached.reason}`);
+    if (this.suspended) return deny(`task owner is suspended: ${this.suspended.reason}`);
+    if (this.acceptanceHazard) return deny("the acceptance commit outcome is unknown");
+    if (this.acceptanceReservation) return deny("an acceptance reservation is active");
+    const task = this.task;
+    if (!task) return deny("no managed task exists");
+    if (task.taskId !== taskId) return deny("the current task is a different task");
+    if (taskRevision !== null && task.taskRevision !== taskRevision) {
+      return deny(`the current task is at revision ${task.taskRevision}, not ${taskRevision}`);
+    }
+    if (options.requireActive && task.status !== "active") {
+      return deny(`the current task is ${task.status}`);
+    }
+    const subject = options.subject;
+    if (subject !== undefined) {
+      if (subject.workspaceRoot !== this.workspaceRoot) return deny("session workspace does not match the task owner workspace");
+      if (subject.sessionId !== task.anchor.sessionId) return deny("task belongs to a different OMP session");
+      try {
+        if (!parseBranch(subject.branch).some((entry) => entry.id === task.anchor.messageId)) {
+          return deny("task anchor is not in the current conversation branch");
+        }
+      } catch {
+        return deny("the current conversation branch is not a usable task branch");
+      }
+    }
+    return { usable: true, reason: null };
   }
 
   private reportHostCallbackFailure(callback: "onEvent" | "onStateChange", eventType: string, error: unknown): void {
@@ -697,6 +894,7 @@ export class TaskOwner {
       text: raw,
       observedAt,
       baseLeafId,
+      baselineTaskId: this.task?.taskId ?? null,
       baselineTaskRevision: this.task?.taskRevision ?? null,
       started: false,
       anchorMessageId: null,
@@ -708,6 +906,7 @@ export class TaskOwner {
       source,
       turnId: this.grant.turnId,
       baseLeafId,
+      baselineTaskId: this.grant.baselineTaskId,
       baselineTaskRevision: this.grant.baselineTaskRevision,
       textLength: raw.length,
       ...(superseded === undefined ? {} : { supersededTurnId: superseded.turnId }),
@@ -904,8 +1103,13 @@ export class TaskOwner {
    * the observation leaf closes the authority-to-create/change window, even
    * inside one OMP run (background follow-ups do not emit before_agent_start).
    * Task-bound capability continuation does not use this path.
+   *
+   * This resolver is pure for a legal window: it returns a candidate anchor
+   * and never writes the live grant. Capacity, target or preflight failures
+   * must leave the observed grant exactly as it was. A genuine invalidated
+   * authority window still closes deliberately below.
    */
-  private resolveAuthority(subject: TaskSubject, grant: UserTurnGrant): TaskAnchor {
+  private resolveAuthorityCandidate(subject: TaskSubject, grant: UserTurnGrant): TaskAnchor {
     const entries = parseBranch(subject.branch);
     const baseIndex = entries.findIndex((entry) => entry.id === grant.baseLeafId);
     if (baseIndex < 0) {
@@ -958,7 +1162,6 @@ export class TaskOwner {
         `The user authority window was closed by a non-user control message (${blocking.slice(0, 4).join(", ")}); a background or custom trigger cannot start or change a task.`,
       );
     }
-    grant.anchorMessageId = anchor.entry.id;
     return {
       sessionId: grant.sessionId,
       messageId: anchor.entry.id,
@@ -984,6 +1187,27 @@ export class TaskOwner {
     if (!entries.some((entry) => entry.id === task.anchor.messageId)) {
       throw new TaskOwnerError("Task anchor is not in the current conversation branch; B1 will not assume execution rights.");
     }
+  }
+
+  /** Compare the caller's immutable selector before any state, budget or process change. */
+  private assertTaskGuard(expected: TaskGuard, task: ManagedTask): void {
+    if (expected.taskId !== task.taskId) {
+      throw new TaskOwnerError(
+        `expectedTaskId does not match the current task (${task.taskId} at taskRevision ${task.taskRevision}); no task state changed.`,
+      );
+    }
+    if (expected.taskRevision !== task.taskRevision) {
+      throw new TaskOwnerError(
+        `stale expectedTaskRevision ${expected.taskRevision}; the current task is at ${task.taskRevision}. No task state changed.`,
+      );
+    }
+  }
+
+  /** Read-only visibility for retained target facts. */
+  private taskVisible(subject: TaskSubject, task: ManagedTask): boolean {
+    if (task.anchor.sessionId !== subject.sessionId) return false;
+    if (this.detached) return true;
+    return parseBranch(subject.branch).some((entry) => entry.id === task.anchor.messageId);
   }
 
   /**
@@ -1133,6 +1357,8 @@ export class TaskOwner {
     // fact. Set the terminal task state before notifications or diagnostics.
     task.status = "accepted";
     task.acceptance = acceptance;
+    this.tasks.set(task.taskId, task);
+    this.stateEpoch += 1;
     const warnings = [...install.warnings];
     // Only now may postcommit cleanup/fsync run. Their failure is a warning,
     // never a rollback or a different installation fact.
@@ -1166,8 +1392,8 @@ export class TaskOwner {
 
   /** Read-only accepted terminal fact; never uses active-only verification. */
   acceptedReference(taskId: string): AcceptanceReference | null {
-    const task = this.task;
-    if (!task || task.taskId !== taskId || task.status !== "accepted" || task.acceptance === null) return null;
+    const task = this.tasks.get(taskId);
+    if (!task || task.status !== "accepted" || task.acceptance === null) return null;
     return { ...task.acceptance };
   }
 
@@ -1180,6 +1406,12 @@ export class TaskOwner {
     if (subject.agentKind !== "main") throw new TaskOwnerError("Only the main OMP session may start a managed task.");
     this.assertAttached("Task start");
     if (this.suspended) throw new TaskOwnerError(`Task start is unavailable: ${this.suspended.reason}.`);
+    if (this.acceptanceHazard) {
+      throw new TaskOwnerError("A previous acceptance installation outcome is unknown; a new task cannot be started while unresolved responsibility exists.");
+    }
+    if (this.acceptanceReservation) {
+      throw new TaskOwnerError("An acceptance reservation is active; a new task cannot be started until it is released.");
+    }
     const grant = this.grant;
     if (!grant || !grant.started) {
       throw new TaskOwnerError("No live genuine user turn authorizes starting a task.");
@@ -1187,24 +1419,48 @@ export class TaskOwner {
     if (grant.sessionId !== subject.sessionId) {
       throw new TaskOwnerError("The live user turn belongs to another session.");
     }
-    const anchor = this.resolveAuthority(subject, grant);
-    if (this.task) {
-      if (this.task.anchor.messageId === anchor.messageId) {
-        this.changed({
-          type: "task_duplicate_start",
-          taskId: this.task.taskId,
-          taskRevision: this.task.taskRevision,
-          messageId: anchor.messageId,
-          status: this.task.status,
-        });
-        return { created: false, task: copyTask(this.task) };
+    const anchor = this.resolveAuthorityCandidate(subject, grant);
+    const anchorKey = messageKey(anchor.sessionId, anchor.messageId);
+    // Replaying the same genuine message returns the task that message
+    // created, even when it is now retained history. It never binds the
+    // replay to whatever task is current later.
+    const recordedAnchor = this.anchorIndex.get(anchorKey);
+    if (recordedAnchor) {
+      const original = this.tasks.get(recordedAnchor.taskId);
+      if (!original) throw new TaskOwnerError("The recorded task anchor is no longer retained; refusing to reinterpret it as a new task.");
+      this.changed({
+        type: "task_duplicate_start",
+        taskId: original.taskId,
+        taskRevision: original.taskRevision,
+        messageId: anchor.messageId,
+        status: original.status,
+        historical: original !== this.task,
+      });
+      return { created: false, task: copyTask(original), historical: original !== this.task };
+    }
+    // A message already consumed to revise or cancel a task is never
+    // repurposed into a new task, even inside the same live turn.
+    for (const action of ["revise", "cancel"] as const) {
+      if (this.controlIndex.has(controlKey(anchor.sessionId, anchor.messageId, action))) {
+        throw new TaskOwnerError(`This user message was already consumed to ${action} a task and cannot create a new task.`);
       }
-      if (this.task.status === "accepted") {
-        throw new TaskOwnerError("The task is already accepted and terminal; it cannot be restarted or re-anchored.");
-      }
-      throw new TaskOwnerError("A task already belongs to a different user message; B1 does not merge or rebind tasks.");
+    }
+    const previous = this.task;
+    if (previous && previous.status === "active") {
+      throw new TaskOwnerError("The current task is still active; inspect, revise or cancel it before starting another task. An active task is never replaced implicitly.");
+    }
+    if (this.tasks.size >= TASK_HISTORY_LIMIT) {
+      throw new TaskOwnerError(`Task retention is full (${TASK_HISTORY_LIMIT} retained tasks including the current task); no old task or anchor was evicted, and no new task was created.`);
+    }
+    if (this.anchorIndex.size + this.controlIndex.size >= TASK_REPLAY_ENTRY_LIMIT) {
+      throw new TaskOwnerError(`Task replay capacity is full (${TASK_REPLAY_ENTRY_LIMIT} anchor/control entries); no old replay entry was evicted, and no new task was created.`);
     }
     const taskId = identifier(`task-${this.newId()}`, "taskId");
+    // A host id generator may repeat. Retained history is never overwritten:
+    // reject the candidate before building or committing anything.
+    if (this.tasks.has(taskId)) {
+      throw new TaskOwnerError("The host-generated taskId is already retained; no existing task, anchor or history was replaced.");
+    }
     const createdAt = this.now();
     const original: RequirementSource = {
       revision: TASK_REVISION_START,
@@ -1246,11 +1502,22 @@ export class TaskOwner {
       acceptance: null,
       admissions: 0,
     };
-    // Transactional response preflight: the caller builds the exact response
-    // envelope from the candidate before any owner state is committed.
+    // Transactional preflight: complete response/history work (the caller's
+    // builder) before any owner state changes. A reentrant callback that
+    // mutates this owner invalidates the candidate via the epoch check.
+    const epoch = this.stateEpoch;
+    const currentBefore = this.task;
     validateCandidate?.(task);
+    this.assertFinalStartState(currentBefore, grant, anchorKey, epoch, task.taskId);
+    // Commit the new current task, its replay index and the resolved anchor
+    // without any external call between these assignments. The previous
+    // terminal task stays immutable and retained.
+    grant.anchorMessageId = anchor.messageId;
+    this.tasks.set(task.taskId, task);
+    this.anchorIndex.set(anchorKey, { taskId: task.taskId });
     this.task = task;
     this.tasksCreated += 1;
+    this.stateEpoch += 1;
     this.changed({
       type: "task_started",
       taskId: task.taskId,
@@ -1259,33 +1526,62 @@ export class TaskOwner {
       messageId: task.anchor.messageId,
       sessionId: task.anchor.sessionId,
       source: task.anchor.source,
+      ...(previous === undefined ? {} : { previousTaskId: previous.taskId, previousStatus: previous.status }),
     });
-    return { created: true, task: copyTask(task) };
+    return { created: true, task: copyTask(task), historical: false };
+  }
+
+  /** Pure final check immediately before a new-task commit. */
+  private assertFinalStartState(
+    currentBefore: ManagedTask | undefined,
+    grantBefore: UserTurnGrant,
+    anchorKey: string,
+    epoch: number,
+    taskId: string,
+  ): void {
+    if (this.detached) throw new TaskOwnerError("The conversation binding detached during preflight; no task was created.");
+    if (this.suspended) throw new TaskOwnerError(`Task start became unavailable during preflight: ${this.suspended.reason}.`);
+    if (this.acceptanceHazard) throw new TaskOwnerError("An unknown acceptance installation appeared during preflight; no task was created.");
+    if (this.task !== currentBefore) throw new TaskOwnerError("The current task changed during preflight; no task was created.");
+    if (this.grant !== grantBefore || !grantBefore.started) {
+      throw new TaskOwnerError("The authorizing user turn changed during preflight; no task was created.");
+    }
+    if (this.anchorIndex.has(anchorKey)) throw new TaskOwnerError("This user message anchor was claimed during preflight; no task was created.");
+    if (this.tasks.has(taskId)) throw new TaskOwnerError("The host-generated taskId was retained during preflight; no task was created.");
+    if (this.tasks.size >= TASK_HISTORY_LIMIT || this.anchorIndex.size + this.controlIndex.size >= TASK_REPLAY_ENTRY_LIMIT) {
+      throw new TaskOwnerError("Task retention reached capacity during preflight; no task was created.");
+    }
+    if (this.stateEpoch !== epoch) throw new TaskOwnerError("Owner state changed during preflight; no task was created.");
   }
 
   /**
-   * Accept a genuine user requirement amendment. The host-observed input is
-   * authoritative; the model may only add non-authoritative understanding.
-   * Bounds are checked on the candidate ledger before any task field changes.
+   * Accept a genuine user requirement amendment. The current task must be
+   * targeted by the immutable expectedTaskId + expectedTaskRevision selector
+   * captured from host-visible facts. Bounds and replay capacity are checked
+   * on the candidate before any task field changes.
    */
   revise(
     subject: TaskSubject,
+    expected: TaskGuard,
     understanding?: string,
     validateCandidate?: (candidate: ManagedTask) => void,
   ): TaskRevisionResult {
     this.assertSubject(subject);
+    const target = taskSelector(expected);
     if (subject.agentKind !== "main") throw new TaskOwnerError("Only the main OMP session may revise a managed task.");
+    if (!this.task) throw new TaskOwnerError("No managed task exists for this owner.");
+    this.assertTaskGuard(target, this.task);
     this.assertAttached("Task revision");
     if (this.suspended) throw new TaskOwnerError(`Task revision is unavailable: ${this.suspended.reason}.`);
     if (this.acceptanceHazard) {
       throw new TaskOwnerError("Task acceptance installation outcome is unknown; revision cannot rewrite a possibly accepted task.");
     }
-    if (!this.task) throw new TaskOwnerError("No managed task exists for this owner.");
     if (this.task.status === "accepted") throw new TaskOwnerError("An accepted task is terminal and cannot be revised.");
     if (this.task.status !== "active") throw new TaskOwnerError("A cancelled task cannot be revised.");
+    const task = this.task;
     // Independent of any navigation hook: the creation session and anchor
     // must still be reachable on the actual current branch.
-    this.assertTaskReachable(subject, this.task);
+    this.assertTaskReachable(subject, task);
     const grant = this.grant;
     if (!grant || !grant.started || grant.sessionId !== subject.sessionId) {
       throw new TaskOwnerError("No live genuine user turn authorizes revising the task.");
@@ -1293,21 +1589,39 @@ export class TaskOwner {
     // Current-branch proof: the amendment text comes from the actual branch
     // user entry, never from model parameters, and background/custom messages
     // after this grant's anchor close the window.
-    const anchor = this.resolveAuthority(subject, grant);
-    const task = this.task;
+    const anchor = this.resolveAuthorityCandidate(subject, grant);
     if (anchor.messageId === task.anchor.messageId) {
       throw new TaskOwnerError("The task creation message cannot also be accepted as a requirement amendment.");
+    }
+    const createdBy = this.anchorIndex.get(messageKey(anchor.sessionId, anchor.messageId));
+    if (createdBy && createdBy.taskId !== task.taskId) {
+      throw new TaskOwnerError("This user message created a different task and cannot amend the current task.");
+    }
+    if (this.controlIndex.has(controlKey(anchor.sessionId, anchor.messageId, "cancel"))) {
+      throw new TaskOwnerError("This user message was already consumed to cancel a task and cannot revise another task.");
+    }
+    const existingControl = this.controlIndex.get(controlKey(anchor.sessionId, anchor.messageId, "revise"));
+    if (existingControl && existingControl.taskId !== task.taskId) {
+      throw new TaskOwnerError("This user message already amended a different task and cannot amend the current task.");
     }
     if (hasRequirementSource(task.requirementSources, anchor.messageId)) {
       this.changed({ type: "task_revision_duplicate", taskId: task.taskId, messageId: anchor.messageId, taskRevision: task.taskRevision });
       return { revised: false, task: copyTask(task) };
     }
-    if (!revisionBaselineMatches(grant.baselineTaskRevision, task.taskRevision)) {
+    if (existingControl) {
+      throw new TaskOwnerError("The recorded revision replay is inconsistent with the current requirement ledger; refusing to commit.");
+    }
+    if (grant.baselineTaskId !== task.taskId || !revisionBaselineMatches(grant.baselineTaskRevision, task.taskRevision)) {
       throw new TaskOwnerError(
-        `Stale requirement baseline: this input was observed at taskRevision ${String(grant.baselineTaskRevision)}, but the owner is at ${task.taskRevision}; the amendment was not committed.`,
+        `Stale requirement baseline: this input was observed against ${grant.baselineTaskId ?? "no task"} at taskRevision ${String(grant.baselineTaskRevision)}, but the owner is at ${task.taskId} taskRevision ${task.taskRevision}; the amendment was not committed.`,
       );
     }
+    const revisionKey = controlKey(anchor.sessionId, anchor.messageId, "revise");
+    if (this.anchorIndex.size + this.controlIndex.size >= TASK_REPLAY_ENTRY_LIMIT) {
+      throw new TaskOwnerError(`Task replay capacity is full (${TASK_REPLAY_ENTRY_LIMIT} anchor/control entries); no old entry was evicted and the amendment was not committed.`);
+    }
     const nextRevision = task.taskRevision + 1;
+    const committedAt = this.now();
     const amendment: RequirementSource = {
       revision: nextRevision,
       kind: "amendment",
@@ -1316,7 +1630,7 @@ export class TaskOwner {
       source: anchor.source,
       text: grant.text,
       observedAt: anchor.observedAt,
-      committedAt: this.now(),
+      committedAt,
       previousRevision: task.taskRevision,
     };
     const sources = [...task.requirementSources, amendment];
@@ -1341,11 +1655,33 @@ export class TaskOwner {
       understandingStale: understanding !== undefined ? false : task.understanding !== null,
     };
     assertRequirementCommitBounds({ sources, projection });
-    // Transactional response preflight: validate the exact response built
-    // from the candidate before this owner accepts the new revision.
+    // Transactional preflight: validate the exact response built from the
+    // candidate before this owner accepts the new revision. A reentrant
+    // callback that changes the task, grant or epoch aborts the commit.
+    const epoch = this.stateEpoch;
     validateCandidate?.(candidate);
+    if (this.detached) throw new TaskOwnerError("The conversation binding detached during preflight; the amendment was not committed.");
+    if (this.suspended) throw new TaskOwnerError("Task revision became suspended during preflight; the amendment was not committed.");
+    if (this.acceptanceHazard) throw new TaskOwnerError("An unknown acceptance installation appeared during preflight; the amendment was not committed.");
+    if (this.task !== task || task.taskRevision !== expected.taskRevision) {
+      throw new TaskOwnerError("The current task changed during preflight; the amendment was not committed.");
+    }
+    if (this.grant !== grant || !grant.started) {
+      throw new TaskOwnerError("The authorizing user turn changed during preflight; the amendment was not committed.");
+    }
+    if (this.controlIndex.has(revisionKey)) {
+      throw new TaskOwnerError("This amendment was recorded concurrently during preflight; the commit was abandoned.");
+    }
+    if (this.anchorIndex.size + this.controlIndex.size >= TASK_REPLAY_ENTRY_LIMIT) {
+      throw new TaskOwnerError("Task replay capacity was reached during preflight; the amendment was not committed.");
+    }
+    if (this.stateEpoch !== epoch) throw new TaskOwnerError("Owner state changed during preflight; the amendment was not committed.");
+    grant.anchorMessageId = anchor.messageId;
     this.invalidateAcceptanceReservation("task revision committed");
     this.task = candidate;
+    this.tasks.set(candidate.taskId, candidate);
+    this.controlIndex.set(revisionKey, { taskId: candidate.taskId, action: "revise" });
+    this.stateEpoch += 1;
     this.changed({
       type: "task_revised",
       taskId: candidate.taskId,
@@ -1392,19 +1728,98 @@ export class TaskOwner {
     return copyTask(this.task);
   }
 
-  cancel(subject: TaskSubject): ManagedTask {
+  /**
+   * Explicit read-only target inspection. The selector must match the retained
+   * task's actual identity; it cannot promote old history to current, register
+   * candidates, or redirect the current pointer.
+   */
+  inspectTarget(subject: TaskSubject, expected: TaskGuard): { target: ManagedTask; historical: boolean } {
     this.assertSubject(subject);
+    const selector = taskSelector(expected);
+    const target = this.tasks.get(selector.taskId);
+    if (!target) throw new TaskOwnerError("No retained task matches expectedTaskId; no history was disclosed.");
+    if (target.taskRevision !== selector.taskRevision) {
+      throw new TaskOwnerError(`stale expectedTaskRevision ${selector.taskRevision}; the retained task is at ${target.taskRevision}. No history was disclosed.`);
+    }
+    if (!this.taskVisible(subject, target)) {
+      throw new TaskOwnerError("The requested task is not visible in this workspace, session and branch; no history was disclosed.");
+    }
+    if (!this.detached && target !== this.task) {
+      const entries = parseBranch(subject.branch);
+      if (!entries.some((entry) => entry.id === target.anchor.messageId)) {
+        throw new TaskOwnerError("The requested task anchor is not visible on the current conversation branch.");
+      }
+    }
+    const historical = target !== this.task;
+    this.changed({
+      type: historical ? "task_history_inspected" : "task_inspected",
+      taskId: target.taskId,
+      taskRevision: target.taskRevision,
+      status: target.status,
+      binding: this.detached ? "detached" : "attached",
+    });
+    return { target: copyTask(target), historical };
+  }
+
+  /**
+   * Bounded read-only terminal history metadata for this owner/session.
+   * Pagination is a display cursor only; it never changes the current task.
+   */
+  historyPage(subject: TaskSubject, cursor: number, limit: number): TaskHistoryPage {
+    this.assertSubject(subject);
+    if (!Number.isSafeInteger(cursor) || cursor < 0) throw new TaskOwnerError("history cursor must be a non-negative integer page offset.");
+    if (!Number.isSafeInteger(limit) || limit < 1 || limit > TASK_HISTORY_PAGE_LIMIT) {
+      throw new TaskOwnerError(`history limit must be an integer between 1 and ${TASK_HISTORY_PAGE_LIMIT}.`);
+    }
+    const visible = [...this.tasks.values()]
+      .filter((task) => task.status !== "active" && this.taskVisible(subject, task))
+      .reverse();
+    if (cursor > visible.length) throw new TaskOwnerError("history cursor is outside the retained visible history.");
+    const page = visible.slice(cursor, cursor + limit).map((task): TaskHistoryRow => {
+      const row: TaskHistoryRow = {
+        taskId: task.taskId,
+        taskRevision: task.taskRevision,
+        status: task.status === "accepted" ? "accepted" : "cancelled",
+        createdAt: task.createdAt,
+        terminalAt: task.acceptance?.acceptedAt ?? task.cancelledAt,
+        anchorMessageId: task.anchor.messageId,
+        anchorSessionId: task.anchor.sessionId,
+        anchorSource: task.anchor.source,
+        sourceCount: task.requirementSources.length,
+        amendmentCount: task.requirementSources.filter((source) => source.kind === "amendment").length,
+        acceptanceId: task.acceptance?.acceptanceId ?? null,
+        acceptanceInstallUnknown: this.acceptanceHazard?.task.taskId === task.taskId,
+        current: task === this.task,
+      };
+      return row;
+    });
+    const nextCursor = cursor + page.length < visible.length ? cursor + page.length : null;
+    this.changed({
+      type: "task_history_read",
+      cursor,
+      limit,
+      returned: page.length,
+      total: visible.length,
+    });
+    return { rows: page, nextCursor, total: visible.length, retention: this.retentionFacts() };
+  }
+
+  cancel(subject: TaskSubject, expected: TaskGuard): ManagedTask {
+    this.assertSubject(subject);
+    const target = taskSelector(expected);
     if (subject.agentKind !== "main") throw new TaskOwnerError("Only the main OMP session may cancel a managed task.");
+    if (!this.task) throw new TaskOwnerError("No managed task exists for this owner.");
+    this.assertTaskGuard(target, this.task);
     this.assertAttached("Task cancellation");
     if (this.suspended) throw new TaskOwnerError(`Task control is unavailable: ${this.suspended.reason}.`);
     if (this.acceptanceHazard) {
       throw new TaskOwnerError("Task acceptance installation outcome is unknown; cancellation cannot rewrite a possibly accepted task.");
     }
-    if (!this.task) throw new TaskOwnerError("No managed task exists for this owner.");
     if (this.task.status === "accepted") {
       throw new TaskOwnerError("An accepted task is terminal and cannot be cancelled.");
     }
-    this.assertTaskReachable(subject, this.task);
+    const task = this.task;
+    this.assertTaskReachable(subject, task);
     const grant = this.grant;
     if (!grant || !grant.started || grant.sessionId !== subject.sessionId) {
       throw new TaskOwnerError("No live genuine user turn authorizes cancelling the task.");
@@ -1414,51 +1829,100 @@ export class TaskOwner {
     // existing reachable task. The task's creation anchor stays immutable; the
     // current grant supplies only this control request's authority. Background
     // or custom messages after the current grant anchor still close the window.
-    this.resolveAuthority(subject, grant);
-    if (this.task.status === "cancelled") {
-      this.changed({ type: "task_cancel_duplicate", taskId: this.task.taskId, taskRevision: this.task.taskRevision });
-      return copyTask(this.task);
+    const anchor = this.resolveAuthorityCandidate(subject, grant);
+    const createdBy = this.anchorIndex.get(messageKey(anchor.sessionId, anchor.messageId));
+    if (createdBy && createdBy.taskId !== task.taskId) {
+      throw new TaskOwnerError("This user message created a different task and cannot cancel the current task.");
     }
+    const revisedBy = this.controlIndex.get(controlKey(anchor.sessionId, anchor.messageId, "revise"));
+    if (revisedBy && revisedBy.taskId !== task.taskId) {
+      throw new TaskOwnerError("This user message already amended a different task and cannot cancel the current task.");
+    }
+    const cancelKey = controlKey(anchor.sessionId, anchor.messageId, "cancel");
+    const existingControl = this.controlIndex.get(cancelKey);
+    if (existingControl && existingControl.taskId !== task.taskId) {
+      throw new TaskOwnerError("This user message already cancelled a different task and cannot cancel the current task.");
+    }
+    if (task.status === "cancelled") {
+      this.changed({ type: "task_cancel_duplicate", taskId: task.taskId, taskRevision: task.taskRevision });
+      return copyTask(task);
+    }
+    if (!existingControl && this.anchorIndex.size + this.controlIndex.size >= TASK_REPLAY_ENTRY_LIMIT) {
+      throw new TaskOwnerError(`Task replay capacity is full (${TASK_REPLAY_ENTRY_LIMIT} anchor/control entries); no old entry was evicted and the task was not cancelled.`);
+    }
+    const epoch = this.stateEpoch;
+    const grantBefore = this.grant;
+    const cancelledAt = this.now();
+    // `now` is host-owned and may reenter. Recheck purely before mutating.
+    if (this.task !== task || this.stateEpoch !== epoch || this.grant !== grantBefore) {
+      throw new TaskOwnerError("Owner state changed while preparing cancellation; the task was not cancelled.");
+    }
+    if (!existingControl && this.anchorIndex.size + this.controlIndex.size >= TASK_REPLAY_ENTRY_LIMIT) {
+      throw new TaskOwnerError("Task replay capacity was reached while preparing cancellation; the task was not cancelled.");
+    }
+    grant.anchorMessageId = anchor.messageId;
     this.invalidateAcceptanceReservation("task cancellation committed");
-    this.task.status = "cancelled";
-    this.task.cancelledAt = this.now();
-    this.changed({ type: "task_cancelled", taskId: this.task.taskId, taskRevision: this.task.taskRevision });
-    return copyTask(this.task);
+    task.status = "cancelled";
+    task.cancelledAt = cancelledAt;
+    this.tasks.set(task.taskId, task);
+    this.controlIndex.set(cancelKey, { taskId: task.taskId, action: "cancel" });
+    this.stateEpoch += 1;
+    this.changed({ type: "task_cancelled", taskId: task.taskId, taskRevision: task.taskRevision });
+    return copyTask(task);
   }
 
   /**
    * The small current-task/admission port. It is deliberately not a capability
-   * market: only host-authorized capability ids are accepted, and cancellation
-   * is re-read at this entry point immediately before the capability acts.
+   * market: only host-authorized capability ids are accepted. The caller must
+   * present the immutable expectedTaskId + expectedTaskRevision it actually
+   * observed; a same revision under another task identity never matches.
    */
-  admit(subject: TaskSubject, capabilityId: string, expectedTaskRevision: number): AdmissionDecision {
+  admit(subject: TaskSubject, capabilityId: string, expected: TaskGuard): AdmissionDecision {
     const capability = identifier(capabilityId, "capabilityId");
-    const expectedIsValid = typeof expectedTaskRevision === "number"
-      && Number.isSafeInteger(expectedTaskRevision)
-      && expectedTaskRevision > 0;
-    const expected = expectedIsValid ? expectedTaskRevision : null;
+    let selector: TaskGuard | null = null;
+    let selectorError: string | null = null;
+    try {
+      selector = taskSelector(expected);
+    } catch (error) {
+      selector = null;
+      selectorError = error instanceof Error ? error.message : String(error);
+    }
     const deny = (reason: string, status: TaskStatus | null): AdmissionDecision => {
+      // Freeze the facts before notification: a synchronous listener may
+      // cancel this task or start another, but this result still describes
+      // the admission decision that was actually made.
+      const current = this.task;
+      const facts = {
+        taskId: current?.taskId ?? null,
+        taskRevision: current?.taskRevision ?? null,
+        anchorMessageId: current?.anchor.messageId ?? null,
+        status,
+      };
       this.changed({
         type: "capability_admission_denied",
         capabilityId: capability,
         reason,
-        taskId: this.task?.taskId ?? null,
-        expectedTaskRevision: expected,
+        taskId: facts.taskId,
+        expectedTaskId: selector?.taskId ?? null,
+        expectedTaskRevision: selector?.taskRevision ?? null,
       });
       return {
         allowed: false,
         reason,
-        taskId: this.task?.taskId ?? null,
+        taskId: facts.taskId,
         ownerId: this.ownerId,
-        taskRevision: this.task?.taskRevision ?? null,
-        expectedTaskRevision: expected,
-        anchorMessageId: this.task?.anchor.messageId ?? null,
+        taskRevision: facts.taskRevision,
+        expectedTaskId: selector?.taskId ?? null,
+        expectedTaskRevision: selector?.taskRevision ?? null,
+        anchorMessageId: facts.anchorMessageId,
         capabilityId: capability,
         actionIndex: null,
-        status,
+        status: facts.status,
       };
     };
-    if (!expectedIsValid) return deny("expectedTaskRevision must be a positive integer", this.task?.status ?? null);
+    if (selector === null) {
+      return deny(selectorError ?? "expectedTaskId and expectedTaskRevision must be a valid task selector", this.task?.status ?? null);
+    }
     try {
       this.assertSubject(subject);
     } catch (error) {
@@ -1467,55 +1931,118 @@ export class TaskOwner {
     if (!this.capabilities.has(capability)) return deny("capability is not authorized by the host", this.task?.status ?? null);
     if (this.detached) return deny(`conversation binding is detached: ${this.detached.reason}`, this.task?.status ?? null);
     if (this.suspended) return deny(`task admissions are suspended: ${this.suspended.reason}`, this.task?.status ?? null);
-    if (!this.task) return deny("no managed task exists", null);
+    const current = this.task;
+    if (!current) return deny("no managed task exists", null);
+    if (selector.taskId !== current.taskId) {
+      return deny(
+        `expectedTaskId ${selector.taskId} is not the current task (${current.taskId}); no admission occurred`,
+        current.status,
+      );
+    }
     if (this.acceptanceHazard) {
-      return deny("the acceptance commit outcome is unknown; no new side effect is admitted", this.task.status);
+      return deny("the acceptance commit outcome is unknown; no new side effect is admitted", current.status);
     }
     if (this.acceptanceReservation) {
-      return deny("an acceptance reservation is active; no new side effect is admitted", this.task.status);
+      return deny("an acceptance reservation is active; no new side effect is admitted", current.status);
     }
     try {
-      this.assertTaskReachable(subject, this.task);
+      this.assertTaskReachable(subject, current);
     } catch (error) {
-      return deny(error instanceof Error ? error.message : String(error), this.task.status);
+      return deny(error instanceof Error ? error.message : String(error), current.status);
     }
-    if (this.task.status !== "active") {
+    if (current.status !== "active") {
       return deny(
-        this.task.status === "accepted" ? "task is accepted and terminal" : "task is cancelled",
-        this.task.status,
+        current.status === "accepted" ? "task is accepted and terminal" : "task is cancelled",
+        current.status,
       );
     }
     // Optimistic, non-authoritative guard compared immediately before the
     // owned counter changes. The host mints the actual revision; the caller
     // cannot authorize or acquire a revision by naming it.
-    if (expected !== this.task.taskRevision) {
+    if (selector.taskRevision !== current.taskRevision) {
       return deny(
-        `stale expected taskRevision ${expected}; the owner is at ${this.task.taskRevision}`,
-        this.task.status,
+        `stale expected taskRevision ${selector.taskRevision}; the owner is at ${current.taskRevision}`,
+        current.status,
       );
     }
-    this.task.admissions += 1;
+    const actionIndex = current.admissions + 1;
+    const facts = {
+      taskId: current.taskId,
+      taskRevision: current.taskRevision,
+      anchorMessageId: current.anchor.messageId,
+      status: current.status,
+    };
+    current.admissions = actionIndex;
+    this.stateEpoch += 1;
+    // Notification may synchronously mutate this owner. Return only the
+    // frozen admission facts for the task that was actually admitted.
     this.changed({
       type: "capability_admission_allowed",
       capabilityId: capability,
-      taskId: this.task.taskId,
+      taskId: facts.taskId,
       ownerId: this.ownerId,
-      messageId: this.task.anchor.messageId,
-      taskRevision: this.task.taskRevision,
-      expectedTaskRevision: expected,
-      actionIndex: this.task.admissions,
+      messageId: facts.anchorMessageId,
+      taskRevision: facts.taskRevision,
+      expectedTaskId: selector.taskId,
+      expectedTaskRevision: selector.taskRevision,
+      actionIndex,
     });
+    // A synchronous notification may have cancelled/replaced the task or
+    // detached the conversation. The count and allowed event stay committed,
+    // but the capability must not act on a task that is no longer current.
+    const retained = this.tasks.get(facts.taskId);
+    const stillCurrent = this.task !== undefined
+      && this.task.taskId === facts.taskId
+      && this.task.taskRevision === facts.taskRevision
+      && this.task.status === "active"
+      && !this.detached
+      && !this.suspended
+      && this.acceptanceHazard === undefined
+      && this.acceptanceReservation === undefined;
+    let reachable = stillCurrent;
+    if (reachable) {
+      try {
+        this.assertTaskReachable(subject, this.task!);
+      } catch {
+        reachable = false;
+      }
+    }
+    if (!reachable) {
+      const status = retained?.status ?? facts.status;
+      this.changed({
+        type: "capability_admission_revoked",
+        capabilityId: capability,
+        taskId: facts.taskId,
+        taskRevision: facts.taskRevision,
+        actionIndex,
+        status,
+      });
+      return {
+        allowed: false,
+        reason: "the admitted task or conversation binding changed before the capability acted; the committed admission was revoked",
+        taskId: facts.taskId,
+        ownerId: this.ownerId,
+        taskRevision: facts.taskRevision,
+        expectedTaskId: selector.taskId,
+        expectedTaskRevision: selector.taskRevision,
+        anchorMessageId: facts.anchorMessageId,
+        capabilityId: capability,
+        actionIndex,
+        status,
+      };
+    }
     return {
       allowed: true,
       reason: null,
-      taskId: this.task.taskId,
+      taskId: facts.taskId,
       ownerId: this.ownerId,
-      taskRevision: this.task.taskRevision,
-      expectedTaskRevision: expected,
-      anchorMessageId: this.task.anchor.messageId,
+      taskRevision: facts.taskRevision,
+      expectedTaskId: selector.taskId,
+      expectedTaskRevision: selector.taskRevision,
+      anchorMessageId: facts.anchorMessageId,
       capabilityId: capability,
-      actionIndex: this.task.admissions,
-      status: this.task.status,
+      actionIndex,
+      status: facts.status,
     };
   }
 }

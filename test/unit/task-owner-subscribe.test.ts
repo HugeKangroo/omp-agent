@@ -38,6 +38,12 @@ function subject(branch: readonly unknown[]): TaskSubject {
   return { sessionId: SESSION, workspaceRoot: WORKSPACE, agentKind: "main", branch };
 }
 
+function guard(owner: TaskOwner) {
+  const task = owner.snapshot().currentTask;
+  if (!task) throw new Error("test setup: no current task");
+  return { taskId: task.taskId, taskRevision: task.taskRevision };
+}
+
 function observe(owner: TaskOwner, text: string, baseLeafId = "leaf-1") {
   owner.observeInput({
     sessionId: SESSION,
@@ -137,7 +143,7 @@ describe("TaskOwner host-only event subscription", () => {
     ];
     observe(owner, "Please cancel the managed task.", "assistant-1");
     owner.observeAgentStart({ sessionId: SESSION, prompt: "Please cancel the managed task.", reason: "prompt" });
-    owner.cancel(subject(taskBranch));
+    owner.cancel(subject(taskBranch), guard(owner));
     expect(owner.snapshot().currentTask?.status).toBe("cancelled");
     expect(observed).toContain("task_cancelled");
     expect(failures.filter((failure) => failure.eventType === "task_cancelled")).toHaveLength(1);
@@ -177,7 +183,7 @@ describe("TaskOwner host-only event subscription", () => {
     observe(owner, "Please cancel the managed task.", "assistant-1");
     owner.observeAgentStart({ sessionId: SESSION, prompt: "Please cancel the managed task.", reason: "prompt" });
 
-    expect(() => owner.cancel(subject(taskBranch))).toThrow("host audit failed");
+    expect(() => owner.cancel(subject(taskBranch), guard(owner))).toThrow("host audit failed");
     expect(seen).toContain("task_cancelled");
     expect(owner.snapshot().currentTask?.status).toBe("cancelled");
     // A host callback error is not an optional-listener failure.
@@ -218,7 +224,7 @@ describe("TaskOwner host-only event subscription", () => {
 
     let caught = false;
     try {
-      owner.cancel(subject(taskBranch));
+      owner.cancel(subject(taskBranch), guard(owner));
     } catch (error) {
       caught = true;
       expect(error).toBeUndefined();

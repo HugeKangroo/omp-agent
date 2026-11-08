@@ -179,24 +179,26 @@ export default function b1Capability(pi) {
       type: "object",
       properties: {
         action: { type: "string", enum: ["progress"] },
-        expectedTaskRevision: { type: "integer", minimum: 1, description: "Optimistic revision guard; not authority." },
+        expectedTaskId: { type: "string", description: "Exact current task selector copied from host-visible task facts; not authority." },
+        expectedTaskRevision: { type: "integer", minimum: 1, description: "Optimistic revision guard paired with expectedTaskId; not authority." },
       },
       additionalProperties: false,
-      required: ["action", "expectedTaskRevision"],
+      required: ["action", "expectedTaskId", "expectedTaskRevision"],
     },
     approval: "write",
     loadMode: "essential",
     async execute(_toolCallId, args, _signal, _onUpdate, context) {
       if (!args || typeof args !== "object" || Array.isArray(args)
-        || Object.keys(args).some((key) => key !== "action" && key !== "expectedTaskRevision")
+        || Object.keys(args).some((key) => key !== "action" && key !== "expectedTaskId" && key !== "expectedTaskRevision")
         || args.action !== "progress"
+        || typeof args.expectedTaskId !== "string" || !args.expectedTaskId
         || !Number.isSafeInteger(args.expectedTaskRevision) || args.expectedTaskRevision < 1) {
         return {
-          content: [{ type: "text", text: "agent_test_capability requires action=progress and a positive integer expectedTaskRevision." }],
+          content: [{ type: "text", text: "agent_test_capability requires action=progress, expectedTaskId and a positive integer expectedTaskRevision." }],
           isError: true,
         };
       }
-      const decision = admitPublishedTask(context, "test-progress", args.expectedTaskRevision);
+      const decision = admitPublishedTask(context, "test-progress", args.expectedTaskId, args.expectedTaskRevision);
       const counter = decision.allowed ? incrementCounter() : null;
       return {
         content: [{ type: "text", text: JSON.stringify({ ...decision, counter }) }],

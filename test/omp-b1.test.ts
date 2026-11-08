@@ -1,8 +1,17 @@
 import { expect, test } from "bun:test";
-import { B1OmpSession, type B1RunOptions } from "./harness/b1-run.ts";
+import { B1OmpSession, markActiveSessionsFailed, type B1RunOptions } from "./harness/b1-run.ts";
 import { classifyAdmissionReceipt } from "../src/task-requirements.ts";
 
-const integration = process.env.RUN_REAL_OMP_TEST === "1" ? test : test.skip;
+const integration = process.env.RUN_REAL_OMP_TEST === "1"
+  ? (name: string, fn: () => Promise<unknown>, timeoutMs: number = TEST_TIMEOUT) => test(name, async () => {
+    try {
+      await fn();
+    } catch (error) {
+      markActiveSessionsFailed(error);
+      throw error;
+    }
+  }, timeoutMs)
+  : test.skip;
 const TEST_TIMEOUT = 60_000;
 
 type Snapshot = Awaited<ReturnType<B1OmpSession["snapshot"]>>;
@@ -68,6 +77,9 @@ async function withSession(options: B1RunOptions, run: (session: B1OmpSession) =
   try {
     await session.start();
     await run(session);
+  } catch (error) {
+    session.markFailure(error);
+    throw error;
   } finally {
     await session.cleanup();
   }
@@ -645,6 +657,20 @@ integration("native tree navigation to an older assistant detaches capability au
     const freshEmitted = events(afterFresh, "fixtureAudit", "tool_call_emitted").find((event) => event.toolCallId === "b1-fresh-session-progress");
     expect(freshEmitted).toBeDefined();
     expect(freshEmitted?.tool).toBe("agent_test_capability");
+    const freshReplay = events(afterFresh, "fixtureAudit", "replayed_task_ref").find((event) => event.branch === "fresh-session");
+    expect(freshReplay).toBeDefined();
+    expect(freshReplay?.source).toBe("tool-result");
+    expect(typeof freshReplay?.sourceToolCallId).toBe("string");
+    expect(typeof freshReplay?.sourceSequence).toBe("number");
+    expect(events(afterDenial, "fixtureAudit", "observed_tool_result_ref")
+      .some((event) => event.toolCallId === freshReplay?.sourceToolCallId
+        && event.sequence === freshReplay?.sourceSequence
+        && event.expectedTaskId === freshReplay?.expectedTaskId
+        && event.expectedTaskRevision === freshReplay?.expectedTaskRevision)).toBe(true);
+    expect(freshEmitted?.arguments).toMatchObject({
+      expectedTaskId: freshReplay?.expectedTaskId,
+      expectedTaskRevision: freshReplay?.expectedTaskRevision,
+    });
     const freshFrames = toolEnds(afterFresh, "b1-fresh-session-progress");
     expect(freshFrames).toHaveLength(1);
     expect((freshFrames[0]?.result as Event).isError).toBe(true);

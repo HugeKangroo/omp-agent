@@ -1,6 +1,6 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { EXPECTED_OMP_VERSION, parseOmpVersion } from "./admission.ts";
@@ -41,6 +41,106 @@ export interface B1RunOptions {
   };
 }
 
+const ACTIVE_SESSIONS = new Set<B1OmpSession>();
+
+export interface B1EvidenceExport {
+  target: string;
+  complete: boolean;
+  copied: string[];
+  skipped: string[];
+}
+
+export interface B1CleanupEvidenceFacts {
+  reason: string | undefined;
+  preserveSource: boolean;
+}
+
+/**
+ * Combine the original failure with any cleanup failure. Cleanup failures are
+ * always a failure reason and always preserve the original private root.
+ */
+export function cleanupEvidenceFacts(input: {
+  testFailure: string | undefined;
+  processFailure: string | undefined;
+  cleanupFailure: string | undefined;
+}): B1CleanupEvidenceFacts {
+  const original = input.testFailure ?? input.processFailure;
+  const parts: string[] = [];
+  if (original !== undefined) parts.push(original);
+  if (input.cleanupFailure !== undefined) parts.push(`cleanup failure: ${input.cleanupFailure}`);
+  return {
+    reason: parts.length ? parts.join("\n") : undefined,
+    preserveSource: input.cleanupFailure !== undefined,
+  };
+}
+
+/**
+ * Copy only this session's existing files, plus the real in-memory frames and
+ * stderr, into a uniquely named directory under the explicit test evidence
+ * root. Total copied files are bounded; no other filesystem path is read. A
+ * skipped file makes the export explicitly incomplete so the caller keeps the
+ * original root; the copy bounds are never widened.
+ */
+export async function exportB1Evidence(values: {
+  sourceRoot: string;
+  evidenceRoot: string;
+  scenario: string;
+  reason: string;
+  frames: readonly unknown[];
+  stderr: string;
+  pid?: number | null;
+  budgetBytes?: number;
+}): Promise<B1EvidenceExport> {
+  await mkdir(values.evidenceRoot, { recursive: true, mode: 0o700 });
+  const scenario = values.scenario.replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 48);
+  const target = await mkdtemp(path.join(values.evidenceRoot, `${scenario}-attempt-`));
+  let remaining = values.budgetBytes ?? 8 * 1024 * 1024;
+  const copied: string[] = [];
+  const skipped: string[] = [];
+  const copyTree = async (source: string, relative: string): Promise<void> => {
+    const entries = await readdir(source, { withFileTypes: true });
+    for (const entry of entries) {
+      const childRelative = relative ? `${relative}/${entry.name}` : entry.name;
+      const childSource = path.join(source, entry.name);
+      if (entry.isDirectory()) {
+        await mkdir(path.join(target, childRelative), { recursive: true, mode: 0o700 });
+        await copyTree(childSource, childRelative);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      const info = await stat(childSource);
+      if (info.size > remaining) {
+        skipped.push(`${childRelative} (${info.size} bytes over budget)`);
+        continue;
+      }
+      const bytes = await readFile(childSource);
+      remaining -= bytes.byteLength;
+      await writeFile(path.join(target, childRelative), bytes, { mode: 0o600 });
+      copied.push(childRelative);
+    }
+  };
+  await copyTree(values.sourceRoot, "");
+  await writeFile(path.join(target, "frames.json"), JSON.stringify(values.frames, null, 2), { mode: 0o600 });
+  await writeFile(path.join(target, "stderr.log"), values.stderr, { mode: 0o600 });
+  await writeFile(path.join(target, "manifest.json"), JSON.stringify({
+    scenario: values.scenario,
+    reason: values.reason.slice(0, 4000),
+    originalRoot: values.sourceRoot,
+    pid: values.pid ?? null,
+    frames: values.frames.length,
+    complete: skipped.length === 0,
+    copied,
+    skipped,
+  }, null, 2), { mode: 0o600 });
+  return { target, complete: skipped.length === 0, copied, skipped };
+}
+
+/** Mark every live test-owned OMP session so its cleanup preserves evidence. */
+export function markActiveSessionsFailed(error: unknown): void {
+  const reason = error instanceof Error ? error.message : String(error);
+  for (const session of ACTIVE_SESSIONS) session.markFailure(reason);
+}
+
 export class B1OmpSession {
   readonly root: string;
   readonly workspace: string;
@@ -67,6 +167,7 @@ export class B1OmpSession {
   private readonly decoder = new RpcFrameDecoder();
   private stderr = "";
   private failure: Error | undefined;
+  private testFailure: string | undefined;
   private exited = false;
   private exitPromise: Promise<void> | undefined;
   private stopping = false;
@@ -168,7 +269,14 @@ export class B1OmpSession {
       jobTimeoutMs: options.jobs?.timeoutMs,
       observeJobTool: options.jobs?.observeToolSignal,
     }, options.scenario);
+    ACTIVE_SESSIONS.add(session);
     return session;
+  }
+
+  /** Called by the test wrapper before cleanup on an assertion/fixture error. */
+  markFailure(error: unknown): void {
+    if (this.testFailure !== undefined) return;
+    this.testFailure = error instanceof Error ? error.message : String(error);
   }
 
   private configFile(): string {
@@ -578,6 +686,7 @@ export class B1OmpSession {
   async cleanup(): Promise<void> {
     this.stopping = true;
     const child = this.child;
+    let cleanupFailure: Error | undefined;
     try {
       if (child) {
         try { child.stdin.end(); } catch { /* closed */ }
@@ -590,8 +699,60 @@ export class B1OmpSession {
         }
         if (this.groupExists()) throw new Error("OMP process group did not exit after SIGKILL.");
       }
+    } catch (error) {
+      cleanupFailure = error instanceof Error ? error : new Error(String(error));
     } finally {
-      await rm(this.root, { recursive: true, force: true });
+      ACTIVE_SESSIONS.delete(this);
+      const facts = cleanupEvidenceFacts({
+        testFailure: this.testFailure,
+        processFailure: this.failure?.message,
+        cleanupFailure: cleanupFailure?.message,
+      });
+      let removeRoot = facts.reason === undefined && !facts.preserveSource;
+      if (facts.preserveSource) {
+        removeRoot = false;
+        this.stderr += `\n[b1-evidence] cleanup failed (${cleanupFailure!.message}); preserving ${this.root}\n`;
+      }
+      if (facts.reason !== undefined) {
+        const requested = process.env.OMP_AGENT_B1_EVIDENCE_ROOT;
+        if (requested === undefined || !path.isAbsolute(requested)) {
+          removeRoot = false;
+          this.stderr += `\n[b1-evidence] no absolute OMP_AGENT_B1_EVIDENCE_ROOT; preserving ${this.root}\n`;
+        } else {
+          try {
+            const exported = await exportB1Evidence({
+              sourceRoot: this.root,
+              evidenceRoot: requested,
+              scenario: this.scenario,
+              reason: facts.reason,
+              frames: this.frames,
+              stderr: this.stderr,
+              pid: this.child?.pid ?? null,
+            });
+            if (!exported.complete) {
+              removeRoot = false;
+              this.stderr += `\n[b1-evidence] incomplete export (${exported.skipped.length} skipped); preserving ${this.root}\n`;
+              console.error(
+                `[b1-evidence] incomplete export for ${this.scenario}: ${exported.skipped.join(", ")}; partial copy ${exported.target}; preserving ${this.root}`,
+              );
+            } else {
+              console.error(`[b1-evidence] preserved failing ${this.scenario}: ${exported.target}`);
+            }
+          } catch (error) {
+            removeRoot = false;
+            this.stderr += `\n[b1-evidence] export failed (${error instanceof Error ? error.message : String(error)}); preserving ${this.root}\n`;
+          }
+        }
+      }
+      if (!removeRoot) console.error(`[b1-evidence] preserved ${this.root}; reason: ${(facts.reason ?? "").slice(0, 300)}`);
+      if (removeRoot) await rm(this.root, { recursive: true, force: true });
+    }
+    // Keep the original test failure as the primary error. A cleanup-only
+    // failure still fails the test; after an earlier failure it is reported
+    // above and retained in the exported evidence instead of replacing it.
+    if (cleanupFailure !== undefined) {
+      if (this.testFailure === undefined) throw cleanupFailure;
+      console.error(`[b1-evidence] cleanup also failed after the test failure: ${cleanupFailure.message}`);
     }
   }
 }

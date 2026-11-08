@@ -1,12 +1,19 @@
 import { afterEach, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
-import { B1OmpSession } from "./harness/b1-run.ts";
+import { B1OmpSession, markActiveSessionsFailed } from "./harness/b1-run.ts";
 import { MockJobService } from "./harness/job-service.ts";
 
 const TEST_TIMEOUT = 90_000;
-const integration: (name: string, fn: () => Promise<unknown>) => void = process.env.RUN_REAL_OMP_TEST === "1"
-  ? (name, fn) => test(name, fn, TEST_TIMEOUT)
-  : (name, fn) => test.skip(name, fn);
+const integration: (name: string, fn: () => Promise<unknown>, timeoutMs?: number) => void = process.env.RUN_REAL_OMP_TEST === "1"
+  ? (name, fn, timeoutMs = TEST_TIMEOUT) => test(name, async () => {
+    try {
+      await fn();
+    } catch (error) {
+      markActiveSessionsFailed(error);
+      throw error;
+    }
+  }, timeoutMs)
+  : (name, fn, _timeoutMs) => test.skip(name, fn);
 
 type Event = Record<string, unknown>;
 type Snapshot = Awaited<ReturnType<B1OmpSession["snapshot"]>>;
@@ -591,6 +598,23 @@ integration("B3b native revision/session replacement: old revision receipt retai
   const deniedSubmit = toolEnds(replaced, "job-submit-new-session")[0];
   expect(deniedQuery).toBeDefined();
   expect(deniedSubmit).toBeDefined();
+  const jobReplay = events(replaced, "fixtureAudit", "replayed_task_ref").find((event) => event.branch === "new-session-job");
+  expect(jobReplay).toBeDefined();
+  expect(jobReplay?.source).toBe("tool-result");
+  expect(typeof jobReplay?.sourceToolCallId).toBe("string");
+  expect(typeof jobReplay?.sourceSequence).toBe("number");
+  expect(events(replaced, "fixtureAudit", "observed_tool_result_ref")
+    .some((event) => event.toolCallId === jobReplay?.sourceToolCallId
+      && event.sequence === jobReplay?.sourceSequence
+      && event.expectedTaskId === jobReplay?.expectedTaskId
+      && event.expectedTaskRevision === jobReplay?.expectedTaskRevision)).toBe(true);
+  for (const toolCallId of ["job-query-new-session", "job-submit-new-session"]) {
+    const emitted = events(replaced, "fixtureAudit", "tool_call_emitted").find((event) => event.toolCallId === toolCallId);
+    expect(emitted?.arguments).toMatchObject({
+      expectedTaskId: jobReplay?.expectedTaskId,
+      expectedTaskRevision: jobReplay?.expectedTaskRevision,
+    });
+  }
   expect((deniedQuery!.result as Event).isError).toBe(true);
   expect((deniedSubmit!.result as Event).isError).toBe(true);
   expect(resultText(deniedQuery)).toMatch(/unavailable|detached|different OMP session|anchor is not in the current conversation branch/);

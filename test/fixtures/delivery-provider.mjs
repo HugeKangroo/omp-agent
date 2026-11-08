@@ -299,9 +299,9 @@ export default function deliveryFixtureProvider(pi) {
               },
             };
           } else if (turn === 8) {
-            call = { type: "toolCall", id: "delivery-late-cancel", name: "agent_task", arguments: { action: "cancel" } };
+            call = { type: "toolCall", id: "delivery-late-cancel", name: "agent_task", arguments: { action: "cancel", expectedTaskId: state.task.taskId, expectedTaskRevision: state.task.taskRevision } };
           } else if (turn === 9) {
-            call = { type: "toolCall", id: "delivery-late-revise", name: "agent_task", arguments: { action: "revise" } };
+            call = { type: "toolCall", id: "delivery-late-revise", name: "agent_task", arguments: { action: "revise", expectedTaskId: state.task.taskId, expectedTaskRevision: state.task.taskRevision } };
           } else if (turn === 10) {
             call = {
               type: "toolCall",

@@ -59,6 +59,12 @@ function subject(branch: readonly unknown[]): TaskSubject {
   return { sessionId: SESSION, workspaceRoot: WORKSPACE, agentKind: "main", branch };
 }
 
+function guard(owner: TaskOwner, taskRevision?: number) {
+  const task = owner.snapshot().currentTask;
+  if (!task) throw new Error("test setup: no current task");
+  return { taskId: task.taskId, taskRevision: taskRevision ?? task.taskRevision };
+}
+
 let WORKSPACE = "";
 
 function context(branch: readonly unknown[], leafId: string): ExecutionToolContext {
@@ -693,7 +699,7 @@ describe("G2-B1a candidate registry, contract and verification", () => {
           artifactIds: artifactIdsOf(details),
         });
         await enteredPromise;
-        expect(f.owner.revise(subject(f.secondBranch!)).revised).toBe(true);
+        expect(f.owner.revise(subject(f.secondBranch!), guard(f.owner)).revised).toBe(true);
         release();
         const result = await pending;
         expect(result.outcome).toBe("insufficient");
@@ -733,7 +739,7 @@ describe("G2-B1a candidate registry, contract and verification", () => {
           artifactIds: artifactIdsOf(details),
         });
         await enteredPromise;
-        f.owner.cancel(subject(f.branch));
+        f.owner.cancel(subject(f.branch), guard(f.owner));
         release();
         const result = await pending;
         expect(result.outcome).toBe("insufficient");
@@ -887,7 +893,7 @@ describe("G2-B1a candidate registry, contract and verification", () => {
         recordWriter: (filePath, value) => {
           writeJsonAtomicSync(filePath, value);
           if ((value as Record<string, unknown>).phase === "completed") {
-            f.owner.revise(subject(second));
+            f.owner.revise(subject(second), guard(f.owner));
           }
         },
       });
@@ -1387,7 +1393,7 @@ describe("G2-B1a candidate registry, contract and verification", () => {
           currentTask: () => f.owner.snapshot().currentTask,
           now: () => NOW,
           id: () => {
-            expect(f.owner.revise(subject(second)).revised).toBe(true);
+            expect(f.owner.revise(subject(second), guard(f.owner)).revised).toBe(true);
             return "contract-callback-review";
           },
         });
@@ -1406,7 +1412,7 @@ describe("G2-B1a candidate registry, contract and verification", () => {
         const store = new AcceptanceContractStore({
           currentTask: () => f.owner.snapshot().currentTask,
           now: () => {
-            f.owner.cancel(subject(f.branch));
+            f.owner.cancel(subject(f.branch), guard(f.owner));
             return NOW;
           },
           id: () => "contract-clock-cancel",
@@ -1432,7 +1438,7 @@ describe("G2-B1a candidate registry, contract and verification", () => {
         currentTask: () => {
           calls += 1;
           if (calls === reviseOnCall) {
-            expect(f.owner.revise(subject(second)).revised).toBe(true);
+            expect(f.owner.revise(subject(second), guard(f.owner)).revised).toBe(true);
           }
           return f.owner.snapshot().currentTask;
         },

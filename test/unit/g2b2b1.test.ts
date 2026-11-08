@@ -106,6 +106,12 @@ function subject(branch: readonly unknown[]): TaskSubject {
   return { sessionId: SESSION, workspaceRoot: WORKSPACE, agentKind: "main", branch };
 }
 
+function guard(owner: TaskOwner, taskRevision?: number) {
+  const task = owner.snapshot().currentTask;
+  if (!task) throw new Error("test setup: no current task");
+  return { taskId: task.taskId, taskRevision: taskRevision ?? task.taskRevision };
+}
+
 function context(branchSource: readonly unknown[] | (() => readonly unknown[])): OmpToolContext {
   const branch = typeof branchSource === "function" ? branchSource : () => branchSource;
   return {
@@ -547,11 +553,10 @@ describe("G2-B2-B1 host acceptance transaction", () => {
       };
       const first = acceptanceOf(reserved).submit(reserved.ctx, selector(reserved, prepared.deliveryId));
       await started;
-      const task = reserved.owner.snapshot().currentTask!;
       const denied = reserved.owner.admit(
         subject(reserved.branch),
         "local-script",
-        task.taskRevision,
+        guard(reserved.owner),
       );
       expect(denied.allowed).toBe(false);
       expect(denied.reason).toContain("acceptance reservation");
@@ -583,7 +588,7 @@ describe("G2-B2-B1 host acceptance transaction", () => {
       };
       const submitting = acceptanceOf(cancelled).submit(cancelled.ctx, selector(cancelled, prepared.deliveryId));
       await started;
-      cancelled.owner.cancel(subject(cancelled.branch));
+      cancelled.owner.cancel(subject(cancelled.branch), guard(cancelled.owner));
       release();
       const result = await submitting;
       expect(result.outcome).toBe("not_committed");
@@ -698,7 +703,7 @@ describe("G2-B2-B1 host acceptance transaction", () => {
       delivery.readAcceptanceEvidence = async (...args) => { entered(); await gate; return original(...args); };
       const submitting = acceptanceOf(revised).submit(revised.ctx, selector(revised, prepared.deliveryId));
       await started;
-      const revision = revised.owner.revise(subject(revised.live.branch), "amended");
+      const revision = revised.owner.revise(subject(revised.live.branch), guard(revised.owner), "amended");
       expect(revision.revised).toBe(true);
       release();
       const result = await submitting;
@@ -771,12 +776,12 @@ describe("G2-B2-B1 host acceptance transaction", () => {
       const accepted = await acceptanceOf(f).submit(f.ctx, selector(f, prepared.deliveryId));
       expect(accepted.outcome).toBe("committed");
       const acceptedId = accepted.acceptance!.acceptanceId;
-      expect(() => f.owner.cancel(subject(f.branch))).toThrow(/accepted.*terminal/);
+      expect(() => f.owner.cancel(subject(f.branch), guard(f.owner))).toThrow(/accepted.*terminal/);
       expect(f.owner.snapshot().currentTask!.status).toBe("accepted");
       const sameStart = f.owner.start(subject(f.branch));
       expect(sameStart.created).toBe(false);
       expect(sameStart.task.status).toBe("accepted");
-      const denied = f.owner.admit(subject(f.branch), "local-script", task.taskRevision);
+      const denied = f.owner.admit(subject(f.branch), "local-script", guard(f.owner));
       expect(denied.allowed).toBe(false);
       expect(denied.reason).toContain("accepted");
       const executed = await f.entry.adapter.run(f.ctx, {
@@ -795,6 +800,70 @@ describe("G2-B2-B1 host acceptance transaction", () => {
       expect(different.outcome).toBe("not_committed");
       expect(different.taskAccepted).toBe(true);
       expect(different.acceptance).toBeNull();
+    } finally {
+      await f.cleanup();
+    }
+  });
+
+  test("an accepted task stays immutable history while a later genuine message starts a new task", async () => {
+    const f = await fixture();
+    try {
+      const acceptedTask = f.owner.snapshot().currentTask!;
+      const prepared = await prepareAccepted(f);
+      const accepted = await acceptanceOf(f).submit(f.ctx, selector(f, prepared.deliveryId));
+      expect(accepted.outcome).toBe("committed");
+      expect(f.owner.snapshot().currentTask!.status).toBe("accepted");
+
+      const firstUser = f.branch[1] as Entry;
+      const assistantEntry: Entry = {
+        id: "assistant-next",
+        parentId: firstUser.id,
+        type: "message",
+        message: { role: "assistant", content: [{ type: "text", text: "accepted" }], attribution: "agent" },
+      };
+      const nextUser = user("user-next", "assistant-next", "Start a separate follow-up task.");
+      const nextBranch = [...f.branch, assistantEntry, nextUser];
+      expect(f.owner.closeTurn({
+        sessionId: SESSION,
+        branch: f.branch,
+        messages: [{ ...(firstUser.message as Record<string, unknown>), id: firstUser.id }],
+      })).toBe(true);
+      expect(f.owner.observeInput({
+        sessionId: SESSION,
+        workspaceRoot: f.workspace,
+        source: "rpc",
+        text: "Start a separate follow-up task.",
+        observedAt: NOW,
+        baseLeafId: "assistant-next",
+      }).accepted).toBe(true);
+      f.owner.observeAgentStart({
+        sessionId: SESSION,
+        prompt: "Start a separate follow-up task.",
+        reason: "prompt",
+      });
+      const next = f.owner.start(subject(nextBranch));
+      expect(next.created).toBe(true);
+      expect(next.task.taskId).not.toBe(acceptedTask.taskId);
+      expect(next.task.status).toBe("active");
+      expect(f.owner.snapshot().currentTask!.taskId).toBe(next.task.taskId);
+
+      const history = f.owner.historyPage(subject(nextBranch), 0, 16);
+      expect(history.rows[0]).toMatchObject({
+        taskId: acceptedTask.taskId,
+        status: "accepted",
+        acceptanceId: accepted.acceptance!.acceptanceId,
+        current: false,
+      });
+      const inspected = f.owner.inspectTarget(subject(nextBranch), {
+        taskId: acceptedTask.taskId,
+        taskRevision: acceptedTask.taskRevision,
+      });
+      expect(inspected.historical).toBe(true);
+      expect(inspected.target.status).toBe("accepted");
+      expect(inspected.target.acceptance?.acceptanceId).toBe(accepted.acceptance!.acceptanceId);
+      expect(f.owner.acceptedReference(acceptedTask.taskId)?.acceptanceId)
+        .toBe(accepted.acceptance!.acceptanceId);
+      expect(f.owner.snapshot().currentTask!.taskId).toBe(next.task.taskId);
     } finally {
       await f.cleanup();
     }
@@ -1051,7 +1120,7 @@ describe("G2-B2-B1 host acceptance transaction", () => {
       const prepared = await prepareAccepted(f);
       const pending = acceptanceOf(f).submit(f.ctx, selector(f, prepared.deliveryId));
       const task = f.owner.snapshot().currentTask!;
-      const denied = f.owner.admit(subject(f.branch), "local-script", task.taskRevision);
+      const denied = f.owner.admit(subject(f.branch), "local-script", guard(f.owner));
       expect(denied.allowed).toBe(false);
       expect(denied.reason).toContain("acceptance reservation");
       const result = await pending;
@@ -1100,7 +1169,7 @@ describe("G2-B2-B1 host acceptance transaction", () => {
       expect(different.outcome).toBe("unknown");
       expect(different.taskAccepted).toBeNull();
 
-      const denied = f.owner.admit(subject(f.branch), "local-script", task.taskRevision);
+      const denied = f.owner.admit(subject(f.branch), "local-script", guard(f.owner));
       expect(denied.allowed).toBe(false);
       expect(denied.reason).toContain("unknown");
 
@@ -1452,9 +1521,9 @@ describe("G2-B2-B1 host acceptance transaction", () => {
       }
 
       expect(f.owner.snapshot().acceptanceHazard).toEqual(hazard);
-      expect(f.owner.admit(subject(f.branch), "local-script", task.taskRevision).allowed).toBe(false);
-      expect(() => f.owner.cancel(subject(f.branch))).toThrow(/unknown/i);
-      expect(() => f.owner.revise(subject(f.branch))).toThrow(/unknown/i);
+      expect(f.owner.admit(subject(f.branch), "local-script", guard(f.owner)).allowed).toBe(false);
+      expect(() => f.owner.cancel(subject(f.branch), guard(f.owner))).toThrow(/unknown/i);
+      expect(() => f.owner.revise(subject(f.branch), guard(f.owner))).toThrow(/unknown/i);
       f.owner.navigate("session_switch");
       const afterNavigation = await service.inspect(f.ctx, exact);
       expect(afterNavigation.unknown).toEqual(hazard);

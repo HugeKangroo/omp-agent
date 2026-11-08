@@ -54,12 +54,14 @@ bun run test:delivery
 | 入口 | 工具 | 用途 |
 | --- | --- | --- |
 | `src/extension.ts` | `agent_status` 及受管测试工具 | 默认接入与权限边界测试 |
-| `src/task-entry.ts` | `agent_task` | 建立、检查、修订和取消当前任务 |
+| `src/task-entry.ts` | `agent_task` | 建立、检查、修订、取消当前任务，并读取有界历史；终态任务后可继续新任务 |
 | `src/execution-entry.ts` | `agent_execute`、`agent_verify` | 受控执行及宿主验证，需先加载任务入口 |
 | 显式配置交付目录 | `agent_deliver` | 查看能力、生成与预览交付文件；配置接收目录后可提交及查询 |
 | `src/job-entry.ts` | `agent_job` | 独立的作业适配实验，需先加载任务入口 |
 
 执行与验证请求必须引用当前任务及要求版本。运行、产物和回执 ID 只用于选择已登记对象，不授予权限。路径、运行环境、资源限制及验证策略由宿主配置，模型不能通过工具参数修改。
+
+`agent_task` 的修订和取消必须携带从宿主可见任务事实复制的 `expectedTaskId` 与 `expectedTaskRevision`；可选的 `inspect` 选择器用于读取一个可见历史任务。它们只是精确目标/并发 guard，不是授权。一个真实用户消息最多创建一个任务；当前任务仍活动时不会被隐式替换。任务接收或取消后，同一会话的后续真实消息可以创建新任务；旧任务身份、要求和终态只读保留，`history` 返回有界摘要。`agent_job` 的提交和查询同样需要精确任务选择器，旧任务参数不会改指新任务。历史保存在进程内，不构成跨进程恢复。
 
 交付功能需要宿主显式提供绝对 `deliveryRoot`；实验入口对应环境变量为 `OMP_AGENT_DELIVERY_ROOT`。未配置时不注册交付工具。交付目录不能与执行目录重叠。最终接收另需显式提供 `acceptanceRoot`（`OMP_AGENT_ACCEPTANCE_ROOT`），且三个根目录两两不重叠。未配置接收目录时仍可预览，提交会明确返回未启用。
 

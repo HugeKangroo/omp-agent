@@ -2,8 +2,8 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { createFileAudit, type AuditEvent, type AuditSink } from "./audit.ts";
 import { writeJsonAtomicSync } from "./host-record.ts";
-import { subjectFromContext, type OmpToolContext } from "./task-entry-port.ts";
-import type { TaskOwner, TaskOwnerEvent } from "./task-owner.ts";
+import { currentTaskOwner, subjectFromContext, type OmpToolContext } from "./task-entry-port.ts";
+import type { TaskOwner, TaskOwnerEvent, TaskSubject } from "./task-owner.ts";
 
 /**
  * Experimental G1-B3a: one explicit loopback external-job prototype.
@@ -187,13 +187,13 @@ function querySummary(outcome: QueryRemoteOutcome): Record<string, unknown> {
   };
 }
 
-const SUBMIT_KEYS = new Set(["action", "expectedTaskRevision", "payload"]);
-const QUERY_KEYS = new Set(["action"]);
+const SUBMIT_KEYS = new Set(["action", "expectedTaskId", "expectedTaskRevision", "payload"]);
+const QUERY_KEYS = new Set(["action", "expectedTaskId", "expectedTaskRevision"]);
 const FORBIDDEN_KEYS = new Set([
   "operationId", "operationID", "jobId", "jobID", "callId", "taskId", "ownerId",
   "endpoint", "url", "serviceUrl", "cancelIntentId", "fault", "faults", "budget",
   "permission", "permissions", "token", "secret", "capability", "capabilityId",
-  "expectedTaskId", "revision", "rawRequest", "goal",
+  "revision", "rawRequest", "goal",
 ]);
 
 function object(value: unknown, label: string): Record<string, unknown> {
@@ -206,6 +206,15 @@ function object(value: unknown, label: string): Record<string, unknown> {
 function positiveRevision(value: unknown): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value <= 0) {
     throw new JobAdapterError("expectedTaskRevision must be a positive integer.");
+  }
+  return value;
+}
+
+const IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/;
+
+function identifier(value: unknown, label: string): string {
+  if (typeof value !== "string" || !IDENTIFIER.test(value)) {
+    throw new JobAdapterError(`${label} must be a valid identifier copied from the host task view.`);
   }
   return value;
 }
@@ -271,10 +280,11 @@ function loopbackEndpoint(value: string): string {
   return url.origin;
 }
 
-/** Strict model-facing parser. Host endpoints and all identifiers are rejected. */
+/** Strict model-facing parser. Host endpoints and all authority identifiers are rejected. */
 export function parseJobToolArguments(value: unknown): {
   action: "submit" | "query";
-  expectedTaskRevision?: number;
+  expectedTaskId: string;
+  expectedTaskRevision: number;
   payload?: string;
 } {
   const args = object(value, "agent_job arguments");
@@ -291,12 +301,17 @@ export function parseJobToolArguments(value: unknown): {
   const allowed = args.action === "submit" ? SUBMIT_KEYS : QUERY_KEYS;
   const unknown = keys.filter((key) => !allowed.has(key));
   if (unknown.length) throw new JobAdapterError(`agent_job has unsupported field(s): ${unknown.join(", ")}.`);
-  if (args.action === "query") return { action: "query" };
-  if (!("expectedTaskRevision" in args)) throw new JobAdapterError("agent_job submit requires expectedTaskRevision.");
+  if (!("expectedTaskId" in args) || !("expectedTaskRevision" in args)) {
+    throw new JobAdapterError(`agent_job ${args.action} requires expectedTaskId and expectedTaskRevision copied from the current host task view.`);
+  }
+  const expectedTaskId = identifier(args.expectedTaskId, "expectedTaskId");
+  const expectedTaskRevision = positiveRevision(args.expectedTaskRevision);
+  if (args.action === "query") return { action: "query", expectedTaskId, expectedTaskRevision };
   if (!("payload" in args)) throw new JobAdapterError("agent_job submit requires payload.");
   return {
     action: "submit",
-    expectedTaskRevision: positiveRevision(args.expectedTaskRevision),
+    expectedTaskId,
+    expectedTaskRevision,
     payload: boundedPayload(args.payload),
   };
 }
@@ -632,6 +647,51 @@ export class JobAdapter {
     };
   }
 
+  /**
+   * Pure exact-target usability check; calls only in-memory owner getters.
+   * `taskRevision: null` preserves a revision-old query receipt; a read-only
+   * query may target the current cancelled task, but never a replaced one.
+   */
+  private targetUsable(
+    taskId: string,
+    taskRevision: number | null,
+    ownerId: string,
+    requireActive: boolean,
+    subject?: TaskSubject,
+  ): { usable: boolean; reason: string | null } {
+    if (this.disposed) return { usable: false, reason: "job adapter is disposed" };
+    if (currentTaskOwner() !== this.owner) return { usable: false, reason: "the published task owner changed" };
+    const snapshot = this.owner.snapshot();
+    if (snapshot.currentTask?.ownerId !== ownerId) {
+      return { usable: false, reason: "the current task belongs to a different owner" };
+    }
+    return this.owner.targetUsability(taskId, taskRevision, {
+      requireActive,
+      ...(subject === undefined ? {} : { subject }),
+    });
+  }
+
+  /**
+   * Read the actual OMP session/branch after all host callbacks, then run the
+   * pure final target check. The context getters are external; nothing between
+   * this read and the caller's transport may invoke another host callback.
+   */
+  private finalTargetUsable(
+    context: JobToolContext,
+    taskId: string,
+    taskRevision: number | null,
+    ownerId: string,
+    requireActive: boolean,
+  ): { usable: boolean; reason: string | null } {
+    let subject: TaskSubject;
+    try {
+      subject = subjectFromContext(context, this.owner.workspaceRoot);
+    } catch (error) {
+      return { usable: false, reason: `the live OMP conversation context is unavailable (${errorMessage(error)})` };
+    }
+    return this.targetUsable(taskId, taskRevision, ownerId, requireActive, subject);
+  }
+
   private taskContext(context: JobToolContext): {
     subject: ReturnType<typeof subjectFromContext>;
     taskId: string;
@@ -666,13 +726,23 @@ export class JobAdapter {
 
   async submit(
     context: JobToolContext,
-    args: { expectedTaskRevision: number; payload: string },
+    args: { expectedTaskId: string; expectedTaskRevision: number; payload: string },
     signal?: AbortSignal,
   ): Promise<JobToolResult> {
     if (this.disposed) throw new JobAdapterError("Job adapter is disposed.");
     if (signal?.aborted) throw abortedBefore("before admission");
     const traceId = `job-trace-${this.newId()}`;
     const scope = this.taskContext(context);
+    // Immutable task selector is checked before any lookup, reconcile,
+    // admission, budget, registration or transport.
+    if (scope.taskId !== args.expectedTaskId) {
+      throw new JobAdapterError("expectedTaskId does not match the current task; no job lookup, admission or transport occurred.");
+    }
+    if (scope.taskRevision !== args.expectedTaskRevision) {
+      throw new JobAdapterError(
+        `stale expectedTaskRevision ${args.expectedTaskRevision}; the owner is at ${scope.taskRevision}. No job lookup, admission or transport occurred.`,
+      );
+    }
     if (signal?.aborted) throw abortedBefore("before admission");
     const payload = boundedPayload(args.payload);
     const digest = digestOf(payload);
@@ -708,6 +778,23 @@ export class JobAdapter {
         );
       }
       const call = this.startCall(existing, "submit", traceId);
+      // `startCall` invokes the host clock; read the actual context, then
+      // recheck the exact target before the reconcile request can leave.
+      const reconcileUsable = this.finalTargetUsable(context, existing.taskId, existing.taskRevision, existing.ownerId, true);
+      if (!reconcileUsable.usable) {
+        const reason = `task state changed before the reconcile request; no query was sent (${reconcileUsable.reason})`;
+        existing.lastError = reason;
+        this.observe(existing, {
+          source: "preflight_guard",
+          remoteState: null,
+          externalJobId: null,
+          detail: reason,
+          cancelIntentId: existing.cancelIntent?.cancelIntentId ?? null,
+        });
+        this.finishCall(existing, call, "error", reason);
+        this.persist();
+        return this.resultFor(context, "submit", existing, { reconciled: false }, true);
+      }
       const outcome = await this.queryRemote(existing, "submit_reconcile", signal, "model");
       this.finishCall(existing, call, outcome.callOutcome, outcome.error);
       this.persist();
@@ -720,10 +807,27 @@ export class JobAdapter {
     }
 
     if (signal?.aborted) throw abortedBefore("before admission");
-    const decision = this.owner.admit(scope.subject, this.capabilityId, args.expectedTaskRevision);
+    const decision = this.owner.admit(scope.subject, this.capabilityId, {
+      taskId: args.expectedTaskId,
+      taskRevision: args.expectedTaskRevision,
+    });
     if (!decision.allowed) {
       this.safeAudit({ type: "job_submit_denied", traceId, reason: decision.reason });
       throw new JobAdapterError(`Job admission denied: ${decision.reason}`);
+    }
+    if (decision.taskId !== args.expectedTaskId || decision.taskRevision !== args.expectedTaskRevision) {
+      throw new JobAdapterError("the admitted task identity differs from the supplied selector; no operation was registered.");
+    }
+    // Admission notification is reentrant. Re-read the actual owner state
+    // before registering an operation or issuing transport.
+    const admitted = this.owner.snapshot();
+    if (admitted.binding.state !== "attached"
+      || admitted.suspended !== null
+      || admitted.currentTask === null
+      || admitted.currentTask.taskId !== decision.taskId
+      || admitted.currentTask.taskRevision !== decision.taskRevision
+      || admitted.currentTask.status !== "active") {
+      throw new JobAdapterError("the task or conversation binding changed immediately after admission; no operation was registered or dispatched.");
     }
     const operation: JobOperationSnapshot = {
       schemaVersion: JOB_SCHEMA_VERSION,
@@ -773,19 +877,12 @@ export class JobAdapter {
       actionIndex: decision.actionIndex,
     });
 
-    // Independent immediate pre-transport recheck: status, revision, binding
-    // and task/owner identity must still match. This is not another admission.
-    const current = this.owner.snapshot();
-    const task = current.currentTask;
-    const stillAllowed = current.binding.state === "attached"
-      && current.suspended === null
-      && task !== null
-      && task.taskId === operation.taskId
-      && task.ownerId === operation.ownerId
-      && task.status === "active"
-      && task.taskRevision === operation.taskRevision;
-    if (!stillAllowed) {
-      operation.lastError = "task state changed between admission and first transport; dispatch stopped";
+    // Pre-dispatch pure exact-target check. It precedes the host clock and
+    // record write below, so a second pure check runs after those callbacks
+    // and immediately before the actual transport.
+    const preDispatchUsable = this.targetUsable(operation.taskId, operation.taskRevision, operation.ownerId, true);
+    if (!preDispatchUsable.usable) {
+      operation.lastError = `task state changed between admission and first transport; dispatch stopped (${preDispatchUsable.reason})`;
       this.observe(operation, {
         source: "preflight_guard",
         remoteState: null,
@@ -847,6 +944,29 @@ export class JobAdapter {
         // The host record remains unavailable; the transport still never ran.
       }
       throw new JobAdapterError(operation.lastError);
+    }
+
+    // Every host clock, record and notification callback has completed. Read
+    // the actual OMP context, then run the pure final check immediately before
+    // the actual POST. The committed admission, counter and operation identity
+    // stay untouched; a request that never left restores honest
+    // not_dispatched facts.
+    const finalSubmitUsable = this.finalTargetUsable(context, operation.taskId, operation.taskRevision, operation.ownerId, true);
+    if (!finalSubmitUsable.usable) {
+      const reason = `task state changed after the pre-dispatch record write; no request was sent (${finalSubmitUsable.reason})`;
+      operation.dispatch = "not_started";
+      operation.externalState = "not_dispatched";
+      operation.lastError = reason;
+      this.observe(operation, {
+        source: "preflight_guard",
+        remoteState: null,
+        externalJobId: null,
+        detail: reason,
+        cancelIntentId: operation.cancelIntent?.cancelIntentId ?? null,
+      });
+      this.finishCall(operation, call, "error", reason);
+      this.persist();
+      return this.resultFor(context, "submit", operation, { reconciled: false }, true);
     }
     try {
       const response = await this.request("POST", "/jobs", {
@@ -933,16 +1053,54 @@ export class JobAdapter {
     }
   }
 
-  async query(context: JobToolContext, signal?: AbortSignal): Promise<JobToolResult> {
+  async query(
+    context: JobToolContext,
+    args: { expectedTaskId: string; expectedTaskRevision: number },
+    signal?: AbortSignal,
+  ): Promise<JobToolResult> {
     if (this.disposed) throw new JobAdapterError("Job adapter is disposed.");
     if (signal?.aborted) throw abortedBefore("before query");
     const traceId = `job-trace-${this.newId()}`;
     const scope = this.taskContext(context);
+    // Exact-target guards run before byTask lookup, call registration, remote
+    // request or cleanup scheduling. Query never redirects old task A to the
+    // operation registered for current task B.
+    if (scope.taskId !== args.expectedTaskId) {
+      throw new JobAdapterError("expectedTaskId does not match the current task; no job lookup or query occurred.");
+    }
+    if (scope.taskRevision !== args.expectedTaskRevision) {
+      throw new JobAdapterError(
+        `stale expectedTaskRevision ${args.expectedTaskRevision}; the owner is at ${scope.taskRevision}. No job lookup or query occurred.`,
+      );
+    }
     if (signal?.aborted) throw abortedBefore("before query");
     const operationId = this.byTask.get(scope.taskId);
     if (!operationId) throw new JobAdapterError("No job operation is registered for this task.");
     const operation = this.operations.get(operationId)!;
     const call = this.startCall(operation, "query", traceId);
+    // `startCall` invokes the host clock. Read the actual context, then
+    // recheck the immutable operation target after that callback and before
+    // any response projection or model request. A revision-old receipt and a
+    // current cancelled task remain legal; a replaced/unreachable branch does
+    // not.
+    const queryUsable = this.finalTargetUsable(context, operation.taskId, null, operation.ownerId, false);
+    if (!queryUsable.usable) {
+      const reason = `the current task changed before the query request; no query was sent (${queryUsable.reason})`;
+      operation.lastError = reason;
+      this.observe(operation, {
+        source: "query_preflight_guard",
+        remoteState: null,
+        externalJobId: operation.externalJobId,
+        detail: reason,
+        cancelIntentId: operation.cancelIntent?.cancelIntentId ?? null,
+      });
+      this.finishCall(operation, call, "error", reason);
+      this.persist();
+      return this.resultFor(context, "query", operation, {
+        traceId,
+        query: { outcome: "error", aborted: false, fresh: false, remoteState: null, error: reason },
+      }, true);
+    }
     if (operation.dispatch === "not_started") {
       this.finishCall(operation, call, "ok", "operation was never dispatched");
       this.persist();

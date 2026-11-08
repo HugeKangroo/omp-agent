@@ -269,7 +269,7 @@ export default function executionFixtureProvider(pi) {
                 type: "toolCall",
                 id: "exec-cancel",
                 name: "agent_task",
-                arguments: { action: "cancel" },
+                arguments: { action: "cancel", expectedTaskId: identityOf().taskId, expectedTaskRevision: identityOf().taskRevision },
               },
             ];
           } else {

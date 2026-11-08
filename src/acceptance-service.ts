@@ -172,6 +172,7 @@ interface PendingHumanReview {
   capability: object;
   selector: AcceptanceSelector;
   expected: FrozenTaskRef;
+  token: AcceptanceReservationToken;
   issuedAt: string;
   expiresAt: string;
   startedMonotonic: number;
@@ -1349,6 +1350,7 @@ export class AcceptanceService {
         capability: Object.freeze({}),
         selector,
         expected,
+        token,
         issuedAt: issuedRaw,
         expiresAt,
         startedMonotonic,
@@ -1414,9 +1416,21 @@ export class AcceptanceService {
         else signal.addEventListener("abort", onCallerAbort, { once: true });
       }
       unsubscribeReview = this.owner.subscribe((event) => {
-        if (typeof event.type === "string" && REVIEW_INVALIDATION_EVENTS.has(event.type)) {
-          this.abortPendingReview("invalidated", `the owner changed during human review (${event.type})`);
+        if (typeof event.type !== "string" || !REVIEW_INVALIDATION_EVENTS.has(event.type)) return;
+        // Task-specific facts only invalidate review of that exact task. A
+        // delayed task_started for another task must not abort a still-valid
+        // reservation; a real switch closes it only when the reservation is
+        // actually no longer current.
+        if (event.type === "task_started") {
+          if (this.owner.reservationCurrent(pending.token)) return;
+          this.abortPendingReview("invalidated", "the acceptance reservation is no longer current (task_started)");
+          return;
         }
+        if ((event.type === "task_revised"
+          || event.type === "task_cancelled"
+          || event.type === "task_accepted")
+          && event.taskId !== pending.selector.expectedTaskId) return;
+        this.abortPendingReview("invalidated", `the owner changed during human review (${event.type})`);
       });
       const stopBeforePresentation = (): HumanReviewOperationResult | null => {
         if (pending.abort !== null) {

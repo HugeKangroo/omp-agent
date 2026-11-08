@@ -347,9 +347,13 @@ export function createVerificationEntry(pi: VerificationApi, options: Verificati
   });
 
   const unsubscribe = owner.subscribe((event) => {
-    if (event.type !== "task_cancelled"
-      && event.type !== "task_revised"
-      && event.type !== "task_binding_detached") return;
+    if (event.type === "task_cancelled" || event.type === "task_revised") {
+      // Task-specific control events only invalidate work for that exact task.
+      const current = owner.snapshot().currentTask;
+      if (current === null || event.taskId !== current.taskId) return;
+    } else if (event.type !== "task_binding_detached") {
+      return;
+    }
     for (const controller of controllers) controller.abort();
   });
 

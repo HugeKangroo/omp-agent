@@ -23,8 +23,9 @@ import { currentTaskOwner, type OmpToolContext } from "./task-entry-port.ts";
  * - OMP_AGENT_JOB_CAPABILITY: host-authorized active-business capability id
  * - OMP_AGENT_JOB_TIMEOUT_MS: optional host request timeout
  *
- * The model supplies only action/payload/expectedTaskRevision. It cannot
- * choose endpoints, operation/job/call/task/owner ids, faults or budgets.
+ * The model supplies only action/payload plus expectedTaskId and
+ * expectedTaskRevision copied from the host task view. It cannot choose
+ * endpoints, operation/job/call/owner ids, faults or budgets.
  */
 
 interface OmpTool {
@@ -56,12 +57,16 @@ const JOB_PARAMETERS = {
     action: {
       type: "string",
       enum: ["submit", "query"],
-      description: "Submit the one logical job for this task, or query the registered operation.",
+      description: "Submit the one logical job for this task, or query the same registered operation.",
+    },
+    expectedTaskId: {
+      type: "string",
+      description: "Required for submit and query. Copy the current taskId exactly from the host task view; it is a selector, never authority.",
     },
     expectedTaskRevision: {
       type: "integer",
       minimum: 1,
-      description: "Optimistic guard for submit only. The owner rechecks it at admission.",
+      description: "Required for submit and query. Copy the current taskRevision exactly; an old task's revision never selects a newer task.",
     },
     payload: {
       type: "string",
@@ -72,7 +77,7 @@ const JOB_PARAMETERS = {
   required: ["action"],
 } as const;
 
-const DESCRIPTION = "Experimental one-job adapter. Submit a bounded opaque payload for the current managed task, or query the same host-registered operation. The host chooses the loopback service, operation ids, capability and cancellation. Submit requires expectedTaskRevision; the owner may deny it. Repeating the identical payload queries the existing operation and never creates a second one. Query reports the actual external state; tool success is not task acceptance. Cancellation is host-driven after agent_task cancel.";
+const DESCRIPTION = "Experimental one-job adapter for the current managed task. Submit a bounded opaque payload, or query the operation registered for that exact task. The host chooses the loopback service, operation ids, capability and cancellation. Submit and query require expectedTaskId and expectedTaskRevision copied from the current host task view; they are exact selectors, not authority, and are checked before any lookup, admission or transport. Repeating the identical payload queries the existing operation and never creates a second one. Query reports the actual external state; tool success is not task acceptance. Cancellation is host-driven after agent_task cancel. A historical task's job operation is not queryable through this tool.";
 
 function stderr(message: string, details?: unknown): void {
   try {
@@ -149,11 +154,15 @@ export function createJobEntry(pi: OmpApi, options: {
         });
         if (parsed.action === "submit") {
           return await adapter.submit(context, {
-            expectedTaskRevision: parsed.expectedTaskRevision!,
+            expectedTaskId: parsed.expectedTaskId,
+            expectedTaskRevision: parsed.expectedTaskRevision,
             payload: parsed.payload!,
           }, signal);
         }
-        return await adapter.query(context, signal);
+        return await adapter.query(context, {
+          expectedTaskId: parsed.expectedTaskId,
+          expectedTaskRevision: parsed.expectedTaskRevision,
+        }, signal);
       } catch (error) {
         safeAudit(audit, { type: "job_tool_rejected", error: errorMessage(error) });
         return errorResult(errorMessage(error));

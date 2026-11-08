@@ -67,6 +67,12 @@ function subject(branch: readonly unknown[], sessionId = SESSION): TaskSubject {
   return { sessionId, workspaceRoot: WORKSPACE, agentKind: "main", branch };
 }
 
+function guard(owner: TaskOwner, taskRevision?: number) {
+  const task = owner.snapshot().currentTask;
+  if (!task) throw new Error("test setup: no current task");
+  return { taskId: task.taskId, taskRevision: taskRevision ?? task.taskRevision };
+}
+
 function makeOwner(options: { capabilities?: string[] } = {}): {
   owner: TaskOwner;
   states: TaskOwnerSnapshot[];
@@ -176,7 +182,7 @@ describe("conversational task ownership", () => {
     ];
     expect(observe(owner, { text: "Same words.", baseLeafId: "assistant-1" }).accepted).toBe(true);
     owner.observeAgentStart({ sessionId: SESSION, prompt: "Same words.", reason: "prompt" });
-    expect(() => owner.start(subject(secondBranch))).toThrow(/different user message/);
+    expect(() => owner.start(subject(secondBranch))).toThrow(/still active|never replaced implicitly/);
     expect(owner.snapshot().tasksCreated).toBe(1);
     expect(owner.snapshot().currentTask?.anchor.messageId).toBe("user-1");
   });
@@ -220,7 +226,7 @@ describe("conversational task ownership", () => {
     const backgroundBranch = [...branch, assistant("assistant-1", "user-1"), background("background-1", "assistant-1")];
     expect(owner.closeTurn({ sessionId: SESSION, branch, messages: [messageOf(user("user-1", "leaf-1", "Please handle the managed task."))] })).toBe(true);
 
-    const first = owner.admit(subject(backgroundBranch), "test-progress", 1);
+    const first = owner.admit(subject(backgroundBranch), "test-progress", guard(owner));
     expect(first).toMatchObject({
       allowed: true,
       taskId: created.task.taskId,
@@ -231,13 +237,13 @@ describe("conversational task ownership", () => {
       actionIndex: 1,
       status: "active",
     });
-    const second = owner.admit(subject(backgroundBranch), "test-progress", 1);
+    const second = owner.admit(subject(backgroundBranch), "test-progress", guard(owner));
     expect(second.actionIndex).toBe(2);
     expect(owner.snapshot().tasksCreated).toBe(1);
     expect(owner.snapshot().currentTask?.admissions).toBe(2);
     expect(owner.snapshot().currentTask?.taskRevision).toBe(1);
 
-    const unauthorized = owner.admit(subject(backgroundBranch), "not-registered", 1);
+    const unauthorized = owner.admit(subject(backgroundBranch), "not-registered", guard(owner));
     expect(unauthorized).toMatchObject({ allowed: false, reason: "capability is not authorized by the host", actionIndex: null });
     expect(owner.snapshot().currentTask?.admissions).toBe(2);
   });
@@ -248,13 +254,13 @@ describe("conversational task ownership", () => {
     observe(owner);
     const created = startFor(owner, branch);
     expect(created.task.taskRevision).toBe(1);
-    const cancelled = owner.cancel(subject(branch));
+    const cancelled = owner.cancel(subject(branch), guard(owner));
     expect(cancelled.status).toBe("cancelled");
     expect(cancelled.taskRevision).toBe(1);
     expect(cancelled.cancelledAt).toBe(NOW);
-    expect(owner.cancel(subject(branch)).status).toBe("cancelled");
+    expect(owner.cancel(subject(branch), guard(owner)).status).toBe("cancelled");
 
-    const denied = owner.admit(subject(branch), "test-progress", 1);
+    const denied = owner.admit(subject(branch), "test-progress", guard(owner));
     expect(denied).toMatchObject({ allowed: false, reason: "task is cancelled", status: "cancelled", actionIndex: null });
     expect(owner.snapshot().currentTask?.admissions).toBe(0);
     expect(owner.snapshot().currentTask?.taskRevision).toBe(1);
@@ -272,7 +278,7 @@ describe("conversational task ownership", () => {
     expect(() => owner.inspect(subject(backgroundBranch, "other-session"))).toThrow(/different OMP session/);
     const unrelatedBranch = [base("leaf-9"), user("user-9", "leaf-9", "Unrelated.")];
     expect(() => owner.inspect(subject(unrelatedBranch))).toThrow(/anchor is not in the current conversation branch/);
-    expect(owner.admit(subject(unrelatedBranch), "test-progress", 1)).toMatchObject({
+    expect(owner.admit(subject(unrelatedBranch), "test-progress", guard(owner))).toMatchObject({
       allowed: false,
       reason: "Task anchor is not in the current conversation branch; B1 will not assume execution rights.",
     });
@@ -527,15 +533,15 @@ describe("conversational task ownership", () => {
     const branch = [base(), user("user-1", "leaf-1", "Please handle the managed task.")];
     observe(owner);
     const created = startFor(owner, branch);
-    expect(owner.admit(subject(branch), "test-progress", 1).allowed).toBe(true);
+    expect(owner.admit(subject(branch), "test-progress", guard(owner)).allowed).toBe(true);
     observe(owner, { text: "Steering request." });
     expect(owner.snapshot().suspended?.reason).toBe("unsupported overlapping user turns");
 
-    const denied = owner.admit(subject(branch), "test-progress", 1);
+    const denied = owner.admit(subject(branch), "test-progress", guard(owner));
     expect(denied).toMatchObject({ allowed: false, reason: "task admissions are suspended: unsupported overlapping user turns", actionIndex: null });
     expect(owner.snapshot().currentTask?.admissions).toBe(1);
     expect(owner.inspect(subject(branch)).taskId).toBe(created.task.taskId);
-    expect(() => owner.cancel(subject(branch))).toThrow(/Task control is unavailable/);
+    expect(() => owner.cancel(subject(branch), guard(owner))).toThrow(/Task control is unavailable/);
 
     owner.sessionChanged("session-b1-recovered");
     expect(owner.snapshot().suspended).toBeNull();
@@ -563,7 +569,7 @@ describe("conversational task ownership", () => {
     owner.observeAgentStart({ sessionId: SESSION, prompt: "Please cancel the managed task.", reason: "prompt" });
     expect(owner.snapshot().activeGrant?.turnId).not.toBe(1);
 
-    const cancelled = owner.cancel(subject(taskBranch));
+    const cancelled = owner.cancel(subject(taskBranch), guard(owner));
     expect(cancelled).toMatchObject({
       taskId: created.task.taskId,
       status: "cancelled",
@@ -574,7 +580,7 @@ describe("conversational task ownership", () => {
     expect(cancelled.anchor).toEqual(created.task.anchor);
     expect(cancelled.anchor.messageId).toBe("user-1");
 
-    const denied = owner.admit(subject(taskBranch), "test-progress", 1);
+    const denied = owner.admit(subject(taskBranch), "test-progress", guard(owner));
     expect(denied).toMatchObject({ allowed: false, reason: "task is cancelled", status: "cancelled", actionIndex: null });
     expect(owner.snapshot().currentTask?.admissions).toBe(0);
     expect(owner.snapshot().currentTask?.taskRevision).toBe(1);
@@ -594,7 +600,7 @@ describe("conversational task ownership", () => {
     observe(owner, { text: "Please cancel the managed task.", baseLeafId: "assistant-1" });
     owner.observeAgentStart({ sessionId: SESSION, prompt: "Please cancel the managed task.", reason: "prompt" });
     // The current grant's base leaf is absent from this branch; only the task's old anchor is.
-    expect(() => owner.cancel(subject(firstBranch)))
+    expect(() => owner.cancel(subject(firstBranch), guard(owner)))
       .toThrow(/anchor is not present|does not match the host-observed input/);
     expect(owner.snapshot().currentTask?.status).toBe("active");
   });
@@ -673,4 +679,220 @@ describe("conversational task ownership", () => {
     expect(owner.closeTurn({ sessionId: SESSION, branch: secondBranch, messages: [endOf("Second request.", T2)] })).toBe(true);
     expect(owner.snapshot().activeGrant).toBeNull();
   });
+});
+
+/** Bounded public host-input sequence: every entry is a real start/revise/cancel. */
+function capacityTask(owner: TaskOwner, index: number): {
+  branch: Entry[];
+  taskId: string;
+  baseLeafId: string;
+} {
+  const baseLeafId = `cap-leaf-${index}`;
+  const userId = `cap-user-${index}-0`;
+  const text = `Capacity request ${index}.`;
+  const branch: Entry[] = [base(baseLeafId), user(userId, baseLeafId, text)];
+  expect(observe(owner, { text, baseLeafId }).accepted).toBe(true);
+  owner.observeAgentStart({ sessionId: SESSION, prompt: text, reason: "prompt" });
+  const created = owner.start(subject(branch));
+  expect(created.created).toBe(true);
+  expect(owner.closeTurn({ sessionId: SESSION, branch, messages: [messageOf(user(userId, baseLeafId, text))] })).toBe(true);
+  return { branch, taskId: created.task.taskId, baseLeafId: userId };
+}
+
+function capacityAmend(owner: TaskOwner, state: { branch: Entry[]; taskId: string; baseLeafId: string }, index: number, round: number): void {
+  const userId = `cap-user-${index}-${round}`;
+  const text = `Capacity amendment ${index}.${round}.`;
+  const previousLeaf = state.branch.at(-1)!.id;
+  state.branch.push(user(userId, previousLeaf, text));
+  expect(observe(owner, { text, baseLeafId: previousLeaf }).accepted).toBe(true);
+  owner.observeAgentStart({ sessionId: SESSION, prompt: text, reason: "prompt" });
+  const task = owner.snapshot().currentTask!;
+  expect(owner.revise(subject(state.branch), { taskId: task.taskId, taskRevision: task.taskRevision }).revised).toBe(true);
+  expect(owner.closeTurn({ sessionId: SESSION, branch: state.branch, messages: [messageOf(user(userId, previousLeaf, text))] })).toBe(true);
+  state.baseLeafId = userId;
+}
+
+function capacityCancel(owner: TaskOwner, state: { branch: Entry[]; taskId: string; baseLeafId: string }, index: number): void {
+  const userId = `cap-user-${index}-cancel`;
+  const text = `Capacity cancellation ${index}.`;
+  const previousLeaf = state.branch.at(-1)!.id;
+  state.branch.push(user(userId, previousLeaf, text));
+  expect(observe(owner, { text, baseLeafId: previousLeaf }).accepted).toBe(true);
+  owner.observeAgentStart({ sessionId: SESSION, prompt: text, reason: "prompt" });
+  const task = owner.snapshot().currentTask!;
+  owner.cancel(subject(state.branch), { taskId: task.taskId, taskRevision: task.taskRevision });
+  expect(owner.closeTurn({ sessionId: SESSION, branch: state.branch, messages: [messageOf(user(userId, previousLeaf, text))] })).toBe(true);
+  state.baseLeafId = userId;
+}
+
+describe("B3-A repair: retained identity, grants and bounded capacity", () => {
+  test("a repeated host taskId never overwrites retained history, anchors or the live grant", () => {
+    let sequence = 0;
+    const ids = ["task-id-1", "task-id-1", "task-id-2"];
+    const owner = new TaskOwner({
+      workspaceRoot: WORKSPACE,
+      ownerId: "owner-b3a-duplicate-id",
+      now: () => NOW,
+      id: () => ids[Math.min(sequence++, ids.length - 1)]!,
+    });
+    const first = [base(), user("user-1", "leaf-1", "First request.")];
+    observe(owner, { text: "First request." });
+    owner.observeAgentStart({ sessionId: SESSION, prompt: "First request.", reason: "prompt" });
+    const created = owner.start(subject(first)).task;
+    expect(created.taskId).toBe("task-task-id-1");
+    expect(owner.closeTurn({ sessionId: SESSION, branch: first, messages: [messageOf(user("user-1", "leaf-1", "First request."))] })).toBe(true);
+
+    const second = [
+      ...first,
+      assistant("assistant-1", "user-1"),
+      user("user-2", "assistant-1", "Second request."),
+    ];
+    expect(observe(owner, { text: "Second request.", baseLeafId: "assistant-1" }).accepted).toBe(true);
+    owner.observeAgentStart({ sessionId: SESSION, prompt: "Second request.", reason: "prompt" });
+    owner.cancel(subject(second), guard(owner));
+    expect(owner.closeTurn({ sessionId: SESSION, branch: second, messages: [messageOf(user("user-2", "assistant-1", "Second request."))] })).toBe(true);
+
+    const third = [
+      ...second,
+      assistant("assistant-2", "user-2"),
+      user("user-3", "assistant-2", "Third request."),
+    ];
+    expect(observe(owner, { text: "Third request.", baseLeafId: "assistant-2" }).accepted).toBe(true);
+    owner.observeAgentStart({ sessionId: SESSION, prompt: "Third request.", reason: "prompt" });
+    const grantBefore = JSON.parse(JSON.stringify(owner.snapshot().activeGrant));
+    const before = owner.snapshot();
+    expect(() => owner.start(subject(third))).toThrow(/taskId is already retained/);
+
+    const after = owner.snapshot();
+    expect(after.tasksCreated).toBe(1);
+    expect(after.retention.tasksRetained).toBe(1);
+    expect(after.currentTask?.taskId).toBe(created.taskId);
+    expect(after.currentTask?.status).toBe("cancelled");
+    expect(after.currentTask?.requirementSources).toEqual(created.requirementSources);
+    expect(after.retention.replayEntries).toBe(before.retention.replayEntries);
+    expect(after.activeGrant).toEqual(grantBefore);
+    expect(after.activeGrant?.anchorMessageId).toBeNull();
+    expect(owner.inspectTarget(subject(third), { taskId: created.taskId, taskRevision: 1 }).target.taskId)
+      .toBe(created.taskId);
+  });
+
+  test("active-task, retention, preflight and replayed-capacity failures leave the live grant untouched", () => {
+    const { owner } = makeOwner();
+    const first = [base(), user("user-1", "leaf-1", "First request.")];
+    observe(owner, { text: "First request." });
+    startFor(owner, first);
+    expect(owner.closeTurn({ sessionId: SESSION, branch: first, messages: [messageOf(user("user-1", "leaf-1", "First request."))] })).toBe(true);
+
+    const second = [...first, assistant("assistant-1", "user-1"), user("user-2", "assistant-1", "Second request.")];
+    expect(observe(owner, { text: "Second request.", baseLeafId: "assistant-1" }).accepted).toBe(true);
+    owner.observeAgentStart({ sessionId: SESSION, prompt: "Second request.", reason: "prompt" });
+    const activeGrant = JSON.parse(JSON.stringify(owner.snapshot().activeGrant));
+    expect(() => owner.start(subject(second))).toThrow(/still active/);
+    expect(owner.snapshot().activeGrant).toEqual(activeGrant);
+    expect(owner.snapshot().activeGrant?.anchorMessageId).toBeNull();
+    owner.cancel(subject(second), guard(owner));
+    expect(owner.snapshot().activeGrant?.anchorMessageId).toBe("user-2");
+    expect(owner.closeTurn({ sessionId: SESSION, branch: second, messages: [messageOf(user("user-2", "assistant-1", "Second request."))] })).toBe(true);
+
+    const third = [...second, assistant("assistant-2", "user-2"), user("user-3", "assistant-2", "Third request.")];
+    expect(observe(owner, { text: "Third request.", baseLeafId: "assistant-2" }).accepted).toBe(true);
+    owner.observeAgentStart({ sessionId: SESSION, prompt: "Third request.", reason: "prompt" });
+    const preflightGrant = JSON.parse(JSON.stringify(owner.snapshot().activeGrant));
+    expect(() => owner.start(subject(third), undefined, () => { throw new Error("preflight boom"); }))
+      .toThrow(/preflight boom/);
+    expect(owner.snapshot().activeGrant).toEqual(preflightGrant);
+    expect(owner.snapshot().activeGrant?.anchorMessageId).toBeNull();
+    expect(owner.snapshot().tasksCreated).toBe(1);
+    expect(owner.snapshot().currentTask?.status).toBe("cancelled");
+
+    // 128 retained tasks: the bounded public sequence uses one genuine start
+    // and one genuine cancel per task; no private map is seeded.
+    const retention = makeOwner().owner;
+    for (let index = 0; index < 128; index += 1) {
+      const state = capacityTask(retention, index);
+      capacityCancel(retention, state, index);
+    }
+    expect(retention.snapshot().retention).toMatchObject({ tasksRetained: 128, replayEntries: 256 });
+    const newBase = "retention-leaf-129";
+    const newUser = "retention-user-129";
+    expect(observe(retention, { text: "One task too many.", baseLeafId: newBase }).accepted).toBe(true);
+    retention.observeAgentStart({ sessionId: SESSION, prompt: "One task too many.", reason: "prompt" });
+    const retentionGrant = JSON.parse(JSON.stringify(retention.snapshot().activeGrant));
+    expect(() => retention.start(subject([base(newBase), user(newUser, newBase, "One task too many.")])))
+      .toThrow(/retention is full/);
+    expect(retention.snapshot().activeGrant).toEqual(retentionGrant);
+    expect(retention.snapshot().activeGrant?.anchorMessageId).toBeNull();
+    expect(retention.snapshot().tasksCreated).toBe(128);
+    expect(retention.snapshot().retention.tasksRetained).toBe(128);
+  }, 60_000);
+
+  test("the 4096 replay boundary rejects revise, cancel and start while preserving grant and task", () => {
+    const fill = (owner: TaskOwner): void => {
+      // 124 tasks x (1 anchor + 31 revise + 1 cancel) = 4092 entries.
+      for (let index = 0; index < 124; index += 1) {
+        const state = capacityTask(owner, index);
+        for (let round = 1; round <= 31; round += 1) capacityAmend(owner, state, index, round);
+        capacityCancel(owner, state, index);
+      }
+      expect(owner.snapshot().retention.replayEntries).toBe(4092);
+    };
+
+    // Exactly 4096 entries while the current task is still active.
+    const { owner } = makeOwner();
+    fill(owner);
+    const last = capacityTask(owner, 124);
+    capacityAmend(owner, last, 124, 1);
+    capacityAmend(owner, last, 124, 2);
+    capacityAmend(owner, last, 124, 3);
+    expect(owner.snapshot().retention.replayEntries).toBe(4096);
+    expect(owner.snapshot().currentTask?.taskRevision).toBe(4);
+
+    const reviseLeaf = "cap-assistant-124-4";
+    const reviseUser = "cap-user-124-4";
+    last.branch.push(assistant(reviseLeaf, last.baseLeafId), user(reviseUser, reviseLeaf, "Capacity amendment 124.4."));
+    expect(observe(owner, { text: "Capacity amendment 124.4.", baseLeafId: reviseLeaf }).accepted).toBe(true);
+    owner.observeAgentStart({ sessionId: SESSION, prompt: "Capacity amendment 124.4.", reason: "prompt" });
+    const reviseGrant = JSON.parse(JSON.stringify(owner.snapshot().activeGrant));
+    expect(() => owner.revise(subject(last.branch), guard(owner))).toThrow(/replay capacity is full/);
+    expect(owner.snapshot().activeGrant).toEqual(reviseGrant);
+    expect(owner.snapshot().activeGrant?.anchorMessageId).toBeNull();
+    expect(owner.snapshot().currentTask?.taskRevision).toBe(4);
+    expect(owner.snapshot().retention.replayEntries).toBe(4096);
+    expect(owner.closeTurn({ sessionId: SESSION, branch: last.branch, messages: [messageOf(user(reviseUser, reviseLeaf, "Capacity amendment 124.4."))] })).toBe(true);
+
+    const cancelLeaf = "cap-assistant-124-cancel";
+    const cancelUser = "cap-user-124-cancel";
+    last.branch.push(assistant(cancelLeaf, reviseUser), user(cancelUser, cancelLeaf, "Capacity cancellation 124."));
+    expect(observe(owner, { text: "Capacity cancellation 124.", baseLeafId: cancelLeaf }).accepted).toBe(true);
+    owner.observeAgentStart({ sessionId: SESSION, prompt: "Capacity cancellation 124.", reason: "prompt" });
+    const cancelGrant = JSON.parse(JSON.stringify(owner.snapshot().activeGrant));
+    expect(() => owner.cancel(subject(last.branch), guard(owner))).toThrow(/replay capacity is full/);
+    expect(owner.snapshot().activeGrant).toEqual(cancelGrant);
+    expect(owner.snapshot().activeGrant?.anchorMessageId).toBeNull();
+    expect(owner.snapshot().currentTask?.status).toBe("active");
+    expect(owner.snapshot().currentTask?.taskRevision).toBe(4);
+
+    // Exactly 4096 entries with a terminal current task: a new start fails.
+    const startOwner = makeOwner().owner;
+    fill(startOwner);
+    const terminal = capacityTask(startOwner, 124);
+    capacityAmend(startOwner, terminal, 124, 1);
+    capacityAmend(startOwner, terminal, 124, 2);
+    capacityCancel(startOwner, terminal, 124);
+    expect(startOwner.snapshot().retention.replayEntries).toBe(4096);
+    expect(startOwner.snapshot().currentTask?.status).toBe("cancelled");
+
+    const startLeaf = "cap-assistant-125";
+    const startUser = "cap-user-125";
+    terminal.branch.push(assistant(startLeaf, terminal.baseLeafId), user(startUser, startLeaf, "One task beyond replay capacity."));
+    expect(observe(startOwner, { text: "One task beyond replay capacity.", baseLeafId: startLeaf }).accepted).toBe(true);
+    startOwner.observeAgentStart({ sessionId: SESSION, prompt: "One task beyond replay capacity.", reason: "prompt" });
+    const startGrant = JSON.parse(JSON.stringify(startOwner.snapshot().activeGrant));
+    expect(() => startOwner.start(subject(terminal.branch))).toThrow(/replay capacity is full/);
+    expect(startOwner.snapshot().activeGrant).toEqual(startGrant);
+    expect(startOwner.snapshot().activeGrant?.anchorMessageId).toBeNull();
+    expect(startOwner.snapshot().tasksCreated).toBe(125);
+    expect(startOwner.snapshot().retention).toMatchObject({ tasksRetained: 125, replayEntries: 4096 });
+    expect(startOwner.snapshot().currentTask?.status).toBe("cancelled");
+  }, 120_000);
 });

@@ -18,6 +18,8 @@ bun run test:delivery
 
 The other commands above start actual OMP processes with temporary profiles and local deterministic test providers or services. They do not call a paid model. `OMP_COMMAND` can override the OMP executable.
 
+For entry/job native failures, set `OMP_AGENT_B1_EVIDENCE_ROOT` to an absolute test-owned directory. The harness then copies this attempt's real frames, stderr, state, audit, fixture and job records into a unique `*-attempt-*` directory (bounded to 8 MiB) before cleanup. The copy limit applies to files under the source root; actual frames and stderr are also saved. Without that setting, or if export fails, skips files, or process cleanup fails, the existing private temporary root is preserved and its path is reported; only test-owned processes are terminated. No machine-specific path is embedded in the tests.
+
 ## What the tests establish
 
 - Task ownership, requirement changes, session binding, and capability admission.
@@ -35,7 +37,7 @@ Deterministic integration tests establish interface and control behavior. They d
 
 ## Verification status
 
-The reviewed product source passed type checking, 317 unit tests (3,061 assertions), and 15 isolated human-review tests (155 assertions). Independent component checks covered 26 scenarios and a reentrant context-change regression. Existing actual OMP execution and delivery suites provide separate evidence for entry composition, real files, and process accounting.
+The repaired product source passed type checking, 351 unit tests (28,610 assertions), and 15 isolated human-review tests (155 assertions). Independent component checks covered 26 scenarios and a reentrant context-change regression. Actual OMP entry (18 tests / 529 assertions) and job (10 / 239) suites passed on this revision. Execution (6 / 112) and delivery (5 / 233) results from the preceding repair were reused after their dependency and input hashes were confirmed unchanged. These provide separate evidence for entry composition, real files, and process accounting.
 
 All eight native review scenarios have passed after fixture corrections. The matrix covers default-off and invalid configuration, initial Enter, Escape, small-window resize, complete-content acceptance without an automatic contract, acceptance with valid partial automatic coverage, and the actual five-minute deadline. Positive captures are independently checked against full requirements, file bytes, source/input identities, and completed terminal paints. Offline mutations remove or alter evidence to check that the grader rejects incomplete results.
 

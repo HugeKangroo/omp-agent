@@ -27,6 +27,72 @@ const taskContextsOf = (messages) => (messages || []).flatMap((message) => {
   }
 });
 
+/**
+ * Process-lifetime memory of complete task refs actually observed in prior
+ * toolResult.content, with the source toolCallId and a monotonic observation
+ * sequence. It survives a provider factory recreation, and is read only by
+ * explicit adversarial same-process replay branches. Host task-context
+ * messages never write this cache, so a new session's current context cannot
+ * stand in for a pre-switch observation. The normal selector helper never
+ * reads this cache.
+ */
+const REF_MEMORY_KEY = Symbol.for("omp-agent.b1.observed-task-refs.v2");
+const REF_MEMORY = globalThis[REF_MEMORY_KEY] ??= { observations: [], sequence: 0 };
+const MAX_OBSERVED_TASK_REFS = 64;
+
+const refOfValue = (value) => {
+  const task = value?.task ?? value?.current;
+  if (!task || typeof task.taskId !== "string" || !Number.isSafeInteger(task.taskRevision)) return undefined;
+  return { expectedTaskId: task.taskId, expectedTaskRevision: task.taskRevision };
+};
+
+const rememberToolResultRef = (ref, toolCallId, step) => {
+  if (ref === undefined) return undefined;
+  REF_MEMORY.sequence += 1;
+  const observation = {
+    ...ref,
+    source: "tool-result",
+    toolCallId: typeof toolCallId === "string" ? toolCallId : null,
+    sequence: REF_MEMORY.sequence,
+    step,
+  };
+  REF_MEMORY.observations.push(observation);
+  if (REF_MEMORY.observations.length > MAX_OBSERVED_TASK_REFS) REF_MEMORY.observations.shift();
+  return observation;
+};
+
+/** Last ref observed in actual prior tool output, or undefined. Never `{}`. */
+const replayedTaskRef = () => REF_MEMORY.observations.at(-1);
+
+/**
+ * Copy the last complete task ref from actual host task-context content first
+ * (compaction removes old tool results but the context hook always projects
+ * the current owner facts), then from the latest tool output in this input.
+ */
+const taskRefOf = (messages) => {
+  const contexts = taskContextsOf(messages);
+  for (let index = contexts.length - 1; index >= 0; index -= 1) {
+    const ref = refOfValue(contexts[index]);
+    if (ref !== undefined) return ref;
+  }
+  const toolResults = (messages || []).filter((message) => message?.role === "toolResult");
+  for (let index = toolResults.length - 1; index >= 0; index -= 1) {
+    const text = textOf(toolResults[index]?.content);
+    try {
+      const ref = refOfValue(JSON.parse(text));
+      if (ref !== undefined) return ref;
+    } catch {
+      // Tool output that is not task facts contributes nothing.
+    }
+  }
+  return {};
+};
+
+const taskIdArg = (messages) => {
+  const ref = taskRefOf(messages);
+  return ref.expectedTaskId === undefined ? {} : { expectedTaskId: ref.expectedTaskId };
+};
+
 /** Observability only: provider-view message shape. Decisions use the step schedule. */
 const messageFacts = (context) => context.messages.map((message) => ({
   role: typeof message.role === "string" ? message.role : null,
@@ -137,6 +203,18 @@ export default function b1FixtureProvider(pi) {
         const turn = step++;
         const toolResults = context.messages.filter((message) => message.role === "toolResult");
         const taskContexts = taskContextsOf(context.messages);
+        for (const result of toolResults) {
+          try {
+            const observation = rememberToolResultRef(
+              refOfValue(JSON.parse(textOf(result?.content))),
+              result?.toolCallId,
+              turn,
+            );
+            if (observation !== undefined) audit({ type: "observed_tool_result_ref", ...observation });
+          } catch {
+            // A non-JSON tool result contributes no ref.
+          }
+        }
         const contextBefore = pendingContextInput;
         pendingContextInput = undefined;
         audit({
@@ -200,7 +278,7 @@ export default function b1FixtureProvider(pi) {
           if (turn === 0) {
             call = { type: "toolCall", id: "b1-start", name: "agent_task", arguments: { action: "start", understanding: "authorized task" } };
           } else if (turn === 1) {
-            call = { type: "toolCall", id: "b1-progress-1", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
+            call = { type: "toolCall", id: "b1-progress-1", name: "agent_test_capability", arguments: { action: "progress", ...taskIdArg(context.messages), expectedTaskRevision: 1 } };
           } else if (turn === 2) {
             text = "The task is established. A background progress result may follow.";
             injectBackground();
@@ -216,7 +294,7 @@ export default function b1FixtureProvider(pi) {
               type: "toolCall",
               id: "b1-background-progress",
               name: "agent_test_capability",
-              arguments: { action: "progress", expectedTaskRevision: 1 },
+              arguments: { action: "progress", ...taskIdArg(context.messages), expectedTaskRevision: 1 },
             };
           } else {
             text = "DONE: background progressed the existing task only.";
@@ -228,7 +306,7 @@ export default function b1FixtureProvider(pi) {
             text = "A background control message may follow.";
             injectBackground();
           } else if (turn === 2) {
-            call = { type: "toolCall", id: "b1-background-cancel", name: "agent_task", arguments: { action: "cancel" } };
+            call = { type: "toolCall", id: "b1-background-cancel", name: "agent_task", arguments: { action: "cancel", ...taskRefOf(context.messages) } };
           } else {
             text = "DONE: background cancellation was refused.";
           }
@@ -259,9 +337,9 @@ export default function b1FixtureProvider(pi) {
           if (turn === 0) {
             call = { type: "toolCall", id: "b1-start", name: "agent_task", arguments: { action: "start", understanding: "authorized task" } };
           } else if (turn === 1) {
-            call = { type: "toolCall", id: "b1-cancel", name: "agent_task", arguments: { action: "cancel" } };
+            call = { type: "toolCall", id: "b1-cancel", name: "agent_task", arguments: { action: "cancel", ...taskRefOf(context.messages) } };
           } else if (turn === 2) {
-            call = { type: "toolCall", id: "b1-late-progress", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
+            call = { type: "toolCall", id: "b1-late-progress", name: "agent_test_capability", arguments: { action: "progress", ...taskIdArg(context.messages), expectedTaskRevision: 1 } };
           } else {
             text = "DONE: cancellation was checked at the capability entry.";
           }
@@ -281,9 +359,9 @@ export default function b1FixtureProvider(pi) {
           } else if (turn === 1) {
             text = "DONE: first prompt created the task.";
           } else if (turn === 2) {
-            call = { type: "toolCall", id: "b1-cancel", name: "agent_task", arguments: { action: "cancel" } };
+            call = { type: "toolCall", id: "b1-cancel", name: "agent_task", arguments: { action: "cancel", ...taskRefOf(context.messages) } };
           } else if (turn === 3) {
-            call = { type: "toolCall", id: "b1-late-progress", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
+            call = { type: "toolCall", id: "b1-late-progress", name: "agent_test_capability", arguments: { action: "progress", ...taskIdArg(context.messages), expectedTaskRevision: 1 } };
           } else {
             text = "DONE: a later genuine user turn cancelled the task.";
           }
@@ -303,11 +381,35 @@ export default function b1FixtureProvider(pi) {
           } else if (promptText.includes("OWN_TASK")) {
             call = { type: "toolCall", id: "b1-start", name: "agent_task", arguments: { action: "start", understanding: "navigation binding test task" } };
           } else if (promptText.includes("SECOND_OBSERVATION")) {
-            call = { type: "toolCall", id: "b1-progress", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
+            call = { type: "toolCall", id: "b1-progress", name: "agent_test_capability", arguments: { action: "progress", ...taskIdArg(context.messages), expectedTaskRevision: 1 } };
           } else if (promptText.includes("AFTER_NAVIGATION")) {
-            call = { type: "toolCall", id: "b1-detached-progress", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
+            call = { type: "toolCall", id: "b1-detached-progress", name: "agent_test_capability", arguments: { action: "progress", ...taskIdArg(context.messages), expectedTaskRevision: 1 } };
           } else if (promptText.includes("FRESH_SESSION")) {
-            call = { type: "toolCall", id: "b1-fresh-session-progress", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
+            const replay = replayedTaskRef();
+            if (replay === undefined) {
+              text = "UNEXPECTED_REPLAY_SOURCE: no prior toolResult task ref observation";
+            } else {
+              audit({
+                type: "replayed_task_ref",
+                branch: "fresh-session",
+                step: turn,
+                expectedTaskId: replay.expectedTaskId,
+                expectedTaskRevision: replay.expectedTaskRevision,
+                source: replay.source,
+                sourceToolCallId: replay.toolCallId,
+                sourceSequence: replay.sequence,
+              });
+              call = {
+                type: "toolCall",
+                id: "b1-fresh-session-progress",
+                name: "agent_test_capability",
+                arguments: {
+                  action: "progress",
+                  expectedTaskId: replay.expectedTaskId,
+                  expectedTaskRevision: replay.expectedTaskRevision,
+                },
+              };
+            }
           } else {
             text = "UNEXPECTED_NAVIGATION_PROMPT";
           }
@@ -326,19 +428,19 @@ export default function b1FixtureProvider(pi) {
           if (turn === 0) {
             call = { type: "toolCall", id: "b1-start", name: "agent_task", arguments: { action: "start", understanding: "initial understanding" } };
           } else if (turn === 1) {
-            call = { type: "toolCall", id: "b1-progress-before", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
+            call = { type: "toolCall", id: "b1-progress-before", name: "agent_test_capability", arguments: { action: "progress", ...taskIdArg(context.messages), expectedTaskRevision: 1 } };
           } else if (turn === 2) {
             text = "DONE: first prompt created the task.";
           } else if (turn === 3) {
-            call = { type: "toolCall", id: "b1-revise-1", name: "agent_task", arguments: { action: "revise", understanding: "revised understanding" } };
+            call = { type: "toolCall", id: "b1-revise-1", name: "agent_task", arguments: { action: "revise", ...taskRefOf(context.messages), understanding: "revised understanding" } };
           } else if (turn === 4) {
             // Same genuine user turn, same host message: a retry must not add
             // a second source record or bump the revision again.
-            call = { type: "toolCall", id: "b1-revise-2", name: "agent_task", arguments: { action: "revise" } };
+            call = { type: "toolCall", id: "b1-revise-2", name: "agent_task", arguments: { action: "revise", ...taskRefOf(context.messages) } };
           } else if (turn === 5) {
-            call = { type: "toolCall", id: "b1-stale-progress", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
+            call = { type: "toolCall", id: "b1-stale-progress", name: "agent_test_capability", arguments: { action: "progress", ...taskIdArg(context.messages), expectedTaskRevision: 1 } };
           } else if (turn === 6) {
-            call = { type: "toolCall", id: "b1-progress-after", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 2 } };
+            call = { type: "toolCall", id: "b1-progress-after", name: "agent_test_capability", arguments: { action: "progress", ...taskIdArg(context.messages), expectedTaskRevision: 2 } };
           } else {
             text = "DONE: requirement amendment accepted once.";
           }
@@ -348,27 +450,27 @@ export default function b1FixtureProvider(pi) {
           } else if (turn === 1) {
             text = "DONE: pre-compaction task created.";
           } else if (turn === 2) {
-            call = { type: "toolCall", id: "b1-compact-revise-pre", name: "agent_task", arguments: { action: "revise", understanding: "pre-compaction amendment" } };
+            call = { type: "toolCall", id: "b1-compact-revise-pre", name: "agent_task", arguments: { action: "revise", ...taskRefOf(context.messages), understanding: "pre-compaction amendment" } };
           } else if (turn === 3) {
             text = "DONE: pre-compaction amendment accepted.";
           } else if (turn === 4) {
             text = "HARMLESS_RESPONSE: harmless later turn after both requirements.";
           } else if (turn === 5) {
-            call = { type: "toolCall", id: "b1-after-compact-cancel", name: "agent_task", arguments: { action: "cancel" } };
+            call = { type: "toolCall", id: "b1-after-compact-cancel", name: "agent_task", arguments: { action: "cancel", ...taskRefOf(context.messages) } };
           } else if (turn === 6) {
             call = { type: "toolCall", id: "b1-after-compact-start", name: "agent_task", arguments: { action: "start", understanding: "summary claims a new task" } };
           } else if (turn === 7) {
-            call = { type: "toolCall", id: "b1-after-compact-revise", name: "agent_task", arguments: { action: "revise", understanding: "summary claims a revision" } };
+            call = { type: "toolCall", id: "b1-after-compact-revise", name: "agent_task", arguments: { action: "revise", ...taskRefOf(context.messages), understanding: "summary claims a revision" } };
           } else if (turn === 8) {
-            call = { type: "toolCall", id: "b1-after-compact-progress", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 2 } };
+            call = { type: "toolCall", id: "b1-after-compact-progress", name: "agent_test_capability", arguments: { action: "progress", ...taskIdArg(context.messages), expectedTaskRevision: 2 } };
           } else if (turn === 9) {
             text = "ATTACK_FINISHED: background control was denied and authorized progress continued.";
           } else if (turn === 10) {
             call = { type: "toolCall", id: "b1-post-compact-inspect", name: "agent_task", arguments: { action: "inspect" } };
           } else if (turn === 11) {
-            call = { type: "toolCall", id: "b1-post-compact-revise", name: "agent_task", arguments: { action: "revise", understanding: "post-compaction genuine amendment" } };
+            call = { type: "toolCall", id: "b1-post-compact-revise", name: "agent_task", arguments: { action: "revise", ...taskRefOf(context.messages), understanding: "post-compaction genuine amendment" } };
           } else if (turn === 12) {
-            call = { type: "toolCall", id: "b1-post-compact-revise-retry", name: "agent_task", arguments: { action: "revise" } };
+            call = { type: "toolCall", id: "b1-post-compact-revise-retry", name: "agent_task", arguments: { action: "revise", ...taskRefOf(context.messages) } };
           } else if (turn === 13) {
             text = "DONE: post-compaction genuine revision accepted once.";
           } else {
@@ -393,7 +495,7 @@ export default function b1FixtureProvider(pi) {
           } else if (turn === 1) {
             text = "DONE: first prompt created the task.";
           } else if (turn === 2) {
-            call = { type: "toolCall", id: "b1-revise", name: "agent_task", arguments: { action: "revise", understanding: "post-command revision" } };
+            call = { type: "toolCall", id: "b1-revise", name: "agent_task", arguments: { action: "revise", ...taskRefOf(context.messages), understanding: "post-command revision" } };
           } else if (turn === 3) {
             text = "DONE: the genuine revision after a local command preserved the task.";
           } else {
@@ -403,13 +505,13 @@ export default function b1FixtureProvider(pi) {
           if (turn === 0) {
             call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
           } else if (turn === 1) {
-            call = { type: "toolCall", id: "job-submit-1", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+            call = { type: "toolCall", id: "job-submit-1", name: "agent_job", arguments: { action: "submit", ...taskIdArg(context.messages), expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
           } else if (turn === 2) {
-            call = { type: "toolCall", id: "job-query-running", name: "agent_job", arguments: { action: "query" } };
+            call = { type: "toolCall", id: "job-query-running", name: "agent_job", arguments: { action: "query", ...taskRefOf(context.messages) } };
           } else if (turn === 3) {
             text = "DONE: submitted one job and observed it running.";
           } else if (turn === 4) {
-            call = { type: "toolCall", id: "job-query-succeeded", name: "agent_job", arguments: { action: "query" } };
+            call = { type: "toolCall", id: "job-query-succeeded", name: "agent_job", arguments: { action: "query", ...taskRefOf(context.messages) } };
           } else {
             text = "DONE: the host completed the job; the task remains active.";
           }
@@ -417,13 +519,13 @@ export default function b1FixtureProvider(pi) {
           if (turn === 0) {
             call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
           } else if (turn === 1) {
-            call = { type: "toolCall", id: "job-submit-lost", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+            call = { type: "toolCall", id: "job-submit-lost", name: "agent_job", arguments: { action: "submit", ...taskIdArg(context.messages), expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
           } else if (turn === 2) {
-            call = { type: "toolCall", id: "job-submit-reconcile", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+            call = { type: "toolCall", id: "job-submit-reconcile", name: "agent_job", arguments: { action: "submit", ...taskIdArg(context.messages), expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
           } else if (turn === 3) {
-            call = { type: "toolCall", id: "job-submit-conflict", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "changed-payload-must-conflict" } };
+            call = { type: "toolCall", id: "job-submit-conflict", name: "agent_job", arguments: { action: "submit", ...taskIdArg(context.messages), expectedTaskRevision: 1, payload: "changed-payload-must-conflict" } };
           } else if (turn === 4) {
-            call = { type: "toolCall", id: "job-query-after-lost", name: "agent_job", arguments: { action: "query" } };
+            call = { type: "toolCall", id: "job-query-after-lost", name: "agent_job", arguments: { action: "query", ...taskRefOf(context.messages) } };
           } else {
             text = "DONE: the lost acknowledgement was reconciled by the original operation id.";
           }
@@ -431,17 +533,17 @@ export default function b1FixtureProvider(pi) {
           if (turn === 0) {
             call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
           } else if (turn === 1) {
-            call = { type: "toolCall", id: "job-submit-cancel", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+            call = { type: "toolCall", id: "job-submit-cancel", name: "agent_job", arguments: { action: "submit", ...taskIdArg(context.messages), expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
           } else if (turn === 2) {
             text = "DONE: first prompt submitted the job.";
           } else if (turn === 3) {
-            call = { type: "toolCall", id: "job-task-cancel", name: "agent_task", arguments: { action: "cancel" } };
+            call = { type: "toolCall", id: "job-task-cancel", name: "agent_task", arguments: { action: "cancel", ...taskRefOf(context.messages) } };
           } else if (turn === 4) {
             text = "DONE: the genuine user cancelled the task; no model job cancel was called.";
           } else if (turn === 5) {
-            call = { type: "toolCall", id: "job-query-after-cancel", name: "agent_job", arguments: { action: "query" } };
+            call = { type: "toolCall", id: "job-query-after-cancel", name: "agent_job", arguments: { action: "query", ...taskRefOf(context.messages) } };
           } else if (turn === 6) {
-            call = { type: "toolCall", id: "job-submit-after-cancel", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+            call = { type: "toolCall", id: "job-submit-after-cancel", name: "agent_job", arguments: { action: "submit", ...taskIdArg(context.messages), expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
           } else {
             text = "DONE: host cleanup was observed and new submission was denied.";
           }
@@ -449,15 +551,15 @@ export default function b1FixtureProvider(pi) {
           if (turn === 0) {
             call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
           } else if (turn === 1) {
-            call = { type: "toolCall", id: "job-submit-complete", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+            call = { type: "toolCall", id: "job-submit-complete", name: "agent_job", arguments: { action: "submit", ...taskIdArg(context.messages), expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
           } else if (turn === 2) {
             text = "DONE: first prompt submitted the job.";
           } else if (turn === 3) {
-            call = { type: "toolCall", id: "job-task-cancel-complete", name: "agent_task", arguments: { action: "cancel" } };
+            call = { type: "toolCall", id: "job-task-cancel-complete", name: "agent_task", arguments: { action: "cancel", ...taskRefOf(context.messages) } };
           } else if (turn === 4) {
-            call = { type: "toolCall", id: "job-query-complete", name: "agent_job", arguments: { action: "query" } };
+            call = { type: "toolCall", id: "job-query-complete", name: "agent_job", arguments: { action: "query", ...taskRefOf(context.messages) } };
           } else if (turn === 5) {
-            call = { type: "toolCall", id: "job-submit-complete-denied", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+            call = { type: "toolCall", id: "job-submit-complete-denied", name: "agent_job", arguments: { action: "submit", ...taskIdArg(context.messages), expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
           } else {
             text = "DONE: completion won cancellation and the task was not accepted.";
           }
@@ -465,13 +567,13 @@ export default function b1FixtureProvider(pi) {
           if (turn === 0) {
             call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
           } else if (turn === 1) {
-            call = { type: "toolCall", id: "job-submit-abort", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+            call = { type: "toolCall", id: "job-submit-abort", name: "agent_job", arguments: { action: "submit", ...taskIdArg(context.messages), expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
           } else if (turn === 2) {
             text = "DONE: submitted the job before the delayed query.";
           } else if (turn === 3) {
-            call = { type: "toolCall", id: "job-query-aborted", name: "agent_job", arguments: { action: "query" } };
+            call = { type: "toolCall", id: "job-query-aborted", name: "agent_job", arguments: { action: "query", ...taskRefOf(context.messages) } };
           } else if (turn === 4) {
-            call = { type: "toolCall", id: "job-query-after-abort", name: "agent_job", arguments: { action: "query" } };
+            call = { type: "toolCall", id: "job-query-after-abort", name: "agent_job", arguments: { action: "query", ...taskRefOf(context.messages) } };
           } else {
             text = "DONE: the interrupted query did not change the task or remote job.";
           }
@@ -479,9 +581,9 @@ export default function b1FixtureProvider(pi) {
           if (turn === 0) {
             call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
           } else if (turn === 1) {
-            call = { type: "toolCall", id: "job-submit-held", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+            call = { type: "toolCall", id: "job-submit-held", name: "agent_job", arguments: { action: "submit", ...taskIdArg(context.messages), expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
           } else if (turn === 2) {
-            call = { type: "toolCall", id: "job-query-after-submit-abort", name: "agent_job", arguments: { action: "query" } };
+            call = { type: "toolCall", id: "job-query-after-submit-abort", name: "agent_job", arguments: { action: "query", ...taskRefOf(context.messages) } };
           } else {
             text = "DONE: the original operation reconciled after the interrupted submit.";
           }
@@ -489,7 +591,7 @@ export default function b1FixtureProvider(pi) {
           if (turn === 0) {
             call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
           } else if (turn === 1) {
-            call = { type: "toolCall", id: "job-submit-kill", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+            call = { type: "toolCall", id: "job-submit-kill", name: "agent_job", arguments: { action: "submit", ...taskIdArg(context.messages), expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
           } else {
             text = "DONE: job running before the host kills OMP.";
           }
@@ -498,8 +600,8 @@ export default function b1FixtureProvider(pi) {
             call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
           } else if (turn === 1) {
             calls = [
-              { type: "toolCall", id: "job-submit-raced", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } },
-              { type: "toolCall", id: "job-task-cancel-raced", name: "agent_task", arguments: { action: "cancel" } },
+              { type: "toolCall", id: "job-submit-raced", name: "agent_job", arguments: { action: "submit", ...taskIdArg(context.messages), expectedTaskRevision: 1, payload: "alpha-prototype-payload" } },
+              { type: "toolCall", id: "job-task-cancel-raced", name: "agent_task", arguments: { action: "cancel", ...taskRefOf(context.messages) } },
             ];
           } else {
             text = "DONE: concurrent submit and task cancellation settled on one intent.";
@@ -512,26 +614,60 @@ export default function b1FixtureProvider(pi) {
           const replacementToolsDone = context.messages.some((message) => message.role === "toolResult"
             && (message.toolCallId === "job-query-new-session" || message.toolCallId === "job-submit-new-session"));
           if (promptText.includes("NEW_SESSION_JOB") && !replacementToolsDone) {
-            calls = [
-              { type: "toolCall", id: "job-query-new-session", name: "agent_job", arguments: { action: "query" } },
-              { type: "toolCall", id: "job-submit-new-session", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } },
-            ];
+            const replay = replayedTaskRef();
+            if (replay === undefined) {
+              text = "UNEXPECTED_REPLAY_SOURCE: no prior toolResult task ref observation";
+            } else {
+              audit({
+                type: "replayed_task_ref",
+                branch: "new-session-job",
+                step: turn,
+                expectedTaskId: replay.expectedTaskId,
+                expectedTaskRevision: replay.expectedTaskRevision,
+                source: replay.source,
+                sourceToolCallId: replay.toolCallId,
+                sourceSequence: replay.sequence,
+              });
+              calls = [
+                {
+                  type: "toolCall",
+                  id: "job-query-new-session",
+                  name: "agent_job",
+                  arguments: {
+                    action: "query",
+                    expectedTaskId: replay.expectedTaskId,
+                    expectedTaskRevision: replay.expectedTaskRevision,
+                  },
+                },
+                {
+                  type: "toolCall",
+                  id: "job-submit-new-session",
+                  name: "agent_job",
+                  arguments: {
+                    action: "submit",
+                    expectedTaskId: replay.expectedTaskId,
+                    expectedTaskRevision: replay.expectedTaskRevision,
+                    payload: "alpha-prototype-payload",
+                  },
+                },
+              ];
+            }
           } else if (promptText.includes("NEW_SESSION_JOB") && replacementToolsDone) {
             text = "DONE: the replacement session was denied before any external request.";
           } else if (turn === 0) {
             call = { type: "toolCall", id: "job-start", name: "agent_task", arguments: { action: "start", understanding: "one external job" } };
           } else if (turn === 1) {
-            call = { type: "toolCall", id: "job-submit-revise", name: "agent_job", arguments: { action: "submit", expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
+            call = { type: "toolCall", id: "job-submit-revise", name: "agent_job", arguments: { action: "submit", ...taskIdArg(context.messages), expectedTaskRevision: 1, payload: "alpha-prototype-payload" } };
           } else if (turn === 2) {
             text = "DONE: first prompt submitted revision 1.";
           } else if (turn === 3) {
-            call = { type: "toolCall", id: "job-revise-2", name: "agent_task", arguments: { action: "revise", understanding: "second genuine requirement" } };
+            call = { type: "toolCall", id: "job-revise-2", name: "agent_task", arguments: { action: "revise", ...taskRefOf(context.messages), understanding: "second genuine requirement" } };
           } else if (turn === 4) {
-            call = { type: "toolCall", id: "job-query-after-revise", name: "agent_job", arguments: { action: "query" } };
+            call = { type: "toolCall", id: "job-query-after-revise", name: "agent_job", arguments: { action: "query", ...taskRefOf(context.messages) } };
           } else if (turn === 5) {
             text = "DONE: late job receipt remains bound to revision 1 while the task is revision 2.";
           } else if (turn === 6) {
-            call = { type: "toolCall", id: "job-task-cancel-held", name: "agent_task", arguments: { action: "cancel" } };
+            call = { type: "toolCall", id: "job-task-cancel-held", name: "agent_task", arguments: { action: "cancel", ...taskRefOf(context.messages) } };
           } else {
             text = "DONE: cancellation committed before session replacement.";
           }
@@ -542,9 +678,9 @@ export default function b1FixtureProvider(pi) {
             text = "A background revision claim may follow.";
             injectBackground();
           } else if (turn === 2) {
-            call = { type: "toolCall", id: "b1-background-revise", name: "agent_task", arguments: { action: "revise", understanding: "background claims revision" } };
+            call = { type: "toolCall", id: "b1-background-revise", name: "agent_task", arguments: { action: "revise", ...taskRefOf(context.messages), understanding: "background claims revision" } };
           } else if (turn === 3) {
-            call = { type: "toolCall", id: "b1-background-progress", name: "agent_test_capability", arguments: { action: "progress", expectedTaskRevision: 1 } };
+            call = { type: "toolCall", id: "b1-background-progress", name: "agent_test_capability", arguments: { action: "progress", ...taskIdArg(context.messages), expectedTaskRevision: 1 } };
           } else {
             text = "DONE: background revision was refused; authorized progress continued.";
           }

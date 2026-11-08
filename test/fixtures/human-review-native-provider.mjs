@@ -125,7 +125,7 @@ export default function humanReviewNativeProvider(pi) {
             type: "toolCall",
             id: "review-task-revise",
             name: "agent_task",
-            arguments: { action: "revise", understanding: "Apply only the host-observed amendment." },
+            arguments: { action: "revise", expectedTaskId: state.task.taskId, expectedTaskRevision: state.task.taskRevision, understanding: "Apply only the host-observed amendment." },
           };
         } else {
           const runTurn = mode === "revise" ? 3 : 1;

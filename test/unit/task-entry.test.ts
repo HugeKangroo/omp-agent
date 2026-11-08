@@ -2,10 +2,16 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { createTaskEntry } from "../../src/task-entry.ts";
-import type { OmpToolContext } from "../../src/task-entry-port.ts";
-import type { TaskOwnerSnapshot } from "../../src/task-owner.ts";
-import { MAX_TASK_CONTROL_RESPONSE_BYTES } from "../../src/task-requirements.ts";
+import { createTaskEntry, admitPublishedTask } from "../../src/task-entry.ts";
+import {
+  clearPublishedTaskOwner,
+  currentTaskOwner,
+  publishTaskOwner,
+  subjectFromContext,
+  type OmpToolContext,
+} from "../../src/task-entry-port.ts";
+import { TaskOwner, type TaskOwnerSnapshot, type TaskSubject } from "../../src/task-owner.ts";
+import { MAX_TASK_CONTROL_RESPONSE_BYTES, requirementsDigest } from "../../src/task-requirements.ts";
 
 type Api = Parameters<typeof createTaskEntry>[0];
 type Tool = {
@@ -37,7 +43,7 @@ function userEntry(id: string, parentId: string, text: string) {
   };
 }
 
-async function setup(): Promise<{
+async function setup(options: { id?: () => string } = {}): Promise<{
   tool: Tool;
   context: OmpToolContext;
   input(text: string): void;
@@ -47,6 +53,7 @@ async function setup(): Promise<{
   navigate(): void;
   taskCount(): number;
   status(): string | null;
+  guard(): { expectedTaskId: string; expectedTaskRevision: number };
   snapshot(): TaskOwnerSnapshot;
 }> {
   const root = await realpath(await mkdtemp(path.join(tmpdir(), "omp-agent-b1-entry-")));
@@ -64,6 +71,7 @@ async function setup(): Promise<{
     statePath: path.join(root, "state.json"),
     auditPath: path.join(root, "audit.jsonl"),
     capabilities: ["test-progress"],
+    ...(options.id === undefined ? {} : { id: options.id }),
   });
   let currentText = "";
   let leafId = "leaf-1";
@@ -113,6 +121,11 @@ async function setup(): Promise<{
     },
     taskCount: () => owner.snapshot().tasksCreated,
     status: () => owner.snapshot().currentTask?.status ?? null,
+    guard() {
+      const task = owner.snapshot().currentTask;
+      if (!task) throw new Error("test setup: no current task");
+      return { expectedTaskId: task.taskId, expectedTaskRevision: task.taskRevision };
+    },
     snapshot: () => owner.snapshot(),
   };
 }
@@ -134,7 +147,7 @@ describe("B1 entry control boundaries", () => {
     harness.beforeStart("Please own the release checklist.");
     const created = await harness.tool.execute("call-1", { action: "start" }, undefined, undefined, harness.context);
     expect(created.isError).toBeUndefined();
-    const revised = await harness.tool.execute("call-2", { action: "revise" }, AbortSignal.abort(), undefined, harness.context);
+    const revised = await harness.tool.execute("call-2", { action: "revise", ...harness.guard() }, AbortSignal.abort(), undefined, harness.context);
     expect(revised.isError).toBe(true);
     expect(harness.snapshot().currentTask!.taskRevision).toBe(1);
     expect(harness.snapshot().currentTask!.requirementSources).toHaveLength(1);
@@ -173,7 +186,7 @@ describe("B1 entry control boundaries", () => {
     const created = await harness.tool.execute("call-1", { action: "start" }, undefined, undefined, harness.context);
     expect(created.isError).toBeUndefined();
     expect(harness.status()).toBe("active");
-    const cancelled = await harness.tool.execute("call-2", { action: "cancel" }, AbortSignal.abort(), undefined, harness.context);
+    const cancelled = await harness.tool.execute("call-2", { action: "cancel", ...harness.guard() }, AbortSignal.abort(), undefined, harness.context);
     expect(cancelled.isError).toBe(true);
     expect(harness.status()).toBe("active");
   });
@@ -219,7 +232,7 @@ describe("B1 entry control boundaries", () => {
     harness.closeTurn(request);
     harness.input(amendment);
     harness.beforeStart(amendment);
-    const revised = await harness.tool.execute("call-revise", { action: "revise" }, undefined, undefined, harness.context);
+    const revised = await harness.tool.execute("call-revise", { action: "revise", ...harness.guard() }, undefined, undefined, harness.context);
     expect(revised.isError).toBeUndefined();
     const reviseDetails = revised.details as { task: Record<string, unknown>; requirements: Record<string, unknown> };
     expect(reviseDetails.task.taskRevision).toBe(2);
@@ -246,6 +259,66 @@ describe("B1 entry control boundaries", () => {
     expect(after.requirementSources[1]!.text).toBe(amendment);
     expect(JSON.stringify(started)).toBe(startJson);
     expect((JSON.parse(revised.content![0]!.text) as typeof reviseDetails).task.taskRevision).toBe(2);
+  });
+
+  test("the published admission port rechecks the owner and current task after notification", async () => {
+    {
+      const harness = await setup();
+      harness.input("Please own the release checklist.");
+      harness.beforeStart("Please own the release checklist.");
+      const created = await harness.tool.execute("call-1", { action: "start" }, undefined, undefined, harness.context);
+      expect(created.isError).toBeUndefined();
+      const task = harness.snapshot().currentTask!;
+      const owner = currentTaskOwner()!;
+      expect(admitPublishedTask(harness.context, "test-progress", task.taskId, task.taskRevision))
+        .toMatchObject({ allowed: true, taskId: task.taskId, expectedTaskId: task.taskId, actionIndex: 1 });
+      expect(harness.snapshot().currentTask!.admissions).toBe(1);
+
+      owner.subscribe((event) => {
+        if (event.type === "capability_admission_allowed") {
+          owner.cancel(subjectFromContext(harness.context, owner.workspaceRoot), {
+            taskId: task.taskId,
+            taskRevision: task.taskRevision,
+          });
+        }
+      });
+      const revoked = admitPublishedTask(harness.context, "test-progress", task.taskId, task.taskRevision);
+      expect(revoked).toMatchObject({
+        allowed: false,
+        taskId: task.taskId,
+        expectedTaskId: task.taskId,
+        actionIndex: 2,
+        status: "cancelled",
+        reason: expect.stringContaining("revoked"),
+      });
+      expect(harness.snapshot().currentTask!.admissions).toBe(2);
+    }
+    {
+      const harness = await setup();
+      harness.input("Please own the release checklist.");
+      harness.beforeStart("Please own the release checklist.");
+      await harness.tool.execute("call-1", { action: "start" }, undefined, undefined, harness.context);
+      const task = harness.snapshot().currentTask!;
+      const owner = currentTaskOwner()!;
+      const context: OmpToolContext = {
+        ...harness.context,
+        sessionManager: {
+          getSessionId: () => "session-b1-entry",
+          getLeafId: () => null,
+          getBranch: () => {
+            clearPublishedTaskOwner(owner);
+            return [];
+          },
+        },
+      };
+      const denied = admitPublishedTask(context, "test-progress", task.taskId, task.taskRevision);
+      expect(denied).toMatchObject({
+        allowed: false,
+        reason: expect.stringContaining("published task owner changed"),
+        actionIndex: null,
+      });
+      expect(harness.snapshot().currentTask!.admissions).toBe(0);
+    }
   });
 
   test("a maximum-size accepted task can cancel with a bounded factual response and keep the start response unchanged", async () => {
@@ -283,7 +356,7 @@ describe("B1 entry control boundaries", () => {
     const cancellation = "Please cancel the managed task without creating a new one.";
     harness.input(cancellation);
     harness.beforeStart(cancellation);
-    const cancelled = await harness.tool.execute("call-cancel", { action: "cancel" }, undefined, undefined, harness.context);
+    const cancelled = await harness.tool.execute("call-cancel", { action: "cancel", ...harness.guard() }, undefined, undefined, harness.context);
     expect(cancelled.isError).toBeUndefined();
     expect(new TextEncoder().encode(JSON.stringify(cancelled)).byteLength).toBeLessThanOrEqual(MAX_TASK_CONTROL_RESPONSE_BYTES);
     const details = cancelled.details as { task: Record<string, unknown>; requirements: Record<string, unknown> };
@@ -365,7 +438,7 @@ describe("B1 entry control boundaries", () => {
       const amendment = "a".repeat(length);
       probe.input(amendment);
       probe.beforeStart(amendment);
-      const revised = await probe.tool.execute("call-revise", { action: "revise" }, undefined, undefined, probe.context);
+      const revised = await probe.tool.execute("call-revise", { action: "revise", ...probe.guard() }, undefined, undefined, probe.context);
       return revised.isError ? undefined : new TextEncoder().encode(JSON.stringify(revised)).byteLength;
     };
     let low = 0;
@@ -389,7 +462,7 @@ describe("B1 entry control boundaries", () => {
     const amendment = "a".repeat(maximumAmendment);
     harness.input(amendment);
     harness.beforeStart(amendment);
-    const revised = await harness.tool.execute("call-revise", { action: "revise" }, undefined, undefined, harness.context);
+    const revised = await harness.tool.execute("call-revise", { action: "revise", ...harness.guard() }, undefined, undefined, harness.context);
     expect(revised.isError).toBeUndefined();
     const reviseBytes = new TextEncoder().encode(JSON.stringify(revised)).byteLength;
     expect(reviseBytes).toBeLessThanOrEqual(MAX_TASK_CONTROL_RESPONSE_BYTES);
@@ -400,7 +473,7 @@ describe("B1 entry control boundaries", () => {
     const cancellation = "Please cancel the revised managed task.";
     harness.input(cancellation);
     harness.beforeStart(cancellation);
-    const cancelled = await harness.tool.execute("call-cancel", { action: "cancel" }, undefined, undefined, harness.context);
+    const cancelled = await harness.tool.execute("call-cancel", { action: "cancel", ...harness.guard() }, undefined, undefined, harness.context);
     expect(cancelled.isError).toBeUndefined();
     expect(harness.status()).toBe("cancelled");
     expect(harness.snapshot().currentTask!.taskRevision).toBe(2);
@@ -508,7 +581,7 @@ describe("B1 entry control boundaries", () => {
     harness.closeTurn(request);
     harness.input(amendment);
     harness.beforeStart(amendment);
-    const revised = await harness.tool.execute("call-revise", { action: "revise" }, undefined, undefined, harness.context);
+    const revised = await harness.tool.execute("call-revise", { action: "revise", ...harness.guard() }, undefined, undefined, harness.context);
     expect(revised.isError).toBeUndefined();
     const nextView = JSON.parse((harness.projectContext(prior) as { messages: Array<{ content: string }> }).messages[1]!.content) as typeof view & {
       requirements: { amendments: Array<{ revision: number; source: string; text: string }> };
@@ -543,7 +616,7 @@ describe("B1 entry control boundaries", () => {
     harness.closeTurn(request);
     harness.input(amendment);
     harness.beforeStart(amendment);
-    const revised = await harness.tool.execute("call-revise", { action: "revise" }, undefined, undefined, harness.context);
+    const revised = await harness.tool.execute("call-revise", { action: "revise", ...harness.guard() }, undefined, undefined, harness.context);
     expect(revised.isError).toBeUndefined();
 
     const second = harness.projectContext(first.messages) as { messages: Array<Record<string, unknown>> };
@@ -583,3 +656,170 @@ describe("B1 entry control boundaries", () => {
     expect(harness.projectContext([user])).toBeUndefined();
     expect(harness.taskCount()).toBe(0);
   });
+
+describe("B3-A repair: entry owner binding and final admission usability", () => {
+  test("a real tool getter that publishes a replacement owner neither mutates nor discloses the captured owner", async () => {
+    const harness = await setup();
+    const request = "Please own the retained release checklist.";
+    harness.input(request);
+    harness.beforeStart(request);
+    const created = await harness.tool.execute("call-start", { action: "start" }, undefined, undefined, harness.context);
+    expect(created.isError).toBeUndefined();
+    const task = harness.snapshot().currentTask!;
+    const original = currentTaskOwner()!;
+    expect(original.snapshot().tasksCreated).toBe(1);
+    const branch = harness.context.sessionManager!.getBranch();
+    const replacement = new TaskOwner({
+      workspaceRoot: original.workspaceRoot,
+      ownerId: "owner-b3a-replacement",
+    });
+    const context: OmpToolContext = {
+      ...harness.context,
+      sessionManager: {
+        getSessionId: () => harness.context.sessionManager!.getSessionId(),
+        getLeafId: () => harness.context.sessionManager!.getLeafId(),
+        getBranch: () => {
+          publishTaskOwner(replacement);
+          return branch;
+        },
+      },
+    };
+    try {
+      for (const params of [{ action: "history" }, { action: "inspect" }] as const) {
+        const result = await harness.tool.execute("call-replaced", params, undefined, undefined, context);
+        expect(result.isError).toBe(true);
+        const serialized = JSON.stringify(result);
+        expect(serialized).toContain("published task owner changed");
+        expect(serialized).not.toContain(task.taskId);
+        expect(serialized).not.toContain(request);
+      }
+      expect(original.snapshot().tasksCreated).toBe(1);
+      expect(original.snapshot().currentTask?.taskId).toBe(task.taskId);
+      expect(original.snapshot().currentTask?.rawRequest).toBe(request);
+      expect(replacement.snapshot().tasksCreated).toBe(0);
+    } finally {
+      clearPublishedTaskOwner(replacement);
+      publishTaskOwner(original);
+    }
+  });
+
+  test("a replacement published during start preflight commits no task in the stale owner", async () => {
+    let replacement: TaskOwner | undefined;
+    const harness = await setup({
+      id: () => {
+        if (replacement !== undefined) publishTaskOwner(replacement);
+        return "stale-preflight-id";
+      },
+    });
+    const original = currentTaskOwner()!;
+    replacement = new TaskOwner({
+      workspaceRoot: original.workspaceRoot,
+      ownerId: "owner-b3a-preflight-replacement",
+    });
+    const request = "Please own the stale preflight checklist.";
+    harness.input(request);
+    harness.beforeStart(request);
+    try {
+      const result = await harness.tool.execute("call-start", { action: "start" }, undefined, undefined, harness.context);
+      expect(result.isError).toBe(true);
+      expect(JSON.stringify(result)).toContain("published task owner changed");
+      expect(harness.taskCount()).toBe(0);
+      expect(harness.snapshot().currentTask).toBeNull();
+      expect(replacement.snapshot().tasksCreated).toBe(0);
+    } finally {
+      clearPublishedTaskOwner(replacement);
+      publishTaskOwner(original);
+    }
+  });
+
+  test("the final admission check denies an unreachable final branch after retaining the committed admission", async () => {
+    const harness = await setup();
+    const request = "Please own the release checklist.";
+    harness.input(request);
+    harness.beforeStart(request);
+    await harness.tool.execute("call-start", { action: "start" }, undefined, undefined, harness.context);
+    const task = harness.snapshot().currentTask!;
+    const owner = currentTaskOwner()!;
+    const branch = harness.context.sessionManager!.getBranch();
+    let hits = 0;
+    const context: OmpToolContext = {
+      ...harness.context,
+      sessionManager: {
+        getSessionId: () => "session-b1-entry",
+        getLeafId: () => null,
+        getBranch: () => {
+          hits += 1;
+          return hits === 1 ? branch : [baseEntry()];
+        },
+      },
+    };
+    const decision = admitPublishedTask(context, "test-progress", task.taskId, task.taskRevision);
+    expect(hits).toBe(2);
+    expect(decision).toMatchObject({
+      allowed: false,
+      taskId: task.taskId,
+      taskRevision: 1,
+      expectedTaskId: task.taskId,
+      expectedTaskRevision: 1,
+      actionIndex: 1,
+    });
+    expect(String(decision.reason)).toContain("anchor is not in the current conversation branch");
+    expect(harness.snapshot().currentTask!.admissions).toBe(1);
+    expect(owner.snapshot().currentTask!.admissions).toBe(1);
+  });
+
+  test("the final admission check denies an acceptance reservation created by the last getter", async () => {
+    const harness = await setup();
+    const request = "Please own the release checklist.";
+    harness.input(request);
+    harness.beforeStart(request);
+    await harness.tool.execute("call-start", { action: "start" }, undefined, undefined, harness.context);
+    const task = harness.snapshot().currentTask!;
+    const owner = currentTaskOwner()!;
+    const branch = harness.context.sessionManager!.getBranch();
+    const frozen = {
+      ownerId: task.ownerId,
+      taskId: task.taskId,
+      taskRevision: task.taskRevision,
+      requirementsDigest: requirementsDigest(task.requirementSources),
+    };
+    const subject: TaskSubject = {
+      sessionId: "session-b1-entry",
+      workspaceRoot: owner.workspaceRoot,
+      agentKind: "main",
+      branch,
+    };
+    let token: object | undefined;
+    let hits = 0;
+    const context: OmpToolContext = {
+      ...harness.context,
+      sessionManager: {
+        getSessionId: () => "session-b1-entry",
+        getLeafId: () => null,
+        getBranch: () => {
+          hits += 1;
+          if (hits === 2) token = owner.reserveAcceptance(subject, frozen);
+          return branch;
+        },
+      },
+    };
+    try {
+      const decision = admitPublishedTask(context, "test-progress", task.taskId, task.taskRevision);
+      expect(hits).toBe(2);
+      expect(token).toBeDefined();
+      expect(owner.reservationCurrent(token!)).toBe(true);
+      expect(decision).toMatchObject({
+        allowed: false,
+        taskId: task.taskId,
+        taskRevision: 1,
+        expectedTaskId: task.taskId,
+        expectedTaskRevision: 1,
+        actionIndex: 1,
+      });
+      expect(String(decision.reason)).toContain("acceptance reservation");
+      expect(harness.snapshot().currentTask!.admissions).toBe(1);
+    } finally {
+      if (token !== undefined) owner.releaseAcceptance(token);
+    }
+  });
+});
