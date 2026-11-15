@@ -8,11 +8,11 @@ OMP 负责模型与工具调用循环；插件维护任务身份、要求版本�
 
 ## 当前状态
 
-项目处于实验阶段，尚未正式发布版本。默认受管入口使用宿主 JSON 配置，其实际接线验证固定在 macOS、OMP 18.18.0 和 Bun 1.4.0；另有单独加载的原生工作观察入口和可配置主会话定义入口，在 macOS、OMP 18.20.2 和 Bun 1.4.0 上做版本限定验证。不同入口的验证范围分别记录，其他环境需单独验证。真人使用验收尚未完成。
+项目处于实验阶段，尚未正式发布版本。默认受管入口使用宿主 JSON 配置，其实际接线验证固定在 macOS、OMP 18.18.0 和 Bun 1.4.0；另有单独加载的原生工作观察入口、可配置主会话定义入口和原生子实例入口，在 macOS、OMP 18.20.2 和 Bun 1.4.0 上分别做版本限定验证。不同入口的验证范围分别记录，其他环境需单独验证。真人使用验收尚未完成。
 
 包的默认入口为 `src/daily-entry.ts`。可以从源码检出目录或本地打包后的解包目录加载；下文配置和命令只影响本次启动，不会自动安装到现有 OMP profile。
 
-可配置主会话定义已作为可选实验入口提供，但独立 Agent 实例、实例间 Flow 及多实例/委派仍未接通。该入口在同一 OMP 内核上加载一份显式 Agent Markdown 的初始文本，选择模型并收窄工具范围，不创建独立 Agent 实例或授权层。定义入口已在本机固定版本范围内演示有界定义行为，包括只读汇总与实际转换产物；但仍有已确认的真实模型内容错误和已恢复的工具错误，原生观察入口也仍有未通过独立内容复核的真实模型样本。详见[测试记录](docs/testing.md)。
+可配置主会话定义和原生子实例入口已作为可选实验入口提供；完整独立 Agent 实例生命周期、实例间 Flow、结果信封、取消/被取代工作及产物关联仍未接通。定义入口在同一 OMP 内核上加载一份显式 Agent Markdown 的初始文本，选择模型并收窄工具范围；子实例入口再把一份显式主定义与限定数量的原生直接子任务关联起来，但不替换 OMP 调度、权限或模型循环。两个入口均已在本机固定版本范围内演示有界行为，定义入口包括只读汇总与实际转换产物；但仍有已确认的真实模型内容错误和已恢复的工具错误，原生观察入口也仍有未通过独立内容复核的真实模型样本。详见[测试记录](docs/testing.md)。
 
 ## 已实现能力
 
@@ -121,7 +121,78 @@ omp --cwd "/absolute/path/to/workspace" --no-extensions \
 
 启动时会在异步原生模块导入之前安装拦截。缺少或无效的解析依赖、无效定义、未知身份、已有受管 TaskOwner、已知的模型/工具/会话/工作区漂移或导航都会使绑定失败，并阻止普通输入、提示和工具调用。失败后 `/agent-definition-status` 与只读 `agent_definition` 工具仍可诊断，但不会修复、重载或重新绑定。绑定成功后，定义与所选 Skill 的初始文本被冻结，状态中的快照版本保持稳定；修改文件不会影响当前进程，变更定义必须启动新的 OMP 进程。定义版本只是内容快照标识，不是任务要求版本。
 
-此入口的验证范围固定为 macOS、OMP 18.20.2 与 Bun 1.4.0 的主会话，只支持一个显式绑定，不能与受管 TaskOwner 同时启用，也不支持多实例、子 Agent 委派或跨实例 Flow。冻结范围仅限初始定义与所选 Skill 文本，不冻结脚本、模板或 `skill://` 资源。诊断可能只报告 `hasPendingMessages` 布尔值，没有精确队列计数；已观察到 abort 后 `sessionSettled:false`，不承诺恢复、队列清除或结算。已安装的 input、before_agent_start 与 tool 钩子不覆盖每个 provider 请求、已在运行的工具、缺失插件或操作系统沙箱；普通 OMP 工具副作用仍由宿主权威控制，工作观察报告也不等于语义验证或任务接收。加载该入口不会自动应用策略，也不修改默认入口或默认策略。
+D1 入口自身的验证范围固定为 macOS、OMP 18.20.2 与 Bun 1.4.0 的主会话，只支持一个显式绑定，不能与受管 TaskOwner 同时启用，也不支持多实例、子 Agent 委派或跨实例 Flow；需要限定直接子任务时使用下面的原生子实例入口。冻结范围仅限初始定义与所选 Skill 文本，不冻结脚本、模板或 `skill://` 资源。诊断可能只报告 `hasPendingMessages` 布尔值，没有精确队列计数；已观察到 abort 后 `sessionSettled:false`，不承诺恢复、队列清除或结算。已安装的 input、before_agent_start 与 tool 钩子不覆盖每个 provider 请求、已在运行的工具、缺失插件或操作系统沙箱；普通 OMP 工具副作用仍由宿主权威控制，工作观察报告也不等于语义验证或任务接收。加载该入口不会自动应用策略，也不修改默认入口或默认策略。
+
+### 原生子实例入口（实验）
+
+`src/instanced-native-entry.ts` 是新的显式可选入口，把一份现有 `--agent-definition` 主定义与 1–8 份显式 Agent Markdown 子定义关联到 OMP 原生 `task` 直接子任务。它组合 D1 主定义绑定与现有原生工作观察，不新增模型循环、任务执行器或定义格式；包目录默认入口仍为 `daily-entry.ts`。主定义应放在原生子定义发现目录之外，避免与子定义发现结果冲突。只加载该入口；`--no-extensions` 会关闭扩展的自动发现，但显式 `--extension` 仍会加载。
+
+主定义沿用 D1 的 `name`、`description`、`tools`、`model`、`autoloadSkills`，不接受子定义的 `blocking`/`structured`。子定义也使用这些字段，并额外要求字面量 `blocking: true`、`structured: false`、显式 `model` 和 `tools`；`autoloadSkills` 可选。所选子文件必须与当前原生 project/user 发现的实际胜出项一致。主定义放在原生子定义发现目录之外，例如 `/absolute/path/to/workspace/.omp/main.md`：
+
+```markdown
+---
+name: main
+description: Delegate bounded file inspection.
+tools:
+  - read
+  - task
+model: provider/model
+---
+
+Delegate requested file inspections to the selected native child definition and report the observed result.
+```
+
+子定义放在项目发现目录，例如 `/absolute/path/to/workspace/.omp/agents/file-reader.md`，以便原生 project 发现选中它：
+
+```markdown
+---
+name: file-reader
+description: Read one requested file and report bounded findings.
+tools:
+  - read
+model: provider/model
+blocking: true
+structured: false
+---
+
+Read the requested file with the available tool. Report what you actually observed and what you did not inspect.
+```
+
+将两处 `provider/model` 替换为当前已配置且可解析的模型；主定义必须声明 `task`，`read` 必须实际存在于活动工具集，且子定义的工具集必须是主定义活动工具集的子集。`name` 在当前主根内必须稳定；改名需要新的 OMP 进程。每个 `task` 调用都会重新加载并冻结一份子定义快照，实例保留该次调用的冻结版本，后续文件修改不会改变它。
+
+入口要求五个生效的 scoped 设置。本地覆盖文件示例：
+
+```yaml
+async:
+  enabled: false
+task:
+  batch: false
+  speculativeLaunch: false
+  workerThreads: 0
+  structured: false
+```
+
+入口检查这五个生效值；其他宿主配置仍由本次本地 profile 决定。
+
+启动示例（所有路径使用绝对路径；该文件只传给本次启动，不要修改全局配置）：
+
+```sh
+omp --cwd "/absolute/path/to/workspace" --no-extensions \
+  --config "/absolute/path/to/omp-instance-profile.yml" \
+  --agent-definition "/absolute/path/to/workspace/.omp/main.md" \
+  --agent-child-definitions '["/absolute/path/to/workspace/.omp/agents/file-reader.md"]' \
+  --extension "/absolute/path/to/omp-agent/src/instanced-native-entry.ts"
+```
+
+`--agent-child-definitions` 接受 1–8 个绝对 `.md` 路径的 JSON 数组。示例使用源码检出路径，不改变包默认安装方式。只支持一个主根/进程、固定 cwd 和直接子任务；任务参数必须是一个扁平对象（`agent`、`task` 及可选的 `description`、`solutionSpace`、`i`），不支持 batch、推测启动、worker、async、structured 输出、原生恢复、导航、共享计划、worktree 或 eval 模式。根、事件总线代际和子工厂身份不匹配时失败关闭；不支持的转换或容量耗尽需要重启恢复。原生权限、工具循环和已有受管 TaskOwner 排除规则保持不变。
+
+新入口只在自身组合中把 `agent_definition` 与 `agent_work` 设为默认不激活，并在主定义绑定成功后显式激活；子定义不能选择这两个伴随工具。子会话的实际模型和活动工具必须与冻结快照完全一致，原生 Role/Skill 全文校验不通过即拒绝。
+
+默认上限为 8 份选中定义、16 个 pending 准入、64 条保留记录和 8 MiB 初始 Role/Skill 正文文本；已用调用 ID 集合同样有界。记录不会驱逐，也没有持久恢复；容量满时拒绝新委派并要求重启。8 MiB 只是初始正文文本上限，不是整个进程的内存预算，也不是 frontmatter 大小限制。
+
+只读 `/agent-instances-status`（或进程内 `getStatus()`）返回当次构建并冻结的非权威诊断。状态 JSON 上限 64 KiB：正常时 `view.complete=true`；超限时 `view.complete=false`、`reason:"encoded-size-limit"`，给出完整详情的字节数与摘要、省略的 selections/pending/instances 数量及阶段计数，详情数组省略但不改变内部记录，也不分页。状态构建失败时 `view.reason:"status-unavailable"`，完整详情指标和未知计数为 `null`，回退载荷的字节与摘要另以 `fallbackBytes`/`fallbackSha256` 单独命名；未知不等于零。`/agent-definition-status` 仍保留。
+
+固定宿主的有界负向验证还覆盖缺失 Skill 与不支持设置：缺失 Skill 的一次 `task` 尝试在子会话启动前被预检阻止；不支持设置使实例层启动失败，D1 主定义仍保持绑定，且无 provider 派发。生命周期 `completed`、`taskResultObserved` 与 Role/Skill 文本门通过都只是观察，不等于产物或语义接收；结果信封、取消、被取代工作和产物关联属于下一阶段（D2-C），尚未实现。不承诺并发、恢复或无上限长会话；这是固定宿主的实验性有界兼容入口，不是完整 D2、模型质量或最终产品就绪证明。
 
 ## 开发与验证
 
@@ -163,6 +234,7 @@ bun pm pack --destination "/absolute/path/to/package-output" --ignore-scripts
 | `src/daily-entry.ts` | `agent_task`、`agent_execute`、`agent_verify`、`agent_deliver` | 通过 `OMP_AGENT_CONFIG` 显式配置的组合入口 |
 | `src/native-entry.ts` | `agent_work` | 单独加载的原生工作观察试点；报告与严格接收分开 |
 | `src/defined-native-entry.ts` | `agent_definition`、`agent_work`、`/agent-definition-status` | 显式主会话 Agent Markdown 绑定；组合现有原生工作观察，绑定状态只读，定义变更需新进程 |
+| `src/instanced-native-entry.ts` | `agent_definition`、`agent_work`、`/agent-definition-status`、`/agent-instances-status` | 组合主定义绑定与有界原生直接子任务关联；实例状态只读，默认包入口不变 |
 | `src/extension.ts` | `agent_status` 及受管测试工具 | 显式加载的接入与权限边界测试 |
 | `src/task-entry.ts` | `agent_task` | 建立、检查、修订、取消当前任务，并读取有界历史；终态任务后可继续新任务 |
 | `src/execution-entry.ts` | `agent_execute`、`agent_verify` | 受控执行及宿主验证，需先加载任务入口 |
@@ -188,7 +260,7 @@ bun pm pack --destination "/absolute/path/to/package-output" --ignore-scripts
 ## 使用边界
 
 - 当前插件用于有界本地试用；尚未正式发布版本，也不会自动安装到日常 profile。
-- 主会话定义入口固定为单进程、单显式绑定，且不能与受管 TaskOwner 同时启用；不支持多实例、子 Agent 委派或跨实例 Flow。
+- 主会话定义入口固定为单进程、单显式绑定，且不能与受管 TaskOwner 同时启用。原生子实例入口只支持一个主根、直接子任务和有界内存记录；完整多实例、实例间 Flow、结果信封及恢复仍未提供。
 - 受管执行只支持已验证范围内的运行时与授权输入，不提供任意命令或任意工作区访问；原生入口沿用 OMP 的原生执行权限。
 - 验证结果会区分通过、失败和覆盖不足；模型自测不能代替宿主验证。
 - 候选登记和交付索引目前保存在进程内，不承诺重启后自动恢复。
