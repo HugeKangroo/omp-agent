@@ -92,6 +92,12 @@ A replay of the same report signature revalidates the selection and returns the 
 
 These are engineering checks only. No actual OMP host run exercised A1; earlier C2 host evidence applies to the code version frozen for that run, not to new host execution. The snapshot is a same-read text capture, not a guarantee of later filesystem state or future file integrity, and receipts cover only the listed conditions on the supplied bytes; the checker makes no filesystem, process or model call. No A2 consumer, live-work binding, store, entry, CLI or permission change was made, and no default policy changed.
 
+### Generic child handoff compatibility
+
+One bounded actual run on the fixed macOS/OMP 18.20.2/Bun 1.4.0 probe used one parent and two sequential same-definition native children, with 8 local deterministic provider requests, 2 `task` calls and 4 tool calls in total (2 read-only child stubs) in 1,917 ms. The real parent task reference bound through the parent tool-call id/index 0, native lifecycle child id, distinct child session/factory, complete child prompt and user context, actual stub tool call/context/result, and the parent task result. Main, Role, Skill, model and tool-set facts were confirmed, and the children used the same definition version. The actual child `before_agent_start.prompt` was the native two-newline `Complete assignment thoroughly:` prefix plus the full task string; the model-visible user context added the date/workspace wrapper, and the task reference was absent from the system prompt. The read-only stub was visible to the main session because the child tools stayed within the main ceiling, but main made no calls and stub execution was child-only.
+
+The original automatic grade passed 17 of 18 checks but failed because the grader read a top-level field as nested; that failed record is retained. Corrected offline grading passed all 18 checks on the same saved execution, and an independent raw review passed, with no host rerun and no original overall PASS. Both children shut down, and the parent exited normally on EOF with exit 0, no signals and a gone process group; retained frames, frozen files, current product sources and raw content/fact hashes matched. The A1 snapshot/checker adoption was not executed: the child stub existed only to observe text and tool identity. A1 still has no actual snapshot/checker host acceptance, and no product code, default entry or tool authority changed. The original failed record is a grader-fixture failure, not a product failure.
+
 ## Commands
 
 ```sh
