@@ -8,11 +8,11 @@ OMP 负责模型与工具调用循环；插件维护任务身份、要求版本�
 
 ## 当前状态
 
-项目处于实验阶段，尚未正式发布版本。默认受管入口使用宿主 JSON 配置，其实际接线验证固定在 macOS、OMP 18.18.0 和 Bun 1.4.0；另有单独加载的原生工作观察入口，在 OMP 18.20.2 上验证。两者的版本验证范围分别记录，其他环境需单独验证。真人使用验收尚未完成。
+项目处于实验阶段，尚未正式发布版本。默认受管入口使用宿主 JSON 配置，其实际接线验证固定在 macOS、OMP 18.18.0 和 Bun 1.4.0；另有单独加载的原生工作观察入口和可配置主会话定义入口，在 macOS、OMP 18.20.2 和 Bun 1.4.0 上做版本限定验证。不同入口的验证范围分别记录，其他环境需单独验证。真人使用验收尚未完成。
 
 包的默认入口为 `src/daily-entry.ts`。可以从源码检出目录或本地打包后的解包目录加载；下文配置和命令只影响本次启动，不会自动安装到现有 OMP profile。
 
-可配置 Agent 定义、独立实例及实例间 Flow 尚未接通。固定 OMP 18.20.2 上的原生 Agent Markdown、`task` 子 Agent 与 Skills 兼容性证据已记录在[架构](docs/architecture.md)，主会话定义绑定仍未提供。原生观察入口的实际接线已通过，但仍有未通过独立内容复核的真实模型样本，详见[测试记录](docs/testing.md)。
+可配置主会话定义已作为可选实验入口提供，但独立 Agent 实例、实例间 Flow 及多实例/委派仍未接通。该入口在同一 OMP 内核上加载一份显式 Agent Markdown 的初始文本，选择模型并收窄工具范围，不创建独立 Agent 实例或授权层。定义入口已在本机固定版本范围内演示有界定义行为，包括只读汇总与实际转换产物；但仍有已确认的真实模型内容错误和已恢复的工具错误，原生观察入口也仍有未通过独立内容复核的真实模型样本。详见[测试记录](docs/testing.md)。
 
 ## 已实现能力
 
@@ -90,6 +90,39 @@ omp --cwd "/absolute/path/to/workspace" --no-extensions \
 
 记录仅保留在当前主会话进程的有界内存中，不能恢复旧任务。工具运行过但没有报告时，入口最多发送一次有期限的结束提醒；这是建议，不保证模型遵从。它不提供执行隔离、不接管原生权限、不保证子 Agent 继承策略，也不把其他工具的副作用登记为受管产物。文件摘要仅说明读取时观察到的字节，不证明这些字节经过所选检查。
 
+### 可配置主会话定义入口（实验）
+
+`src/defined-native-entry.ts` 可单独显式加载一份 Agent Markdown，为当前主会话提供初始定义文本。它不替换 OMP 内核：模型/工具循环、权限、原生工具与 Skill 目录仍由宿主提供；不同定义只是同一内核上的不同配置。名称、角色和定义正文都不是权威，不授予工具、审批、任务权限或流程权威。
+
+示例 `/absolute/path/to/file-reviewer.md`：
+
+```markdown
+---
+name: file-reviewer
+description: Review one requested file and report bounded findings.
+tools:
+  - read
+---
+
+Inspect the requested file with the available tool. Report concrete findings and state what you did not inspect. Do not claim tools or permissions you do not have.
+```
+
+启动命令（插件目录和定义文件都使用绝对路径）：
+
+```sh
+omp --cwd "/absolute/path/to/workspace" --no-extensions \
+  --agent-definition "/absolute/path/to/file-reviewer.md" \
+  --extension "/absolute/path/to/omp-agent/src/defined-native-entry.ts"
+```
+
+只加载该入口；包目录的默认入口仍为 `daily-entry.ts`，普通目录加载方式不变。示例中的 `read` 必须实际存在于当前活动工具集，否则严格预检会拒绝；应按宿主实际工具调整。
+
+入口在绑定前严格预检绝对路径、常规非链接文件、原生解析一致性和允许字段。初始 frontmatter 只接受 `name`、`description`、`tools`、`model` 和 `autoloadSkills`，其他原生字段按名称拒绝，正文必须非空。`tools` 只能收窄宿主当前活动工具集：省略表示继承当前集合，显式 `[]` 表示不保留角色工具，列出的名称必须精确存在于当前集合；未知或已停用工具会被拒绝。只读的 `agent_definition` 与观察用的 `agent_work` 仍作为伴随工具保留。`model` 至多一个，由宿主解析器解析；`provider/id` 必须精确解析为同一身份，裸名称或 `@` 前缀选择器保留原拼写并记录解析身份，thinking/routing 后缀、多重选择器、无法解析或 `provider/id` 不精确匹配会被拒绝；`@` 只是模型选择器拼写，不是权限角色。`autoloadSkills` 必须精确匹配当前活动 Skill 名称；缺失、重复、超过 8 个、歧义别名或加载后的元数据不一致会使绑定失败，入口不自行扫描或覆盖 Skill 发现结果。
+
+启动时会在异步原生模块导入之前安装拦截。缺少或无效的解析依赖、无效定义、未知身份、已有受管 TaskOwner、已知的模型/工具/会话/工作区漂移或导航都会使绑定失败，并阻止普通输入、提示和工具调用。失败后 `/agent-definition-status` 与只读 `agent_definition` 工具仍可诊断，但不会修复、重载或重新绑定。绑定成功后，定义与所选 Skill 的初始文本被冻结，状态中的快照版本保持稳定；修改文件不会影响当前进程，变更定义必须启动新的 OMP 进程。定义版本只是内容快照标识，不是任务要求版本。
+
+此入口的验证范围固定为 macOS、OMP 18.20.2 与 Bun 1.4.0 的主会话，只支持一个显式绑定，不能与受管 TaskOwner 同时启用，也不支持多实例、子 Agent 委派或跨实例 Flow。冻结范围仅限初始定义与所选 Skill 文本，不冻结脚本、模板或 `skill://` 资源。诊断可能只报告 `hasPendingMessages` 布尔值，没有精确队列计数；已观察到 abort 后 `sessionSettled:false`，不承诺恢复、队列清除或结算。已安装的 input、before_agent_start 与 tool 钩子不覆盖每个 provider 请求、已在运行的工具、缺失插件或操作系统沙箱；普通 OMP 工具副作用仍由宿主权威控制，工作观察报告也不等于语义验证或任务接收。加载该入口不会自动应用策略，也不修改默认入口或默认策略。
+
 ## 开发与验证
 
 需要本机安装 Bun 和 OMP。在项目目录运行：
@@ -129,6 +162,7 @@ bun pm pack --destination "/absolute/path/to/package-output" --ignore-scripts
 | --- | --- | --- |
 | `src/daily-entry.ts` | `agent_task`、`agent_execute`、`agent_verify`、`agent_deliver` | 通过 `OMP_AGENT_CONFIG` 显式配置的组合入口 |
 | `src/native-entry.ts` | `agent_work` | 单独加载的原生工作观察试点；报告与严格接收分开 |
+| `src/defined-native-entry.ts` | `agent_definition`、`agent_work`、`/agent-definition-status` | 显式主会话 Agent Markdown 绑定；组合现有原生工作观察，绑定状态只读，定义变更需新进程 |
 | `src/extension.ts` | `agent_status` 及受管测试工具 | 显式加载的接入与权限边界测试 |
 | `src/task-entry.ts` | `agent_task` | 建立、检查、修订、取消当前任务，并读取有界历史；终态任务后可继续新任务 |
 | `src/execution-entry.ts` | `agent_execute`、`agent_verify` | 受控执行及宿主验证，需先加载任务入口 |
@@ -154,6 +188,7 @@ bun pm pack --destination "/absolute/path/to/package-output" --ignore-scripts
 ## 使用边界
 
 - 当前插件用于有界本地试用；尚未正式发布版本，也不会自动安装到日常 profile。
+- 主会话定义入口固定为单进程、单显式绑定，且不能与受管 TaskOwner 同时启用；不支持多实例、子 Agent 委派或跨实例 Flow。
 - 受管执行只支持已验证范围内的运行时与授权输入，不提供任意命令或任意工作区访问；原生入口沿用 OMP 的原生执行权限。
 - 验证结果会区分通过、失败和覆盖不足；模型自测不能代替宿主验证。
 - 候选登记和交付索引目前保存在进程内，不承诺重启后自动恢复。
