@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, realpath } from "node:fs/promises";
 import path from "node:path";
@@ -69,6 +69,24 @@ export interface NativeObservedFile {
   bytes: number;
   sha256: string;
   observedAt: number;
+}
+
+/**
+ * One textual read of one workspace file. The text is decoded from the same
+ * buffer used for the byte count and hash; it is not a claim about later
+ * filesystem state.
+ */
+export interface NativeWorkspaceTextSnapshot {
+  readonly captureId: string;
+  readonly file: Readonly<NativeObservedFile>;
+  readonly text: string;
+}
+
+const issuedTextSnapshots = new WeakSet<NativeWorkspaceTextSnapshot>();
+
+/** Source-identity check for this module only; it is not a permission grant. */
+export function isNativeWorkspaceTextSnapshot(value: unknown): value is NativeWorkspaceTextSnapshot {
+  return typeof value === "object" && value !== null && issuedTextSnapshots.has(value as NativeWorkspaceTextSnapshot);
 }
 
 function isErrno(error: unknown, code: string): boolean {
@@ -214,15 +232,17 @@ async function recheckDirectories(
  * Reads one explicitly selected text file below the canonical workspace root.
  * Existing parents must be real directories, the final component must be a
  * regular file opened with O_NOFOLLOW, and device/inode/size/timestamps are
- * compared before and after the read. The returned hash describes only the
- * bytes read at `observedAt`; it is not managed provenance or future state.
+ * compared before and after the read. The returned hash and text describe only
+ * the bytes read at `observedAt`; they are not managed provenance or future
+ * state. UTF-8 is decoded with the BOM retained, so re-encoding reproduces the
+ * read buffer exactly.
  */
-export async function observeWorkspaceFile(
+export async function captureWorkspaceText(
   root: string,
   relativePath: string,
   io: NativeFileIo = nodeFileIo,
   observedAt: number = Date.now(),
-): Promise<NativeObservedFile> {
+): Promise<NativeWorkspaceTextSnapshot> {
   const relative = validateRelativePath(relativePath);
   const rootIdentity = await rootOf(io, root);
   const canonicalRoot = rootIdentity.canonical;
@@ -326,20 +346,43 @@ export async function observeWorkspaceFile(
     if (buffer.includes(0)) {
       throw new NativeFileError("Output file is not UTF-8 text.", "non-text");
     }
+    let text: string;
     try {
-      new TextDecoder("utf-8", { fatal: true }).decode(buffer);
+      // ignoreBOM keeps a leading UTF-8 BOM as U+FEFF in the decoded text.
+      text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(buffer);
     } catch {
       throw new NativeFileError("Output file is not valid UTF-8 text.", "non-text");
     }
-    return {
+    const file: Readonly<NativeObservedFile> = Object.freeze({
       relativePath: relative,
       bytes: read,
       sha256: createHash("sha256").update(buffer).digest("hex"),
       observedAt,
-    };
+    });
+    const snapshot: NativeWorkspaceTextSnapshot = Object.freeze({
+      captureId: randomUUID(),
+      file,
+      text,
+    });
+    issuedTextSnapshots.add(snapshot);
+    return snapshot;
   } finally {
     await handle.close().catch(() => undefined);
   }
+}
+
+/**
+ * Existing observation API. It returns an independent, mutable copy of the
+ * plain file facts and never exposes the text or capture identity.
+ */
+export async function observeWorkspaceFile(
+  root: string,
+  relativePath: string,
+  io: NativeFileIo = nodeFileIo,
+  observedAt: number = Date.now(),
+): Promise<NativeObservedFile> {
+  const snapshot = await captureWorkspaceText(root, relativePath, io, observedAt);
+  return { ...snapshot.file };
 }
 
 export function sha256Hex(value: string | Uint8Array): string {

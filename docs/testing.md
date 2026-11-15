@@ -86,6 +86,12 @@ A separate previously unrun case B completed in 2,099 ms: 1 parent, 1 child, 7 p
 
 A replay of the same report signature revalidates the selection and returns the immutable historical receipt without rereading files. Missing or unreadable signal, lifecycle/abort/conflict evidence, reentry, pending or unknown source, and instance/root/work changes refuse before publication. Correct hashes and file observations still do not establish original child delivery, exclusive authorship, commit-time file state, meaningful check coverage or semantic acceptance. No actual tool-test version binding is claimed; versioned handoff is deferred to D3. These fixed-host results are limited to macOS, OMP 18.20.2, Bun 1.4.0 and the local deterministic provider.
 
+## Native text snapshot and checker (A1)
+
+`bun test test/unit/native-snapshot-checker.test.ts test/unit/native-entry.test.ts` exercises the new snapshot/checker leaf with the existing native-entry regressions. Nine new focused cases verify actual one-open/read capture of BOM, Unicode, CRLF and empty text; a snapshot unaffected by later source writes; V1 failure followed by V2 success; V1→V2→V1 ABA rejection with equal bytes but a different capture id; an old snapshot still matching its receipt after disk changes; a same-digest newly created plan being refused; frozen plans and deep-frozen receipts; bounded rejection of forged snapshots, plans and receipts, accessors, proxies, symbols and oversized shapes; JSON-pointer escapes, array bounds and inherited keys; and the plan-size boundary at 16,383, 16,384 and 16,385 bytes. Final `bun run check` passed type checking, 768 unit tests (41 files, 34,524 assertions) and 15 human-review simulations, exit 0.
+
+These are engineering checks only. No actual OMP host run exercised A1; earlier C2 host evidence applies to the code version frozen for that run, not to new host execution. The snapshot is a same-read text capture, not a guarantee of later filesystem state or future file integrity, and receipts cover only the listed conditions on the supplied bytes; the checker makes no filesystem, process or model call. No A2 consumer, live-work binding, store, entry, CLI or permission change was made, and no default policy changed.
+
 ## Commands
 
 ```sh
