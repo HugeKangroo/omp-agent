@@ -11,13 +11,13 @@ import {
   type ResolveModelPort,
 } from "./agent-definition.ts";
 import {
-  AGENT_DEFINITION_STATUS_COMMAND,
   AGENT_DEFINITION_TOOL,
   DEFINITION_BINDING_COMPANION_TOOLS,
   type DefinitionLoader,
 } from "./definition-binding.ts";
 import {
   createDefinedNativeEntry,
+  type DefinedNativeContext,
   type DefinedNativeEntryOptions,
   type DefinedNativePorts,
   type DefinedOmpApi,
@@ -59,8 +59,6 @@ const NATIVE_SKILLS_SPECIFIER = "@oh-my-pi/pi-coding-agent/extensibility/skills"
 const NATIVE_SETTINGS_SPECIFIER = "@oh-my-pi/pi-coding-agent/config/settings";
 const NATIVE_REGISTRY_SPECIFIER = "@oh-my-pi/pi-coding-agent/config/registry";
 const ROLE_FRAME = "\u2042 Role\n{{agent}}\n\u2042 Coop";
-const STATUS_COMMAND_INPUT = `/${AGENT_INSTANCES_STATUS_COMMAND}`;
-const DEFINITION_STATUS_COMMAND_INPUT = `/${AGENT_DEFINITION_STATUS_COMMAND}`;
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 20_000;
 const MAX_STARTUP_TIMEOUT_MS = 25_000;
@@ -634,18 +632,6 @@ function abortNow(context: NativeContext): void {
   }
 }
 
-function isExactStatusCommand(event: unknown): boolean {
-  return isRecord(event)
-    && typeof event.text === "string"
-    && event.text.trim() === STATUS_COMMAND_INPUT;
-}
-
-function isExactDefinitionStatusCommand(event: unknown): boolean {
-  return isRecord(event)
-    && typeof event.text === "string"
-    && event.text.trim() === DEFINITION_STATUS_COMMAND_INPUT;
-}
-
 function readSkillMetadata(raw: unknown): DefinitionSkillMetadata[] {
   if (!Array.isArray(raw)) throw new Error("getActiveSkills() did not return the native Skill array.");
   return raw.map((entry, index) => {
@@ -1188,28 +1174,32 @@ function compositionApi(pi: InstancedOmpApi): DefinedOmpApi {
   }) as DefinedOmpApi;
 }
 
+function showInstanceStatus(factory: FactoryContext, context: DefinedNativeContext): void {
+  let text: string;
+  try {
+    text = JSON.stringify(buildStatus(factory));
+  } catch (error) {
+    text = JSON.stringify(buildStatusFailure(factory, error));
+  }
+  try {
+    if (context.hasUI === true && typeof context.ui?.notify === "function") {
+      context.ui.notify(text, "info");
+      return;
+    }
+    // Never write raw JSON to stdout: the host owns that stream in RPC.
+    stderr("agent_instances_status", { text });
+  } catch {
+    // Display failure is not a gate decision.
+  }
+}
+
 function registerStatusCommand(pi: InstancedOmpApi, factory: FactoryContext): boolean {
   if (typeof pi.registerCommand !== "function") return false;
   try {
     pi.registerCommand(AGENT_INSTANCES_STATUS_COMMAND, {
       description: "Show read-only bounded native child instance status.",
       handler(_args, context) {
-        let text: string;
-        try {
-          text = JSON.stringify(buildStatus(factory));
-        } catch (error) {
-          text = JSON.stringify(buildStatusFailure(factory, error));
-        }
-        try {
-          if (context.hasUI === true && typeof context.ui?.notify === "function") {
-            context.ui.notify(text, "info");
-            return;
-          }
-          // Never write raw JSON to stdout: the host owns that stream in RPC.
-          stderr("agent_instances_status", { text });
-        } catch {
-          // Display failure is not a gate decision.
-        }
+        showInstanceStatus(factory, context);
       },
     });
     return true;
@@ -2661,6 +2651,12 @@ export function createInstancedNativeEntry(
     stderr("flag_registration_failed", { reason: errorMessage(error) });
   }
 
+  // This is the single fixed seam for D1's early instance-status display. It
+  // is not a router: the name is fixed by D1, and D1 still runs its own
+  // controller gate first. Before synchronous registration below this returns
+  // no match; a missing/throwing registrar stays unregistered and D1 emits a
+  // local unavailable diagnostic instead of a status/binding bypass.
+  let statusFactory: FactoryContext | null = null;
   const d1Options: DefinedNativeEntryOptions = {
     ...(options.mainDefinitionPath === undefined ? {} : { definitionPath: options.mainDefinitionPath }),
     ...(options.nativePorts === undefined ? {} : {
@@ -2672,6 +2668,16 @@ export function createInstancedNativeEntry(
     }),
     ...(options.loadMainDefinition === undefined ? {} : { loadDefinition: options.loadMainDefinition }),
     startupTimeoutMs: d1TimeoutMs,
+    statusComposition: {
+      instanceStatus: {
+        isRegistered: () => statusFactory !== null && statusFactory.statusCommandRegistered,
+        show(context) {
+          if (statusFactory !== null && statusFactory.statusCommandRegistered) {
+            showInstanceStatus(statusFactory, context);
+          }
+        },
+      },
+    },
   };
   definitionEntry = createDefinedNativeEntry(compositionApi(pi), d1Options);
 
@@ -2703,6 +2709,8 @@ export function createInstancedNativeEntry(
     disposed: false,
   };
   factory.statusCommandRegistered = registerStatusCommand(pi, factory);
+  // Readiness is published only after the synchronous registrar succeeded.
+  if (factory.statusCommandRegistered) statusFactory = factory;
   factory.eventBusSubscribed = subscribeLifecycle(factory);
 
   pi.on("session_start", async (_event, context) => {
@@ -2733,7 +2741,7 @@ export function createInstancedNativeEntry(
     }
   });
 
-  pi.on("input", (event, context) => {
+  pi.on("input", (_event, context) => {
     try {
       const facts = readHostFacts(context);
       if (factory.disposed) {
@@ -2745,11 +2753,8 @@ export function createInstancedNativeEntry(
         abortNow(context);
         return { handled: true };
       }
-      // The exact read-only commands must reach host dispatch even when this
-      // instance layer failed. D1's own input gate still owns
-      // /agent-definition-status authorization and identity checks.
-      if (factory.statusCommandRegistered && isExactStatusCommand(event)) return undefined;
-      if (isExactDefinitionStatusCommand(event)) return undefined;
+      // D1's earlier input gate owns both reserved diagnostics. This layer
+      // keeps only its existing main/root authorization for other input.
       const root = moduleRoot;
       if (root === null || root.factoryId !== factory.id) return { handled: true };
       if (!refreshRoot(factory, root, pi, context)) return { handled: true };

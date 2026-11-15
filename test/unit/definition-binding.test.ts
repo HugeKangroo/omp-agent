@@ -336,7 +336,11 @@ class Host {
     for (const handler of this.handlers.get(type) ?? []) {
       const result = await handler({ ...current, type }, context);
       last = result;
-      if (type === "input" && isRecord(result) && result.handled === true) return result;
+      if (type === "input" && isRecord(result)) {
+        if (result.handled === true) return result;
+        if (typeof result.text === "string") current = { ...current, text: result.text };
+        if ("images" in result) current = { ...current, images: result.images };
+      }
       if (type === "tool_call" && isRecord(result) && result.block === true) return result;
       if (type === "before_agent_start" && isRecord(result) && Array.isArray(result.systemPrompt)) {
         current = { ...current, systemPrompt: result.systemPrompt };
@@ -349,8 +353,52 @@ class Host {
     await this.emit("session_start", {}, context);
   }
 
-  async input(text: string, context: NativeContext = this.context): Promise<unknown> {
-    return await this.emit("input", { text, source: "rpc" }, context);
+  async input(
+    text: string,
+    context: NativeContext = this.context,
+    options: { readonly source?: string; readonly images?: unknown } = {},
+  ): Promise<unknown> {
+    return await this.emit("input", {
+      text,
+      source: options.source ?? "rpc",
+      ...("images" in options ? { images: options.images } : {}),
+    }, context);
+  }
+
+  /**
+   * Minimal fixed-runner analogue: apply input transforms, stop on handled,
+   * otherwise dispatch the transformed slash command name to this fake
+   * registry. This is the control that makes command-collision assertions
+   * meaningful instead of trivially relying on `input` never dispatching.
+   */
+  async submit(
+    text: string,
+    options: { readonly source?: string; readonly images?: unknown } = {},
+  ): Promise<{ readonly handled: boolean; readonly command?: string }> {
+    let current: Record<string, unknown> = {
+      text,
+      source: options.source ?? "rpc",
+      ...("images" in options ? { images: options.images } : {}),
+    };
+    for (const handler of this.handlers.get("input") ?? []) {
+      const result = await handler({ ...current, type: "input" }, this.context);
+      if (isRecord(result)) {
+        if (result.handled === true) return { handled: true };
+        if (typeof result.text === "string") current = { ...current, text: result.text };
+        if ("images" in result) current = { ...current, images: result.images };
+      }
+    }
+    const trimmed = String(current.text).trim();
+    const match = /^\/([^\s]+)(?:\s+(.*))?$/s.exec(trimmed);
+    const name = match?.[1];
+    if (name !== undefined) {
+      const command = this.commands.get(name);
+      if (command !== undefined) {
+        await command(match?.[2] ?? "", this.context);
+        return { handled: false, command: name };
+      }
+    }
+    return { handled: false };
   }
 
   async prompt(prompt: string, context: NativeContext = this.context): Promise<{ systemPrompt?: string[] } | undefined> {
@@ -448,6 +496,20 @@ function reportDetails(result: NativeToolResult): Record<string, any> {
 
 function statusOf(control: DefinedNativeEntryControls): Record<string, any> {
   return control.controller.getStatus();
+}
+
+async function inspectWork(host: Host, toolCallId: string): Promise<Record<string, any>> {
+  const result = await host.callTool(AGENT_WORK, toolCallId, { action: "inspect" });
+  if ("blocked" in result) throw new Error("agent_work inspect was unexpectedly blocked");
+  expect(result.isError).not.toBe(true);
+  return result.details as Record<string, any>;
+}
+
+async function stopAdvisory(host: Host): Promise<Record<string, any> | undefined> {
+  return await host.emit("session_stop", {
+    signal: new AbortController().signal,
+    stop_hook_active: false,
+  }, host.context) as Record<string, any> | undefined;
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
@@ -795,11 +857,22 @@ describe("optional main definition binding", () => {
     expect(loaderCalls).toBe(1);
 
     expect(await host.input("ordinary failed work")).toEqual({ handled: true });
-    expect(await host.input("  /agent-definition-status  ")).toBeUndefined();
+    const displayed = host.notifications.length;
+    expect(await host.input("  /agent-definition-status  ")).toEqual({ handled: true });
+    expect(host.notifications).toHaveLength(displayed + 1);
+    expect(host.notifications.at(-1)).toContain('"phase":"failed"');
+    expect(host.notifications.at(-1)).toContain("missing Skill");
+
     expect(await host.input("/agent-definition-status extra")).toEqual({ handled: true });
+    expect(host.notifications).toHaveLength(displayed + 2);
+    expect(host.notifications.at(-1)).toContain("accepts no arguments or images");
+    expect(host.notifications.at(-1)).not.toContain('"phase"');
     expect(await host.input("//agent-definition-status")).toEqual({ handled: true });
+    expect(host.notifications.at(-1)).not.toContain('"phase"');
     expect(await host.input("agent-definition-status")).toEqual({ handled: true });
+    expect(host.notifications.at(-1)).not.toContain('"phase"');
     expect(await host.input("/agent-definition-status-other")).toEqual({ handled: true });
+    expect(host.notifications.at(-1)).not.toContain('"phase"');
 
     const command = host.commands.get("agent-definition-status");
     expect(command).toBeDefined();
@@ -839,8 +912,13 @@ describe("optional main definition binding", () => {
       await control.controller.whenIdle();
       expect(statusOf(control).phase).toBe("failed");
       expect(host.commands.has("agent-definition-status")).toBe(false);
+      // The recognized token is refused locally instead of being queued or
+      // sent to an observer/provider; it never becomes a status bypass.
       expect(await host.input("/agent-definition-status")).toEqual({ handled: true });
+      expect(host.notifications.at(-1)).toContain("agent-definition-status is unavailable");
+      expect(host.notifications.at(-1)).not.toContain('"phase"');
       expect(await host.input("  /agent-definition-status  ")).toEqual({ handled: true });
+      expect(host.notifications.at(-1)).toContain("agent-definition-status is unavailable");
       control.dispose();
     }
   });
@@ -851,12 +929,296 @@ describe("optional main definition binding", () => {
     const control = startEntry(host, fixture);
     await host.sessionStart();
     expect(host.commands.has("agent-definition-status")).toBe(true);
+    const displayed = host.notifications.length;
     expect(await host.input("/agent-definition-status")).toEqual({ handled: true });
+    expect(host.notifications).toHaveLength(displayed + 1);
+    expect(host.notifications.at(-1)).not.toContain('"phase"');
     expect(await host.input("  /agent-definition-status  ")).toEqual({ handled: true });
+    expect(host.notifications).toHaveLength(displayed + 2);
+    expect(host.notifications.at(-1)).not.toContain('"phase"');
     const status = statusOf(control);
     expect(status.phase).toBe("failed");
     expect(status.failure).toContain("identity is unavailable");
     control.dispose();
+  });
+
+  test("local status input preserves active and ended work generation, calls and reminder", async () => {
+    const fixture = await definitionFixture({ name: "local-status", body: "body", tools: ["read"] });
+    const host = newHost(fixture);
+    const control = startEntry(host, fixture);
+    await host.sessionStart();
+    await control.controller.whenIdle();
+    expect(statusOf(control).phase).toBe("bound");
+
+    await host.input("status work");
+    expect(await host.prompt("status work")).toBeDefined();
+    await host.observe("status-read", "read", "observed");
+    const before = await inspectWork(host, "inspect-status-before");
+    expect(before.current.status).toBe("active");
+    expect(before.pendingInputs.count).toBe(0);
+
+    const displayed = host.notifications.length;
+    expect(await host.input("  /agent-definition-status  ")).toEqual({ handled: true });
+    expect(await host.input("/agent-definition-status")).toEqual({ handled: true });
+    expect(host.notifications).toHaveLength(displayed + 2);
+    for (const notification of host.notifications.slice(displayed)) {
+      expect(notification).toContain('"phase":"bound"');
+    }
+    const after = await inspectWork(host, "inspect-status-after");
+    expect(after.current.observationId).toBe(before.current.observationId);
+    expect(after.current.generation).toBe(before.current.generation);
+    expect(after.current.calls.filter((call: any) => call.toolName !== AGENT_WORK))
+      .toEqual(before.current.calls.filter((call: any) => call.toolName !== AGENT_WORK));
+    expect(after.current.reminder).toEqual(before.current.reminder);
+    expect(after.pendingInputs.count).toBe(0);
+
+    await host.emit("agent_end", { willContinue: false });
+    const endedBefore = await inspectWork(host, "inspect-ended-status-before");
+    expect(endedBefore.current.status).toBe("ended");
+    expect(await host.input("/agent-definition-status")).toEqual({ handled: true });
+    expect(host.notifications).toHaveLength(displayed + 3);
+    const endedAfter = await inspectWork(host, "inspect-ended-status-after");
+    expect(endedAfter.current.status).toBe("ended");
+    expect(endedAfter.current.observationId).toBe(endedBefore.current.observationId);
+    expect(endedAfter.current.generation).toBe(endedBefore.current.generation);
+    expect(endedAfter.current.calls.filter((call: any) => call.toolName !== AGENT_WORK))
+      .toEqual(endedBefore.current.calls.filter((call: any) => call.toolName !== AGENT_WORK));
+    expect(endedAfter.current.reminder).toEqual(endedBefore.current.reminder);
+    expect(endedAfter.pendingInputs.count).toBe(0);
+  });
+
+  test("local status input neither clears nor manufactures genuine pending ingress", async () => {
+    const fixture = await definitionFixture({ name: "pending-status", body: "body", tools: ["read"] });
+    const host = newHost(fixture);
+    const control = startEntry(host, fixture);
+    await host.sessionStart();
+    await control.controller.whenIdle();
+
+    await host.input("pending genuine input");
+    const before = await inspectWork(host, "inspect-pending-before");
+    expect(before.current).toBeNull();
+    expect(before.pendingInputs.count).toBe(1);
+    expect(await host.input("/agent-definition-status")).toEqual({ handled: true });
+    const afterStatus = await inspectWork(host, "inspect-pending-after-status");
+    expect(afterStatus.current).toBeNull();
+    expect(afterStatus.pendingInputs.count).toBe(1);
+
+    await host.prompt("pending genuine input");
+    const prepared = await inspectWork(host, "inspect-pending-prepared");
+    expect(prepared.current.request.attribution).toBe("matched-user-input");
+    expect(prepared.current.request.excerpt).toBe("pending genuine input");
+    expect(prepared.pendingInputs.count).toBe(0);
+  });
+
+  test("repeated identical pending ingress keeps its ambiguity across a local status input", async () => {
+    const fixture = await definitionFixture({ name: "ambiguous-status", body: "body", tools: ["read"] });
+    const host = newHost(fixture);
+    const control = startEntry(host, fixture);
+    await host.sessionStart();
+    await control.controller.whenIdle();
+
+    await host.input("ambiguous genuine input");
+    await host.input("ambiguous genuine input");
+    expect(await host.input("/agent-definition-status")).toEqual({ handled: true });
+    await host.prompt("ambiguous genuine input");
+    const ambiguous = await inspectWork(host, "inspect-pending-ambiguous");
+    expect(ambiguous.current.request.attribution).toBe("unknown");
+    expect(ambiguous.current.evidence.unavailableReason).toContain("ambiguous");
+    expect(ambiguous.pendingInputs.count).toBe(0);
+  });
+
+  test("local status input displays a resolving binding without setters or reload", async () => {
+    const fixture = await definitionFixture({ name: "resolving-status", body: "body", tools: ["read"] });
+    const host = newHost(fixture);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let loaderCalls = 0;
+    const control = startEntry(host, fixture, {
+      loadDefinition: async (input) => {
+        loaderCalls += 1;
+        await gate;
+        return await loadDefinitionSnapshot({
+          definitionPath: input.definitionPath,
+          workspaceRoot: input.workspaceRoot,
+          parseAgent: fixture.ports.parseAgent,
+          parseFrontmatter: fixture.ports.parseFrontmatter,
+          availableSkills: fixture.ports.getActiveSkills().map((skill) => skill as DefinitionSkillMetadata),
+          availableTools: input.availableTools,
+          currentModel: input.currentModel,
+          resolveModel: input.resolveModel,
+          nativeSource: "explicit",
+        });
+      },
+    });
+    const starting = host.sessionStart();
+    expect(statusOf(control).phase).toBe("resolving");
+    const before = {
+      modelCalls: host.modelCalls.length,
+      toolSets: host.toolSets.length,
+      modelResolves: host.modelResolveCalls,
+      aborts: host.aborts,
+    };
+    const displayed = host.notifications.length;
+    expect(await host.input("/agent-definition-status")).toEqual({ handled: true });
+    expect(host.notifications).toHaveLength(displayed + 1);
+    expect(host.notifications.at(-1)).toContain('"phase":"resolving"');
+    expect(loaderCalls).toBe(1);
+    expect(host.modelCalls).toHaveLength(before.modelCalls);
+    expect(host.toolSets).toHaveLength(before.toolSets);
+    expect(host.modelResolveCalls).toBe(before.modelResolves);
+    expect(host.aborts).toBe(before.aborts);
+    release();
+    await starting;
+    await control.controller.whenIdle();
+    expect(statusOf(control).phase).toBe("bound");
+  });
+
+  test("status input preserves the issued one-shot advisory and its work generation", async () => {
+    const fixture = await definitionFixture({ name: "advisory-status", body: "body", tools: ["read"] });
+    const host = newHost(fixture);
+    const control = startEntry(host, fixture);
+    await host.sessionStart();
+    await control.controller.whenIdle();
+
+    await host.input("advisory work");
+    expect(await host.prompt("advisory work")).toBeDefined();
+    await host.observe("advisory-read", "read", "observed");
+    const before = await inspectWork(host, "inspect-advisory-before");
+    const reminder = await stopAdvisory(host);
+    expect(reminder?.continue).toBe(true);
+    const reminderText = String(reminder?.additionalContext);
+    expect(reminderText).toContain("one-time advisory");
+
+    const displayed = host.notifications.length;
+    expect(await host.input("/agent-definition-status")).toEqual({ handled: true });
+    expect(await host.input("/agent-definition-status")).toEqual({ handled: true });
+    expect(host.notifications).toHaveLength(displayed + 2);
+
+    expect(await host.prompt(reminderText)).toBeDefined();
+    const after = await inspectWork(host, "inspect-advisory-after");
+    expect(after.current.observationId).toBe(before.current.observationId);
+    expect(after.current.generation).toBe(before.current.generation);
+    expect(after.current.request.attribution).toBe("matched-user-input");
+    expect(after.current.request.excerpt).toBe("advisory work");
+    expect(after.current.reminder.used).toBe(true);
+    expect(after.pendingInputs.count).toBe(0);
+    expect((await stopAdvisory(host))?.continue).not.toBe(true);
+  });
+
+  test("malformed reserved diagnostics are locally refused without queueing", async () => {
+    const fixture = await definitionFixture({ name: "malformed-status", body: "body", tools: ["read"] });
+    const host = newHost(fixture);
+    const control = startEntry(host, fixture);
+    await host.sessionStart();
+    await control.controller.whenIdle();
+    await host.input("pending before malformed diagnostics");
+
+    const displayed = host.notifications.length;
+    expect(await host.input("/agent-definition-status extra")).toEqual({ handled: true });
+    expect(host.notifications.at(-1)).toContain("accepts no arguments or images");
+    expect(await host.input("/agent-definition-status", host.context, { images: [{ type: "image" }] }))
+      .toEqual({ handled: true });
+    expect(host.notifications.at(-1)).toContain("accepts no arguments or images");
+    expect(await host.input("/agent-definition-status", host.context, { images: null }))
+      .toEqual({ handled: true });
+    expect(host.notifications.at(-1)).toContain("accepts no arguments or images");
+    expect(host.notifications).toHaveLength(displayed + 3);
+
+    const pending = await inspectWork(host, "inspect-malformed-pending");
+    expect(pending.current).toBeNull();
+    expect(pending.pendingInputs.count).toBe(1);
+
+    expect(await host.input("\t/agent-definition-status\n", host.context, { images: [] }))
+      .toEqual({ handled: true });
+    expect(host.notifications).toHaveLength(displayed + 4);
+    expect(host.notifications.at(-1)).toContain('"phase":"bound"');
+  });
+
+  test("unsupported status sources and lookalikes keep the existing gate path", async () => {
+    const fixture = await definitionFixture({ name: "source-status", body: "body", tools: ["read"] });
+    const host = newHost(fixture);
+    const control = startEntry(host, fixture);
+    await host.sessionStart();
+    await control.controller.whenIdle();
+
+    const displayed = host.notifications.length;
+    expect(await host.input("/agent-definition-status", host.context, { source: "extension" })).toBeUndefined();
+    expect(host.notifications).toHaveLength(displayed);
+    expect(await host.input("//agent-definition-status")).toBeUndefined();
+    expect(await host.input("/agent-definition-status-other")).toBeUndefined();
+    expect(await host.input("prefix /agent-definition-status")).toBeUndefined();
+    expect(host.notifications).toHaveLength(displayed);
+    const queued = await inspectWork(host, "inspect-source-status");
+    expect(queued.current).toBeNull();
+    expect(queued.pendingInputs.count).toBe(4);
+  });
+
+  test("earlier transforms are matched as delivered; later transforms and same-name commands do not run", async () => {
+    const fixture = await definitionFixture({ name: "transform-status", body: "body", tools: ["read"] });
+    const host = newHost(fixture);
+    let transformAway = false;
+    host.handlers.set("input", [(event) => {
+      if (!isRecord(event) || typeof event.text !== "string") return undefined;
+      if (event.text === "/to-status") return { text: "/agent-definition-status" };
+      if (event.text === "/to-status-with-image") {
+        return { text: "/agent-definition-status", images: [{ type: "image" }] };
+      }
+      if (event.text === "/agent-definition-status" && transformAway) {
+        return { text: "ordinary transformed work" };
+      }
+      return undefined;
+    }]);
+    const control = startEntry(host, fixture);
+    await host.sessionStart();
+    await control.controller.whenIdle();
+    expect(statusOf(control).phase).toBe("bound");
+
+    const displayed = host.notifications.length;
+    expect(await host.submit("/to-status")).toEqual({ handled: true });
+    expect(host.notifications).toHaveLength(displayed + 1);
+    expect(host.notifications.at(-1)).toContain('"phase":"bound"');
+
+    // The driver preserves transformed images, so the attachment cannot be
+    // silently dropped while the text is rewritten into a status token.
+    expect(await host.submit("/to-status-with-image")).toEqual({ handled: true });
+    expect(host.notifications).toHaveLength(displayed + 2);
+    expect(host.notifications.at(-1)).toContain("accepts no arguments or images");
+
+    transformAway = true;
+    expect(await host.submit("/agent-definition-status")).toEqual({ handled: false });
+    expect(host.notifications).toHaveLength(displayed + 2);
+
+    transformAway = false;
+    let laterTransforms = 0;
+    host.handlers.get("input")!.push((event) => {
+      if (isRecord(event) && event.text === "/agent-definition-status") {
+        laterTransforms += 1;
+        return { text: "/agent-definition-status extra" };
+      }
+      return undefined;
+    });
+    let sameNameCommandRuns = 0;
+    host.commands.set("agent-definition-status", () => {
+      sameNameCommandRuns += 1;
+    });
+    expect(await host.submit("/agent-definition-status")).toEqual({ handled: true });
+    expect(laterTransforms).toBe(0);
+    expect(sameNameCommandRuns).toBe(0);
+    expect(host.notifications).toHaveLength(displayed + 3);
+
+    // Control: the same driver really does dispatch a non-reserved command
+    // when the input stage does not handle it.
+    let controlCommandRuns = 0;
+    host.commands.set("control-diagnostic", () => {
+      controlCommandRuns += 1;
+    });
+    expect(await host.submit("/control-diagnostic")).toEqual({
+      handled: false,
+      command: "control-diagnostic",
+    });
+    expect(controlCommandRuns).toBe(1);
   });
 
   test("model setter false, tool setter failure and later drift fail explicitly", async () => {
@@ -1207,6 +1569,9 @@ describe("optional main definition binding", () => {
     expect(subStatus.failure).toContain("Subagent");
     expect(subStatus.restartRequired).toBe(false);
     expect(await subHost.input("sub input stays native")).toBeUndefined();
+    const subDisplayed = subHost.notifications.length;
+    expect(await subHost.input("/agent-definition-status")).toBeUndefined();
+    expect(subHost.notifications).toHaveLength(subDisplayed);
     expect(await subHost.prompt("sub prompt")).toBeUndefined();
     expect(await subHost.emit("tool_call", { toolCallId: "sub-call", toolName: "read", input: {} })).toBeUndefined();
     expect(subHost.modelCalls).toHaveLength(0);

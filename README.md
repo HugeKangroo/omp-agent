@@ -121,6 +121,8 @@ omp --cwd "/absolute/path/to/workspace" --no-extensions \
 
 启动时会在异步原生模块导入之前安装拦截。缺少或无效的解析依赖、无效定义、未知身份、已有受管 TaskOwner、已知的模型/工具/会话/工作区漂移或导航都会使绑定失败，并阻止普通输入、提示和工具调用。失败后 `/agent-definition-status` 与只读 `agent_definition` 工具仍可诊断，但不会修复、重载或重新绑定。绑定成功后，定义与所选 Skill 的初始文本被冻结，状态中的快照版本保持稳定；修改文件不会影响当前进程，变更定义必须启动新的 OMP 进程。定义版本只是内容快照标识，不是任务要求版本。
 
+主会话交互式/RPC 输入中的精确 `/agent-definition-status` 会在本地显示只读绑定状态：不创建新工作、不清除已发出的一次性提醒；带参数或图片会被拒绝，命令注册缺失或失败时返回不可用诊断。独立入口只保留这一个状态名；`/agent-instances-status` 只在可选实例组合中存在，且需要主绑定校验通过和实例命令已注册。状态读取使用最新事实，检测到实际绑定漂移时可能拒绝已变化的绑定；显示本身失败会被本地消费，不会触发模型或创建工作，也不保证追加可见通知，且不构成绑定失败。
+
 D1 入口自身的验证范围固定为 macOS、OMP 18.20.2 与 Bun 1.4.0 的主会话，只支持一个显式绑定，不能与受管 TaskOwner 同时启用，也不支持多实例、子 Agent 委派或跨实例 Flow；需要限定直接子任务时使用下面的原生子实例入口。冻结范围仅限初始定义与所选 Skill 文本，不冻结脚本、模板或 `skill://` 资源。诊断可能只报告 `hasPendingMessages` 布尔值，没有精确队列计数；已观察到 abort 后 `sessionSettled:false`，不承诺恢复、队列清除或结算。已安装的 input、before_agent_start 与 tool 钩子不覆盖每个 provider 请求、已在运行的工具、缺失插件或操作系统沙箱；普通 OMP 工具副作用仍由宿主权威控制，工作观察报告也不等于语义验证或任务接收。加载该入口不会自动应用策略，也不修改默认入口或默认策略。
 
 ### 原生子实例入口（实验）
@@ -191,6 +193,8 @@ omp --cwd "/absolute/path/to/workspace" --no-extensions \
 默认上限为 8 份选中定义、16 个 pending 准入、64 条保留记录和 8 MiB 初始 Role/Skill 正文文本；已用调用 ID 集合同样有界。记录不会驱逐，也没有持久恢复；容量满时拒绝新委派并要求重启。8 MiB 只是初始正文文本上限，不是整个进程的内存预算，也不是 frontmatter 大小限制。
 
 只读 `/agent-instances-status`（或进程内 `getStatus()`）返回当次构建并冻结的非权威诊断。状态 JSON 上限 64 KiB：正常时 `view.complete=true`；超限时 `view.complete=false`、`reason:"encoded-size-limit"`，给出完整详情的字节数与摘要、省略的 selections/pending/instances 数量及阶段计数，详情数组省略但不改变内部记录，也不分页。状态构建失败时 `view.reason:"status-unavailable"`，完整详情指标和未知计数为 `null`，回退载荷的字节与摘要另以 `fallbackBytes`/`fallbackSha256` 单独命名；未知不等于零。`/agent-definition-status` 仍保留。
+
+实例状态输入沿用本地早期识别，仅在主绑定校验通过且实例命令已注册时显示；实例根失败仍可显示只读状态，主绑定失败或解析中时拒绝实例诊断，`/agent-definition-status` 仍可用。该显示同样不创建 pending 工作、不清除一次性提醒；默认包入口仍为 `daily-entry.ts`。
 
 固定宿主的有界负向验证还覆盖缺失 Skill 与不支持设置：缺失 Skill 的一次 `task` 尝试在子会话启动前被预检阻止；不支持设置使实例层启动失败，D1 主定义仍保持绑定，且无 provider 派发。生命周期 `completed`、`taskResultObserved` 与 Role/Skill 文本门通过都只是观察，不等于产物或语义接收；结果信封、取消、被取代工作和产物关联属于下一阶段（D2-C），尚未实现。不承诺并发、恢复或无上限长会话；这是固定宿主的实验性有界兼容入口，不是完整 D2、模型质量或最终产品就绪证明。
 

@@ -77,6 +77,23 @@ export interface DefinedNativePorts {
   readonly getActiveSkills: () => readonly unknown[];
 }
 
+/**
+ * INTERNAL trusted-composition seam used only by the opt-in instanced entry.
+ *
+ * It is deliberately not a command router or registry. The sibling entry can
+ * expose exactly its fixed `/agent-instances-status` display; D1 still runs
+ * its own binding gate before that display, so a failed D1 binding is never
+ * bypassed. A missing slot leaves the command on the existing host path.
+ */
+export interface DefinedNativeStatusComposition {
+  readonly instanceStatus?: {
+    /** True only after the sibling synchronously registered its command. */
+    isRegistered(): boolean;
+    /** Called only for the fixed instance status token after D1's gate allows it. */
+    show(context: DefinedNativeContext): void;
+  };
+}
+
 export interface DefinedNativeEntryOptions {
   /** Test/integration override; production reads the registered string flag. */
   readonly definitionPath?: string;
@@ -87,6 +104,8 @@ export interface DefinedNativeEntryOptions {
   /** Bounded session_start wait; default 20s, clamped to at most 25s. */
   readonly startupTimeoutMs?: number;
   readonly diagnostic?: (event: DefinitionBindingDiagnostic) => void;
+  /** INTERNAL trusted composition only; never a public command capability. */
+  readonly statusComposition?: DefinedNativeStatusComposition;
 }
 
 export interface DefinedNativeEntryControls {
@@ -149,17 +168,52 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 const STATUS_COMMAND_INPUT = `/${AGENT_DEFINITION_STATUS_COMMAND}`;
+// The sibling entry owns this reserved name; D1 only recognizes it when that
+// entry supplies the fixed composition slot below. This is not a command
+// registry lookup.
+const INSTANCE_STATUS_COMMAND_INPUT = "/agent-instances-status";
+
+type DiagnosticCommand = "definition" | "instances";
+type DiagnosticInput =
+  | { readonly kind: "exact"; readonly command: DiagnosticCommand }
+  | { readonly kind: "malformed"; readonly command: DiagnosticCommand };
 
 /**
- * The fixed host runs the `input` hook before slash-command dispatch, so a
- * failed binding would otherwise swallow its own read-only status command.
- * Match only that exact trimmed command; prefixes, suffixes, aliases and every
- * other slash command stay behind the binding gate.
+ * The fixed host runs the `input` hook before slash-command dispatch. Recognize
+ * only the two fixed diagnostic tokens after earlier transforms, from genuine
+ * interactive/RPC ingress, and never create a general slash-command bypass.
+ *
+ * - Exact token, no images: successful diagnostic syntax.
+ * - Exact token with nonempty or malformed images: malformed diagnostic syntax.
+ * - Token followed by whitespace arguments: malformed diagnostic syntax.
+ * - Prefix/suffix/lookalike names and ordinary prose: not recognized.
+ *
+ * Arguments are refused locally below rather than queued as task text or
+ * dispatched to an observer/provider.
  */
-function isExactStatusCommand(event: unknown): boolean {
-  return isRecord(event)
-    && typeof event.text === "string"
-    && event.text.trim() === STATUS_COMMAND_INPUT;
+function classifyDiagnosticInput(event: unknown): DiagnosticInput | null {
+  if (!isRecord(event) || typeof event.text !== "string") return null;
+  if (event.source !== "interactive" && event.source !== "rpc") return null;
+  const trimmed = event.text.trim();
+  const commands: readonly (readonly [DiagnosticCommand, string])[] = [
+    ["definition", STATUS_COMMAND_INPUT],
+    ["instances", INSTANCE_STATUS_COMMAND_INPUT],
+  ];
+  for (const [command, token] of commands) {
+    if (trimmed === token) {
+      const images = event.images;
+      if (images !== undefined && (!Array.isArray(images) || images.length !== 0)) {
+        return { kind: "malformed", command };
+      }
+      return { kind: "exact", command };
+    }
+    if (trimmed.length > token.length
+      && trimmed.startsWith(token)
+      && /\s/.test(trimmed[token.length] ?? "")) {
+      return { kind: "malformed", command };
+    }
+  }
+  return null;
 }
 
 function stderr(message: string, details?: unknown): void {
@@ -499,33 +553,66 @@ function registerDefinitionTool(pi: DefinedOmpApi, controller: DefinitionBinding
   }
 }
 
+function showStatusText(
+  context: DefinedNativeContext,
+  text: string,
+  type: "info" | "warning",
+  event: string,
+): void {
+  try {
+    if (context.hasUI === true && typeof context.ui?.notify === "function") {
+      context.ui.notify(text, type);
+      return;
+    }
+    // Never write raw JSON to stdout: the host owns that stream in RPC.
+    stderr(event, { text });
+  } catch {
+    // A status display failure is not a binding decision.
+  }
+}
+
+function showDefinitionStatus(
+  controller: DefinitionBindingController,
+  context: DefinedNativeContext,
+): void {
+  const facts = readFacts(context);
+  if (facts.agentKind === "main") {
+    // Refresh actual host facts before reading the frozen status; a stale
+    // bound claim after a model/tool change is not allowed.
+    controller.allowsObservation(facts);
+  }
+  const text = facts.agentKind === "main"
+    ? JSON.stringify(controller.getStatus())
+    : `agent-definition-status is main-session status only; the current agent identity is ${facts.agentKind} and has no main binding.`;
+  showStatusText(context, text, facts.agentKind === "main" ? "info" : "warning", "agent_definition_status");
+}
+
+function showDefinitionStatusUnavailable(context: DefinedNativeContext): void {
+  showStatusText(
+    context,
+    "agent-definition-status is unavailable: the host did not register the command; no binding status was read.",
+    "warning",
+    "agent_definition_status_refused",
+  );
+}
+
+function showDiagnosticSyntaxRefused(context: DefinedNativeContext, command: "definition" | "instances"): void {
+  const name = command === "definition" ? "agent-definition-status" : "agent-instances-status";
+  showStatusText(
+    context,
+    `${name} accepts no arguments or images; no command ran.`,
+    "warning",
+    command === "definition" ? "agent_definition_status_refused" : "agent_instances_status_refused",
+  );
+}
+
 function registerStatusCommand(pi: DefinedOmpApi, controller: DefinitionBindingController): boolean {
-  // The input exception exists only when the host actually registered the
-  // read-only command. An unavailable or throwing registrar leaves no bypass.
   if (typeof pi.registerCommand !== "function") return false;
   try {
     pi.registerCommand(AGENT_DEFINITION_STATUS_COMMAND, {
       description: "Show read-only agent definition binding status.",
       handler(_args, context) {
-        const facts = readFacts(context);
-        if (facts.agentKind === "main") {
-          // Refresh actual host facts before reading the frozen status; a
-          // stale bound claim after a model/tool change is not allowed.
-          controller.allowsObservation(facts);
-        }
-        const text = facts.agentKind === "main"
-          ? JSON.stringify(controller.getStatus())
-          : `agent-definition-status is main-session status only; the current agent identity is ${facts.agentKind} and has no main binding.`;
-        try {
-          if (context.hasUI === true && typeof context.ui?.notify === "function") {
-            context.ui.notify(text, facts.agentKind === "main" ? "info" : "warning");
-            return;
-          }
-          // Never write raw JSON to stdout: the host owns that stream in RPC.
-          stderr("agent_definition_status", { text });
-        } catch {
-          // A status display failure is not a binding decision.
-        }
+        showDefinitionStatus(controller, context);
       },
     });
     return true;
@@ -637,15 +724,51 @@ export function createDefinedNativeEntry(
     touch(context);
     try {
       const facts = readFacts(context);
-      // The host runs this hook before slash-command dispatch. Let only the
-      // exact registered read-only status command reach that dispatch while
-      // the binding is failed or resolving; ordinary work and every other
-      // command remain gated. Unknown identity is still fail-closed, and the
-      // before_agent_start gate still blocks any accidental prompt fallback.
-      if (statusCommandRegistered
-        && isExactStatusCommand(event)
-        && facts.agentKind === "main") {
-        return undefined;
+      if (facts.agentKind === "main") {
+        const diagnostic = classifyDiagnosticInput(event);
+        if (diagnostic?.command === "definition") {
+          // The definition diagnostic must remain able to explain a failed or
+          // resolving binding, so it precedes controller.onInput. Successful
+          // display requires the host's own registration; otherwise the same
+          // recognized token gets a local refusal, never a status/binding
+          // bypass and never the observer/provider path.
+          if (diagnostic.kind === "exact" && statusCommandRegistered) {
+            try {
+              showDefinitionStatus(controller, context);
+            } catch {
+              // The recognized diagnostic is consumed even when display fails.
+            }
+          } else if (diagnostic.kind === "malformed") {
+            showDiagnosticSyntaxRefused(context, "definition");
+          } else {
+            showDefinitionStatusUnavailable(context);
+          }
+          return { handled: true };
+        }
+        const composition = options.statusComposition?.instanceStatus;
+        if (diagnostic?.command === "instances" && composition !== undefined) {
+          // Instance status cannot bypass D1 authorization: failed, resolving,
+          // closed or unknown D1 states keep their existing gate decision.
+          const gate = controller.onInput(facts);
+          if (gate !== undefined) return gate;
+          if (diagnostic.kind === "malformed") {
+            showDiagnosticSyntaxRefused(context, "instances");
+          } else if (composition.isRegistered()) {
+            try {
+              composition.show(context);
+            } catch {
+              // The recognized diagnostic is consumed even when display fails.
+            }
+          } else {
+            showStatusText(
+              context,
+              "agent-instances-status is unavailable: the host did not register the command; no instance status was read.",
+              "warning",
+              "agent_instances_status_refused",
+            );
+          }
+          return { handled: true };
+        }
       }
       return controller.onInput(facts);
     } catch (error) {

@@ -194,6 +194,8 @@ interface HostOptions {
   readonly activeTools?: readonly string[];
   readonly hasUI?: boolean;
   readonly bus?: TestBus;
+  /** Synthetic host registrar behavior for both fixed status commands. */
+  readonly commandRegistration?: "ok" | "missing" | "throws";
 }
 
 interface TestBus {
@@ -238,6 +240,7 @@ class Host {
   sessionId: string;
   cwd: string;
   readonly hasUI: boolean;
+  readonly commandRegistration: "ok" | "missing" | "throws";
   aborts = 0;
 
   constructor(options: HostOptions = {}) {
@@ -251,6 +254,7 @@ class Host {
     this.currentModel = options.currentModel ?? MAIN_MODEL;
     this.activeTools = [...(options.activeTools ?? ["read", "task"])];
     this.hasUI = options.hasUI ?? true;
+    this.commandRegistration = options.commandRegistration ?? "ok";
     this.bus = options.bus ?? createTestBus();
     this.models = new Map(options.models ?? [
       ["fixture/main", MAIN_MODEL],
@@ -323,9 +327,14 @@ class Host {
       getFlag(name) {
         return host.flags.get(name);
       },
-      registerCommand(name, commandOptions) {
-        host.commands.set(name, commandOptions.handler as CommandHandler);
-      },
+      ...(host.commandRegistration === "missing" ? {} : {
+        registerCommand(name: string, commandOptions: { handler: CommandHandler }) {
+          if (host.commandRegistration === "throws") {
+            throw new Error("synthetic status command registration failure");
+          }
+          host.commands.set(name, commandOptions.handler);
+        },
+      }),
       getActiveTools() {
         return [...host.activeTools];
       },
@@ -347,7 +356,11 @@ class Host {
     for (const handler of this.handlers.get(type) ?? []) {
       const result = await handler({ ...current, type }, context);
       last = result;
-      if (type === "input" && isRecord(result) && result.handled === true) return result;
+      if (type === "input" && isRecord(result)) {
+        if (result.handled === true) return result;
+        if (typeof result.text === "string") current = { ...current, text: result.text };
+        if ("images" in result) current = { ...current, images: result.images };
+      }
       if (type === "tool_call" && isRecord(result) && result.block === true) return result;
       if (type === "before_agent_start" && isRecord(result) && Array.isArray(result.systemPrompt)) {
         current = { ...current, systemPrompt: result.systemPrompt };
@@ -360,8 +373,101 @@ class Host {
     await this.emit("session_start", {});
   }
 
-  async input(text: string): Promise<unknown> {
-    return await this.emit("input", { text, source: "rpc" });
+  async input(
+    text: string,
+    options: { readonly source?: string; readonly images?: unknown } = {},
+  ): Promise<unknown> {
+    return await this.emit("input", {
+      text,
+      source: options.source ?? "rpc",
+      ...("images" in options ? { images: options.images } : {}),
+    });
+  }
+
+  async prepare(prompt: string): Promise<unknown> {
+    return await this.emit("before_agent_start", {
+      reason: "prompt",
+      prompt,
+      systemPrompt: ["base"],
+    });
+  }
+
+  /**
+   * Minimal fixed-runner analogue: apply input transforms, stop on handled,
+   * otherwise dispatch the transformed slash command name to this fake
+   * registry. The dispatch control proves command-collision assertions.
+   */
+  async submit(
+    text: string,
+    options: { readonly source?: string; readonly images?: unknown } = {},
+  ): Promise<{ readonly handled: boolean; readonly command?: string }> {
+    let current: Record<string, unknown> = {
+      text,
+      source: options.source ?? "rpc",
+      ...("images" in options ? { images: options.images } : {}),
+    };
+    for (const handler of this.handlers.get("input") ?? []) {
+      const result = await handler({ ...current, type: "input" }, this.context);
+      if (isRecord(result)) {
+        if (result.handled === true) return { handled: true };
+        if (typeof result.text === "string") current = { ...current, text: result.text };
+        if ("images" in result) current = { ...current, images: result.images };
+      }
+    }
+    const trimmed = String(current.text).trim();
+    const match = /^\/([^\s]+)(?:\s+(.*))?$/s.exec(trimmed);
+    const name = match?.[1];
+    if (name !== undefined) {
+      const command = this.commands.get(name);
+      if (command !== undefined) {
+        await command(match?.[2] ?? "", this.context);
+        return { handled: false, command: name };
+      }
+    }
+    return { handled: false };
+  }
+
+  async observe(toolCallId: string, toolName: string, text: string): Promise<void> {
+    await this.emit("tool_call", { toolCallId, toolName, input: {} });
+    await this.emit("tool_result", {
+      toolCallId,
+      toolName,
+      input: {},
+      content: [{ type: "text", text }],
+      isError: false,
+    });
+  }
+
+  async work(toolCallId: string, params: unknown): Promise<NativeToolResult> {
+    await this.emit("tool_call", { toolCallId, toolName: NATIVE_WORK_TOOL, input: params });
+    const tool = this.tools.get(NATIVE_WORK_TOOL);
+    if (tool === undefined) throw new Error("agent_work was not registered");
+    const result = await tool.execute(toolCallId, params, undefined, undefined, this.context);
+    await this.emit("tool_result", {
+      toolCallId,
+      toolName: NATIVE_WORK_TOOL,
+      input: params,
+      content: result.content,
+      isError: result.isError === true,
+      details: result.details,
+    });
+    return result;
+  }
+
+  async stop(): Promise<{ continue?: boolean; additionalContext?: string } | undefined> {
+    const handlers = this.handlers.get("session_stop") ?? [];
+    let advisory: { continue?: boolean; additionalContext?: string } | undefined;
+    for (const handler of handlers) {
+      const result = await handler({
+        type: "session_stop",
+        signal: new AbortController().signal,
+        stop_hook_active: false,
+      }, this.context);
+      if (advisory === undefined && isRecord(result) && result.continue === true) {
+        advisory = result as { continue?: boolean; additionalContext?: string };
+      }
+    }
+    return advisory;
   }
 
   async prompt(systemPrompt: readonly string[]): Promise<unknown> {
@@ -420,6 +526,7 @@ interface RootOptions {
   readonly mainTools?: readonly string[];
   readonly main?: DefinitionSnapshot;
   readonly hostActiveTools?: readonly string[];
+  readonly commandRegistration?: "ok" | "missing" | "throws";
 }
 
 async function startRoot(options: RootOptions = {}): Promise<RootFixture> {
@@ -442,6 +549,7 @@ async function startRoot(options: RootOptions = {}): Promise<RootFixture> {
   });
   const host = new Host({
     activeTools: options.hostActiveTools ?? (options.mainTools ?? ["read", "task"]),
+    ...(options.commandRegistration === undefined ? {} : { commandRegistration: options.commandRegistration }),
   });
   const entry = createInstancedNativeEntry(host.pi, {
     mainDefinitionPath: main.definition.canonicalPath,
@@ -559,6 +667,12 @@ function skillMessage(snapshot: DefinitionSnapshot): Record<string, unknown> {
 
 function status(root: RootFixture): InstancedEntryStatus {
   return root.entry.getStatus();
+}
+
+async function inspectWork(root: RootFixture, toolCallId: string): Promise<Record<string, any>> {
+  const result = await root.host.work(toolCallId, { action: "inspect" });
+  expect(result.isError).not.toBe(true);
+  return result.details as Record<string, any>;
 }
 
 function records(root: RootFixture): InstancedEntryStatus["instances"] {
@@ -763,8 +877,15 @@ describe("opt-in native instance entry", () => {
     expect(status(root).phase).toBe("failed");
     expect(status(root).failure).toContain("task.batch");
     expect(status(root).main.phase).toBe("bound");
-    expect(await root.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND}`)).toBeUndefined();
-    expect(await root.host.input(`/${AGENT_DEFINITION_STATUS_COMMAND}`)).toBeUndefined();
+    const displayed = root.host.notifications.length;
+    expect(await root.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND}`)).toEqual({ handled: true });
+    expect(await root.host.input(`/${AGENT_DEFINITION_STATUS_COMMAND}`)).toEqual({ handled: true });
+    expect(root.host.notifications).toHaveLength(displayed + 2);
+    const instanceStatus = JSON.parse(String(root.host.notifications.at(-2)));
+    expect(instanceStatus.schema).toBe(INSTANCED_NATIVE_ENTRY_SCHEMA);
+    expect(instanceStatus.phase).toBe("failed");
+    expect(instanceStatus.main.phase).toBe("bound");
+    expect(JSON.parse(String(root.host.notifications.at(-1))).phase).toBe("bound");
     root.host.command(AGENT_INSTANCES_STATUS_COMMAND);
     const notified = root.host.notifications.at(-1);
     expect(notified).toBeDefined();
@@ -1524,14 +1645,321 @@ describe("opt-in native instance entry", () => {
     expect(status(root).main.phase).toBe("bound");
     await root.host.emit("session_shutdown", {});
     expect(status(root).phase).toBe("closed");
-    // D1's own input gate still sees this exact path and decides on it while
-    // the instance root is closed.
-    expect(await root.host.input(`/${AGENT_DEFINITION_STATUS_COMMAND}`)).toBeUndefined();
-    // The instance status command remains directly registered.
+    // D1's own input gate still diagnoses its closed binding locally, and it
+    // still authorizes the instance status token first. A closed D1 gate means
+    // the instance status is not displayed by the local slot.
+    expect(await root.host.input(`/${AGENT_DEFINITION_STATUS_COMMAND}`)).toEqual({ handled: true });
+    expect(JSON.parse(String(root.host.notifications.at(-1))).phase).toBe("disposed");
+    const beforeInstance = root.host.notifications.length;
+    expect(await root.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND}`)).toEqual({ handled: true });
+    expect(root.host.notifications).toHaveLength(beforeInstance + 1);
+    expect(root.host.notifications.at(-1)).not.toContain(INSTANCED_NATIVE_ENTRY_SCHEMA);
+    // The instance status command remains directly registered and observable.
     root.host.command(AGENT_INSTANCES_STATUS_COMMAND);
     const notified = JSON.parse(String(root.host.notifications.at(-1)));
     expect(notified.schema).toBe(INSTANCED_NATIVE_ENTRY_SCHEMA);
     expect(notified.phase).toBe("closed");
+  });
+
+  test("a disposed instance entry still reports its read-only status directly", async () => {
+    const root = await startRoot();
+    expect(status(root).phase).toBe("ready");
+    root.entry.dispose();
+    root.host.command(AGENT_INSTANCES_STATUS_COMMAND);
+    const shown = JSON.parse(String(root.host.notifications.at(-1)));
+    expect(shown.schema).toBe(INSTANCED_NATIVE_ENTRY_SCHEMA);
+    expect(shown.phase).toBe("closed");
+    expect(shown.factory.disposed).toBe(true);
+  });
+
+  test("local instance and D1 status input preserve active and ended work state", async () => {
+    const root = await startRoot();
+    expect(status(root).phase).toBe("ready");
+    expect(status(root).main.phase).toBe("bound");
+    await root.host.input("instance status work");
+    await root.host.prepare("instance status work");
+    await root.host.observe("instance-status-read", "read", "observed");
+    const before = await inspectWork(root, "inspect-instance-status-before");
+    expect(before.current.status).toBe("active");
+    expect(before.pendingInputs.count).toBe(0);
+
+    const displayed = root.host.notifications.length;
+    expect(await root.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND}`)).toEqual({ handled: true });
+    expect(await root.host.input(`/${AGENT_DEFINITION_STATUS_COMMAND}`)).toEqual({ handled: true });
+    expect(root.host.notifications).toHaveLength(displayed + 2);
+    const instanceStatus = JSON.parse(String(root.host.notifications.at(-2)));
+    expect(instanceStatus.schema).toBe(INSTANCED_NATIVE_ENTRY_SCHEMA);
+    expect(instanceStatus.phase).toBe("ready");
+    expect(instanceStatus.main.phase).toBe("bound");
+    expect(JSON.parse(String(root.host.notifications.at(-1))).phase).toBe("bound");
+
+    const after = await inspectWork(root, "inspect-instance-status-after");
+    expect(after.current.observationId).toBe(before.current.observationId);
+    expect(after.current.generation).toBe(before.current.generation);
+    expect(after.current.calls.filter((call: any) => call.toolName !== NATIVE_WORK_TOOL))
+      .toEqual(before.current.calls.filter((call: any) => call.toolName !== NATIVE_WORK_TOOL));
+    expect(after.current.reminder).toEqual(before.current.reminder);
+    expect(after.pendingInputs.count).toBe(0);
+
+    await root.host.emit("agent_end", { willContinue: false });
+    const endedBefore = await inspectWork(root, "inspect-instance-status-ended-before");
+    expect(endedBefore.current.status).toBe("ended");
+    expect(await root.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND}`)).toEqual({ handled: true });
+    expect(root.host.notifications).toHaveLength(displayed + 3);
+    const endedAfter = await inspectWork(root, "inspect-instance-status-ended-after");
+    expect(endedAfter.current.status).toBe("ended");
+    expect(endedAfter.current.observationId).toBe(endedBefore.current.observationId);
+    expect(endedAfter.current.generation).toBe(endedBefore.current.generation);
+    expect(endedAfter.current.calls.filter((call: any) => call.toolName !== NATIVE_WORK_TOOL))
+      .toEqual(endedBefore.current.calls.filter((call: any) => call.toolName !== NATIVE_WORK_TOOL));
+    expect(endedAfter.current.reminder).toEqual(endedBefore.current.reminder);
+    expect(endedAfter.pendingInputs.count).toBe(0);
+  });
+
+  test("local instance status input neither clears nor manufactures pending ingress", async () => {
+    const root = await startRoot();
+    await root.host.input("pending instance ingress");
+    const before = await inspectWork(root, "inspect-instance-pending-before");
+    expect(before.current).toBeNull();
+    expect(before.pendingInputs.count).toBe(1);
+    expect(await root.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND}`)).toEqual({ handled: true });
+    const afterStatus = await inspectWork(root, "inspect-instance-pending-after-status");
+    expect(afterStatus.current).toBeNull();
+    expect(afterStatus.pendingInputs.count).toBe(1);
+
+    await root.host.prepare("pending instance ingress");
+    const prepared = await inspectWork(root, "inspect-instance-pending-prepared");
+    expect(prepared.current.request.attribution).toBe("matched-user-input");
+    expect(prepared.current.request.excerpt).toBe("pending instance ingress");
+    expect(prepared.pendingInputs.count).toBe(0);
+  });
+
+  test("repeated identical pending ingress keeps its ambiguity across a local status input", async () => {
+    const root = await startRoot();
+    await root.host.input("ambiguous instance ingress");
+    await root.host.input("ambiguous instance ingress");
+    expect(await root.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND}`)).toEqual({ handled: true });
+    await root.host.prepare("ambiguous instance ingress");
+    const ambiguous = await inspectWork(root, "inspect-instance-ambiguous");
+    expect(ambiguous.current.request.attribution).toBe("unknown");
+    expect(ambiguous.current.evidence.unavailableReason).toContain("ambiguous");
+    expect(ambiguous.pendingInputs.count).toBe(0);
+  });
+
+  test("local instance status input preserves the issued one-shot advisory", async () => {
+    const root = await startRoot();
+    await root.host.input("instance advisory work");
+    await root.host.prepare("instance advisory work");
+    await root.host.observe("instance-advisory-read", "read", "observed");
+    const before = await inspectWork(root, "inspect-instance-advisory-before");
+    const reminder = await root.host.stop();
+    expect(reminder?.continue).toBe(true);
+    const reminderText = String(reminder?.additionalContext);
+    expect(reminderText).toContain("one-time advisory");
+
+    const displayed = root.host.notifications.length;
+    expect(await root.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND}`)).toEqual({ handled: true });
+    expect(await root.host.input(`/${AGENT_DEFINITION_STATUS_COMMAND}`)).toEqual({ handled: true });
+    expect(root.host.notifications).toHaveLength(displayed + 2);
+
+    await root.host.prepare(reminderText);
+    const after = await inspectWork(root, "inspect-instance-advisory-after");
+    expect(after.current.observationId).toBe(before.current.observationId);
+    expect(after.current.generation).toBe(before.current.generation);
+    expect(after.current.request.attribution).toBe("matched-user-input");
+    expect(after.current.reminder.used).toBe(true);
+    expect(after.pendingInputs.count).toBe(0);
+    expect((await root.host.stop())?.continue).not.toBe(true);
+  });
+
+  test("throwing status displays during early input are consumed without failing the root or work state", async () => {
+    const root = await startRoot();
+    expect(status(root).phase).toBe("ready");
+    expect(status(root).main.phase).toBe("bound");
+
+    await root.host.input("notify throw work");
+    await root.host.prepare("notify throw work");
+    await root.host.observe("notify-throw-read", "read", "observed");
+    const reminder = await root.host.stop();
+    expect(reminder?.continue).toBe(true);
+    await root.host.input("pending notify throw input");
+
+    const before = await inspectWork(root, "inspect-notify-throw-before");
+    expect(before.current.status).toBe("active");
+    expect(before.current.request.excerpt).toBe("notify throw work");
+    expect(before.current.reminder.used).toBe(true);
+    expect(before.pendingInputs.count).toBe(1);
+
+    let laterInputRuns = 0;
+    root.host.handlers.get("input")!.push(() => {
+      laterInputRuns += 1;
+      return undefined;
+    });
+    const displayed = root.host.notifications.length;
+    const ui = root.host.context.ui as { notify?: () => void };
+    const notify = ui.notify;
+    if (notify === undefined) throw new Error("expected a UI notifier");
+    let displayCalls = 0;
+    ui.notify = () => {
+      displayCalls += 1;
+      throw new Error("synthetic status display failure");
+    };
+    try {
+      for (const command of [AGENT_DEFINITION_STATUS_COMMAND, AGENT_INSTANCES_STATUS_COMMAND]) {
+        expect(await root.host.input(`/${command}`)).toEqual({ handled: true });
+      }
+    } finally {
+      ui.notify = notify;
+    }
+    expect(displayCalls).toBe(2);
+    expect(laterInputRuns).toBe(0);
+    expect(root.host.notifications).toHaveLength(displayed);
+    expect(status(root).phase).toBe("ready");
+    expect(status(root).main.phase).toBe("bound");
+
+    const after = await inspectWork(root, "inspect-notify-throw-after");
+    expect(after.current.observationId).toBe(before.current.observationId);
+    expect(after.current.generation).toBe(before.current.generation);
+    expect(after.current.request).toEqual(before.current.request);
+    expect(after.current.reminder).toEqual(before.current.reminder);
+    expect(after.current.calls.filter((call: any) => call.toolName !== NATIVE_WORK_TOOL))
+      .toEqual(before.current.calls.filter((call: any) => call.toolName !== NATIVE_WORK_TOOL));
+    expect(after.pendingInputs.count).toBe(1);
+    expect((await root.host.stop())?.continue).not.toBe(true);
+
+    await root.host.emit("agent_end", { willContinue: false });
+    await root.host.prepare("pending notify throw input");
+    const pendingPrepared = await inspectWork(root, "inspect-notify-throw-pending");
+    expect(pendingPrepared.current.request.attribution).toBe("matched-user-input");
+    expect(pendingPrepared.current.request.excerpt).toBe("pending notify throw input");
+    expect(pendingPrepared.pendingInputs.count).toBe(0);
+  });
+
+  test("instance status is displayed for a failed instance root but not past a failed D1 gate", async () => {
+    const failedInstance = await startRoot({ childDefinitions: [] });
+    expect(status(failedInstance).phase).toBe("failed");
+    expect(status(failedInstance).main.phase).toBe("bound");
+    const displayed = failedInstance.host.notifications.length;
+    expect(await failedInstance.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND}`)).toEqual({ handled: true });
+    expect(failedInstance.host.notifications).toHaveLength(displayed + 1);
+    const shown = JSON.parse(String(failedInstance.host.notifications.at(-1)));
+    expect(shown.schema).toBe(INSTANCED_NATIVE_ENTRY_SCHEMA);
+    expect(shown.phase).toBe("failed");
+    expect(shown.main.phase).toBe("bound");
+    failedInstance.entry.dispose();
+
+    const failedD1 = await startRoot();
+    failedD1.host.currentModel = OTHER_MODEL;
+    const beforeD1 = failedD1.host.notifications.length;
+    expect(await failedD1.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND}`)).toEqual({ handled: true });
+    expect(failedD1.host.notifications).toHaveLength(beforeD1 + 1);
+    expect(failedD1.host.notifications.at(-1)).not.toContain(INSTANCED_NATIVE_ENTRY_SCHEMA);
+    expect(status(failedD1).phase).toBe("ready");
+    expect(status(failedD1).main.phase).toBe("failed");
+  });
+
+  test("missing or throwing registrars get local unavailable diagnostics for both reserved commands", async () => {
+    for (const commandRegistration of ["missing", "throws"] as const) {
+      const root = await startRoot({ commandRegistration });
+      expect(status(root).phase).toBe("ready");
+      expect(status(root).main.phase).toBe("bound");
+      expect(root.host.commands.size).toBe(0);
+      const displayed = root.host.notifications.length;
+      expect(await root.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND}`)).toEqual({ handled: true });
+      expect(root.host.notifications).toHaveLength(displayed + 1);
+      expect(root.host.notifications.at(-1)).toContain("agent-instances-status is unavailable");
+      expect(root.host.notifications.at(-1)).not.toContain(INSTANCED_NATIVE_ENTRY_SCHEMA);
+      expect(await root.host.input(`/${AGENT_DEFINITION_STATUS_COMMAND}`)).toEqual({ handled: true });
+      expect(root.host.notifications).toHaveLength(displayed + 2);
+      expect(root.host.notifications.at(-1)).toContain("agent-definition-status is unavailable");
+      expect(root.host.notifications.at(-1)).not.toContain('"phase"');
+      expect(await root.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND} extra`)).toEqual({ handled: true });
+      expect(root.host.notifications.at(-1)).toContain("accepts no arguments or images");
+      expect(root.host.notifications).toHaveLength(displayed + 3);
+      root.entry.dispose();
+    }
+  });
+
+  test("malformed instance diagnostics are refused locally without queueing attachments", async () => {
+    const root = await startRoot();
+    await root.host.input("pending before instance diagnostics");
+    const displayed = root.host.notifications.length;
+    expect(await root.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND} extra`)).toEqual({ handled: true });
+    expect(await root.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND}`, { images: [{ type: "image" }] }))
+      .toEqual({ handled: true });
+    expect(await root.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND}`, { images: null }))
+      .toEqual({ handled: true });
+    expect(root.host.notifications).toHaveLength(displayed + 3);
+    for (const notification of root.host.notifications.slice(displayed)) {
+      expect(notification).toContain("accepts no arguments or images");
+    }
+    const pending = await inspectWork(root, "inspect-instance-malformed-pending");
+    expect(pending.current).toBeNull();
+    expect(pending.pendingInputs.count).toBe(1);
+
+    expect(await root.host.input(`\t/${AGENT_INSTANCES_STATUS_COMMAND}\n`, { images: [] }))
+      .toEqual({ handled: true });
+    expect(root.host.notifications).toHaveLength(displayed + 4);
+    expect(JSON.parse(String(root.host.notifications.at(-1))).schema).toBe(INSTANCED_NATIVE_ENTRY_SCHEMA);
+
+    expect(await root.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND}`, { source: "extension" })).toBeUndefined();
+    expect(root.host.notifications).toHaveLength(displayed + 4);
+    expect(await root.host.input(`/${AGENT_INSTANCES_STATUS_COMMAND}-other`)).toBeUndefined();
+    const existingPath = await inspectWork(root, "inspect-instance-existing-path");
+    expect(existingPath.pendingInputs.count).toBe(3);
+  });
+
+  test("earlier instance-status transforms are handled; later transforms and same-name commands do not run", async () => {
+    const root = await startRoot();
+    let transformAway = false;
+    const entryHandlers = root.host.handlers.get("input") ?? [];
+    root.host.handlers.set("input", [(event) => {
+      if (!isRecord(event) || typeof event.text !== "string") return undefined;
+      if (event.text === "/to-instance-status") return { text: `/${AGENT_INSTANCES_STATUS_COMMAND}` };
+      if (event.text === `/${AGENT_INSTANCES_STATUS_COMMAND}` && transformAway) {
+        return { text: "ordinary transformed instance input" };
+      }
+      return undefined;
+    }, ...entryHandlers]);
+
+    const displayed = root.host.notifications.length;
+    expect(await root.host.submit("/to-instance-status")).toEqual({ handled: true });
+    expect(root.host.notifications).toHaveLength(displayed + 1);
+    expect(JSON.parse(String(root.host.notifications.at(-1))).schema).toBe(INSTANCED_NATIVE_ENTRY_SCHEMA);
+
+    transformAway = true;
+    expect(await root.host.submit(`/${AGENT_INSTANCES_STATUS_COMMAND}`)).toEqual({ handled: false });
+    expect(root.host.notifications).toHaveLength(displayed + 1);
+
+    transformAway = false;
+    let laterTransforms = 0;
+    root.host.handlers.get("input")!.push((event) => {
+      if (isRecord(event) && event.text === `/${AGENT_INSTANCES_STATUS_COMMAND}`) {
+        laterTransforms += 1;
+        return { text: `/${AGENT_INSTANCES_STATUS_COMMAND} extra` };
+      }
+      return undefined;
+    });
+    let sameNameCommandRuns = 0;
+    root.host.commands.set(AGENT_INSTANCES_STATUS_COMMAND, () => {
+      sameNameCommandRuns += 1;
+    });
+    expect(await root.host.submit(`/${AGENT_INSTANCES_STATUS_COMMAND}`)).toEqual({ handled: true });
+    expect(laterTransforms).toBe(0);
+    expect(sameNameCommandRuns).toBe(0);
+    expect(JSON.parse(String(root.host.notifications.at(-1))).schema).toBe(INSTANCED_NATIVE_ENTRY_SCHEMA);
+
+    // Control: the same driver really does dispatch a non-reserved command
+    // when the input stage does not handle it.
+    let controlCommandRuns = 0;
+    root.host.commands.set("control-diagnostic", () => {
+      controlCommandRuns += 1;
+    });
+    expect(await root.host.submit("/control-diagnostic")).toEqual({
+      handled: false,
+      command: "control-diagnostic",
+    });
+    expect(controlCommandRuns).toBe(1);
   });
 
   test("bounds status views with an explicit budget while small views stay fully detailed", async () => {
