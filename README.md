@@ -12,7 +12,7 @@ OMP 负责模型与工具调用循环；插件维护任务身份、要求版本�
 
 包的默认入口为 `src/daily-entry.ts`。可以从源码检出目录或本地打包后的解包目录加载；下文配置和命令只影响本次启动，不会自动安装到现有 OMP profile。
 
-可配置主会话定义和原生子实例入口已作为可选实验入口提供；完整独立 Agent 实例生命周期、实例间 Flow、跨进程恢复和产物接受仍未接通。子实例入口已加入进程内的结果信封与工作状态只读观察，并已在固定宿主上完成一次有界的 C1 实际运行，自动判定与独立原始复核均通过。定义入口在同一 OMP 内核上加载一份显式 Agent Markdown 的初始文本，选择模型并收窄工具范围；子实例入口再把一份显式主定义与限定数量的原生直接子任务关联起来，但不替换 OMP 调度、权限或模型循环。两个入口均已在本机固定版本范围内演示有界行为，定义入口包括只读汇总与实际转换产物；但仍有已确认的真实模型内容错误和已恢复的工具错误，原生观察入口也仍有未通过独立内容复核的真实模型样本。详见[测试记录](docs/testing.md)。
+可配置主会话定义和原生子实例入口已作为可选实验入口提供；完整独立 Agent 实例生命周期、实例间 Flow、跨进程恢复和产物接受仍未接通。子实例入口已加入进程内的结果信封与工作状态只读观察，并已在固定宿主上完成一次有界的 C1 实际运行，自动判定与独立原始复核均通过。C1 观察本身保持只读且未改变；在其之上另提供可选的单结果报告关联（C2），普通报告和默认入口不变。定义入口在同一 OMP 内核上加载一份显式 Agent Markdown 的初始文本，选择模型并收窄工具范围；子实例入口再把一份显式主定义与限定数量的原生直接子任务关联起来，但不替换 OMP 调度、权限或模型循环。两个入口均已在本机固定版本范围内演示有界行为，定义入口包括只读汇总与实际转换产物；但仍有已确认的真实模型内容错误和已恢复的工具错误，原生观察入口也仍有未通过独立内容复核的真实模型样本。详见[测试记录](docs/testing.md)。
 
 ## 已实现能力
 
@@ -198,11 +198,32 @@ omp --cwd "/absolute/path/to/workspace" --no-extensions \
 
 实例状态中的 `instances[].observation.work` 是该进程内的只读工作调用快照，复用原生工作观察对实际 `task` 调用的捕获。`scope` 固定为 `last-owner-main-hook`，表示最近一次真实 owner-main 钩子保存了该检查；检查状态区分 `current`、`suspended`、`ended`、`stale` 和 `unavailable`。该快照不是实时查询：`getStatus()` 只重放已存字段，不查询缓存上下文，也不表示工作仍然当前。子会话在父结果信封之前正常关闭，不阻止后续结果作为观察保存，也不丢弃已存工作观察；导航、根关闭或根失败会清除已存检查并记录失效原因，而不是新造一次检查。
 
-`instances[].observation.result` 是只读外壳，包含 `observation` 与 `error`；其中 `observation` 是该进程内保存的实际 `task` 结果不可变有界候选，关联实际实例、父调用 ID、索引、子 ID、子会话与冻结的定义版本。信封摘要来自后续中间件之前的规范化完整快照，上限为 64 KiB、深度 32 和 4096 个节点；输出摘录至多 1024 UTF-8 字节。超限、编码不支持或不可读时显式返回 `unavailable`，不产生部分摘要或伪造的完整哈希。子级 abort/failure 与外壳工具成功分开记录；冲突和终态证据保持粘滞，正常关闭本身不推断父级取消，`parentCancellation` 固定为 `unknown`，`semanticAcceptance` 为 `not-evaluated`。`outputPath` 只是原生 transcript 的声明；新的结果观察本身不读取该路径、不哈希或关联业务产物，也不授权发布或接收。继承的 `agent_work` 报告行为不变；结果观察与产物发布/关联的集成属于 C2，尚未实现。
+`instances[].observation.result` 是只读外壳，包含 `observation` 与 `error`；其中 `observation` 是该进程内保存的实际 `task` 结果不可变有界候选，关联实际实例、父调用 ID、索引、子 ID、子会话与冻结的定义版本。信封摘要来自后续中间件之前的规范化完整快照，上限为 64 KiB、深度 32 和 4096 个节点；输出摘录至多 1024 UTF-8 字节。超限、编码不支持或不可读时显式返回 `unavailable`，不产生部分摘要或伪造的完整哈希。子级 abort/failure 与外壳工具成功分开记录；冲突和终态证据保持粘滞，正常关闭本身不推断父级取消，`parentCancellation` 固定为 `unknown`，`semanticAcceptance` 为 `not-evaluated`。`outputPath` 只是原生 transcript 的声明；C1 结果观察本身不读取该路径、不哈希或关联业务产物，也不授权发布或接收，且不改变 `agent_work` 的普通报告路径。可选的 C2 关联只在该原生子实例入口的组合中提供：`agent_work inspect` 的 `instanceResults` 列出有界候选（最多 64 项、编码后 64 KiB，`total`/`omitted` 说明是否完整；整表不可用时计数为 `null`；缺少完整信封摘要的行以 `null` 返回且不可用，其他不可用行仍可保留已知摘要）。`agent_work report` 可选传入 `instanceResult`，其三个值必须逐字取自当前 inspect 中 `available:true` 的行；`parentToolCallId` 还须列入 `checks`。所有 `outputFiles` 都关联到这一个结果，也可以不选择文件。下面的值均为占位符，必须替换为当前实际 inspect 输出，不能自行构造或改写摘要：
 
-前述 64 KiB 只是返回状态的上限；它可能省略详情数组，但不是总堆内存或记录上限。这些观察不改变默认入口、设置、模型、工具集或调度行为。
+```json
+{
+  "action": "report",
+  "checks": [
+    {
+      "toolCallId": "<parentToolCallId from the available instanceResults row>",
+      "purpose": "Delegated child task observed for this request."
+    }
+  ],
+  "outputFiles": ["<workspace-relative file read during this report>"],
+  "outcome": "completed",
+  "instanceResult": {
+    "instanceId": "<instanceId from the same inspect row>",
+    "parentToolCallId": "<parentToolCallId from the same inspect row and checks>",
+    "envelopeSha256": "<envelopeSha256 from the same inspect row>"
+  }
+}
+```
 
-固定宿主的有界负向验证还覆盖缺失 Skill 与不支持设置：缺失 Skill 的一次 `task` 尝试在子会话启动前被预检阻止；不支持设置使实例层启动失败，D1 主定义仍保持绑定，且无 provider 派发。生命周期 `completed`、`taskResultObserved` 与 Role/Skill 文本门通过都只是观察，不等于产物或语义接收。上述结果与工作观察已由固定宿主上的有界 C1 实际运行覆盖：3 个父 OMP 进程、3 个原生子会话、8 次本地确定性 provider 请求、3 次 `task` 调用和 0 次子工具调用；3 个父 OMP 进程均在 EOF 后以 0 退出，无信号且进程组消失。正常、提前中止和迟到结果三例分别得到 completed、aborted 和 completed 信封；提前中止时子级 `aborted:true` 而外层为 false，迟到子级成功没有推断父级取消。两类 C1 观察都只是只读观察，不新增准入、报告发布或接收门禁；继承的 `agent_work` 报告检查与既有根、pending、导航身份检查保持原行为。工作观察的 `stale`/`suspended` 只反映暂停或被替换的调用，不单独改变准入；把被取代工作作为新的报告发布门禁、产物读取/关联和跨进程恢复仍未实现，父级取消保持 `unknown`，不承诺推断。该运行限于固定 OMP 18.20.2、Bun 1.4.0 和 macOS 的确定性本地 provider，不代表付费模型质量、完整 D2/C2 或产品就绪；旧的固定宿主时序/状态运行仍作为各自历史证据保留。不承诺并发、恢复或无上限长会话；这是固定宿主的实验性有界兼容入口，不是完整 D2、模型质量或最终产品就绪证明。
+不需要关联时省略 `instanceResult`，普通报告行为不变。工具结果的 `instanceResult` 字段是事实快照，保留原实例关联、工作引用和信封摘要/字节/范围，并标注 `artifactBasis:"observed-during-report"`、`semanticAcceptance:"not-evaluated"`。输出文件字节是本次报告期间实际读取的版本，不是子级原始交付、唯一作者、提交时文件状态、原子多文件快照、有意义的检查覆盖或语义验收；选定结果信封是 middleware 观察，不是最终父级可见结果或验证回执。当前没有实际工具测试的版本绑定；版本化交接留待 D3。
+
+上述实例状态的 64 KiB 响应上限和 C2 候选目录的 64 KiB 编码上限都只是返回/检查上限；它们可能省略详情或候选，但不是总堆内存或记录上限。这些观察不改变默认入口、设置、模型、工具集或调度行为。
+
+固定宿主的有界负向验证还覆盖缺失 Skill 与不支持设置：缺失 Skill 的一次 `task` 尝试在子会话启动前被预检阻止；不支持设置使实例层启动失败，D1 主定义仍保持绑定，且无 provider 派发。生命周期 `completed`、`taskResultObserved` 与 Role/Skill 文本门通过都只是观察，不等于产物或语义接收。上述结果与工作观察已由固定宿主上的有界 C1 实际运行覆盖：3 个父 OMP 进程、3 个原生子会话、8 次本地确定性 provider 请求、3 次 `task` 调用和 0 次子工具调用；3 个父 OMP 进程均在 EOF 后以 0 退出，无信号且进程组消失。正常、提前中止和迟到结果三例分别得到 completed、aborted 和 completed 信封；提前中止时子级 `aborted:true` 而外层为 false，迟到子级成功没有推断父级取消。两类 C1 观察本身仍只是只读观察，不新增普通报告门禁；C2 只对显式选择的单个结果增加报告发布门禁，并复用既有根、pending、导航、信号和工作检查。工作观察的 `stale`/`suspended` 只反映暂停或被替换的调用，普通报告不会仅因工作被取代而新增 C2 门禁。多结果文件分配、子级原始交付清单、提交时快照、跨进程恢复和产物接收仍未实现，父级取消保持 `unknown`，不承诺推断。该运行限于固定 OMP 18.20.2、Bun 1.4.0 和 macOS 的确定性本地 provider，不代表付费模型质量、完整 D2/C2 或产品就绪；旧的固定宿主时序/状态运行仍作为各自历史证据保留。不承诺并发、恢复或无上限长会话；这是固定宿主的实验性有界兼容入口，不是完整 D2、模型质量或最终产品就绪证明。
 
 ## 开发与验证
 

@@ -439,10 +439,19 @@ class Host {
   }
 
   async work(toolCallId: string, params: unknown): Promise<NativeToolResult> {
-    await this.emit("tool_call", { toolCallId, toolName: NATIVE_WORK_TOOL, input: params });
+    return await this.workWithSignal(toolCallId, params, undefined, this.context);
+  }
+
+  async workWithSignal(
+    toolCallId: string,
+    params: unknown,
+    signal: AbortSignal | undefined,
+    context: InstancedNativeContext = this.context,
+  ): Promise<NativeToolResult> {
+    await this.emit("tool_call", { toolCallId, toolName: NATIVE_WORK_TOOL, input: params }, context);
     const tool = this.tools.get(NATIVE_WORK_TOOL);
     if (tool === undefined) throw new Error("agent_work was not registered");
-    const result = await tool.execute(toolCallId, params, undefined, undefined, this.context);
+    const result = await tool.execute(toolCallId, params, signal, undefined, context);
     await this.emit("tool_result", {
       toolCallId,
       toolName: NATIVE_WORK_TOOL,
@@ -450,7 +459,7 @@ class Host {
       content: result.content,
       isError: result.isError === true,
       details: result.details,
-    });
+    }, context);
     return result;
   }
 
@@ -779,6 +788,114 @@ function taskResultEvent(
     details: { results: [result] },
   };
 }
+
+interface ReportFixture {
+  readonly root: RootFixture;
+  readonly alpha: DefinitionSnapshot;
+  readonly child: ChildFixture | null;
+  readonly call: string;
+  readonly childId: string;
+}
+
+/**
+ * Real success fixture: activate native work, admit, bind the child session,
+ * then run the existing Role and Skill text gates. C1 envelopes alone never
+ * replace those verifications.
+ */
+async function reportFixture(options: {
+  readonly children?: readonly DefinitionSnapshot[];
+  readonly result?: ResultSpec | false;
+  readonly resultEvent?: Record<string, unknown>;
+  readonly close?: boolean;
+  readonly verify?: boolean;
+  readonly workSource?: string;
+  readonly call?: string;
+  readonly childId?: string;
+} = {}): Promise<ReportFixture> {
+  const alpha = options.children?.[0] ?? childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+  const root = await startRoot({ children: options.children ?? [alpha] });
+  const text = "report fixture request";
+  await root.host.input(text, { source: options.workSource ?? "interactive" });
+  await root.host.prepare(text);
+  const call = options.call ?? "task-report";
+  const childId = options.childId ?? "ChildReport";
+  await admit(root, call);
+  const child = await startChild(root, call, childId);
+  if (options.verify !== false) {
+    await child.host.prompt(childPrompt(alpha.definition.body));
+    await child.host.emitContext([]);
+  }
+  if (options.close === true) {
+    root.host.lifecycle({
+      status: "completed",
+      id: childId,
+      parentToolCallId: call,
+      index: 0,
+      agent: alpha.definition.name,
+    });
+    await child.host.emit("session_shutdown", {});
+  }
+  if (options.resultEvent !== undefined) {
+    await root.host.emit("tool_result", options.resultEvent);
+  } else if (options.result !== false) {
+    await root.host.emit("tool_result", taskResultEvent(
+      call,
+      childId,
+      alpha.definition.name,
+      options.result ?? {},
+    ));
+  }
+  return { root, alpha, child, call, childId };
+}
+
+async function instanceCatalog(root: RootFixture, toolCallId = "inspect-instance-results"): Promise<Record<string, any>> {
+  const result = await root.host.work(toolCallId, { action: "inspect" });
+  expect(result.isError).not.toBe(true);
+  return (result.details as Record<string, any>).instanceResults;
+}
+
+function catalogRow(catalog: Record<string, any>, parentToolCallId: string): Record<string, any> {
+  const row = catalog.items.find((item: Record<string, any>) => item.parentToolCallId === parentToolCallId);
+  if (row === undefined) throw new Error(`no catalog row for ${parentToolCallId}`);
+  return row;
+}
+
+function selectedReportParams(row: Record<string, any>, call = row.parentToolCallId): Record<string, unknown> {
+  return {
+    action: "report",
+    checks: [{ toolCallId: call, purpose: "delegated work" }],
+    outputFiles: [],
+    outcome: "completed",
+    instanceResult: {
+      instanceId: row.instanceId,
+      parentToolCallId: call,
+      envelopeSha256: row.envelopeSha256,
+    },
+  };
+}
+
+async function selectedReport(
+  root: RootFixture,
+  params: Record<string, unknown>,
+  options: {
+    readonly toolCallId?: string;
+    readonly signal?: AbortSignal;
+    readonly context?: InstancedNativeContext;
+  } = {},
+): Promise<NativeToolResult> {
+  return await root.host.workWithSignal(
+    options.toolCallId ?? "report-instance-result",
+    params,
+    options.signal ?? new AbortController().signal,
+    options.context ?? root.host.context,
+  );
+}
+
+function expectReportRefused(result: NativeToolResult, pattern: RegExp): void {
+  expect(result.isError).toBe(true);
+  expect(String((result.content[0] as { text?: string } | undefined)?.text ?? "")).toMatch(pattern);
+}
+
 
 describe("opt-in native instance entry", () => {
   test("composition marks both companions defaultInactive and D1 activates them on the main root", async () => {
@@ -2921,5 +3038,466 @@ describe("opt-in native instance entry", () => {
     expect(record.observation.result.observation?.reason).toBe("event-unreadable");
     expect(record.observation.result.error).toBeNull();
     expect(status(root).phase).toBe("ready");
+  });
+});
+
+
+/** Context read count inside the selected report's final refresh/live checks. */
+const LATE_REPORT_CONTEXT_READ = 56;
+
+function reentrantContext(
+  real: InstancedNativeContext,
+  atRead: number,
+  effect: () => void,
+): { readonly context: InstancedNativeContext; fired(): boolean } {
+  let count = 0;
+  let didFire = false;
+  const context = new Proxy({} as InstancedNativeContext, {
+    get(_target, property) {
+      count += 1;
+      if (!didFire && count === atRead) {
+        didFire = true;
+        effect();
+      }
+      return (real as unknown as Record<PropertyKey, unknown>)[property];
+    },
+  });
+  return { context, fired: () => didFire };
+}
+
+describe("C2 fixed instance report port", () => {
+  test("reports one selector after real Role and Skill gates plus normal child close", async () => {
+    const fixture = await reportFixture({ close: true });
+    const record = records(fixture.root)[0]!;
+    expect(record.roleGate).toBe("verified");
+    expect(record.skillGate).toBe("verified");
+    expect(record.roleRefusalCode).toBeNull();
+    expect(record.skillRefusalCode).toBeNull();
+    expect(record.phase).toBe("closed");
+    const observation = record.observation.result.observation!;
+    expect(observation.state).toBe("observed");
+    expect(observation.reason).toBe("observed-envelope");
+    expect(observation.link).toBe("instance");
+    expect(observation.outcome).toBe("completed-envelope");
+
+    const inspected = await inspectWork(fixture.root, "inspect-success");
+    const catalog = inspected.instanceResults;
+    expect(catalog.state).toBe("available");
+    const row = catalogRow(catalog, fixture.call);
+    expect(row.available).toBe(true);
+    expect(row.envelopeSha256).toBe(observation.envelope.sha256);
+
+    const result = await selectedReport(
+      fixture.root,
+      selectedReportParams(row),
+      { toolCallId: "report-verified-closed" },
+    );
+    expect(result.isError).not.toBe(true);
+    const details = result.details as Record<string, any>;
+    expect(details.instanceResult).toMatchObject({
+      result: {
+        instanceId: row.instanceId,
+        parentToolCallId: fixture.call,
+        index: 0,
+        childId: fixture.childId,
+        childSessionId: `session-${fixture.childId}`,
+        agentName: "alpha",
+        parentSessionId: "session-root",
+        workspaceRoot: WORKSPACE,
+        rootEpoch: 0,
+        definitionVersion: "alpha-v1",
+      },
+      work: {
+        observationId: (inspected.current as Record<string, any>).observationId,
+        generation: (inspected.current as Record<string, any>).generation,
+        sessionId: "session-root",
+        workspaceRoot: WORKSPACE,
+        toolCallId: fixture.call,
+        toolName: "task",
+      },
+      envelope: {
+        sha256: row.envelopeSha256,
+        bytes: observation.envelope.bytes,
+        scope: "tool-result-middleware",
+      },
+      artifactBasis: "observed-during-report",
+      semanticAcceptance: "not-evaluated",
+    });
+    expect(details.observed.outputFiles).toEqual([]);
+
+    // Direct status remains a stored replay: it neither refreshes nor mutates
+    // the C1 observation or the recorded report.
+    const before = JSON.stringify(records(fixture.root)[0]!.observation);
+    fixture.root.entry.getStatus();
+    expect(JSON.stringify(records(fixture.root)[0]!.observation)).toBe(before);
+    expect((await inspectWork(fixture.root, "inspect-after-report")).current.report.recordedAt)
+      .toBe(details.recordedAt);
+  });
+
+  test("a completed-shaped C1 envelope cannot replace missing Role or Skill verification", async () => {
+    const fixture = await reportFixture({ verify: false, close: true });
+    const record = records(fixture.root)[0]!;
+    expect(record.roleGate).toBe("unobserved");
+    expect(record.skillGate).toBe("unobserved");
+    const catalog = await instanceCatalog(fixture.root);
+    const row = catalogRow(catalog, fixture.call);
+    expect(row.available).toBe(false);
+    expect(row.reason).toContain("Role and Skill gates");
+    const result = await selectedReport(fixture.root, selectedReportParams(row), {
+      toolCallId: "report-unverified-gates",
+    });
+    expectReportRefused(result, /Role and Skill gates|No report was recorded/);
+    expect((await inspectWork(fixture.root, "inspect-unverified-gates")).current.report ?? null).toBeNull();
+  });
+
+  test("two same-definition children keep distinct selectors and the v1 result stays v1 after v2", async () => {
+    const alphaV1 = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+    const alphaV2 = childSnapshot("alpha", "ALPHA_BODY_V2", "alpha-v2");
+    let current = alphaV1;
+    const root = await startRoot({
+      children: [alphaV1],
+      loadChild: async () => current,
+    });
+    await beginWork(root, "two child report request");
+    await admit(root, "task-child-a");
+    const childA = await startChild(root, "task-child-a", "ChildA");
+    await childA.host.prompt(childPrompt(alphaV1.definition.body));
+    await childA.host.emitContext([]);
+    root.host.lifecycle({
+      status: "completed",
+      id: "ChildA",
+      parentToolCallId: "task-child-a",
+      index: 0,
+      agent: "alpha",
+    });
+    await root.host.emit("tool_result", taskResultEvent("task-child-a", "ChildA", "alpha", {
+      output: "child A output",
+    }));
+
+    current = alphaV2;
+    await admit(root, "task-child-b");
+    const childB = await startChild(root, "task-child-b", "ChildB");
+    await childB.host.prompt(childPrompt(alphaV2.definition.body));
+    await childB.host.emitContext([]);
+    root.host.lifecycle({
+      status: "completed",
+      id: "ChildB",
+      parentToolCallId: "task-child-b",
+      index: 0,
+      agent: "alpha",
+    });
+    await root.host.emit("tool_result", taskResultEvent("task-child-b", "ChildB", "alpha", {
+      output: "child B output",
+    }));
+
+    const instances = records(root);
+    expect(instances).toHaveLength(2);
+    expect(instances[0]!.childId).toBe("ChildA");
+    expect(instances[1]!.childId).toBe("ChildB");
+    expect(instances[0]!.version).toBe("alpha-v1");
+    expect(instances[1]!.version).toBe("alpha-v2");
+    expect(instances[0]!.roleGate).toBe("verified");
+    expect(instances[1]!.roleGate).toBe("verified");
+    expect(instances[0]!.skillGate).toBe("verified");
+    expect(instances[1]!.skillGate).toBe("verified");
+
+    const catalog = await instanceCatalog(root);
+    const rowA = catalogRow(catalog, "task-child-a");
+    const rowB = catalogRow(catalog, "task-child-b");
+    expect(rowA.instanceId).not.toBe(rowB.instanceId);
+    expect(rowA.available).toBe(true);
+    expect(rowB.available).toBe(true);
+    expect(rowA.envelopeSha256).not.toBe(rowB.envelopeSha256);
+
+    const result = await selectedReport(root, selectedReportParams(rowA), {
+      toolCallId: "report-v1-after-v2",
+    });
+    expect(result.isError).not.toBe(true);
+    const facts = (result.details as Record<string, any>).instanceResult;
+    expect(facts.result.childId).toBe("ChildA");
+    expect(facts.result.definitionVersion).toBe("alpha-v1");
+    expect(facts.envelope.sha256).toBe(rowA.envelopeSha256);
+    expect(facts.result.instanceId).toBe(instances[0]!.id);
+  });
+
+  test("refuses absent, unavailable, call-only, failed and aborted C1 observations", async () => {
+    const unavailableEvent = {
+      toolCallId: "task-report",
+      toolName: "task",
+      content: [],
+      isError: true,
+    };
+    const cases: {
+      readonly name: string;
+      readonly options: Parameters<typeof reportFixture>[0];
+    }[] = [
+      { name: "absent", options: { result: false } },
+      { name: "unavailable", options: { resultEvent: unavailableEvent } },
+      {
+        name: "call-only",
+        options: { resultEvent: taskResultEvent("task-report", null, "alpha") },
+      },
+      {
+        name: "failed",
+        options: { result: { isError: true, exitCode: 1, error: "child failed" } },
+      },
+      { name: "aborted", options: { result: { aborted: true } } },
+    ];
+    for (const item of cases) {
+      const fixture = await reportFixture(item.options);
+      const catalog = await instanceCatalog(fixture.root);
+      const row = catalogRow(catalog, fixture.call);
+      expect(row.available).toBe(false);
+      expect(row.reason).toBeTruthy();
+      const params = selectedReportParams({
+        ...row,
+        envelopeSha256: row.envelopeSha256 ?? "0".repeat(64),
+      });
+      const result = await selectedReport(fixture.root, params, {
+        toolCallId: `report-refused-${item.name}`,
+      });
+      expectReportRefused(result, /No report was recorded/);
+      const after = await inspectWork(fixture.root, `inspect-refused-${item.name}`);
+      expect(after.current.report ?? null).toBeNull();
+      fixture.root.entry.dispose();
+    }
+  });
+
+  test("refuses unknown call, instance and digest selectors plus a foreign main context", async () => {
+    const fixture = await reportFixture({ close: true });
+    const catalog = await instanceCatalog(fixture.root);
+    const row = catalogRow(catalog, fixture.call);
+    const valid = selectedReportParams(row);
+
+    const wrongParent = {
+      ...valid,
+      instanceResult: {
+        ...(valid.instanceResult as Record<string, unknown>),
+        parentToolCallId: "task-unknown",
+      },
+    };
+    expectReportRefused(
+      await selectedReport(fixture.root, wrongParent, { toolCallId: "report-wrong-parent" }),
+      /must be selected in checks|No report was recorded/,
+    );
+
+    const wrongInstance = {
+      ...valid,
+      instanceResult: {
+        ...(valid.instanceResult as Record<string, unknown>),
+        instanceId: "instance-unknown",
+      },
+    };
+    expectReportRefused(
+      await selectedReport(fixture.root, wrongInstance, { toolCallId: "report-wrong-instance" }),
+      /no retained instance record|No report was recorded/,
+    );
+
+    const wrongDigest = {
+      ...valid,
+      instanceResult: {
+        ...(valid.instanceResult as Record<string, unknown>),
+        envelopeSha256: "1".repeat(64),
+      },
+    };
+    expectReportRefused(
+      await selectedReport(fixture.root, wrongDigest, { toolCallId: "report-wrong-digest" }),
+      /does not match|No report was recorded/,
+    );
+
+    expectReportRefused(
+      await selectedReport(fixture.root, valid, {
+        toolCallId: "report-foreign-main",
+        context: ownerContext({ agentId: "OtherMain" }),
+      }),
+      /actual main agent|owner|No report was recorded/,
+    );
+    expect((await inspectWork(fixture.root, "inspect-after-bad-selectors")).current.report ?? null).toBeNull();
+  });
+
+  test("identical canonical C1 duplicates replay the receipt, later conflicts refuse history", async () => {
+    const fixture = await reportFixture({ close: true });
+    const catalog = await instanceCatalog(fixture.root, "inspect-replay");
+    const row = catalogRow(catalog, fixture.call);
+    const params = selectedReportParams(row);
+    const original = await selectedReport(fixture.root, params, {
+      toolCallId: "report-replay-original",
+    });
+    expect(original.isError).not.toBe(true);
+    const originalDetails = original.details as Record<string, any>;
+    const frozen = records(fixture.root)[0]!.observation.result.observation;
+
+    await fixture.root.host.emit("tool_result", taskResultEvent(fixture.call, fixture.childId, "alpha"));
+    expect(records(fixture.root)[0]!.observation.result.observation).toBe(frozen);
+    const replay = await selectedReport(fixture.root, params, {
+      toolCallId: "report-replay-identical",
+    });
+    expect(replay.isError).not.toBe(true);
+    const replayDetails = replay.details as Record<string, any>;
+    expect(replayDetails.recordedAt).toBe(originalDetails.recordedAt);
+    expect(replayDetails.instanceResult).toEqual(originalDetails.instanceResult);
+
+    await fixture.root.host.emit("tool_result", taskResultEvent(fixture.call, fixture.childId, "alpha", {
+      output: "changed after publication",
+    }));
+    const conflicted = records(fixture.root)[0]!.observation.result.observation!;
+    expect(conflicted.state).toBe("conflicted");
+    expect(conflicted).not.toBe(frozen);
+    expectReportRefused(
+      await selectedReport(fixture.root, params, { toolCallId: "report-replay-after-conflict" }),
+      /conflict|No report was recorded/,
+    );
+    expect((await inspectWork(fixture.root, "inspect-after-conflict")).current.report.recordedAt)
+      .toBe(originalDetails.recordedAt);
+  });
+
+  test("new identical input, unknown source and ended work refuse without publication", async () => {
+    const pendingFixture = await reportFixture({ close: true });
+    const pendingCatalog = await instanceCatalog(pendingFixture.root, "inspect-pending");
+    const pendingRow = catalogRow(pendingCatalog, pendingFixture.call);
+    await pendingFixture.root.host.input("report fixture request", { source: "interactive" });
+    expectReportRefused(
+      await selectedReport(pendingFixture.root, selectedReportParams(pendingRow), {
+        toolCallId: "report-pending-identical-input",
+      }),
+      /pending|input|No report was recorded/,
+    );
+    expect((await inspectWork(pendingFixture.root, "inspect-pending-after")).current.report ?? null).toBeNull();
+    pendingFixture.root.entry.dispose();
+
+    const unknownFixture = await reportFixture({ close: true, workSource: "plugin" });
+    const unknownCatalog = await instanceCatalog(unknownFixture.root, "inspect-unknown-source");
+    expect(unknownCatalog.state).toBe("unavailable");
+    expect(unknownCatalog.total).toBeNull();
+    const unknownRecord = records(unknownFixture.root)[0]!;
+    const unknownObservation = unknownRecord.observation.result.observation!;
+    expectReportRefused(
+      await selectedReport(unknownFixture.root, {
+        action: "report",
+        checks: [{ toolCallId: unknownFixture.call, purpose: "delegated work" }],
+        outputFiles: [],
+        outcome: "completed",
+        instanceResult: {
+          instanceId: unknownRecord.id,
+          parentToolCallId: unknownFixture.call,
+          envelopeSha256: unknownObservation.envelope.sha256,
+        },
+      }, { toolCallId: "report-unknown-source" }),
+      /source|evidence|work|No report was recorded/,
+    );
+    unknownFixture.root.entry.dispose();
+
+    const endedFixture = await reportFixture({ close: true });
+    const endedCatalog = await instanceCatalog(endedFixture.root, "inspect-ended");
+    const endedRow = catalogRow(endedCatalog, endedFixture.call);
+    await endedFixture.root.host.emit("agent_end", {});
+    await endedFixture.root.host.input("replacement request", { source: "interactive" });
+    await endedFixture.root.host.prepare("replacement request");
+    expectReportRefused(
+      await selectedReport(endedFixture.root, selectedReportParams(endedRow), {
+        toolCallId: "report-after-work-reopen",
+      }),
+      /not retained|work|No report was recorded/,
+    );
+  });
+
+  test("a late getter that closes the instance root or disposes the factory refuses publication", async () => {
+    const closeFixture = await reportFixture({ close: true });
+    const closeCatalog = await instanceCatalog(closeFixture.root, "inspect-reentry-close");
+    const closeRow = catalogRow(closeCatalog, closeFixture.call);
+    const closeTrigger = reentrantContext(
+      closeFixture.root.host.context,
+      LATE_REPORT_CONTEXT_READ,
+      () => {
+        const handler = closeFixture.root.host.handlers.get("session_shutdown")?.at(-1);
+        if (handler === undefined) throw new Error("session_shutdown handler is missing");
+        handler({}, closeFixture.root.host.context);
+      },
+    );
+    expectReportRefused(
+      await selectedReport(closeFixture.root, selectedReportParams(closeRow), {
+        toolCallId: "report-reentry-root-close",
+        context: closeTrigger.context,
+      }),
+      /disposed|root|No report was recorded/,
+    );
+    expect(closeTrigger.fired()).toBe(true);
+    closeFixture.root.entry.dispose();
+
+    const disposeFixture = await reportFixture({ close: true });
+    const disposeCatalog = await instanceCatalog(disposeFixture.root, "inspect-reentry-dispose");
+    const disposeRow = catalogRow(disposeCatalog, disposeFixture.call);
+    const disposeTrigger = reentrantContext(
+      disposeFixture.root.host.context,
+      LATE_REPORT_CONTEXT_READ,
+      () => disposeFixture.root.entry.dispose(),
+    );
+    expectReportRefused(
+      await selectedReport(disposeFixture.root, selectedReportParams(disposeRow), {
+        toolCallId: "report-reentry-dispose",
+        context: disposeTrigger.context,
+      }),
+      /disposed|root|No report was recorded/,
+    );
+    expect(disposeTrigger.fired()).toBe(true);
+  });
+
+  test("a late getter that changes the frozen C1 result or lifecycle is refused by pure revalidation", async () => {
+    const conflictFixture = await reportFixture({ close: true });
+    const conflictCatalog = await instanceCatalog(conflictFixture.root, "inspect-reentry-c1");
+    const conflictRow = catalogRow(conflictCatalog, conflictFixture.call);
+    const frozen = records(conflictFixture.root)[0]!.observation.result.observation!;
+    const conflictTrigger = reentrantContext(
+      conflictFixture.root.host.context,
+      LATE_REPORT_CONTEXT_READ,
+      () => {
+        const handler = conflictFixture.root.host.handlers.get("tool_result")?.at(-1);
+        if (handler === undefined) throw new Error("tool_result handler is missing");
+        handler(taskResultEvent(
+          conflictFixture.call,
+          conflictFixture.childId,
+          "alpha",
+          { output: "late conflicting result" },
+        ), conflictFixture.root.host.context);
+      },
+    );
+    expectReportRefused(
+      await selectedReport(conflictFixture.root, selectedReportParams(conflictRow), {
+        toolCallId: "report-reentry-c1-conflict",
+        context: conflictTrigger.context,
+      }),
+      /changed|conflict|No report was recorded/,
+    );
+    expect(conflictTrigger.fired()).toBe(true);
+    const conflicted = records(conflictFixture.root)[0]!.observation.result.observation!;
+    expect(conflicted.state).toBe("conflicted");
+    expect(conflicted).not.toBe(frozen);
+    expect((await inspectWork(conflictFixture.root, "inspect-reentry-c1-after")).current.report ?? null).toBeNull();
+    conflictFixture.root.entry.dispose();
+
+    const lifecycleFixture = await reportFixture({ close: true });
+    const lifecycleCatalog = await instanceCatalog(lifecycleFixture.root, "inspect-reentry-lifecycle");
+    const lifecycleRow = catalogRow(lifecycleCatalog, lifecycleFixture.call);
+    const lifecycleTrigger = reentrantContext(
+      lifecycleFixture.root.host.context,
+      LATE_REPORT_CONTEXT_READ,
+      () => lifecycleFixture.root.host.lifecycle({
+        status: "aborted",
+        id: lifecycleFixture.childId,
+        parentToolCallId: lifecycleFixture.call,
+        index: 0,
+        agent: "alpha",
+      }),
+    );
+    expectReportRefused(
+      await selectedReport(lifecycleFixture.root, selectedReportParams(lifecycleRow), {
+        toolCallId: "report-reentry-lifecycle",
+        context: lifecycleTrigger.context,
+      }),
+      /lifecycle|abort|No report was recorded/,
+    );
+    expect(lifecycleTrigger.fired()).toBe(true);
+    expect(records(lifecycleFixture.root)[0]!.observation.lifecycleEvidence.aborted).toBe(true);
+    expect((await inspectWork(lifecycleFixture.root, "inspect-reentry-lifecycle-after")).current.report ?? null).toBeNull();
   });
 });

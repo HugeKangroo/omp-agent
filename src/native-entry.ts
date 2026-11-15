@@ -16,6 +16,20 @@ import {
   type NativeObservedFile,
 } from "./native-work.ts";
 import { canonicalWorkspaceRoot, currentTaskOwner } from "./task-entry-port.ts";
+import {
+  boundNativeInstanceReportCatalog,
+  readNativeInstanceReportSelection,
+  snapshotNativeInstanceReportFacts,
+  unavailableNativeInstanceReportCatalog,
+  type NativeInstanceReportCatalog,
+  type NativeInstanceReportCheck,
+  type NativeInstanceReportFacts,
+  type NativeInstanceReportPort,
+  type NativeInstanceReportPreparation,
+  type NativeInstanceReportPrepareResult,
+  type NativeInstanceReportSelection,
+  type NativeReportWorkIdentity,
+} from "./native-instance-report.ts";
 
 /**
  * Explicitly loaded alternative entry for ordinary OMP-native work.
@@ -47,7 +61,7 @@ const MAX_RESULT_EXCERPT_CHARS = 1000;
 export const NATIVE_WORK_GUIDANCE = [
   "Work in the ordinary OMP native loop: understand the goal and constraints, choose methods, inspect relevant inputs, execute, actually check the result, and repair or report limits.",
   "The explicitly loaded agent_work tool records only non-authoritative per-request observations in this main session; it is not the managed TaskOwner, permission, acceptance, verification, or a replacement task system.",
-  "If you use agent_work report, select only real completed tool calls from that same work, state a model-declared outcome and limitations, and distinguish observed result facts from unverified coverage. Never describe a report as accepted or globally verified.",
+  "If you use agent_work report, select only real completed tool calls from that same work, state a model-declared outcome and limitations, and distinguish observed result facts from unverified coverage. Never describe a report as accepted or globally verified. When associating one observed native instance result, copy its instanceId, parentToolCallId and envelopeSha256 from agent_work inspect into the optional instanceResult selector and include that task call in checks; outputFiles remain bytes observed during this report, not semantic acceptance.",
   "Native tools and OMP authorization are unchanged; perform proportional actual checks when supported, and otherwise report unverified or blocked outcomes plainly rather than claiming a pass.",
   "For tasks restricted to supplied evidence, separate facts and derivations the sources support from assumptions and recommendations, and treat missing information as unknown instead of adding an unrequested alternative premise. Check the final artifact and final reply against the original sources and the requested constraints, including scope and length, not just a self-written checker or keyword presence, then report remaining uncertainty honestly.",
   "This does not forbid explicitly requested hypothetical exploration, labeled as such, or proportionate curiosity in other tasks.",
@@ -108,6 +122,8 @@ export interface NativeEntryOptions {
   maxPendingInputs?: number;
   maxReportBindings?: number;
   maxRememberedCallIds?: number;
+  /** INTERNAL trusted composition only; supplied once by the instanced entry. */
+  instanceReports?: NativeInstanceReportPort;
 }
 
 export const NATIVE_WORK_CALL_INSPECTION_SCHEMA = "omp-agent.native-work-call-inspection.v1";
@@ -343,6 +359,7 @@ interface EntryState {
   maxPendingInputs: number;
   maxReportBindings: number;
   maxRememberedCallIds: number;
+  instanceReports: NativeInstanceReportPort | null;
 }
 
 export interface NativeWorkCheckReport {
@@ -399,6 +416,8 @@ export interface NativeWorkReport {
   };
   recordedAt: number;
   caveats: string[];
+  /** Present only when this report explicitly selected one C1-observed result. */
+  instanceResult?: NativeInstanceReportFacts;
 }
 
 interface ReportCheckArgument {
@@ -422,6 +441,7 @@ type ParsedArguments =
       outcome: ReportOutcome;
       summary: string | null;
       limitations: string[];
+      instanceResult?: NativeInstanceReportSelection;
     };
 
 type ReportArguments = Extract<ParsedArguments, { action: "report" }>;
@@ -449,6 +469,320 @@ function errorMessage(error: unknown): string {
 
 function isAborted(signal: AbortSignal | undefined): boolean {
   return signal?.aborted === true;
+}
+
+const ACTUAL_ABORTED_GETTER = (() => {
+  try {
+    return Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get ?? null;
+  } catch {
+    return null;
+  }
+})();
+
+type ActualAbortRead =
+  | { readonly ok: true; readonly aborted: boolean }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Brand-check and read one actual host AbortSignal through the captured native
+ * prototype getter. This never invokes an own `aborted` getter, so a duck or
+ * proxy cannot masquerade as the host's abort state.
+ */
+function readActualAbortSignal(signal: unknown): ActualAbortRead {
+  if (signal === undefined || signal === null) {
+    return { ok: false, reason: "the actual host AbortSignal is missing" };
+  }
+  if (ACTUAL_ABORTED_GETTER === null) {
+    return { ok: false, reason: "the host AbortSignal aborted getter is unavailable" };
+  }
+  try {
+    const aborted: unknown = Reflect.apply(ACTUAL_ABORTED_GETTER, signal, []);
+    if (typeof aborted !== "boolean") {
+      return { ok: false, reason: "the host AbortSignal aborted state is unreadable" };
+    }
+    return { ok: true, aborted };
+  } catch {
+    return { ok: false, reason: "the supplied signal is not a readable actual host AbortSignal" };
+  }
+}
+
+function safeErrorText(value: unknown): string {
+  try {
+    if (value instanceof Error) {
+      try {
+        if (typeof value.message === "string") return value.message;
+      } catch {
+        // Fall through to a bounded generic form.
+      }
+      return "Error";
+    }
+  } catch {
+    return "unreadable failure";
+  }
+  try {
+    return String(value);
+  } catch {
+    return "unreadable failure";
+  }
+}
+
+function boundPortReason(value: unknown, fallback: string): string {
+  const text = typeof value === "string" ? value : safeErrorText(value);
+  const normalized = text.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
+  if (normalized.length === 0) return fallback;
+  return normalized.length <= 320 ? normalized : `${normalized.slice(0, 317)}...`;
+}
+
+type PlainResponseFailure = "thenable" | "accessor" | "shape";
+
+type PlainResponseRead =
+  | { readonly ok: true; readonly fields: ReadonlyMap<string, unknown> }
+  | { readonly ok: false; readonly failure: PlainResponseFailure };
+
+const PREPARE_RESPONSE_KEYS = ["ok", "prepared", "reason"] as const;
+const PREPARED_RESPONSE_KEYS = ["facts", "refresh", "revalidate"] as const;
+const REFRESH_RESPONSE_KEYS = ["ok", "reason"] as const;
+
+/**
+ * Read one strict plain-data response shape. No accessor or `then` getter is
+ * invoked: both are detected through own-property descriptors on the value and
+ * its one allowed prototype. Only own data properties from the fixed key set
+ * are read.
+ */
+function readPlainResponse(
+  value: unknown,
+  allowedKeys: readonly string[],
+): PlainResponseRead {
+  try {
+    // isRecord/Array.isArray can throw on a revoked or hostile proxy.
+    if (!isRecord(value)) return { ok: false, failure: "shape" };
+    // Only a plain object is accepted. Checking that boundary first bounds the
+    // `then` inspection to this value and Object.prototype; a proxy cannot make
+    // the check walk an arbitrary or self-referential prototype chain.
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) {
+      return { ok: false, failure: "shape" };
+    }
+    if (Object.getOwnPropertyDescriptor(value, "then") !== undefined) {
+      return { ok: false, failure: "thenable" };
+    }
+    if (prototype !== null
+      && Object.getOwnPropertyDescriptor(prototype, "then") !== undefined) {
+      return { ok: false, failure: "thenable" };
+    }
+    const fields = new Map<string, unknown>();
+    for (const key of Object.getOwnPropertyNames(value)) {
+      if (!allowedKeys.includes(key)) return { ok: false, failure: "shape" };
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined) return { ok: false, failure: "shape" };
+      if (!("value" in descriptor)) return { ok: false, failure: "accessor" };
+      fields.set(key, descriptor.value);
+    }
+    return { ok: true, fields };
+  } catch {
+    return { ok: false, failure: "shape" };
+  }
+}
+
+function plainResponseReason(
+  failure: PlainResponseFailure,
+  label: string,
+  fallback: string,
+): string {
+  if (failure === "thenable") {
+    return `${label} returned a thenable; synchronous plain data is required`;
+  }
+  if (failure === "accessor") {
+    return `${label} returned an accessor property; synchronous plain data is required`;
+  }
+  return fallback;
+}
+
+const NATIVE_PROMISE_THEN = Promise.prototype.then;
+
+/**
+ * Detect a native Promise by brand-calling the captured Promise.prototype.then.
+ * This also consumes a rejection without reading an arbitrary `then` getter or
+ * awaiting any callback result. A non-Promise or thenable returns false.
+ */
+function consumeNativePromise(value: unknown): boolean {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return false;
+  try {
+    Reflect.apply(NATIVE_PROMISE_THEN, value, [() => undefined, () => undefined]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+type PreparedPortSuccess = {
+  readonly ok: true;
+  readonly facts: NativeInstanceReportFacts;
+  readonly refresh: () => NativeInstanceReportCheck;
+  readonly revalidate: () => string | null;
+};
+type PortInvocationFailure = { readonly ok: false; readonly reason: string };
+
+function invokePreparedRefresh(
+  check: () => NativeInstanceReportCheck,
+): NativeInstanceReportCheck {
+  let raw: unknown;
+  try {
+    raw = check();
+  } catch (error) {
+    return { ok: false, reason: `instance result refresh threw: ${boundPortReason(error, "unreadable failure")}` };
+  }
+  if (consumeNativePromise(raw)) {
+    return { ok: false, reason: "instance result refresh returned a promise; a synchronous check is required" };
+  }
+  const response = readPlainResponse(raw, REFRESH_RESPONSE_KEYS);
+  if (!response.ok) {
+    return {
+      ok: false,
+      reason: plainResponseReason(
+        response.failure,
+        "instance result refresh",
+        "instance result refresh returned an unreadable check",
+      ),
+    };
+  }
+  const ok = response.fields.get("ok");
+  if (ok === true) return { ok: true };
+  if (ok === false) {
+    const reason = response.fields.get("reason");
+    return {
+      ok: false,
+      reason: typeof reason === "string" && reason.length > 0
+        ? boundPortReason(reason, "instance result check failed")
+        : "instance result check failed without a readable reason",
+    };
+  }
+  return { ok: false, reason: "instance result refresh returned an unknown check result" };
+}
+
+/**
+ * Final revalidation is primitive-only: null succeeds, a string refuses, and
+ * any other return is refused without reading properties or `.then` except the
+ * captured native Promise brand consumed above to avoid an unhandled rejection.
+ */
+function invokeFinalRevalidate(check: () => string | null): NativeInstanceReportCheck {
+  let raw: unknown;
+  try {
+    raw = check();
+  } catch (error) {
+    return { ok: false, reason: `instance result revalidate threw: ${boundPortReason(error, "unreadable failure")}` };
+  }
+  if (raw === null) return { ok: true };
+  if (typeof raw === "string") {
+    return { ok: false, reason: boundPortReason(raw, "instance result revalidate refused") };
+  }
+  if (consumeNativePromise(raw)) {
+    return { ok: false, reason: "instance result revalidate returned a promise; a synchronous primitive result is required" };
+  }
+  return { ok: false, reason: "instance result revalidate returned a non-primitive final check" };
+}
+
+/**
+ * Call the internal port once and copy all callbacks before any file I/O. The
+ * returned closures hold the original preparation object; no property lookup
+ * on it happens during the final publication stage.
+ */
+function prepareReportInstance(
+  port: NativeInstanceReportPort,
+  selection: NativeInstanceReportSelection,
+  work: NativeReportWorkIdentity,
+  context: NativeContext,
+): PreparedPortSuccess | PortInvocationFailure {
+  let raw: unknown;
+  try {
+    raw = port.prepare(selection, work, context);
+  } catch (error) {
+    return {
+      ok: false,
+      reason: `instance result preparation threw: ${boundPortReason(error, "unreadable failure")}`,
+    };
+  }
+  if (consumeNativePromise(raw)) {
+    return { ok: false, reason: "instance result preparation returned a promise; synchronous preparation is required" };
+  }
+  const response = readPlainResponse(raw, PREPARE_RESPONSE_KEYS);
+  if (!response.ok) {
+    return {
+      ok: false,
+      reason: plainResponseReason(
+        response.failure,
+        "instance result preparation",
+        "instance result preparation returned an unreadable result",
+      ),
+    };
+  }
+  const ok = response.fields.get("ok");
+  if (ok === false) {
+    const reason = response.fields.get("reason");
+    return {
+      ok: false,
+      reason: typeof reason === "string" && reason.length > 0
+        ? boundPortReason(reason, "instance result is unavailable")
+        : "instance result is unavailable without a readable reason",
+    };
+  }
+  if (ok !== true) {
+    return { ok: false, reason: "instance result preparation returned an unknown result" };
+  }
+  const preparedValue = response.fields.get("prepared");
+  if (consumeNativePromise(preparedValue)) {
+    return { ok: false, reason: "instance result preparation object is a promise; synchronous preparation is required" };
+  }
+  const prepared = readPlainResponse(preparedValue, PREPARED_RESPONSE_KEYS);
+  if (!prepared.ok) {
+    return {
+      ok: false,
+      reason: plainResponseReason(
+        prepared.failure,
+        "instance result preparation object",
+        "instance result preparation returned no readable preparation object",
+      ),
+    };
+  }
+  // Read facts and both methods exactly once, before any later I/O.
+  const factsValue = prepared.fields.get("facts");
+  const refreshValue = prepared.fields.get("refresh");
+  const revalidateValue = prepared.fields.get("revalidate");
+  if (typeof refreshValue !== "function" || typeof revalidateValue !== "function") {
+    return { ok: false, reason: "instance result preparation did not provide synchronous refresh and revalidate methods" };
+  }
+  const facts = snapshotNativeInstanceReportFacts(factsValue, selection, work);
+  if (!facts.ok) return { ok: false, reason: facts.reason };
+  const refresh = refreshValue as (this: unknown, context: NativeContext) => NativeInstanceReportCheck;
+  const revalidate = revalidateValue as (this: unknown) => string | null;
+  return {
+    ok: true,
+    facts: facts.facts,
+    refresh: () => Reflect.apply(refresh, preparedValue, [context]) as NativeInstanceReportCheck,
+    revalidate: () => Reflect.apply(revalidate, preparedValue, []) as string | null,
+  };
+}
+
+function inspectReportInstances(
+  port: NativeInstanceReportPort | null,
+  context: NativeContext,
+  work: NativeReportWorkIdentity | null,
+): NativeInstanceReportCatalog {
+  if (port === null) {
+    return unavailableNativeInstanceReportCatalog("instance result composition is not configured");
+  }
+  let raw: unknown;
+  try {
+    raw = port.inspect(context, work);
+  } catch (error) {
+    return unavailableNativeInstanceReportCatalog(
+      `instance result inspection threw: ${boundPortReason(error, "unreadable failure")}`,
+    );
+  }
+  if (consumeNativePromise(raw)) {
+    return unavailableNativeInstanceReportCatalog("instance result inspection returned a promise; synchronous inspection is required");
+  }
+  return boundNativeInstanceReportCatalog(raw);
 }
 
 function readSessionId(context: NativeContext): string | null {
@@ -510,7 +844,15 @@ function parseArguments(value: unknown): ParsedArguments {
   }
   if (value.action !== "report") throw new Error("agent_work action must be inspect or report.");
 
-  const allowed = new Set(["action", "checks", "outputFiles", "outcome", "summary", "limitations"]);
+  const allowed = new Set([
+    "action",
+    "checks",
+    "outputFiles",
+    "outcome",
+    "summary",
+    "limitations",
+    "instanceResult",
+  ]);
   const unsupported = keys.filter((key) => !allowed.has(key));
   if (unsupported.length > 0) throw new Error(`agent_work report has unsupported field(s): ${unsupported.join(", ")}.`);
 
@@ -577,7 +919,26 @@ function parseArguments(value: unknown): ParsedArguments {
     return text;
   });
 
-  return { action: "report", checks, outputFiles, outcome, summary, limitations };
+  let instanceResult: NativeInstanceReportSelection | undefined;
+  if (Object.hasOwn(value, "instanceResult")) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, "instanceResult");
+    if (descriptor === undefined || !("value" in descriptor)) {
+      throw new Error("agent_work instanceResult must be an own data field, not an accessor.");
+    }
+    const read = readNativeInstanceReportSelection(descriptor.value);
+    if (!read.ok) throw new Error(`agent_work ${read.reason}`);
+    instanceResult = read.selection;
+  }
+
+  return {
+    action: "report",
+    checks,
+    outputFiles,
+    outcome,
+    summary,
+    limitations,
+    ...(instanceResult === undefined ? {} : { instanceResult }),
+  };
 }
 
 function createState(options: NativeEntryOptions): EntryState {
@@ -604,6 +965,7 @@ function createState(options: NativeEntryOptions): EntryState {
     maxPendingInputs: clampInteger(options.maxPendingInputs, DEFAULT_MAX_PENDING_INPUTS, 1, 32),
     maxReportBindings: clampInteger(options.maxReportBindings, DEFAULT_MAX_REPORT_BINDINGS, 4, 64),
     maxRememberedCallIds: clampInteger(options.maxRememberedCallIds, DEFAULT_MAX_REMEMBERED_CALL_IDS, 2, 8192),
+    instanceReports: options.instanceReports ?? null,
   };
 }
 
@@ -1251,6 +1613,7 @@ function reportSignature(work: Work, parsed: ReportArguments): string {
     outcome: parsed.outcome,
     summary: parsed.summary ?? "",
     limitations: parsed.limitations,
+    ...(parsed.instanceResult === undefined ? {} : { instanceResult: parsed.instanceResult }),
   }));
 }
 
@@ -1272,6 +1635,7 @@ function buildReport(
   selected: SelectedCheck[],
   files: NativeObservedFile[],
   recordedAt: number,
+  instanceResult: NativeInstanceReportFacts | undefined,
 ): NativeWorkReport {
   const checks: NativeWorkCheckReport[] = selected.map(({ call, result, purpose }) => ({
     toolCallId: call.toolCallId,
@@ -1313,6 +1677,14 @@ function buildReport(
   for (const file of files) {
     unverified.push(
       `File ${file.relativePath}: bytes and sha256 observed at report time; not managed provenance, future immutability, independent check coverage, or proof a selected check inspected that version.`,
+    );
+  }
+  if (instanceResult !== undefined) {
+    unverified.push(
+      `Selected result ${instanceResult.result.instanceId}/${instanceResult.result.parentToolCallId}: output files are bytes read during this report, not the child's original delivered version, exclusive authorship, a commit-time filesystem snapshot, or an atomic multi-file snapshot.`,
+    );
+    unverified.push(
+      "The selected result envelope is a tool-result-middleware observation; semanticAcceptance remains not-evaluated.",
     );
   }
 
@@ -1366,6 +1738,7 @@ function buildReport(
       "Tool names, success flags, file bytes and hashes do not establish semantic correctness or full check coverage.",
       "No host-level independent verification or global acceptance was performed.",
     ],
+    ...(instanceResult === undefined ? {} : { instanceResult }),
   };
   return deepFreeze(report);
 }
@@ -1453,8 +1826,89 @@ function workSummary(state: EntryState, work: Work): Record<string, unknown> {
   };
 }
 
+function inspectWorkIdentity(work: Work | null): {
+  observationId: string;
+  generation: number;
+  sessionId: string | null;
+  workspaceRoot: string | null;
+} | null {
+  return work === null
+    ? null
+    : {
+        observationId: work.observationId,
+        generation: work.generation,
+        sessionId: work.sessionId,
+        workspaceRoot: work.workspaceRoot,
+      };
+}
+
+function sameInspectWorkIdentity(
+  left: ReturnType<typeof inspectWorkIdentity>,
+  right: ReturnType<typeof inspectWorkIdentity>,
+): boolean {
+  if (left === null || right === null) return left === right;
+  return left.observationId === right.observationId
+    && left.generation === right.generation
+    && left.sessionId === right.sessionId
+    && left.workspaceRoot === right.workspaceRoot;
+}
+
+/**
+ * Judge only captured native state after every inspect host read. An available
+ * catalog requires the same active work, available matched evidence and zero
+ * pending/dropped ingress; an id-only comparison is not enough.
+ */
+function inspectCatalogStateFailure(
+  state: EntryState,
+  expectedWorkIdentity: ReturnType<typeof inspectWorkIdentity>,
+): string | null {
+  const work = state.current;
+  if (work === null
+    || !sameInspectWorkIdentity(expectedWorkIdentity, inspectWorkIdentity(work))) {
+    return "the current work identity changed while the instance result port was reading; no candidate catalog is trusted";
+  }
+  if (work.invalidated || work.status !== "active") {
+    return "the current work is no longer active; no candidate catalog is trusted";
+  }
+  if (work.evidenceState !== "available") {
+    return "the current work evidence is unavailable; no candidate catalog is trusted";
+  }
+  if (work.requestAttribution !== "matched-user-input") {
+    return "the current work request attribution is not a matched genuine input; no candidate catalog is trusted";
+  }
+  if (state.pending.length > 0 || state.pendingDropped > 0) {
+    return "pending or dropped ingress changed while the instance result port was reading; no candidate catalog is trusted";
+  }
+  return null;
+}
+
 function inspectResult(state: EntryState, context: NativeContext): NativeToolResult {
-  // Finish all host reads first, then apply a pure currentness decision so a
+  // The port may reenter host/state code. Finish its host reads and the final
+  // host/current identity reads before building any inspection view; a changed
+  // identity invalidates the candidate catalog instead of returning stale
+  // context or a stale work view.
+  let preMain: boolean | null = null;
+  let preSessionId: string | null = null;
+  let preWorkspaceRoot: string | null = null;
+  if (state.instanceReports !== null) {
+    preMain = readMain(context);
+    preSessionId = readSessionId(context);
+    preWorkspaceRoot = readWorkspace(context);
+  }
+  const preWorkIdentity = inspectWorkIdentity(state.current);
+  const portWork = preWorkIdentity !== null
+    && preWorkIdentity.sessionId !== null
+    && preWorkIdentity.workspaceRoot !== null
+    ? Object.freeze({
+        observationId: preWorkIdentity.observationId,
+        generation: preWorkIdentity.generation,
+        sessionId: preWorkIdentity.sessionId,
+        workspaceRoot: preWorkIdentity.workspaceRoot,
+      })
+    : null;
+  let instanceResults = inspectReportInstances(state.instanceReports, context, portWork);
+
+  // Finish all host reads, then apply a pure currentness decision so a
   // reentrant getter cannot leave a stale work labelled as current.
   // now is also an injected host callback; finish it before reading the live
   // snapshot and before the pure decision.
@@ -1463,6 +1917,16 @@ function inspectResult(state: EntryState, context: NativeContext): NativeToolRes
   const sessionId = readSessionId(context);
   const workspaceRoot = readWorkspace(context);
   const owner = currentTaskOwner();
+
+  if (preMain !== null
+    && (preMain !== main
+      || preSessionId !== sessionId
+      || preWorkspaceRoot !== workspaceRoot
+      || !sameInspectWorkIdentity(preWorkIdentity, inspectWorkIdentity(state.current)))) {
+    instanceResults = unavailableNativeInstanceReportCatalog(
+      "inspect context or current work identity changed while the instance result port was reading; no candidate catalog is trusted",
+    );
+  }
 
   if (!state.disposed && state.enabled) {
     if (owner !== undefined) {
@@ -1474,6 +1938,16 @@ function inspectResult(state: EntryState, context: NativeContext): NativeToolRes
       && (state.current.sessionId !== sessionId || state.current.workspaceRoot !== workspaceRoot)
     ) {
       invalidateCurrent(state, "session or workspace changed before inspection");
+    }
+  }
+
+  // The port may have computed an available row before a later host getter
+  // queued ingress or changed evidence without changing the work id. Judge the
+  // complete captured state now, after all host reads and base invalidations.
+  if (state.instanceReports !== null && instanceResults.state === "available") {
+    const catalogFailure = inspectCatalogStateFailure(state, preWorkIdentity);
+    if (catalogFailure !== null) {
+      instanceResults = unavailableNativeInstanceReportCatalog(catalogFailure);
     }
   }
 
@@ -1494,6 +1968,7 @@ function inspectResult(state: EntryState, context: NativeContext): NativeToolRes
       count: state.pending.length,
       dropped: state.pendingDropped,
     },
+    instanceResults,
     bounds: {
       maxRetainedWorks: state.maxRetainedWorks,
       maxCallsPerWork: state.maxCallsPerWork,
@@ -1511,6 +1986,8 @@ function inspectResult(state: EntryState, context: NativeContext): NativeToolRes
       "Reused or previously seen call ids, ids evicted from retention, and new ids after the bounded uniqueness guard fills stay ambiguous and are never selectable.",
       "agent_work report routing uses the same bounded uniqueness guard; once it fills, new report routing ids are withheld while already-retained bindings remain replayable.",
       "The current work is compared with the live session id and sessionManager.getCwd() identity; /clear, /move and navigation invalidate it.",
+      "instanceResults lists bounded inspection-time candidate selectors; presence or absence is not permission, and the final report revalidates the exact result, work and lifecycle.",
+      "A selected result associates output file bytes read during that report; it does not establish original child delivery, exclusive authorship, commit-time file state or semantic acceptance.",
     ],
   };
   return successResult(details, "Non-authoritative native work inspection.");
@@ -1676,6 +2153,290 @@ function revalidateSelected(
   return null;
 }
 
+function workedIdentity(work: Work): NativeReportWorkIdentity | null {
+  if (work.sessionId === null || work.workspaceRoot === null) return null;
+  return Object.freeze({
+    observationId: work.observationId,
+    generation: work.generation,
+    sessionId: work.sessionId,
+    workspaceRoot: work.workspaceRoot,
+  });
+}
+
+function selectedParent(
+  selected: readonly SelectedCheck[],
+  selection: NativeInstanceReportSelection,
+): { parent: SelectedCheck } | { error: NativeToolResult } {
+  const parent = selected.find((item) => item.call.toolCallId === selection.parentToolCallId);
+  if (parent === undefined) {
+    return {
+      error: errorResult(
+        `agent_work report refused: instanceResult.parentToolCallId ${JSON.stringify(selection.parentToolCallId)} must be selected in checks as the actual task call. No report was recorded.`,
+      ),
+    };
+  }
+  if (parent.call.toolName !== "task") {
+    return {
+      error: errorResult(
+        "agent_work report refused: instanceResult.parentToolCallId must identify an actual observed task call. No report was recorded.",
+      ),
+    };
+  }
+  return { parent };
+}
+
+/**
+ * The selected path additionally requires a genuine source, no queued or
+ * dropped ingress and the unchanged current parent task call. classifyCallAssociation
+ * remains the single pure association classifier; these checks make the
+ * selected requirement explicit instead of relying on generic currentness.
+ */
+function selectedCurrentnessFailure(
+  state: EntryState,
+  work: Work,
+  parent: SelectedCheck,
+): NativeToolResult | null {
+  if (state.pendingDropped > 0) {
+    return errorResult(
+      "agent_work report refused: queued ingress was dropped, so the selected instance result association is ambiguous. No report was recorded.",
+    );
+  }
+  if (state.pending.length > 0) {
+    return errorResult(
+      "agent_work report refused: a new input is pending, so the selected instance result association is ambiguous. No report was recorded.",
+    );
+  }
+  if (work.requestAttribution !== "matched-user-input" || work.evidenceState !== "available") {
+    return errorResult(
+      "agent_work report refused: the selected instance result requires a genuine matched request source and available work evidence. No report was recorded.",
+    );
+  }
+  if (!callSelectable(state, work, parent.call) || parent.call.result !== parent.result) {
+    return errorResult(
+      "agent_work report refused: the selected parent task call changed or is no longer selectable. No report was recorded.",
+    );
+  }
+  const classification = classifyCallAssociation(state, work, parent.call);
+  if (classification.state !== "current") {
+    return errorResult(
+      `agent_work report refused: the selected parent task call is no longer current (${classification.reason}). No report was recorded.`,
+    );
+  }
+  return null;
+}
+
+type SelectedLiveRead =
+  | { readonly ok: true; readonly live: LiveContextSnapshot }
+  | { readonly ok: false; readonly result: NativeToolResult };
+
+/** Complete host context reads first, then read the actual host signal last. */
+function readSelectedLiveContext(
+  state: EntryState,
+  context: NativeContext,
+  signal: unknown,
+  when: string,
+): SelectedLiveRead {
+  const main = readMain(context);
+  const sessionId = readSessionId(context);
+  const workspaceRoot = readWorkspace(context);
+  const owner = currentTaskOwner();
+  const signalRead = readActualAbortSignal(signal);
+  if (!signalRead.ok) {
+    return {
+      ok: false,
+      result: errorResult(`agent_work report refused: ${signalRead.reason} ${when}. No report was recorded.`),
+    };
+  }
+  return {
+    ok: true,
+    live: {
+      main,
+      sessionId,
+      workspaceRoot,
+      owner,
+      aborted: signalRead.aborted,
+      disposed: state.disposed,
+      enabled: state.enabled,
+    },
+  };
+}
+
+function selectedSignalFailure(signal: unknown, when: string): NativeToolResult | null {
+  const read = readActualAbortSignal(signal);
+  if (!read.ok) {
+    return errorResult(`agent_work report refused: ${read.reason} ${when}. No report was recorded.`);
+  }
+  if (read.aborted) {
+    return errorResult(`agent_work report was cancelled ${when}. No report was recorded.`);
+  }
+  return null;
+}
+
+async function executeSelectedReport(
+  state: EntryState,
+  toolCallId: string,
+  parsed: ReportArguments,
+  selection: NativeInstanceReportSelection,
+  signal: unknown,
+  context: NativeContext,
+): Promise<NativeToolResult> {
+  const port = state.instanceReports;
+  if (port === null) {
+    return errorResult(
+      "agent_work report refused: the explicit instanceResult selection is unavailable because no instance result composition is configured. No report was recorded.",
+    );
+  }
+  const initialSignal = selectedSignalFailure(signal, "before report preparation");
+  if (initialSignal !== null) return initialSignal;
+
+  const binding = state.reportBindings.get(toolCallId);
+  if (binding === undefined) {
+    return errorResult("agent_work report context is unavailable: no matching tool_call preflight was observed for this call id.");
+  }
+  const initialRouting = reportRoutingFailure(state, toolCallId, binding);
+  if (initialRouting !== null) return initialRouting;
+  if (binding.unavailableReason !== null) {
+    return errorResult(`agent_work report is unavailable for this work: ${binding.unavailableReason}. No report was recorded.`);
+  }
+  const work = binding.work;
+  if (work.invalidated) {
+    return errorResult("agent_work report refused because its work association was invalidated. No report was recorded.");
+  }
+  if (work.evidenceState === "unavailable") {
+    return errorResult(
+      `agent_work report refused: ${work.evidenceUnavailableReason ?? "work evidence is unavailable"}. No report was recorded.`,
+    );
+  }
+  if (work.sessionId === null || work.workspaceRoot === null) {
+    return errorResult("agent_work report refused: session or workspace identity is unavailable. No report was recorded.");
+  }
+
+  const initialSelection = selectChecks(state, work, parsed.checks);
+  if ("error" in initialSelection) return initialSelection.error;
+  const initialParent = selectedParent(initialSelection.selected, selection);
+  if ("error" in initialParent) return initialParent.error;
+
+  // Capture the report work and selected result, then finish all preparation
+  // metadata reads before the first file I/O.
+  const workIdentity = workedIdentity(work);
+  if (workIdentity === null) {
+    return errorResult("agent_work report refused: session or workspace identity is unavailable. No report was recorded.");
+  }
+  const prepared = prepareReportInstance(port, selection, workIdentity, context);
+  if (!prepared.ok) {
+    return errorResult(`agent_work report refused: ${prepared.reason}. No report was recorded.`);
+  }
+  const instanceFacts = prepared.facts;
+  const preRefresh = invokePreparedRefresh(() => prepared.refresh());
+  if (!preRefresh.ok) {
+    return errorResult(`agent_work report refused: ${preRefresh.reason}. No report was recorded.`);
+  }
+  const preLive = readSelectedLiveContext(state, context, signal, "while preparing the selected result");
+  if (!preLive.ok) return preLive.result;
+  const preRevalidate = invokeFinalRevalidate(prepared.revalidate);
+  if (!preRevalidate.ok) {
+    return errorResult(`agent_work report refused: ${preRevalidate.reason}. No report was recorded.`);
+  }
+  // Native pure gates follow the primitive revalidate success.
+  const preProblem = currentnessFailure(state, preLive.live, binding, work, "report");
+  if (preProblem !== null) return preProblem;
+  const preRouting = reportRoutingFailure(state, toolCallId, binding);
+  if (preRouting !== null) return preRouting;
+  const preSelected = selectedCurrentnessFailure(state, work, initialParent.parent);
+  if (preSelected !== null) return preSelected;
+  const preRevalidatedSelected = revalidateSelected(state, work, initialSelection.selected);
+  if (preRevalidatedSelected !== null) return preRevalidatedSelected;
+
+  const signature = reportSignature(work, parsed);
+  if (work.report !== null) {
+    if (work.reportSignature === signature) {
+      return successResult(
+        clonePlain(work.report),
+        "Existing identical report observed; files were not reread and the original recordedAt is preserved.",
+      );
+    }
+    return errorResult("agent_work report refused: a different report is already recorded for this work and cannot be rewritten.");
+  }
+
+  const files: NativeObservedFile[] = [];
+  let totalBytes = 0;
+  for (const relativePath of parsed.outputFiles) {
+    const beforeFileSignal = selectedSignalFailure(signal, "while observing output files");
+    if (beforeFileSignal !== null) return beforeFileSignal;
+    const beforeFileSelected = selectedCurrentnessFailure(state, work, initialParent.parent);
+    if (beforeFileSelected !== null) return beforeFileSelected;
+    let file: NativeObservedFile;
+    try {
+      file = await observeWorkspaceFile(work.workspaceRoot, relativePath, state.fileIo, state.now());
+    } catch (error) {
+      const code = error instanceof NativeFileError ? ` (${error.code})` : "";
+      return errorResult(
+        `agent_work report refused output file ${JSON.stringify(relativePath)}${code}: ${errorMessage(error)} No report was recorded.`,
+      );
+    }
+    totalBytes += file.bytes;
+    if (totalBytes > MAX_OUTPUT_TOTAL_BYTES) {
+      return errorResult(
+        `agent_work report refused: observed output files exceed ${MAX_OUTPUT_TOTAL_BYTES} bytes. No report was recorded.`,
+      );
+    }
+    files.push(file);
+  }
+
+  // The synchronous refresh and its strict response shape check finish before
+  // any final host or clock read. The already-captured pure revalidate callback
+  // runs after all host reads, then only pure native checks may precede
+  // publication.
+  const finalRefresh = invokePreparedRefresh(prepared.refresh);
+  if (!finalRefresh.ok) {
+    return errorResult(`agent_work report refused: ${finalRefresh.reason}. No report was recorded.`);
+  }
+  const recordedAt = state.now();
+  const finalLive = readSelectedLiveContext(state, context, signal, "while observing outputs");
+  if (!finalLive.ok) return finalLive.result;
+  const finalRevalidate = invokeFinalRevalidate(prepared.revalidate);
+  if (!finalRevalidate.ok) {
+    return errorResult(`agent_work report refused: ${finalRevalidate.reason}. No report was recorded.`);
+  }
+
+  // No callback property lookup, host getter or await may follow this point.
+  const finalProblem = currentnessFailure(state, finalLive.live, binding, work, "final");
+  if (finalProblem !== null) return finalProblem;
+  const finalRouting = reportRoutingFailure(state, toolCallId, binding);
+  if (finalRouting !== null) return finalRouting;
+  const finalSelected = selectedCurrentnessFailure(state, work, initialParent.parent);
+  if (finalSelected !== null) return finalSelected;
+  const finalSignature = reportSignature(work, parsed);
+  const invalidatedSelected = revalidateSelected(state, work, initialSelection.selected);
+  if (invalidatedSelected !== null) return invalidatedSelected;
+  if (work.report !== null) {
+    if (work.reportSignature === finalSignature) {
+      return successResult(
+        clonePlain(work.report),
+        "Existing identical report observed; this invocation's file reads were not published and the original recordedAt and byte observations are preserved.",
+      );
+    }
+    return errorResult("agent_work report refused: a different report is already recorded for this work and cannot be rewritten.");
+  }
+
+  const report = buildReport(
+    work,
+    parsed,
+    work.sessionId,
+    work.workspaceRoot,
+    initialSelection.selected,
+    files,
+    recordedAt,
+    instanceFacts,
+  );
+  work.report = report;
+  work.reportSignature = finalSignature;
+  return successResult(
+    clonePlain(report),
+    "Recorded non-authoritative native work observations associated with one observed instance result; this is not semantic acceptance or verification.",
+  );
+}
+
 async function executeReport(
   state: EntryState,
   toolCallId: string,
@@ -1683,6 +2444,9 @@ async function executeReport(
   signal: AbortSignal | undefined,
   context: NativeContext,
 ): Promise<NativeToolResult> {
+  if (parsed.instanceResult !== undefined) {
+    return executeSelectedReport(state, toolCallId, parsed, parsed.instanceResult, signal, context);
+  }
   if (isAborted(signal)) return errorResult("agent_work report was cancelled before any effect; no report was recorded.");
   const binding = state.reportBindings.get(toolCallId);
   if (binding === undefined) {
@@ -1786,6 +2550,7 @@ async function executeReport(
     selected,
     files,
     recordedAt,
+    undefined,
   );
   work.report = report;
   work.reportSignature = finalSignature;
@@ -2249,6 +3014,31 @@ const AGENT_WORK_PARAMETERS = {
       items: { type: "string", maxLength: MAX_LIMITATION_CHARS },
       description: "Model-declared limitations or unverified coverage.",
     },
+    instanceResult: {
+      type: "object",
+      properties: {
+        instanceId: {
+          type: "string",
+          minLength: 1,
+          maxLength: MAX_TOOL_CALL_ID_CHARS,
+          description: "Observed instance id copied exactly from agent_work inspect instanceResults.",
+        },
+        parentToolCallId: {
+          type: "string",
+          minLength: 1,
+          maxLength: MAX_TOOL_CALL_ID_CHARS,
+          description: "Observed parent task call id; it must also appear in checks.",
+        },
+        envelopeSha256: {
+          type: "string",
+          pattern: "^[0-9a-f]{64}$",
+          description: "Lowercase sha256 of the observed complete task tool_result envelope.",
+        },
+      },
+      required: ["instanceId", "parentToolCallId", "envelopeSha256"],
+      additionalProperties: false,
+      description: "Optional one observed native instance result for this report. Selectors come only from inspect; byte/file observations do not establish semantic acceptance.",
+    },
   },
   required: ["action"],
   additionalProperties: false,
@@ -2267,7 +3057,7 @@ export function createNativeEntry(pi: NativeOmpApi, options: NativeEntryOptions 
       name: NATIVE_WORK_TOOL,
       label: "Native work observation",
       description:
-        "Inspect or record bounded non-authoritative observations of the current main-session work. inspect shows retained work and observed call facts. report selects only real completed tool call ids from this same work, with model-declared purposes, outcome and limitations, plus optional workspace-relative text output files. It creates no managed task, authority, acceptance or verification, blocks no native tool, and reports this plugin's tool_result observations after any earlier middleware. agent_work calls cannot be selected as checks.",
+        "Inspect or record bounded non-authoritative observations of the current main-session work. inspect shows retained work, observed call facts, and bounded candidate selectors for observed native instance results. report selects only real completed tool call ids from this same work, with model-declared purposes, outcome and limitations, plus optional workspace-relative text output files. An optional instanceResult selector associates all reported output files with exactly one observed result; its parent task call must be in checks and its ids/digest must come from inspect. Selected file hashes are bytes read during the report, not original child delivery, exclusive authorship, commit-time filesystem state, semantic acceptance or verification. It creates no managed task, authority, acceptance or verification, blocks no native tool, and reports this plugin's tool_result observations after any earlier middleware. agent_work calls cannot be selected as checks.",
       parameters: AGENT_WORK_PARAMETERS,
       approval: "read",
       loadMode: "essential",

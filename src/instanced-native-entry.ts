@@ -29,10 +29,24 @@ import type {
   NativeWorkCallReference,
 } from "./native-entry.ts";
 import {
+  MAX_ENVELOPE_BYTES,
   observeNativeInstanceResult,
   type NativeInstanceResultAssociation,
   type NativeInstanceResultObservation,
 } from "./native-instance-result.ts";
+import {
+  MAX_NATIVE_INSTANCE_REPORT_CATALOG_BYTES,
+  MAX_NATIVE_INSTANCE_REPORT_CATALOG_ITEMS,
+  unavailableNativeInstanceReportCatalog,
+  type NativeInstanceReportCatalog,
+  type NativeInstanceReportCatalogItem,
+  type NativeInstanceReportCheck,
+  type NativeInstanceReportFacts,
+  type NativeInstanceReportPort,
+  type NativeInstanceReportPrepareResult,
+  type NativeInstanceReportSelection,
+  type NativeReportWorkIdentity,
+} from "./native-instance-report.ts";
 import {
   verifyNativeAutoloadSkills,
   verifyNativeChildRole,
@@ -1895,6 +1909,655 @@ function assessResultLifecycleConflict(record: InstanceRecord): void {
   }
 }
 
+interface ReportInstanceBinding {
+  readonly factory: FactoryContext;
+  readonly root: RootState;
+  readonly record: InstanceRecord;
+  readonly workRef: NativeWorkCallReference;
+  readonly observation: NativeInstanceResultObservation;
+  readonly selection: NativeInstanceReportSelection;
+  readonly expectedWork: NativeReportWorkIdentity;
+  readonly rootEpoch: number;
+  readonly rootAgentId: string;
+  readonly rootSessionId: string;
+  readonly rootWorkspaceRoot: string;
+  readonly envelopeSha256: string;
+  readonly envelopeBytes: number;
+}
+
+function observedReportEnvelope(
+  observation: NativeInstanceResultObservation | null,
+): { readonly sha256: string; readonly bytes: number } | null {
+  if (observation === null
+    || observation.state !== "observed"
+    || observation.envelope.encoding !== "canonical-json"
+    || observation.envelope.complete !== true) {
+    return null;
+  }
+  const sha256 = observation.envelope.sha256;
+  const bytes = observation.envelope.bytes;
+  if (typeof sha256 !== "string"
+    || !/^[0-9a-f]{64}$/.test(sha256)
+    || typeof bytes !== "number"
+    || !Number.isSafeInteger(bytes)
+    || bytes < 1
+    || bytes > MAX_ENVELOPE_BYTES) {
+    return null;
+  }
+  return { sha256, bytes };
+}
+
+/**
+ * Frozen C1 plus admission/lifecycle gates for the selected report path only.
+ * This never mutates a record, root, refusal or observation.
+ */
+function reportResultFailure(
+  record: InstanceRecord,
+  root: RootState,
+  selection?: NativeInstanceReportSelection,
+): string | null {
+  if (record.admittedRootToken !== root.token) {
+    return "the instance admission belongs to a stale root generation";
+  }
+  if (record.admittedEpoch !== root.epoch) {
+    return "the instance admission belongs to a stale root epoch";
+  }
+  if (record.phase === "refused") {
+    return `the instance admission was refused${record.refusalCode === null ? "" : ` (${record.refusalCode})`}`;
+  }
+  if (record.refusalCode !== null || record.refusalMessage !== null) {
+    return "the instance admission has sticky refusal evidence";
+  }
+  if (record.roleGate !== "verified" || record.skillGate !== "verified") {
+    return "the child Role and Skill gates were not both verified before the observed result";
+  }
+  if (record.roleRefusalCode !== null || record.skillRefusalCode !== null) {
+    return "the child Role or Skill gate recorded refusal evidence";
+  }
+  if (record.workRef === null) {
+    return "no original native work reference was captured for the instance";
+  }
+  if (record.workInvalidatedReason !== null) {
+    return `the original native work reference was invalidated (${record.workInvalidatedReason})`;
+  }
+  if (record.lifecycleEvidence.failed || record.lifecycleEvidence.aborted) {
+    return "the native child lifecycle recorded failure or abort evidence";
+  }
+  if (record.lifecycle === "failed" || record.lifecycle === "aborted") {
+    return "the native child lifecycle is terminal failure or abort";
+  }
+  if (record.resultLifecycleConflict !== null) {
+    return `the result conflicts with native lifecycle evidence (${record.resultLifecycleConflict.code})`;
+  }
+  if (record.resultObservationError !== null) {
+    return `the frozen task result observation has a sticky error (${record.resultObservationError})`;
+  }
+  const observation = record.resultObservation;
+  if (observation === null) {
+    return "no frozen task result observation exists for the instance";
+  }
+  if (!record.taskResultObserved) {
+    return "the instance has no recorded task result observation";
+  }
+  if (observation.state !== "observed") {
+    return `the frozen task result observation is ${observation.state} (${observation.reason})`;
+  }
+  if (observation.reason !== "observed-envelope") {
+    return `the frozen task result observation is ${observation.reason}, not an instance-linked envelope`;
+  }
+  if (observation.link !== "instance" || observation.association === null) {
+    return "the frozen task result observation is not instance-linked";
+  }
+  const association = observation.association;
+  if (association.instanceId !== record.id
+    || association.parentToolCallId !== record.parentToolCallId
+    || association.index !== record.index) {
+    return "the frozen task result association does not match this instance admission";
+  }
+  if (record.childId === null || record.childSessionId === null) {
+    return "the instance child id or session is unavailable";
+  }
+  if (association.childId !== record.childId || association.childSessionId !== record.childSessionId) {
+    return "the frozen task result association does not match the bound child identity";
+  }
+  if (association.agentName !== record.definition.name) {
+    return "the frozen task result association names a different definition";
+  }
+  if (root.sessionId === null || root.workspaceRoot === null) {
+    return "the owner session or workspace identity is unavailable";
+  }
+  if (association.parentSessionId !== root.sessionId
+    || association.workspaceRoot !== root.workspaceRoot) {
+    return "the frozen task result association does not match the owner session or workspace";
+  }
+  if (association.rootEpoch !== record.admittedEpoch) {
+    return "the frozen task result association does not match the admitted root epoch";
+  }
+  if (association.definitionVersion !== record.definition.version) {
+    return "the frozen task result association does not match the frozen definition version";
+  }
+  const envelope = observedReportEnvelope(observation);
+  if (envelope === null) {
+    return "the frozen task result envelope is not complete canonical JSON";
+  }
+  if (selection !== undefined
+    && (association.instanceId !== selection.instanceId
+      || association.parentToolCallId !== selection.parentToolCallId
+      || envelope.sha256 !== selection.envelopeSha256)) {
+    return "the frozen task result does not match the explicit instanceResult selector";
+  }
+  if (observation.outcome !== "completed-envelope") {
+    return `the frozen task result outcome is ${observation.outcome}, not completed-envelope`;
+  }
+  if (observation.confirmedChildAbort) {
+    return "the frozen task result records a confirmed child abort";
+  }
+  if (observation.conflict !== null) {
+    return `the frozen task result observation has a sticky conflict (${observation.conflict.reason})`;
+  }
+  const native = observation.native;
+  if (native !== null
+    && (native.errorPresent
+      || native.error !== null
+      || native.aborted === true
+      || native.isError === true)) {
+    return "the frozen task result records native error or abort evidence";
+  }
+  return null;
+}
+
+function reportWorkReferenceFailure(
+  ref: NativeWorkCallReference,
+  selection: NativeInstanceReportSelection,
+  expectedWork: NativeReportWorkIdentity,
+): string | null {
+  if (ref.toolName !== "task" || ref.toolCallId !== selection.parentToolCallId) {
+    return "the original native work reference is not the selected parent task call";
+  }
+  if (ref.observationId !== expectedWork.observationId
+    || ref.generation !== expectedWork.generation
+    || ref.sessionId !== expectedWork.sessionId
+    || ref.workspaceRoot !== expectedWork.workspaceRoot) {
+    return "the original native work reference does not match this report work";
+  }
+  return null;
+}
+
+function reportWorkInspectionFailure(
+  inspection: NativeWorkCallInspection,
+  ref: NativeWorkCallReference,
+  expectedWork: NativeReportWorkIdentity | null,
+): string | null {
+  if (inspection.state !== "current") {
+    return `the native work is ${inspection.state} (${inspection.reason})`;
+  }
+  if (inspection.workPhase !== "active") {
+    return "the native work is not active";
+  }
+  if (inspection.evidenceState !== "available") {
+    return "the native work evidence is not available";
+  }
+  if (inspection.requestAttribution !== "matched-user-input") {
+    return `the native work request attribution is ${inspection.requestAttribution ?? "unavailable"}`;
+  }
+  if (inspection.pendingInputCount !== 0 || inspection.pendingInputsDropped !== 0) {
+    return "the native work has pending or dropped ingress";
+  }
+  if (inspection.callResultState !== "observed") {
+    return "the original parent task call has no observed result";
+  }
+  const association = inspection.association;
+  if (association === null
+    || association.observationId !== ref.observationId
+    || association.generation !== ref.generation
+    || association.sessionId !== ref.sessionId
+    || association.workspaceRoot !== ref.workspaceRoot
+    || association.toolCallId !== ref.toolCallId
+    || association.toolName !== ref.toolName) {
+    return "the native work inspection did not retain the original call reference";
+  }
+  if (expectedWork !== null
+    && (association.observationId !== expectedWork.observationId
+      || association.generation !== expectedWork.generation
+      || association.sessionId !== expectedWork.sessionId
+      || association.workspaceRoot !== expectedWork.workspaceRoot)) {
+    return "the current native work differs from the original report work";
+  }
+  return null;
+}
+
+function inspectReportWork(
+  factory: FactoryContext,
+  ref: NativeWorkCallReference,
+  context: NativeContext,
+): { readonly ok: true; readonly inspection: NativeWorkCallInspection }
+  | { readonly ok: false; readonly reason: string } {
+  try {
+    return {
+      ok: true,
+      inspection: factory.definitionEntry.nativeEntry.inspectCall(ref, context),
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: boundedMessage(`the original native work inspection threw: ${errorMessage(error)}`),
+    };
+  }
+}
+
+function ownerIdentityFailure(
+  root: RootState,
+  expectedWork: NativeReportWorkIdentity,
+  context: NativeContext,
+): string | null {
+  let facts: HostFacts;
+  try {
+    facts = readHostFacts(context);
+  } catch {
+    return "the actual host context could not be read";
+  }
+  if (!matchesOwnerIdentity(root, facts)) {
+    return "the actual main agent, session or live workspace does not match the bound owner";
+  }
+  if (facts.sessionId !== expectedWork.sessionId || facts.workspaceRoot !== expectedWork.workspaceRoot) {
+    return "the live session or workspace differs from the captured report work";
+  }
+  return null;
+}
+
+function localReportBindingFailure(binding: ReportInstanceBinding): string | null {
+  const { factory, root, record, workRef, observation, selection, expectedWork } = binding;
+  if (moduleRoot !== root) {
+    return "the instance root was replaced after preparation";
+  }
+  if (!ownsRoot(factory, root) || !root.open || root.phase !== "ready") {
+    return "the instance root is no longer open and ready";
+  }
+  if (root.factoryId !== factory.id || factory.rootToken !== root.token) {
+    return "the instance root no longer belongs to this factory";
+  }
+  if (root.epoch !== binding.rootEpoch
+    || root.agentId !== binding.rootAgentId
+    || root.sessionId !== binding.rootSessionId
+    || root.workspaceRoot !== binding.rootWorkspaceRoot) {
+    return "the instance root identity or epoch changed after preparation";
+  }
+  if (root.recordByToolCall.get(record.parentToolCallId) !== record
+    || !root.records.includes(record)) {
+    return "the original instance record is no longer retained";
+  }
+  if (record.workRef !== workRef) {
+    return "the original native work reference changed after preparation";
+  }
+  if (record.resultObservation !== observation) {
+    return "the frozen task result observation object changed after preparation";
+  }
+  if (record.id !== selection.instanceId
+    || record.parentToolCallId !== selection.parentToolCallId) {
+    return "the instance record no longer matches the explicit selector";
+  }
+  if (record.childId !== observation.association?.childId
+    || record.childSessionId !== observation.association.childSessionId) {
+    return "the bound child identity changed after preparation";
+  }
+  const resultFailure = reportResultFailure(record, root, selection);
+  if (resultFailure !== null) return resultFailure;
+  const workFailure = reportWorkReferenceFailure(workRef, selection, expectedWork);
+  if (workFailure !== null) return workFailure;
+  const envelope = observedReportEnvelope(observation);
+  if (envelope === null
+    || envelope.sha256 !== binding.envelopeSha256
+    || envelope.bytes !== binding.envelopeBytes) {
+    return "the frozen envelope metadata changed after preparation";
+  }
+  return null;
+}
+
+function checkFailure(reason: string): NativeInstanceReportCheck {
+  return { ok: false, reason: boundedMessage(reason) };
+}
+
+function refreshReportBinding(
+  binding: ReportInstanceBinding,
+  context: NativeContext,
+): NativeInstanceReportCheck {
+  try {
+    if (context === null || context === undefined) {
+      return checkFailure("the actual host context is unavailable");
+    }
+    const beforeFailure = ownerIdentityFailure(binding.root, binding.expectedWork, context);
+    if (beforeFailure !== null) return checkFailure(beforeFailure);
+    const inspected = inspectReportWork(binding.factory, binding.workRef, context);
+    if (!inspected.ok) return checkFailure(inspected.reason);
+    const inspectionFailure = reportWorkInspectionFailure(
+      inspected.inspection,
+      binding.workRef,
+      binding.expectedWork,
+    );
+    if (inspectionFailure !== null) return checkFailure(inspectionFailure);
+    const afterFailure = ownerIdentityFailure(binding.root, binding.expectedWork, context);
+    if (afterFailure !== null) return checkFailure(afterFailure);
+    const localFailure = localReportBindingFailure(binding);
+    if (localFailure !== null) return checkFailure(localFailure);
+    return { ok: true };
+  } catch (error) {
+    return checkFailure(`the prepared instance result refresh threw: ${errorMessage(error)}`);
+  }
+}
+
+function prepareInstanceReport(
+  factory: FactoryContext,
+  selection: NativeInstanceReportSelection,
+  work: NativeReportWorkIdentity,
+  context: NativeContext,
+): NativeInstanceReportPrepareResult {
+  try {
+    const root = moduleRoot;
+    if (root === null) {
+      return { ok: false, reason: "the native instance root is unavailable" };
+    }
+    if (!ownsRoot(factory, root) || !root.open || root.phase !== "ready") {
+      return { ok: false, reason: "the native instance root is not open and ready" };
+    }
+    const expectedWork: NativeReportWorkIdentity = Object.freeze({
+      observationId: work.observationId,
+      generation: work.generation,
+      sessionId: work.sessionId,
+      workspaceRoot: work.workspaceRoot,
+    });
+    const ownerFailure = ownerIdentityFailure(root, expectedWork, context);
+    if (ownerFailure !== null) {
+      return { ok: false, reason: ownerFailure };
+    }
+    const record = root.recordByToolCall.get(selection.parentToolCallId);
+    if (record === undefined
+      || record.id !== selection.instanceId
+      || record.parentToolCallId !== selection.parentToolCallId) {
+      return {
+        ok: false,
+        reason: "no retained instance record matches both the exact parent task call and instance id",
+      };
+    }
+    const ref = record.workRef;
+    if (ref === null) {
+      return { ok: false, reason: "no original native work reference was captured for the instance" };
+    }
+    const refFailure = reportWorkReferenceFailure(ref, selection, expectedWork);
+    if (refFailure !== null) {
+      return { ok: false, reason: refFailure };
+    }
+    const resultFailure = reportResultFailure(record, root, selection);
+    if (resultFailure !== null) {
+      return { ok: false, reason: resultFailure };
+    }
+    const observation = record.resultObservation;
+    const envelope = observedReportEnvelope(observation);
+    if (observation === null || envelope === null || observation.association === null) {
+      return { ok: false, reason: "the frozen task result observation is incomplete" };
+    }
+    if (observation.association.parentSessionId !== expectedWork.sessionId
+      || observation.association.workspaceRoot !== expectedWork.workspaceRoot) {
+      return { ok: false, reason: "the frozen result session or workspace differs from the report work" };
+    }
+    const binding: ReportInstanceBinding = Object.freeze({
+      factory,
+      root,
+      record,
+      workRef: ref,
+      observation,
+      selection: Object.freeze({
+        instanceId: selection.instanceId,
+        parentToolCallId: selection.parentToolCallId,
+        envelopeSha256: selection.envelopeSha256,
+      }),
+      expectedWork,
+      rootEpoch: root.epoch,
+      rootAgentId: root.agentId ?? "",
+      rootSessionId: root.sessionId ?? "",
+      rootWorkspaceRoot: root.workspaceRoot ?? "",
+      envelopeSha256: envelope.sha256,
+      envelopeBytes: envelope.bytes,
+    });
+    const inspected = inspectReportWork(factory, ref, context);
+    if (!inspected.ok) {
+      return { ok: false, reason: inspected.reason };
+    }
+    const inspectionFailure = reportWorkInspectionFailure(inspected.inspection, ref, expectedWork);
+    if (inspectionFailure !== null) {
+      return { ok: false, reason: inspectionFailure };
+    }
+    // Host getters may have reentered navigation, disposal or result
+    // observation while inspectCall read them. Re-read the live owner and then
+    // judge only the captured plain state.
+    const afterOwnerFailure = ownerIdentityFailure(root, expectedWork, context);
+    if (afterOwnerFailure !== null) {
+      return { ok: false, reason: afterOwnerFailure };
+    }
+    const localFailure = localReportBindingFailure(binding);
+    if (localFailure !== null) {
+      return { ok: false, reason: localFailure };
+    }
+    const facts: NativeInstanceReportFacts = deepFreeze({
+      result: { ...observation.association },
+      work: {
+        observationId: ref.observationId,
+        generation: ref.generation,
+        sessionId: ref.sessionId,
+        workspaceRoot: ref.workspaceRoot,
+        toolCallId: ref.toolCallId,
+        toolName: "task" as const,
+      },
+      envelope: {
+        sha256: envelope.sha256,
+        bytes: envelope.bytes,
+        scope: "tool-result-middleware" as const,
+      },
+      artifactBasis: "observed-during-report" as const,
+      semanticAcceptance: "not-evaluated" as const,
+    });
+    const prepared = Object.freeze({
+      facts,
+      refresh(nextContext: NativeContext): NativeInstanceReportCheck {
+        return refreshReportBinding(binding, nextContext);
+      },
+      revalidate(): string | null {
+        return localReportBindingFailure(binding);
+      },
+    });
+    return { ok: true, prepared };
+  } catch (error) {
+    return {
+      ok: false,
+      reason: boundedMessage(`instance result preparation failed: ${errorMessage(error)}`),
+    };
+  }
+}
+
+function reportCatalogRow(
+  record: InstanceRecord,
+  envelopeSha256: string | null,
+  available: boolean,
+  reason: string | null,
+): NativeInstanceReportCatalogItem {
+  return Object.freeze({
+    instanceId: record.id,
+    parentToolCallId: record.parentToolCallId,
+    envelopeSha256,
+    available,
+    reason: reason === null ? null : boundedMessage(reason),
+  });
+}
+
+function reportWorkMatchesReference(
+  ref: NativeWorkCallReference,
+  work: NativeReportWorkIdentity,
+): boolean {
+  return ref.observationId === work.observationId
+    && ref.generation === work.generation
+    && ref.sessionId === work.sessionId
+    && ref.workspaceRoot === work.workspaceRoot;
+}
+
+function catalogRowForRecord(
+  factory: FactoryContext,
+  root: RootState,
+  record: InstanceRecord,
+  context: NativeContext,
+  actualWork: NativeReportWorkIdentity | null,
+): NativeInstanceReportCatalogItem {
+  const observation = record.resultObservation;
+  const envelope = observedReportEnvelope(observation);
+  const digest = envelope === null ? null : envelope.sha256;
+  const localFailure = reportResultFailure(record, root);
+  if (localFailure !== null) {
+    return reportCatalogRow(record, digest, false, localFailure);
+  }
+  if (actualWork === null) {
+    return reportCatalogRow(record, digest, false, "no current report work identity is available");
+  }
+  const ref = record.workRef;
+  if (ref === null) {
+    return reportCatalogRow(record, digest, false, "no original native work reference is retained");
+  }
+  if (actualWork.sessionId !== root.sessionId
+    || actualWork.workspaceRoot !== root.workspaceRoot) {
+    return reportCatalogRow(record, digest, false, "the supplied work belongs to a different owner session or workspace");
+  }
+  if (!reportWorkMatchesReference(ref, actualWork)) {
+    return reportCatalogRow(record, digest, false, "the observed instance belongs to a different work generation");
+  }
+  const inspected = inspectReportWork(factory, ref, context);
+  if (!inspected.ok) {
+    return reportCatalogRow(record, digest, false, inspected.reason);
+  }
+  const inspectionFailure = reportWorkInspectionFailure(inspected.inspection, ref, actualWork);
+  if (inspectionFailure !== null) {
+    return reportCatalogRow(record, digest, false, inspectionFailure);
+  }
+  return reportCatalogRow(record, digest, true, null);
+}
+
+function encodedCatalogBytes(catalog: NativeInstanceReportCatalog): number {
+  return Buffer.byteLength(JSON.stringify(catalog), "utf8");
+}
+
+function finishReportCatalog(
+  items: readonly NativeInstanceReportCatalogItem[],
+  total: number,
+): NativeInstanceReportCatalog {
+  const bounded = [...items];
+  let omitted = total - bounded.length;
+  const build = (): NativeInstanceReportCatalog => Object.freeze({
+    state: "available" as const,
+    reason: null,
+    items: Object.freeze([...bounded]) as readonly NativeInstanceReportCatalogItem[],
+    total,
+    omitted,
+    complete: omitted === 0,
+  });
+  let catalog = build();
+  while (bounded.length > MAX_NATIVE_INSTANCE_REPORT_CATALOG_ITEMS
+    || encodedCatalogBytes(catalog) > MAX_NATIVE_INSTANCE_REPORT_CATALOG_BYTES) {
+    if (bounded.length === 0) {
+      return unavailableNativeInstanceReportCatalog(
+        "the instance result catalog metadata exceeds the bounded encoded size",
+      );
+    }
+    bounded.pop();
+    omitted = total - bounded.length;
+    catalog = build();
+  }
+  return catalog;
+}
+
+/**
+ * Bounded inspection-time candidates from the same live root. Every row was
+ * judged against the actual owner identity and live work inspection. A root,
+ * epoch or record-table change during host reads rejects the whole catalog
+ * instead of mixing facts from a different generation.
+ */
+function inspectInstanceReportCatalog(
+  factory: FactoryContext,
+  context: NativeContext,
+  actualWork: NativeReportWorkIdentity | null,
+): NativeInstanceReportCatalog {
+  try {
+    const root = moduleRoot;
+    if (root === null) {
+      return unavailableNativeInstanceReportCatalog("the native instance root is unavailable");
+    }
+    if (!ownsRoot(factory, root) || !root.open || root.phase !== "ready") {
+      return unavailableNativeInstanceReportCatalog("the native instance root is not open and ready");
+    }
+    let facts: HostFacts;
+    try {
+      facts = readHostFacts(context);
+    } catch {
+      return unavailableNativeInstanceReportCatalog("the actual host context could not be read");
+    }
+    if (!matchesOwnerIdentity(root, facts)) {
+      return unavailableNativeInstanceReportCatalog(
+        "the actual main agent, session or live workspace does not match the bound owner",
+      );
+    }
+    const rootToken = root.token;
+    const rootEpoch = root.epoch;
+    const rootAgentId = root.agentId;
+    const rootSessionId = root.sessionId;
+    const rootWorkspaceRoot = root.workspaceRoot;
+    const records = [...root.records];
+    const total = records.length;
+    const limit = Math.min(records.length, MAX_NATIVE_INSTANCE_REPORT_CATALOG_ITEMS);
+    const items: NativeInstanceReportCatalogItem[] = [];
+    for (let index = 0; index < limit; index += 1) {
+      items.push(catalogRowForRecord(factory, root, records[index]!, context, actualWork));
+    }
+    let after: HostFacts;
+    try {
+      after = readHostFacts(context);
+    } catch {
+      return unavailableNativeInstanceReportCatalog("the actual host context could not be re-read");
+    }
+    if (!matchesOwnerIdentity(root, after)
+      || !ownsRoot(factory, root)
+      || !root.open
+      || root.phase !== "ready"
+      || root.token !== rootToken
+      || root.epoch !== rootEpoch
+      || root.agentId !== rootAgentId
+      || root.sessionId !== rootSessionId
+      || root.workspaceRoot !== rootWorkspaceRoot
+      || root.records.length !== records.length
+      || root.records.some((record, index) => record !== records[index])) {
+      return unavailableNativeInstanceReportCatalog(
+        "the instance root, owner identity or record table changed while inspecting candidates",
+      );
+    }
+    // A later row's host reads may have changed an earlier record's frozen C1
+    // object, gates or map identity. Downgrade those rows rather than returning
+    // a candidate that was not valid at the end of this inspection.
+    for (let index = 0; index < limit; index += 1) {
+      const record = records[index]!;
+      const stillMapped = root.recordByToolCall.get(record.parentToolCallId) === record;
+      const lateFailure = reportResultFailure(record, root);
+      if (!stillMapped || lateFailure !== null) {
+        const lateEnvelope = observedReportEnvelope(record.resultObservation);
+        items[index] = reportCatalogRow(
+          record,
+          lateEnvelope === null ? null : lateEnvelope.sha256,
+          false,
+          stillMapped ? lateFailure ?? "the instance record changed during inspection" : "the instance record map changed during inspection",
+        );
+      }
+    }
+    return finishReportCatalog(items, total);
+  } catch (error) {
+    return unavailableNativeInstanceReportCatalog(
+      boundedMessage(`instance result inspection failed: ${errorMessage(error)}`),
+    );
+  }
+}
+
 function recordAdmissionFailure(root: RootState, code: string, message: string): void {
   root.refusalCount += 1;
   root.lastRefusal = { code: boundedString(code, 64), message: boundedMessage(message) };
@@ -2988,6 +3651,30 @@ export function createInstancedNativeEntry(
   // no match; a missing/throwing registrar stays unregistered and D1 emits a
   // local unavailable diagnostic instead of a status/binding bypass.
   let statusFactory: FactoryContext | null = null;
+  // The port is trusted composition, not a public capability. Its closures
+  // intentionally see the factory only after construction.
+  let portFactory: FactoryContext | null = null;
+  const instanceReportPort: NativeInstanceReportPort = Object.freeze({
+    prepare(
+      selection: NativeInstanceReportSelection,
+      work: NativeReportWorkIdentity,
+      context: NativeContext,
+    ): NativeInstanceReportPrepareResult {
+      if (portFactory === null) {
+        return { ok: false, reason: "the native instance entry is not initialized" };
+      }
+      return prepareInstanceReport(portFactory, selection, work, context);
+    },
+    inspect(
+      context: NativeContext,
+      work: NativeReportWorkIdentity | null,
+    ): NativeInstanceReportCatalog {
+      if (portFactory === null) {
+        return unavailableNativeInstanceReportCatalog("the native instance entry is not initialized");
+      }
+      return inspectInstanceReportCatalog(portFactory, context, work);
+    },
+  });
   const d1Options: DefinedNativeEntryOptions = {
     ...(options.mainDefinitionPath === undefined ? {} : { definitionPath: options.mainDefinitionPath }),
     ...(options.nativePorts === undefined ? {} : {
@@ -2999,6 +3686,7 @@ export function createInstancedNativeEntry(
     }),
     ...(options.loadMainDefinition === undefined ? {} : { loadDefinition: options.loadMainDefinition }),
     startupTimeoutMs: d1TimeoutMs,
+    instanceReports: instanceReportPort,
     statusComposition: {
       instanceStatus: {
         isRegistered: () => statusFactory !== null && statusFactory.statusCommandRegistered,
@@ -3039,6 +3727,7 @@ export function createInstancedNativeEntry(
     refusedReason: null,
     disposed: false,
   };
+  portFactory = factory;
   factory.statusCommandRegistered = registerStatusCommand(pi, factory);
   // Readiness is published only after the synchronous registrar succeeded.
   if (factory.statusCommandRegistered) statusFactory = factory;

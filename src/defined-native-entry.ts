@@ -26,6 +26,7 @@ import {
   type NativeWorkCallCapture,
   type NativeWorkCallInspection,
 } from "./native-entry.ts";
+import type { NativeInstanceReportPort } from "./native-instance-report.ts";
 import { NATIVE_WORK_TOOL } from "./native-work.ts";
 import { canonicalWorkspaceRoot, currentTaskOwner } from "./task-entry-port.ts";
 
@@ -109,6 +110,11 @@ export interface DefinedNativeEntryOptions {
   readonly diagnostic?: (event: DefinitionBindingDiagnostic) => void;
   /** INTERNAL trusted composition only; never a public command capability. */
   readonly statusComposition?: DefinedNativeStatusComposition;
+  /**
+   * INTERNAL trusted composition only; forwarded unchanged to
+   * createNativeEntry and never read or configured from user/model input.
+   */
+  readonly instanceReports?: NativeInstanceReportPort;
 }
 
 export interface DefinedNativeEntryControls {
@@ -877,7 +883,10 @@ export function createDefinedNativeEntry(
 
   let nativeEntry: ReturnType<typeof createNativeEntry>;
   try {
-    nativeEntry = createNativeEntry(guardedNativeApi(pi, controller, touch));
+    nativeEntry = createNativeEntry(
+      guardedNativeApi(pi, controller, touch),
+      options.instanceReports === undefined ? {} : { instanceReports: options.instanceReports },
+    );
   } catch (error) {
     controller.startupFailed(`Native observer composition failed: ${errorMessage(error)}`);
     nativeEntry = {

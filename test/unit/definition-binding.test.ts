@@ -30,6 +30,10 @@ import {
   type NativeContext,
   type NativeToolResult,
 } from "../../src/native-entry.ts";
+import type {
+  NativeInstanceReportPort,
+  NativeReportWorkIdentity,
+} from "../../src/native-instance-report.ts";
 import { clearPublishedTaskOwner, publishTaskOwner } from "../../src/task-entry-port.ts";
 import type { TaskOwner } from "../../src/task-owner.ts";
 
@@ -474,6 +478,7 @@ function startEntry(
     readonly definitionPath?: string;
     readonly useFlag?: boolean;
     readonly startupTimeoutMs?: number;
+    readonly instanceReports?: NativeInstanceReportPort;
   } = {},
 ): DefinedNativeEntryControls {
   const control = createDefinedNativeEntry(host.pi, {
@@ -484,6 +489,7 @@ function startEntry(
     diagnostic: (event) => host.diagnostics.push(event),
     ...(options.loadDefinition === undefined ? {} : { loadDefinition: options.loadDefinition }),
     ...(options.startupTimeoutMs === undefined ? {} : { startupTimeoutMs: options.startupTimeoutMs }),
+    ...(options.instanceReports === undefined ? {} : { instanceReports: options.instanceReports }),
   });
   controls.push(control);
   return control;
@@ -1704,5 +1710,51 @@ describe("optional main definition binding", () => {
     await replacementHost.sessionStart();
     await replacementControl.controller.whenIdle();
     expect(statusOf(replacementControl).version).not.toBe(status.version);
+  });
+
+  test("D1 forwards the internal instance report port only to createNativeEntry", async () => {
+    const fixture = await definitionFixture({
+      name: "forward-port",
+      body: "FORWARD_PORT_BODY",
+      tools: ["read"],
+    });
+    const host = newHost(fixture);
+    let inspectCalls = 0;
+    let inspectedWork: NativeReportWorkIdentity | null = null;
+    const port: NativeInstanceReportPort = {
+      prepare() {
+        throw new Error("prepare is not expected during inspect forwarding");
+      },
+      inspect(_context, work) {
+        inspectCalls += 1;
+        inspectedWork = work;
+        return {
+          state: "available",
+          reason: null,
+          items: [],
+          total: 0,
+          omitted: 0,
+          complete: true,
+        };
+      },
+    };
+    const control = startEntry(host, fixture, { instanceReports: port });
+    await host.sessionStart();
+    await waitFor(() => statusOf(control).phase === "bound");
+    await host.input("forward-port genuine input");
+    expect(await host.prompt("forward-port genuine input")).toBeDefined();
+    const result = await host.callTool(AGENT_WORK, "inspect-forwarded-port", { action: "inspect" });
+    if ("blocked" in result) throw new Error("agent_work inspect was unexpectedly blocked");
+    expect(result.isError).not.toBe(true);
+    expect((result.details as Record<string, any>).instanceResults).toEqual({
+      state: "available",
+      reason: null,
+      items: [],
+      total: 0,
+      omitted: 0,
+      complete: true,
+    });
+    expect(inspectCalls).toBe(1);
+    expect(inspectedWork).toMatchObject({ observationId: expect.stringMatching(/^native-work-\d+$/) });
   });
 });
