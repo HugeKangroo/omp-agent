@@ -1,5 +1,11 @@
 # Release notes
 
+## Native child compatibility note
+
+Documented bounded compatibility evidence on the fixed macOS/OMP 18.20.2/Bun 1.4.0 probe: one RPC parent, two native same-definition children, 6 local deterministic provider requests, 4 all-session tool calls and shutdown of all 3 sessions. The record establishes the native lifecycle parent-call → child-session link, retained prompt segments with one instance marker, per-child input/model/Skill/tool set and matching parent results. Spawn keys differed from child ids, so association relied on native lifecycle records rather than names, order or format guesses.
+
+This is documentation of a compatibility seam only. The package default, product entry, main-only definition binding and OMP scheduling are unchanged, and no instance state isolation is added. Complete instance binding, version changes, cancellation, late delivery, artifact isolation and quality remain unaccepted, no all-real-model pass is claimed, and earlier quality failures remain recorded. The local fixture provider performed no network IO; no process-wide zero-network claim is made. See [Architecture](architecture.md) and [Testing](testing.md).
+
 ## Optional main-session Agent definition entry
 
 Added `src/defined-native-entry.ts`, an optional explicitly loaded entry that binds one Agent Markdown file to the current main session. It uses the existing OMP kernel, native parser and active Skill catalog; the package default remains `daily-entry.ts`. One absolute `--agent-definition` path is read at startup and preflighted, then the definition and selected Skill initial text are frozen under a stable snapshot version. Only `name`, `description`, `tools`, `model` and `autoloadSkills` are accepted. Tools may narrow but not widen the host set, one exact host-resolved model selector is allowed, and Skill names must be exact. Names, roles and definition text grant no authority.
