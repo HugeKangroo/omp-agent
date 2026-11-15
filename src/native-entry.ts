@@ -110,11 +110,84 @@ export interface NativeEntryOptions {
   maxRememberedCallIds?: number;
 }
 
+export const NATIVE_WORK_CALL_INSPECTION_SCHEMA = "omp-agent.native-work-call-inspection.v1";
+
+export interface NativeWorkCallSelector {
+  readonly toolCallId: string;
+  readonly toolName: string;
+}
+
+/** Primitive-only association copy; never contains Work, ObservedCall or context. */
+export interface NativeWorkCallReference {
+  readonly observationId: string;
+  readonly generation: number;
+  readonly sessionId: string;
+  readonly workspaceRoot: string;
+  readonly toolCallId: string;
+  readonly toolName: string;
+}
+
+export type NativeWorkCallState = "current" | "suspended" | "ended" | "stale" | "unavailable";
+
+export type NativeWorkCallReason =
+  | "current-work"
+  | "work-ended"
+  | "pending-input"
+  | "unknown-input-source"
+  | "input-history-truncated"
+  | "work-replaced"
+  | "work-invalidated"
+  | "work-not-retained"
+  | "call-not-retained"
+  | "call-rebound"
+  | "call-conflicted"
+  | "live-session-changed"
+  | "live-workspace-changed"
+  | "invalid-selector"
+  | "foreign-reference"
+  | "entry-disabled"
+  | "entry-disposed"
+  | "managed-owner-present"
+  | "not-main-context"
+  | "live-identity-unavailable"
+  | "call-not-observed"
+  | "binding-inconsistent"
+  | "work-evidence-unavailable"
+  | "call-evidence-unknown";
+
+export interface NativeWorkCallInspection {
+  readonly schema: typeof NATIVE_WORK_CALL_INSPECTION_SCHEMA;
+  readonly authority: "non-authoritative";
+  readonly state: NativeWorkCallState;
+  readonly reason: NativeWorkCallReason;
+  readonly association: NativeWorkCallReference | null;
+  readonly workPhase: "active" | "ended" | "unknown" | null;
+  readonly requestAttribution: RequestAttribution | null;
+  readonly evidenceState: "available" | "unknown-source" | "unavailable" | null;
+  readonly callResultState: "preflight" | "observed" | "unknown" | null;
+  readonly pendingInputCount: number | null;
+  readonly pendingInputsDropped: number | null;
+}
+
+export type NativeWorkCallCapture =
+  | {
+      readonly ok: true;
+      readonly ref: NativeWorkCallReference;
+      readonly inspection: NativeWorkCallInspection;
+    }
+  | {
+      readonly ok: false;
+      readonly ref: null;
+      readonly inspection: NativeWorkCallInspection;
+    };
+
 export interface NativeEntryControls {
   readonly enabled: boolean;
   readonly disabledReason: string | null;
   isEnabled(): boolean;
   dispose(): void;
+  captureCall(selector: NativeWorkCallSelector, context: NativeContext): NativeWorkCallCapture;
+  inspectCall(ref: unknown, context: NativeContext): NativeWorkCallInspection;
 }
 
 type WorkStatus = "active" | "ended" | "unknown";
@@ -1750,7 +1823,366 @@ async function executeTool(
   return executeReport(state, toolCallId, parsed, signal, context);
 }
 
+interface CallPortHost {
+  readonly main: boolean;
+  readonly sessionId: string | null;
+  readonly workspaceRoot: string | null;
+  readonly ownerKnown: boolean;
+  readonly ownerPresent: boolean;
+}
+
+interface ReadCallSelector {
+  readonly ok: boolean;
+  readonly toolCallId: string;
+  readonly toolName: string;
+}
+
+interface CallClassification {
+  readonly state: NativeWorkCallState;
+  readonly reason: NativeWorkCallReason;
+}
+
+function readCallSelector(selector: unknown): ReadCallSelector {
+  let toolCallId: unknown;
+  let toolName: unknown;
+  try {
+    if (selector === null || typeof selector !== "object" || Array.isArray(selector)) {
+      return { ok: false, toolCallId: "", toolName: "" };
+    }
+    const record = selector as Record<string, unknown>;
+    // Read both fields before judging so a reentrant selector getter is not
+    // partially observed and then trusted.
+    toolCallId = record.toolCallId;
+    toolName = record.toolName;
+  } catch {
+    return { ok: false, toolCallId: "", toolName: "" };
+  }
+  const ok = typeof toolCallId === "string"
+    && toolCallId.length >= 1
+    && toolCallId.length <= MAX_TOOL_CALL_ID_CHARS
+    && typeof toolName === "string"
+    && toolName.length >= 1;
+  return {
+    ok,
+    toolCallId: typeof toolCallId === "string" ? toolCallId : "",
+    toolName: typeof toolName === "string" ? toolName : "",
+  };
+}
+
+function readCallPortHost(context: NativeContext): CallPortHost {
+  // Every context/selector getter is read before the final global ownership
+  // read. A reentrant session/cwd getter may publish a managed owner, so the
+  // owner must be observed last and then judged against a fresh state/Maps
+  // read by the caller.
+  const sessionId = readSessionId(context);
+  const workspaceRoot = readWorkspace(context);
+  let main = false;
+  try {
+    main = context.agent?.kind === "main";
+  } catch {
+    main = false;
+  }
+  let ownerKnown = true;
+  let ownerPresent = false;
+  try {
+    ownerPresent = currentTaskOwner() !== undefined;
+  } catch {
+    ownerKnown = false;
+  }
+  return {
+    main,
+    sessionId,
+    workspaceRoot,
+    ownerKnown,
+    ownerPresent,
+  };
+}
+
+function callEntryFailure(state: EntryState, host: CallPortHost): NativeWorkCallReason | null {
+  if (state.disposed) return "entry-disposed";
+  if (!state.enabled) return "entry-disabled";
+  if (!host.ownerKnown) return "live-identity-unavailable";
+  if (host.ownerPresent) return "managed-owner-present";
+  if (!host.main) return "not-main-context";
+  if (host.sessionId === null || host.workspaceRoot === null) return "live-identity-unavailable";
+  return null;
+}
+
+function referenceCopy(source: NativeWorkCallReference): NativeWorkCallReference {
+  return deepFreeze({
+    observationId: source.observationId,
+    generation: source.generation,
+    sessionId: source.sessionId,
+    workspaceRoot: source.workspaceRoot,
+    toolCallId: source.toolCallId,
+    toolName: source.toolName,
+  });
+}
+
+function callInspection(
+  state: EntryState,
+  stateName: NativeWorkCallState,
+  reason: NativeWorkCallReason,
+  association: NativeWorkCallReference | null,
+  work: Work | null,
+  call: ObservedCall | null,
+): NativeWorkCallInspection {
+  return deepFreeze({
+    schema: NATIVE_WORK_CALL_INSPECTION_SCHEMA,
+    authority: "non-authoritative",
+    state: stateName,
+    reason,
+    association: association === null ? null : referenceCopy(association),
+    workPhase: work === null ? null : work.status,
+    requestAttribution: work === null ? null : work.requestAttribution,
+    evidenceState: work === null ? null : work.evidenceState,
+    callResultState: call === null ? null : call.resultState,
+    pendingInputCount: work === null ? null : state.pending.length,
+    pendingInputsDropped: work === null ? null : state.pendingDropped,
+  });
+}
+
+function captureFailure(
+  state: EntryState,
+  stateName: NativeWorkCallState,
+  reason: NativeWorkCallReason,
+  work: Work | null = null,
+  call: ObservedCall | null = null,
+): NativeWorkCallCapture {
+  return deepFreeze({
+    ok: false as const,
+    ref: null,
+    inspection: callInspection(state, stateName, reason, null, work, call),
+  });
+}
+
+function classifyCallAssociation(
+  state: EntryState,
+  work: Work,
+  call: ObservedCall,
+): CallClassification {
+  if (work.evidenceState === "unavailable") {
+    return { state: "unavailable", reason: "work-evidence-unavailable" };
+  }
+  if (call.resultState === "unknown") {
+    return { state: "unavailable", reason: "call-evidence-unknown" };
+  }
+  if (state.pendingDropped > 0) {
+    return { state: "suspended", reason: "input-history-truncated" };
+  }
+  if (state.pending.length > 0) {
+    return { state: "suspended", reason: "pending-input" };
+  }
+  if (work.evidenceState === "unknown-source" || work.requestAttribution !== "matched-user-input") {
+    return { state: "suspended", reason: "unknown-input-source" };
+  }
+  if (work.status === "ended") return { state: "ended", reason: "work-ended" };
+  if (work.status === "active") return { state: "current", reason: "current-work" };
+  return { state: "unavailable", reason: "binding-inconsistent" };
+}
+
+function captureCall(
+  state: EntryState,
+  issuedReferences: WeakSet<object>,
+  selector: unknown,
+  context: NativeContext,
+): NativeWorkCallCapture {
+  // Potential getters finish before any state/Maps judgement.
+  const selected = readCallSelector(selector);
+  const host = readCallPortHost(context);
+  const entryFailure = callEntryFailure(state, host);
+  if (!selected.ok) return captureFailure(state, "unavailable", "invalid-selector");
+  if (entryFailure !== null) return captureFailure(state, "unavailable", entryFailure);
+
+  const toolCallId = selected.toolCallId;
+  const binding = state.callBindings.get(toolCallId);
+  if (binding === undefined) return captureFailure(state, "unavailable", "call-not-observed");
+  const work = binding.work;
+  const call = binding.call;
+  if (call.toolCallId !== toolCallId || call.toolName !== selected.toolName) {
+    return captureFailure(state, "unavailable", "call-not-observed", work, call);
+  }
+  if (!state.works.includes(work)) {
+    return captureFailure(state, "stale", "work-not-retained", work, call);
+  }
+  if (work.invalidated) {
+    return captureFailure(state, "stale", "work-invalidated", work, call);
+  }
+  if (work.callIndex.get(toolCallId) !== call || state.callBindings.get(toolCallId) !== binding) {
+    return captureFailure(state, "unavailable", "binding-inconsistent", work, call);
+  }
+  if (call.associationConflict) {
+    return captureFailure(state, "stale", "call-conflicted", work, call);
+  }
+  if (state.callIdMemory.get(toolCallId) !== work.generation) {
+    return captureFailure(state, "unavailable", "binding-inconsistent", work, call);
+  }
+  if (state.current !== work) {
+    return captureFailure(state, "stale", "work-replaced", work, call);
+  }
+  if (work.sessionId === null || work.workspaceRoot === null) {
+    return captureFailure(state, "unavailable", "work-evidence-unavailable", work, call);
+  }
+  if (host.sessionId !== work.sessionId) {
+    return captureFailure(state, "stale", "live-session-changed", work, call);
+  }
+  if (host.workspaceRoot !== work.workspaceRoot) {
+    return captureFailure(state, "stale", "live-workspace-changed", work, call);
+  }
+
+  const classification = classifyCallAssociation(state, work, call);
+  if (classification.state !== "current"
+    && classification.state !== "suspended"
+    && classification.state !== "ended") {
+    return captureFailure(state, classification.state, classification.reason, work, call);
+  }
+
+  const ref: NativeWorkCallReference = {
+    observationId: work.observationId,
+    generation: work.generation,
+    sessionId: work.sessionId,
+    workspaceRoot: work.workspaceRoot,
+    toolCallId: call.toolCallId,
+    toolName: call.toolName,
+  };
+  issuedReferences.add(ref);
+  deepFreeze(ref);
+  return deepFreeze({
+    ok: true as const,
+    ref,
+    inspection: callInspection(
+      state,
+      classification.state,
+      classification.reason,
+      ref,
+      work,
+      call,
+    ),
+  });
+}
+
+function readIssuedReference(ref: unknown): NativeWorkCallReference | null {
+  try {
+    const record = ref as Record<string, unknown>;
+    const observationId = record.observationId;
+    const generation = record.generation;
+    const sessionId = record.sessionId;
+    const workspaceRoot = record.workspaceRoot;
+    const toolCallId = record.toolCallId;
+    const toolName = record.toolName;
+    if (
+      typeof observationId !== "string"
+      || observationId.length < 1
+      || typeof generation !== "number"
+      || !Number.isSafeInteger(generation)
+      || generation < 1
+      || typeof sessionId !== "string"
+      || sessionId.length < 1
+      || typeof workspaceRoot !== "string"
+      || workspaceRoot.length < 1
+      || typeof toolCallId !== "string"
+      || toolCallId.length < 1
+      || toolCallId.length > MAX_TOOL_CALL_ID_CHARS
+      || typeof toolName !== "string"
+      || toolName.length < 1
+    ) {
+      return null;
+    }
+    return {
+      observationId,
+      generation,
+      sessionId,
+      workspaceRoot,
+      toolCallId,
+      toolName,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function inspectCall(
+  state: EntryState,
+  issuedReferences: WeakSet<object>,
+  ref: unknown,
+  context: NativeContext,
+): NativeWorkCallInspection {
+  // Membership is checked before reading any ref getter. Clones, JSON copies
+  // and refs issued by another controls instance are foreign.
+  if (ref === null
+    || (typeof ref !== "object" && typeof ref !== "function")
+    || !issuedReferences.has(ref as object)) {
+    return callInspection(state, "unavailable", "foreign-reference", null, null, null);
+  }
+  const observed = readIssuedReference(ref);
+  if (observed === null) {
+    return callInspection(state, "unavailable", "foreign-reference", null, null, null);
+  }
+  const host = readCallPortHost(context);
+  const entryFailure = callEntryFailure(state, host);
+  if (entryFailure !== null) {
+    return callInspection(state, "unavailable", entryFailure, observed, null, null);
+  }
+
+  const work = state.works.find((candidate) =>
+    candidate.observationId === observed.observationId
+    && candidate.generation === observed.generation
+  ) ?? null;
+  if (work === null) {
+    return callInspection(state, "stale", "work-not-retained", observed, null, null);
+  }
+  if (work.sessionId !== observed.sessionId || work.workspaceRoot !== observed.workspaceRoot) {
+    return callInspection(state, "stale", "work-replaced", observed, work, null);
+  }
+  if (work.invalidated) {
+    return callInspection(state, "stale", "work-invalidated", observed, work, null);
+  }
+  const call = work.callIndex.get(observed.toolCallId);
+  if (call === undefined) {
+    return callInspection(state, "stale", "call-not-retained", observed, work, null);
+  }
+  if (call.toolCallId !== observed.toolCallId || call.toolName !== observed.toolName) {
+    return callInspection(state, "stale", "call-rebound", observed, work, call);
+  }
+  const binding = state.callBindings.get(observed.toolCallId);
+  if (binding === undefined) {
+    return callInspection(state, "stale", "call-not-retained", observed, work, call);
+  }
+  if (binding.work !== work || binding.call !== call) {
+    return callInspection(state, "stale", "call-rebound", observed, work, call);
+  }
+  if (call.associationConflict) {
+    return callInspection(state, "stale", "call-conflicted", observed, work, call);
+  }
+  if (state.callIdMemory.get(observed.toolCallId) !== work.generation) {
+    return callInspection(state, "stale", "call-rebound", observed, work, call);
+  }
+  if (state.current !== work) {
+    return callInspection(state, "stale", "work-replaced", observed, work, call);
+  }
+  if (work.sessionId === null || work.workspaceRoot === null) {
+    return callInspection(state, "unavailable", "work-evidence-unavailable", observed, work, call);
+  }
+  if (host.sessionId !== work.sessionId) {
+    return callInspection(state, "stale", "live-session-changed", observed, work, call);
+  }
+  if (host.workspaceRoot !== work.workspaceRoot) {
+    return callInspection(state, "stale", "live-workspace-changed", observed, work, call);
+  }
+
+  const classification = classifyCallAssociation(state, work, call);
+  return callInspection(
+    state,
+    classification.state,
+    classification.reason,
+    observed,
+    work,
+    call,
+  );
+}
+
 function createControls(state: EntryState): NativeEntryControls {
+  const issuedReferences = new WeakSet<object>();
   return {
     get enabled() {
       return state.enabled;
@@ -1763,6 +2195,12 @@ function createControls(state: EntryState): NativeEntryControls {
     },
     dispose() {
       disposeState(state, "disposed by the host or test owner");
+    },
+    captureCall(selector, context) {
+      return captureCall(state, issuedReferences, selector, context);
+    },
+    inspectCall(ref, context) {
+      return inspectCall(state, issuedReferences, ref, context);
     },
   };
 }

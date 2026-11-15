@@ -653,6 +653,50 @@ function childPrompt(body: string): string[] {
   return [`${expectedRoleFrame(body)}\n⁂ Completion\nchild-rest`, "base-coop"];
 }
 
+/**
+ * A main-shaped context that can deliberately carry a foreign session or cwd
+ * while keeping the same agent id as the bound owner.
+ */
+function ownerContext(options: {
+  readonly agentKind?: "main" | "sub" | "unknown";
+  readonly agentId?: string;
+  readonly sessionId?: string;
+  readonly cwd?: string;
+} = {}): InstancedNativeContext {
+  const sessionId = options.sessionId ?? "session-root";
+  const cwd = options.cwd ?? WORKSPACE;
+  return {
+    get cwd() {
+      return cwd;
+    },
+    agent: {
+      kind: options.agentKind ?? "main",
+      id: options.agentId ?? "Main",
+      name: "main",
+      parentId: null,
+      depth: 0,
+    },
+    hasUI: true,
+    model: MAIN_MODEL,
+    sessionManager: {
+      getSessionId() {
+        return sessionId;
+      },
+      getCwd() {
+        return cwd;
+      },
+    },
+    models: {
+      current: () => MAIN_MODEL,
+      resolve: () => CHILD_MODEL,
+    },
+    ui: {
+      notify: () => undefined,
+    },
+    abort: () => undefined,
+  } as unknown as InstancedNativeContext;
+}
+
 function skillMessage(snapshot: DefinitionSnapshot): Record<string, unknown> {
   const skill = snapshot.skills[0]!;
   return {
@@ -685,6 +729,55 @@ async function waitFor(predicate: () => boolean): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 1));
   }
   throw new Error("condition did not settle");
+}
+
+/**
+ * Real native work: input + prompt activates the current work, and the native
+ * observer records the later task tool_call that this entry only observes.
+ */
+async function beginWork(root: RootFixture, text: string): Promise<void> {
+  await root.host.input(text, { source: "interactive" });
+  await root.host.prepare(text);
+}
+
+interface ResultSpec {
+  readonly isError?: boolean;
+  readonly output?: string;
+  readonly exitCode?: number;
+  readonly aborted?: boolean;
+  readonly truncated?: boolean;
+  readonly error?: string;
+  readonly abortReason?: string;
+  readonly outputPath?: string;
+}
+
+function taskResultEvent(
+  taskCallId: string,
+  childId: string | null,
+  agent: string,
+  spec: ResultSpec = {},
+): Record<string, unknown> {
+  const output = spec.output ?? "child output";
+  const result: Record<string, unknown> = {
+    index: 0,
+    ...(childId === null ? {} : { id: childId }),
+    agent,
+    exitCode: spec.exitCode ?? 0,
+    aborted: spec.aborted ?? false,
+    truncated: spec.truncated ?? false,
+    output,
+    ...(spec.error === undefined ? {} : { error: spec.error }),
+    ...(spec.abortReason === undefined ? {} : { abortReason: spec.abortReason }),
+    ...(spec.outputPath === undefined ? {} : { outputPath: spec.outputPath }),
+  };
+  return {
+    toolCallId: taskCallId,
+    toolName: "task",
+    input: { agent, task: "fixture task text" },
+    content: [{ type: "text", text: output }],
+    isError: spec.isError ?? false,
+    details: { results: [result] },
+  };
 }
 
 describe("opt-in native instance entry", () => {
@@ -2238,5 +2331,595 @@ describe("opt-in native instance entry", () => {
     const secondCommand = JSON.parse(String(secondHost.notifications.at(-1)));
     expect(secondCommand.view.complete).toBe(true);
     expect(secondCommand.factory.ownsRoot).toBe(false);
+  });
+
+  test("captures the task preflight through the native observer and keeps that exact ref after the async load", async () => {
+    const alpha = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let loaderStarted = false;
+    let loads = 0;
+    const root = await startRoot({
+      children: [alpha],
+      loadChild: async (input) => {
+        expect(input.definitionPath).toBe(alpha.definition.requestedPath);
+        loads += 1;
+        if (loads === 1) return alpha;
+        loaderStarted = true;
+        await gate;
+        return alpha;
+      },
+    });
+    await beginWork(root, "fixture request");
+    const admission = root.host.task("task-ref", { agent: "alpha", task: "fixture task text" });
+    await waitFor(() => loaderStarted);
+    expect(records(root)).toEqual([]);
+    release();
+    expect(blockedReason(await admission)).toBe("");
+
+    const admitted = records(root)[0]!;
+    expect(admitted.observation.work.scope).toBe("last-owner-main-hook");
+    expect("scope" in admitted.observation).toBe(false);
+    expect(admitted.observation.work.capture).toBe("captured");
+    expect(admitted.observation.work.captureReason).toBeNull();
+    expect(admitted.observation.work.hook).toBe("tool_call");
+    expect(admitted.observation.work.inspection?.state).toBe("current");
+    expect(admitted.observation.work.inspection?.association?.toolCallId).toBe("task-ref");
+    expect(Object.isFrozen(admitted.observation)).toBe(true);
+    expect(Object.isFrozen(admitted.observation.work)).toBe(true);
+    const generation = admitted.observation.work.inspection!.association!.generation;
+
+    await root.host.emit("agent_end", {});
+    const ended = records(root)[0]!;
+    expect(ended.observation.work.hook).toBe("agent_end");
+    expect(ended.observation.work.inspection?.state).toBe("ended");
+    expect(ended.observation.work.inspection?.reason).toBe("work-ended");
+    expect(ended.observation.work.inspection?.association?.generation).toBe(generation);
+
+    await root.host.emit("tool_result", taskResultEvent("task-ref", null, "alpha", {
+      isError: true,
+      exitCode: 1,
+      output: "failed child",
+    }));
+    const observed = records(root)[0]!;
+    expect(observed.observation.work.inspection?.association?.generation).toBe(generation);
+    expect(observed.observation.result.observation?.state).toBe("observed");
+    expect(observed.observation.result.observation?.link).toBe("call-only");
+    expect(observed.observation.result.observation?.outcome).toBe("failed-envelope");
+  });
+
+  test("a missing native capture is explicit unavailability and never blocks admission or recaptures at result", async () => {
+    const root = await startRoot();
+    // No input/before_agent_start: the native observer has no current work and
+    // cannot have recorded this call. Admission behavior must stay unchanged.
+    await admit(root, "task-nocapture");
+    const admitted = records(root)[0]!;
+    expect(admitted.phase).toBe("admitted");
+    expect(status(root).phase).toBe("ready");
+    expect(admitted.observation.work.capture).toBe("unavailable");
+    expect(admitted.observation.work.captureReason).toContain("call-not-observed");
+    expect(admitted.observation.work.inspection?.state).toBe("unavailable");
+    expect(admitted.observation.work.inspection?.reason).toBe("call-not-observed");
+    expect(admitted.observation.work.inspection?.association).toBeNull();
+
+    await root.host.emit("tool_result", taskResultEvent("task-nocapture", null, "alpha", {
+      isError: true,
+      exitCode: 1,
+    }));
+    const later = records(root)[0]!;
+    expect(later.observation.work.capture).toBe("unavailable");
+    expect(later.observation.work.inspection?.reason).toBe("call-not-observed");
+    expect(later.observation.result.observation?.state).toBe("observed");
+    expect(later.observation.result.observation?.link).toBe("call-only");
+  });
+
+  test("pending ingress during the async load suspends the stored work association without gating the task", async () => {
+    const alpha = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let loaderStarted = false;
+    let loads = 0;
+    const root = await startRoot({
+      children: [alpha],
+      loadChild: async () => {
+        loads += 1;
+        if (loads === 1) return alpha;
+        loaderStarted = true;
+        await gate;
+        return alpha;
+      },
+    });
+    await beginWork(root, "first request");
+    const admission = root.host.task("task-suspended", { agent: "alpha", task: "fixture task text" });
+    await waitFor(() => loaderStarted);
+    await root.host.input("second request", { source: "interactive" });
+    release();
+    expect(blockedReason(await admission)).toBe("");
+    const admitted = records(root)[0]!;
+    expect(admitted.phase).toBe("admitted");
+    expect(admitted.observation.work.capture).toBe("captured");
+    expect(admitted.observation.work.inspection?.state).toBe("suspended");
+    expect(admitted.observation.work.inspection?.reason).toBe("pending-input");
+    expect(status(root).phase).toBe("ready");
+  });
+
+  test("fresh work after a completed work keeps the old association stale and admits a new call on its own scope", async () => {
+    const root = await startRoot();
+    await beginWork(root, "first request");
+    await admit(root, "task-old-work");
+    const oldGeneration = records(root)[0]!.observation.work.inspection!.association!.generation;
+    await root.host.emit("agent_end", {});
+    expect(records(root)[0]!.observation.work.inspection?.state).toBe("ended");
+
+    await beginWork(root, "second request");
+    const old = records(root)[0]!;
+    expect(old.observation.work.hook).toBe("before_agent_start");
+    expect(old.observation.work.inspection?.state).toBe("stale");
+    expect(old.observation.work.inspection?.reason).toBe("work-replaced");
+    expect(old.observation.work.inspection?.association?.generation).toBe(oldGeneration);
+
+    await admit(root, "task-new-work");
+    const both = records(root);
+    expect(both).toHaveLength(2);
+    expect(both[1]!.observation.work.hook).toBe("tool_call");
+    expect(both[1]!.observation.work.inspection?.state).toBe("current");
+    expect(both[1]!.observation.work.inspection?.association?.generation).not.toBe(oldGeneration);
+    expect(both[0]!.observation.work.inspection?.state).toBe("stale");
+    expect(status(root).phase).toBe("ready");
+  });
+
+  test("two children on one definition keep distinct identities, work scopes and results", async () => {
+    const alpha = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+    const root = await startRoot({ children: [alpha] });
+    await beginWork(root, "first request");
+    await admit(root, "task-one");
+    root.host.lifecycle({ status: "started", id: "ChildOne", parentToolCallId: "task-one", index: 0, agent: "alpha" });
+    await startChild(root, "task-one", "ChildOne", { lifecycle: false });
+    const firstGeneration = records(root)[0]!.observation.work.inspection!.association!.generation;
+
+    await root.host.emit("agent_end", {});
+    await beginWork(root, "second request");
+    await admit(root, "task-two");
+    root.host.lifecycle({ status: "started", id: "ChildTwo", parentToolCallId: "task-two", index: 0, agent: "alpha" });
+    await startChild(root, "task-two", "ChildTwo", { lifecycle: false });
+    const two = records(root);
+    expect(two).toHaveLength(2);
+    expect(two[0]!.childId).toBe("ChildOne");
+    expect(two[1]!.childId).toBe("ChildTwo");
+    expect(two[0]!.observation.work.inspection?.state).toBe("stale");
+    expect(two[1]!.observation.work.inspection?.state).toBe("current");
+    expect(two[1]!.observation.work.inspection?.association?.generation).not.toBe(firstGeneration);
+
+    // V1 result arrives only after V2 was admitted; it must stay on record 1.
+    await root.host.emit("tool_result", taskResultEvent("task-one", "ChildOne", "alpha", {
+      output: "one output",
+    }));
+    await root.host.emit("tool_result", taskResultEvent("task-two", "ChildTwo", "alpha", {
+      output: "two output",
+    }));
+    const [one, second] = records(root);
+    expect(one!.observation.result.observation?.state).toBe("observed");
+    expect(one!.observation.result.observation?.association?.instanceId).toBe(one!.id);
+    expect(one!.observation.result.observation?.association?.childId).toBe("ChildOne");
+    expect(one!.observation.result.observation?.association?.childSessionId).toBe("session-ChildOne");
+    expect(one!.observation.result.observation?.output?.excerpt).toBe("one output");
+    expect(second!.observation.result.observation?.association?.instanceId).toBe(second!.id);
+    expect(second!.observation.result.observation?.association?.childId).toBe("ChildTwo");
+    expect(second!.observation.result.observation?.output?.excerpt).toBe("two output");
+  });
+
+  test("a completed child shutdown still allows a completed envelope as observation only", async () => {
+    const alpha = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+    const root = await startRoot({ children: [alpha] });
+    await beginWork(root, "completed request");
+    await admit(root, "task-completed");
+    root.host.lifecycle({ status: "started", id: "CompletedChild", parentToolCallId: "task-completed", index: 0, agent: "alpha" });
+    const child = await startChild(root, "task-completed", "CompletedChild", { lifecycle: false });
+    expect(records(root)[0]!.phase).toBe("bound");
+
+    root.host.lifecycle({
+      status: "completed",
+      id: "CompletedChild",
+      parentToolCallId: "task-completed",
+      index: 0,
+      agent: "alpha",
+    });
+    await child.host.emit("session_shutdown", {});
+    expect(records(root)[0]!.phase).toBe("closed");
+
+    await root.host.emit("tool_result", taskResultEvent("task-completed", "CompletedChild", "alpha", {
+      output: "done",
+    }));
+    const observed = records(root)[0]!;
+    expect(observed.phase).toBe("closed");
+    expect(observed.lifecycle).toBe("completed");
+    expect(observed.observation.lifecycleEvidence).toEqual({ completed: true, failed: false, aborted: false });
+    expect(observed.observation.result.observation?.state).toBe("observed");
+    expect(observed.observation.result.observation?.outcome).toBe("completed-envelope");
+    expect(observed.observation.result.observation?.semanticAcceptance).toBe("not-evaluated");
+    expect(observed.observation.conflict).toBeNull();
+    expect(observed.taskResultObserved).toBe(true);
+  });
+
+  test("a nested abort stays distinct from outer success and a late completed lifecycle cannot erase it", async () => {
+    const alpha = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+    const root = await startRoot({ children: [alpha] });
+    await beginWork(root, "abort request");
+    await admit(root, "task-abort");
+    root.host.lifecycle({ status: "started", id: "AbortChild", parentToolCallId: "task-abort", index: 0, agent: "alpha" });
+    await startChild(root, "task-abort", "AbortChild", { lifecycle: false });
+    await root.host.emit("agent_end", {});
+
+    await root.host.emit("tool_result", taskResultEvent("task-abort", "AbortChild", "alpha", {
+      isError: false,
+      exitCode: 1,
+      aborted: true,
+      abortReason: "child cancelled",
+      output: "partial",
+    }));
+    let observed = records(root)[0]!;
+    const result = observed.observation.result.observation!;
+    expect(result.state).toBe("observed");
+    expect(result.outcome).toBe("aborted-envelope");
+    expect(result.link).toBe("instance");
+    expect(result.confirmedChildAbort).toBe(true);
+    expect(result.parentCancellation).toBe("unknown");
+    expect(result.semanticAcceptance).toBe("not-evaluated");
+    expect(result.native?.isError).toBe(false);
+    expect(result.native?.aborted).toBe(true);
+
+    root.host.lifecycle({
+      status: "completed",
+      id: "AbortChild",
+      parentToolCallId: "task-abort",
+      index: 0,
+      agent: "alpha",
+    });
+    observed = records(root)[0]!;
+    expect(observed.observation.lifecycleEvidence).toEqual({ completed: true, failed: false, aborted: false });
+    expect(observed.observation.result.observation?.outcome).toBe("aborted-envelope");
+    expect(observed.observation.conflict?.code).toBe("lifecycle-completed-result-aborted");
+    const sticky = observed.observation.conflict;
+
+    // A duplicate envelope is idempotent and cannot rehabilitate the conflict.
+    await root.host.emit("tool_result", taskResultEvent("task-abort", "AbortChild", "alpha", {
+      isError: false,
+      exitCode: 1,
+      aborted: true,
+      abortReason: "child cancelled",
+      output: "partial",
+    }));
+    expect(records(root)[0]!.observation.conflict).toEqual(sticky);
+  });
+
+  test("foreign main, cwd, child and reentrant navigation contexts cannot attach a result or refresh a record", async () => {
+    const alpha = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+    const root = await startRoot({ children: [alpha] });
+    await beginWork(root, "foreign request");
+    await admit(root, "task-foreign");
+    root.host.lifecycle({ status: "started", id: "ForeignChild", parentToolCallId: "task-foreign", index: 0, agent: "alpha" });
+    const child = await startChild(root, "task-foreign", "ForeignChild", { lifecycle: false });
+    const recordBefore = records(root)[0]!;
+    const event = taskResultEvent("task-foreign", "ForeignChild", "alpha", { output: "foreign output" });
+
+    const makeContext = (options: {
+      readonly agentId?: string;
+      readonly sessionId?: string;
+      readonly cwd?: string;
+      readonly onSession?: () => void;
+    }): InstancedNativeContext => {
+      let fired = false;
+      return {
+        get cwd() {
+          return options.cwd ?? WORKSPACE;
+        },
+        agent: {
+          kind: "main",
+          id: options.agentId ?? "Main",
+          name: "main",
+          parentId: null,
+          depth: 0,
+        },
+        hasUI: false,
+        model: MAIN_MODEL,
+        sessionManager: {
+          getSessionId() {
+            if (!fired) {
+              fired = true;
+              options.onSession?.();
+            }
+            return options.sessionId ?? "session-root";
+          },
+          getCwd() {
+            return options.cwd ?? WORKSPACE;
+          },
+        },
+        models: {
+          current: () => MAIN_MODEL,
+          resolve: () => CHILD_MODEL,
+        },
+      } as unknown as InstancedNativeContext;
+    };
+
+    await root.host.emit("tool_result", event, makeContext({ agentId: "OtherMain", sessionId: "session-other" }));
+    await root.host.emit("tool_result", event, makeContext({ cwd: "/foreign-workspace" }));
+    await root.host.emit("tool_result", event, makeContext({ sessionId: "session-other" }));
+    await child.host.emit("tool_result", event);
+    let unchanged = records(root)[0]!;
+    expect(unchanged.observation.result.observation).toBeNull();
+    expect(unchanged.observation.work.hook).toBe(recordBefore.observation.work.hook);
+    expect(status(root).phase).toBe("ready");
+
+    // Reentrant navigation during the identity read invalidates the root and
+    // must not let the outer observation write into the old record.
+    await root.host.emit("tool_result", event, makeContext({
+      onSession: () => {
+        for (const handler of root.host.handlers.get("session_switch") ?? []) {
+          void handler({ type: "session_switch" }, root.host.context);
+        }
+      },
+    }));
+    unchanged = records(root)[0]!;
+    expect(unchanged.observation.result.observation).toBeNull();
+    expect(unchanged.observation.work.inspection).toBeNull();
+    expect(unchanged.observation.work.invalidatedReason).not.toBeNull();
+    expect(status(root).phase).toBe("closed");
+  });
+
+  test("foreign main ending events cannot refresh or invalidate the bound owner observation", async () => {
+    const alpha = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+    const root = await startRoot({ children: [alpha] });
+    await beginWork(root, "owner ending request");
+    await admit(root, "task-owner-ending");
+
+    // The real owner end first refreshes the record and invalidates the
+    // unbound admission; later foreign events must preserve those facts.
+    await root.host.emit("agent_end", {});
+    const ended = records(root)[0]!;
+    expect(ended.observation.work.scope).toBe("last-owner-main-hook");
+    expect(ended.observation.work.hook).toBe("agent_end");
+    expect(ended.observation.work.inspection?.state).toBe("ended");
+    expect(ended.phase).toBe("refused");
+    expect(ended.refusalCode).toBe("work-ended");
+    const generation = ended.observation.work.inspection!.association!.generation;
+    const workEpoch = status(root).root?.workEpoch;
+
+    for (const hook of ["agent_end", "session_stop"] as const) {
+      for (const foreign of [{ sessionId: "session-foreign" }, { cwd: "/foreign-workspace" }]) {
+        await root.host.emit(hook, {}, ownerContext(foreign));
+        const unchanged = records(root)[0]!;
+        expect(unchanged.observation.work.hook).toBe("agent_end");
+        expect(unchanged.observation.work.inspection?.state).toBe("ended");
+        expect(unchanged.observation.work.inspection?.association?.generation).toBe(generation);
+        expect(unchanged.phase).toBe("refused");
+        expect(status(root).root?.workEpoch).toBe(workEpoch);
+        expect(status(root).phase).toBe("ready");
+        expect(status(root).failure).toBeNull();
+      }
+    }
+  });
+
+  test("a host session change read during post-load inspection is refused by the final identity validation", async () => {
+    const alpha = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+    const root = await startRoot({ children: [alpha] });
+    await beginWork(root, "inspect session drift request");
+    const native = root.entry.nativeEntry;
+    const originalInspect = native.inspectCall;
+    try {
+      native.inspectCall = (ref, context) => {
+        // Simulates a host getter read during inspection mutating the live session.
+        root.host.sessionId = "session-mutated-during-inspection";
+        return originalInspect(ref, context);
+      };
+      const refused = await root.host.task("task-inspect-session", { agent: "alpha", task: "drift" });
+      expect(blockedReason(refused)).toContain("identity changed");
+      expect(status(root).phase).toBe("failed");
+      expect(status(root).failure).toContain("identity changed");
+      expect(status(root).instances).toEqual([]);
+    } finally {
+      native.inspectCall = originalInspect;
+    }
+  });
+
+  test("a host tool change read during post-load inspection is refused by the final tools validation", async () => {
+    const alpha = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+    const root = await startRoot({ children: [alpha] });
+    await beginWork(root, "inspect tools drift request");
+    const native = root.entry.nativeEntry;
+    const originalInspect = native.inspectCall;
+    try {
+      native.inspectCall = (ref, context) => {
+        // Simulates a host getter read during inspection mutating the live tools.
+        root.host.activeTools = ["read", "task", "write"];
+        return originalInspect(ref, context);
+      };
+      const refused = await root.host.task("task-inspect-tools", { agent: "alpha", task: "drift" });
+      expect(blockedReason(refused)).toContain("active tools changed");
+      expect(status(root).phase).toBe("failed");
+      expect(status(root).failure).toContain("active tools changed");
+      expect(status(root).instances).toEqual([]);
+    } finally {
+      native.inspectCall = originalInspect;
+    }
+  });
+
+  test("an inspection failure is observation unavailability and never blocks a valid admission", async () => {
+    const alpha = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+    const root = await startRoot({ children: [alpha] });
+    await beginWork(root, "inspection unavailable request");
+    const native = root.entry.nativeEntry;
+    const originalInspect = native.inspectCall;
+    try {
+      native.inspectCall = () => {
+        throw new Error("synthetic inspection failure");
+      };
+      const result = await root.host.task("task-inspect-unavailable", { agent: "alpha", task: "inspection unavailable" });
+      expect(blockedReason(result)).toBe("");
+      const admitted = records(root)[0]!;
+      expect(admitted.phase).toBe("admitted");
+      expect(admitted.observation.work.capture).toBe("captured");
+      expect(admitted.observation.work.hook).toBe("tool_call");
+      expect(admitted.observation.work.inspection).toBeNull();
+      expect(admitted.observation.work.error).toContain("synthetic inspection failure");
+      expect(status(root).phase).toBe("ready");
+    } finally {
+      native.inspectCall = originalInspect;
+    }
+  });
+
+  test("getStatus only replays the last hook observation and navigation marks it unavailable", async () => {
+    const alpha = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+    const root = await startRoot({ children: [alpha] });
+    await beginWork(root, "status request");
+    await admit(root, "task-status-observe");
+    root.host.lifecycle({ status: "started", id: "StatusObsChild", parentToolCallId: "task-status-observe", index: 0, agent: "alpha" });
+    await startChild(root, "task-status-observe", "StatusObsChild", { lifecycle: false });
+    const first = status(root);
+    const second = status(root);
+    expect(second).not.toBe(first);
+    expect(second.instances[0]!.observation.work.hook).toBe("tool_call");
+    expect(second.instances[0]!.observation.work.inspection?.state).toBe("current");
+
+    root.host.lifecycle({
+      status: "completed",
+      id: "StatusObsChild",
+      parentToolCallId: "task-status-observe",
+      index: 0,
+      agent: "alpha",
+    });
+    expect(records(root)[0]!.observation.work.hook).toBe("tool_call");
+    const afterLifecycle = status(root);
+    expect(afterLifecycle.instances[0]!.observation.work.inspection?.state).toBe("current");
+
+    await root.host.emit("agent_end", {});
+    expect(records(root)[0]!.observation.work.hook).toBe("agent_end");
+    expect(records(root)[0]!.observation.work.inspection?.state).toBe("ended");
+
+    // The host may change the session UUID before navigation; explicit
+    // invalidation must still prevent an apparent live current claim.
+    root.host.sessionId = "session-after-navigation";
+    await root.host.emit("session_switch", {});
+    const closed = status(root);
+    expect(closed.phase).toBe("closed");
+    expect(closed.instances[0]!.observation.work.inspection).toBeNull();
+    expect(closed.instances[0]!.observation.work.invalidatedReason).not.toBeNull();
+  });
+
+  test("duplicate, mutated, conflicting and unavailable result observations stay bounded and sticky", async () => {
+    const alpha = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+    const root = await startRoot({ children: [alpha] });
+    await beginWork(root, "result request");
+    await admit(root, "task-result");
+    root.host.lifecycle({ status: "started", id: "ResultChild", parentToolCallId: "task-result", index: 0, agent: "alpha" });
+    await startChild(root, "task-result", "ResultChild", { lifecycle: false });
+
+    const original = taskResultEvent("task-result", "ResultChild", "alpha", { output: "original output" });
+    const pristine = structuredClone(original);
+    await root.host.emit("tool_result", original);
+    const first = records(root)[0]!.observation.result.observation!;
+    expect(first.state).toBe("observed");
+    expect(first.output?.excerpt).toBe("original output");
+    expect(first.conflict).toBeNull();
+
+    await root.host.emit("tool_result", structuredClone(pristine));
+    const duplicate = records(root)[0]!.observation.result.observation!;
+    expect(duplicate.state).toBe("observed");
+    expect(duplicate.envelope.sha256).toBe(first.envelope.sha256);
+    expect(duplicate.conflict).toBeNull();
+
+    // Mutation of the emitted object must not alias the retained snapshot.
+    (original.content as { text: string }[])[0]!.text = "MUTATED OUTPUT";
+    ((original.details as { results: { output: string }[] }).results[0]!).output = "MUTATED OUTPUT";
+    expect(JSON.stringify(status(root))).not.toContain("MUTATED OUTPUT");
+    expect(records(root)[0]!.observation.result.observation?.output?.excerpt).toBe("original output");
+
+    await root.host.emit("tool_result", original);
+    const conflicted = records(root)[0]!.observation.result.observation!;
+    expect(conflicted.state).toBe("conflicted");
+    expect(conflicted.reason).toBe("observation-conflict");
+    expect(conflicted.conflict?.reason).toBe("envelope-digest-mismatch");
+    expect(conflicted.output?.excerpt).toBe("original output");
+
+    await root.host.emit("tool_result", pristine);
+    const stillConflicted = records(root)[0]!.observation.result.observation!;
+    expect(stillConflicted.state).toBe("conflicted");
+    expect(stillConflicted.conflict?.reason).toBe("envelope-digest-mismatch");
+
+    // An unavailable first observation is also never rehabilitated.
+    await admit(root, "task-unavailable-result");
+    await root.host.emit("tool_result", {
+      toolCallId: "task-unavailable-result",
+      toolName: "task",
+      content: [],
+      isError: true,
+    });
+    const unavailable = records(root)[1]!.observation.result.observation!;
+    expect(unavailable.state).toBe("unavailable");
+    expect(unavailable.reason).toBe("details-missing");
+    await root.host.emit("tool_result", taskResultEvent("task-unavailable-result", null, "alpha", {
+      isError: true,
+      exitCode: 1,
+    }));
+    const stillUnavailable = records(root)[1]!.observation.result.observation!;
+    expect(stillUnavailable.state).toBe("unavailable");
+    expect(stillUnavailable.reason).toBe("details-missing");
+  });
+
+  test("lifecycle terminal evidence is retained when a later status overwrites the visible lifecycle", async () => {
+    const root = await startRoot();
+    await admit(root, "task-terminal-evidence");
+    root.host.lifecycle({
+      status: "started",
+      id: "EvidenceChild",
+      parentToolCallId: "task-terminal-evidence",
+      index: 0,
+      agent: "alpha",
+    });
+    root.host.lifecycle({
+      status: "completed",
+      id: "EvidenceChild",
+      parentToolCallId: "task-terminal-evidence",
+      index: 0,
+      agent: "alpha",
+    });
+    root.host.lifecycle({
+      status: "aborted",
+      id: "EvidenceChild",
+      parentToolCallId: "task-terminal-evidence",
+      index: 0,
+      agent: "alpha",
+    });
+    const record = records(root)[0]!;
+    expect(record.lifecycle).toBe("aborted");
+    expect(record.lifecycleTerminal).toBe(true);
+    expect(record.observation.lifecycleEvidence).toEqual({ completed: true, failed: false, aborted: true });
+    expect(record.observation.conflict).toBeNull();
+  });
+
+  test("a throwing event reflection becomes explicit observation unavailability without gating", async () => {
+    const root = await startRoot();
+    await admit(root, "task-reflection");
+    const reflected = new Proxy({}, {
+      get(target, property) {
+        if (property === "toolName") return "task";
+        if (property === "toolCallId") return "task-reflection";
+        return Reflect.get(target, property);
+      },
+      getOwnPropertyDescriptor() {
+        throw new Error("synthetic reflection failure");
+      },
+    });
+    const handler = root.host.handlers.get("tool_result")?.at(-1);
+    if (handler === undefined) throw new Error("tool_result handler is missing");
+    await handler(reflected, root.host.context);
+    const record = records(root)[0]!;
+    expect(record.observation.result.observation?.state).toBe("unavailable");
+    expect(record.observation.result.observation?.reason).toBe("event-unreadable");
+    expect(record.observation.result.error).toBeNull();
+    expect(status(root).phase).toBe("ready");
   });
 });

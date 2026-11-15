@@ -19,9 +19,12 @@ import {
 } from "./definition-binding.ts";
 import {
   createNativeEntry,
+  NATIVE_WORK_CALL_INSPECTION_SCHEMA,
   type NativeContext,
   type NativeOmpApi,
   type NativeToolResult,
+  type NativeWorkCallCapture,
+  type NativeWorkCallInspection,
 } from "./native-entry.ts";
 import { NATIVE_WORK_TOOL } from "./native-work.ts";
 import { canonicalWorkspaceRoot, currentTaskOwner } from "./task-entry-port.ts";
@@ -663,6 +666,30 @@ function registerDefinitionSelection(
   };
 }
 
+function unavailableNativeWorkCallInspection(): NativeWorkCallInspection {
+  return Object.freeze({
+    schema: NATIVE_WORK_CALL_INSPECTION_SCHEMA,
+    authority: "non-authoritative",
+    state: "unavailable",
+    reason: "entry-disabled",
+    association: null,
+    workPhase: null,
+    requestAttribution: null,
+    evidenceState: null,
+    callResultState: null,
+    pendingInputCount: null,
+    pendingInputsDropped: null,
+  } satisfies NativeWorkCallInspection);
+}
+
+function unavailableNativeWorkCallCapture(): NativeWorkCallCapture {
+  return Object.freeze({
+    ok: false,
+    ref: null,
+    inspection: unavailableNativeWorkCallInspection(),
+  } satisfies NativeWorkCallCapture);
+}
+
 export function createDefinedNativeEntry(
   pi: DefinedOmpApi,
   options: DefinedNativeEntryOptions = {},
@@ -865,6 +892,12 @@ export function createDefinedNativeEntry(
       },
       dispose() {
         // The binding controller owns failure state.
+      },
+      captureCall() {
+        return unavailableNativeWorkCallCapture();
+      },
+      inspectCall() {
+        return unavailableNativeWorkCallInspection();
       },
     };
   }

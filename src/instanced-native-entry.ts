@@ -22,7 +22,17 @@ import {
   type DefinedNativePorts,
   type DefinedOmpApi,
 } from "./defined-native-entry.ts";
-import type { NativeContext, NativeOmpApi } from "./native-entry.ts";
+import type {
+  NativeContext,
+  NativeOmpApi,
+  NativeWorkCallInspection,
+  NativeWorkCallReference,
+} from "./native-entry.ts";
+import {
+  observeNativeInstanceResult,
+  type NativeInstanceResultAssociation,
+  type NativeInstanceResultObservation,
+} from "./native-instance-result.ts";
 import {
   verifyNativeAutoloadSkills,
   verifyNativeChildRole,
@@ -249,6 +259,51 @@ export type InstancedStatusView =
       readonly omittedFields?: readonly string[];
     };
 
+export type InstancedWorkObservationHook =
+  | "tool_call"
+  | "input"
+  | "before_agent_start"
+  | "tool_result"
+  | "agent_end"
+  | "session_stop";
+
+export interface InstancedWorkObservationStatus {
+  /**
+   * The last real owner-main hook that stored this work observation, with its
+   * hook label. This is observation time, never live currentness.
+   */
+  readonly scope: "last-owner-main-hook";
+  readonly capture: "captured" | "unavailable";
+  readonly captureReason: string | null;
+  readonly hook: InstancedWorkObservationHook | null;
+  readonly error: string | null;
+  readonly invalidatedReason: string | null;
+  readonly inspection: NativeWorkCallInspection | null;
+}
+
+export interface InstancedResultObservationStatus {
+  readonly observation: NativeInstanceResultObservation | null;
+  readonly error: string | null;
+}
+
+export interface InstancedLifecycleEvidenceStatus {
+  readonly completed: boolean;
+  readonly failed: boolean;
+  readonly aborted: boolean;
+}
+
+export interface InstancedInstanceObservationStatus {
+  /**
+   * Stored facts only. getStatus replays these fields; it never queries the
+   * live host, current work or a cached context.
+   */
+  readonly work: InstancedWorkObservationStatus;
+  readonly result: InstancedResultObservationStatus;
+  /** Sticky native lifecycle callback evidence, separate from the work hook. */
+  readonly lifecycleEvidence: InstancedLifecycleEvidenceStatus;
+  readonly conflict: { readonly code: string; readonly message: string } | null;
+}
+
 export interface InstancedEntryStatus {
   readonly schema: typeof INSTANCED_NATIVE_ENTRY_SCHEMA;
   readonly authority: "non-authoritative";
@@ -329,6 +384,7 @@ export interface InstancedEntryStatus {
     readonly lifecycle: string;
     readonly lifecycleTerminal: boolean;
     readonly taskResultObserved: boolean;
+    readonly observation: InstancedInstanceObservationStatus;
     readonly closedReason: string | null;
     readonly retainedBytes: number;
   }[];
@@ -375,6 +431,10 @@ interface PendingAdmission {
   readonly admittedEpoch: number;
   readonly workEpoch: number;
   readonly startedAt: number;
+  readonly workRef: NativeWorkCallReference | null;
+  readonly workCaptureReason: string | null;
+  readonly workInspection: NativeWorkCallInspection | null;
+  readonly workInspectionHook: InstancedWorkObservationHook | null;
   state: "loading" | "invalidated" | "timedout";
 }
 
@@ -411,6 +471,16 @@ interface InstanceRecord {
   lifecycle: string;
   lifecycleTerminal: boolean;
   taskResultObserved: boolean;
+  workRef: NativeWorkCallReference | null;
+  workCaptureReason: string | null;
+  workInspection: NativeWorkCallInspection | null;
+  workInspectionHook: InstancedWorkObservationHook | null;
+  workObservationError: string | null;
+  workInvalidatedReason: string | null;
+  resultObservation: NativeInstanceResultObservation | null;
+  resultObservationError: string | null;
+  readonly lifecycleEvidence: { completed: boolean; failed: boolean; aborted: boolean };
+  resultLifecycleConflict: { code: string; message: string } | null;
   closedReason: string | null;
 }
 
@@ -564,6 +634,21 @@ function readHostFacts(context: NativeContext): HostFacts {
     sessionId,
     workspaceRoot,
   };
+}
+
+/**
+ * Ordinary parent-hook observation requires the complete bound owner identity.
+ * A foreign main context with the same agent id but another live session or
+ * cwd neither refreshes records nor acts as the owner work-ending hook.
+ */
+function matchesOwnerIdentity(root: RootState, facts: HostFacts): boolean {
+  return facts.agentKind === "main"
+    && root.agentId !== null
+    && facts.agentId === root.agentId
+    && root.sessionId !== null
+    && facts.sessionId === root.sessionId
+    && root.workspaceRoot !== null
+    && facts.workspaceRoot === root.workspaceRoot;
 }
 
 function readCurrentModel(context: NativeContext): InstancedModel | undefined {
@@ -922,6 +1007,28 @@ function invalidateUnboundAdmissions(root: RootState, reason: string): void {
   }
 }
 
+function ownsRoot(factory: FactoryContext, root: RootState): boolean {
+  return !factory.disposed
+    && moduleRoot === root
+    && root.factoryId === factory.id
+    && factory.rootToken !== null
+    && root.token === factory.rootToken;
+}
+
+/**
+ * Root disposal/navigation has no live parent context. Mark every stored work
+ * observation unavailable instead of inventing a fresh inspection. Result
+ * observations are historical facts and stay untouched.
+ */
+function invalidateWorkObservations(root: RootState, reason: string): void {
+  const text = boundedMessage(reason);
+  for (const record of root.records) {
+    if (record.workRef === null && record.workInspection === null && record.workObservationError === null) continue;
+    record.workInvalidatedReason = text;
+    record.workInspection = null;
+  }
+}
+
 function failRoot(factory: FactoryContext, root: RootState, code: string, message: string): void {
   if (root.phase === "closed" || root.phase === "failed") return;
   root.open = false;
@@ -931,6 +1038,7 @@ function failRoot(factory: FactoryContext, root: RootState, code: string, messag
   root.lastRefusal = { code: boundedString(code, 64), message: root.failure };
   root.epoch += 1;
   invalidatePending(root, "the instance root failed");
+  invalidateWorkObservations(root, "the instance root failed");
   for (const record of root.records) closeRecord(record, "the instance root failed");
   diagnose(factory, "root-failed", `${code}: ${message}`);
 }
@@ -943,6 +1051,7 @@ function closeRoot(factory: FactoryContext, root: RootState, reason: string): vo
   root.restartRequired = true;
   root.epoch += 1;
   invalidatePending(root, reason);
+  invalidateWorkObservations(root, reason);
   for (const record of root.records) closeRecord(record, reason);
   diagnose(factory, "root-closed", reason);
 }
@@ -1346,7 +1455,13 @@ function onLifecycleEvent(factory: FactoryContext, bus: InstancedEventBus, data:
     record.lifecycle = status.length === 0 ? "unknown" : status;
     if (status === "failed" || status === "aborted" || status === "completed") {
       record.lifecycleTerminal = true;
+      // A later terminal status may overwrite `lifecycle`, but evidence of an
+      // earlier observed abort/failure/completion remains explicit.
+      if (status === "completed") record.lifecycleEvidence.completed = true;
+      if (status === "failed") record.lifecycleEvidence.failed = true;
+      if (status === "aborted") record.lifecycleEvidence.aborted = true;
       closeRecord(record, `native lifecycle ${status}`);
+      assessResultLifecycleConflict(record);
     }
   } catch {
     // EventBus callbacks are not awaited and must never throw into the host.
@@ -1636,6 +1751,150 @@ function block(reason: string): { readonly block: true; readonly reason: string 
   return { block: true, reason: boundedMessage(reason) };
 }
 
+interface CapturedWorkObservation {
+  readonly ref: NativeWorkCallReference | null;
+  readonly reason: string | null;
+  readonly inspection: NativeWorkCallInspection | null;
+}
+
+function captureWorkObservation(
+  factory: FactoryContext,
+  toolCallId: string,
+  context: NativeContext,
+): CapturedWorkObservation {
+  try {
+    const captured = factory.definitionEntry.nativeEntry.captureCall(
+      { toolCallId, toolName: "task" },
+      context,
+    );
+    if (!captured.ok) {
+      return {
+        ref: null,
+        reason: boundedMessage(`native work capture unavailable (${captured.inspection.reason})`),
+        inspection: captured.inspection,
+      };
+    }
+    return { ref: captured.ref, reason: null, inspection: captured.inspection };
+  } catch (error) {
+    return {
+      ref: null,
+      reason: boundedMessage(`native work capture failed: ${errorMessage(error)}`),
+      inspection: null,
+    };
+  }
+}
+
+function inspectWorkObservation(
+  factory: FactoryContext,
+  ref: NativeWorkCallReference,
+  context: NativeContext,
+): { readonly ok: true; readonly inspection: NativeWorkCallInspection }
+  | { readonly ok: false; readonly error: string } {
+  try {
+    return {
+      ok: true,
+      inspection: factory.definitionEntry.nativeEntry.inspectCall(ref, context),
+    };
+  } catch (error) {
+    return { ok: false, error: boundedMessage(`native work inspection failed: ${errorMessage(error)}`) };
+  }
+}
+
+/**
+ * Re-observe every retained work reference with the actual parent context.
+ * Each write is revalidated against the same module root, root token, factory
+ * and record after the inspection because host getters may reenter navigation
+ * or disposal. Read-only: no lock, queue or new record is created.
+ */
+function refreshWorkObservations(
+  factory: FactoryContext,
+  root: RootState,
+  context: NativeContext,
+  hook: InstancedWorkObservationHook,
+): void {
+  if (!ownsRoot(factory, root) || !root.open || root.phase !== "ready") return;
+  let facts: HostFacts;
+  try {
+    facts = readHostFacts(context);
+  } catch {
+    return;
+  }
+  // A foreign main context with the same agent id must not write any record.
+  if (!matchesOwnerIdentity(root, facts)) return;
+  const rootToken = root.token;
+  let scanned = 0;
+  for (const record of root.records) {
+    if (scanned >= factory.limits.maxRecords) break;
+    scanned += 1;
+    const ref = record.workRef;
+    if (ref === null || record.admittedRootToken !== rootToken) continue;
+    const outcome = inspectWorkObservation(factory, ref, context);
+    if (!ownsRoot(factory, root) || root.token !== rootToken || !root.open || root.phase !== "ready") return;
+    if (!root.records.includes(record)
+      || root.recordByToolCall.get(record.parentToolCallId) !== record
+      || record.admittedRootToken !== rootToken
+      || record.workRef !== ref) {
+      continue;
+    }
+    record.workInspectionHook = hook;
+    if (!outcome.ok) {
+      record.workInspection = null;
+      record.workObservationError = outcome.error;
+      continue;
+    }
+    record.workInspection = outcome.inspection;
+    record.workObservationError = null;
+  }
+}
+
+function expectedResultAssociation(
+  record: InstanceRecord,
+  root: RootState,
+): NativeInstanceResultAssociation | null {
+  if (root.sessionId === null || root.workspaceRoot === null) return null;
+  return Object.freeze({
+    instanceId: record.id,
+    parentToolCallId: record.parentToolCallId,
+    index: record.index,
+    childId: record.childId,
+    childSessionId: record.childSessionId,
+    agentName: record.definition.name,
+    parentSessionId: root.sessionId,
+    workspaceRoot: root.workspaceRoot,
+    rootEpoch: record.admittedEpoch,
+    definitionVersion: record.definition.version,
+  });
+}
+
+/**
+ * One sticky diagnostic when an observed envelope and a known native lifecycle
+ * terminal disagree. A normal close or a missing parent cancellation is never
+ * treated as evidence by itself.
+ */
+function assessResultLifecycleConflict(record: InstanceRecord): void {
+  if (record.resultLifecycleConflict !== null) return;
+  const observation = record.resultObservation;
+  if (observation === null || observation.state !== "observed") return;
+  let code: string | null = null;
+  let message: string | null = null;
+  if (observation.outcome === "completed-envelope" && record.lifecycleEvidence.aborted) {
+    code = "lifecycle-aborted-result-completed";
+    message = "The native child lifecycle reported an abort, but the observed result envelope was complete.";
+  } else if (observation.outcome === "completed-envelope" && record.lifecycleEvidence.failed) {
+    code = "lifecycle-failed-result-completed";
+    message = "The native child lifecycle reported failure, but the observed result envelope was complete.";
+  } else if (observation.outcome === "aborted-envelope" && record.lifecycleEvidence.completed) {
+    code = "lifecycle-completed-result-aborted";
+    message = "The native child lifecycle reported completion, but the observed result envelope reported an abort.";
+  } else if (observation.outcome === "failed-envelope" && record.lifecycleEvidence.completed) {
+    code = "lifecycle-completed-result-failed";
+    message = "The native child lifecycle reported completion, but the observed result envelope reported failure.";
+  }
+  if (code !== null && message !== null) {
+    record.resultLifecycleConflict = { code, message: boundedMessage(message) };
+  }
+}
+
 function recordAdmissionFailure(root: RootState, code: string, message: string): void {
   root.refusalCount += 1;
   root.lastRefusal = { code: boundedString(code, 64), message: boundedMessage(message) };
@@ -1713,6 +1972,13 @@ async function admitTask(
     }
     const modelRef: DefinitionModelRef = { provider: currentModel.provider, id: currentModel.id };
     const resolveModel: ResolveModelPort = (selector) => resolveModelFromContext(context, selector);
+    // Observation only: the native observer's earlier tool_call hook already
+    // recorded this exact call. A missing/failed association never blocks an
+    // otherwise valid admission and never falls back to current work.
+    const workObservation = captureWorkObservation(factory, toolCallId, context);
+    if (!ownsRoot(factory, root) || !root.open || root.phase !== "ready") {
+      return block("The native instance root was invalidated while the task call was observed.");
+    }
     const pending: PendingAdmission = {
       parentToolCallId: toolCallId,
       agentName: selected.name,
@@ -1720,6 +1986,10 @@ async function admitTask(
       admittedEpoch: root.epoch,
       workEpoch: root.workEpoch,
       startedAt: Date.now(),
+      workRef: workObservation.ref,
+      workCaptureReason: workObservation.reason,
+      workInspection: workObservation.inspection,
+      workInspectionHook: "tool_call",
       state: "loading",
     };
     root.seenToolCalls.add(toolCallId);
@@ -1758,6 +2028,36 @@ async function admitTask(
       if (!refreshRoot(factory, root, pi, context)) {
         root.pending.delete(toolCallId);
         return block(root.failure ?? "The native instance root became invalid during admission.");
+      }
+      // Observe the original pre-await reference before the final host
+      // validations. Host getters read by inspection can mutate identity or
+      // tools without emitting navigation; those validations below catch the
+      // reads. Observation unavailability itself never gates admission.
+      let workInspection = pending.workInspection;
+      let workObservationError: string | null = null;
+      let workInspectionHook = pending.workInspectionHook;
+      if (pending.workRef !== null) {
+        const observed = inspectWorkObservation(factory, pending.workRef, context);
+        if (root.pending.get(toolCallId) !== pending
+          || pending.state !== "loading"
+          || !ownsRoot(factory, root)
+          || !root.open
+          || root.phase !== "ready"
+          || root.epoch !== pending.admittedEpoch
+          || root.workEpoch !== pending.workEpoch) {
+          if (root.pending.get(toolCallId) === pending) root.pending.delete(toolCallId);
+          const reason = "The task work observation became stale after admission; the admission was not published.";
+          recordAdmissionFailure(root, "admission-stale", reason);
+          return block(reason);
+        }
+        workInspectionHook = "tool_call";
+        if (observed.ok) {
+          workInspection = observed.inspection;
+          workObservationError = null;
+        } else {
+          workInspection = null;
+          workObservationError = observed.error;
+        }
       }
       const finalFacts = readHostFacts(context);
       if (finalFacts.agentKind !== "main"
@@ -1829,6 +2129,16 @@ async function admitTask(
         lifecycle: "none",
         lifecycleTerminal: false,
         taskResultObserved: false,
+        workRef: pending.workRef,
+        workCaptureReason: pending.workCaptureReason,
+        workInspection,
+        workInspectionHook,
+        workObservationError,
+        workInvalidatedReason: null,
+        resultObservation: null,
+        resultObservationError: null,
+        lifecycleEvidence: { completed: false, failed: false, aborted: false },
+        resultLifecycleConflict: null,
         closedReason: null,
       };
       root.records.push(record);
@@ -2380,6 +2690,27 @@ function buildDetailedStatus(factory: FactoryContext): InstancedStatusDetail {
       lifecycle: record.lifecycle,
       lifecycleTerminal: record.lifecycleTerminal,
       taskResultObserved: record.taskResultObserved,
+      observation: {
+        work: {
+          scope: "last-owner-main-hook" as const,
+          capture: record.workRef === null ? "unavailable" as const : "captured" as const,
+          captureReason: record.workCaptureReason,
+          hook: record.workInspectionHook,
+          error: record.workObservationError,
+          invalidatedReason: record.workInvalidatedReason,
+          inspection: record.workInspection,
+        },
+        result: {
+          observation: record.resultObservation,
+          error: record.resultObservationError,
+        },
+        lifecycleEvidence: {
+          completed: record.lifecycleEvidence.completed,
+          failed: record.lifecycleEvidence.failed,
+          aborted: record.lifecycleEvidence.aborted,
+        },
+        conflict: record.resultLifecycleConflict === null ? null : { ...record.resultLifecycleConflict },
+      },
       closedReason: record.closedReason,
       retainedBytes: record.retainedBytes,
     })),
@@ -2758,6 +3089,7 @@ export function createInstancedNativeEntry(
       const root = moduleRoot;
       if (root === null || root.factoryId !== factory.id) return { handled: true };
       if (!refreshRoot(factory, root, pi, context)) return { handled: true };
+      refreshWorkObservations(factory, root, context, "input");
       return undefined;
     } catch (error) {
       const root = moduleRoot;
@@ -2790,6 +3122,7 @@ export function createInstancedNativeEntry(
         abortNow(context);
         return undefined;
       }
+      refreshWorkObservations(factory, root, context, "before_agent_start");
       // D1 owns the main prompt. This entry never rewrites it.
       return undefined;
     } catch (error) {
@@ -2835,29 +3168,81 @@ export function createInstancedNativeEntry(
 
   pi.on("tool_result", (event, context) => {
     try {
+      if (factory.disposed) return;
       const root = moduleRoot;
-      const facts = readHostFacts(context);
-      if (factory.disposed
-        || root === null
+      if (root === null
         || root.factoryId !== factory.id
-        || facts.agentKind !== "main"
-        || !isRecord(event)) {
+        || !ownsRoot(factory, root)
+        || !root.open
+        || root.phase !== "ready") {
         return;
       }
-      if (event.toolName !== "task" || typeof event.toolCallId !== "string") return;
-      const record = root.recordByToolCall.get(event.toolCallId);
-      if (record !== undefined && record.admittedRootToken === root.token) record.taskResultObserved = true;
+      const facts = readHostFacts(context);
+      if (facts.agentKind !== "main"
+        || facts.agentId !== root.agentId
+        || facts.sessionId !== root.sessionId
+        || facts.workspaceRoot !== root.workspaceRoot) {
+        return;
+      }
+      refreshWorkObservations(factory, root, context, "tool_result");
+      if (!ownsRoot(factory, root) || !root.open || root.phase !== "ready") return;
+      const afterRefresh = readHostFacts(context);
+      if (afterRefresh.agentKind !== "main"
+        || afterRefresh.agentId !== root.agentId
+        || afterRefresh.sessionId !== root.sessionId
+        || afterRefresh.workspaceRoot !== root.workspaceRoot) {
+        return;
+      }
+      if (!isRecord(event) || event.toolName !== "task" || typeof event.toolCallId !== "string") return;
+      const toolCallId = event.toolCallId;
+      const record = root.recordByToolCall.get(toolCallId);
+      if (record === undefined
+        || record.admittedRootToken !== root.token
+        || record.parentToolCallId !== toolCallId) {
+        return;
+      }
+      const writeAllowed = (): boolean =>
+        ownsRoot(factory, root)
+        && root.token === record.admittedRootToken
+        && root.open
+        && root.phase === "ready"
+        && root.recordByToolCall.get(toolCallId) === record;
+      const expected = expectedResultAssociation(record, root);
+      if (expected === null) {
+        if (writeAllowed()) {
+          record.resultObservationError ??= "owner session or workspace identity was unavailable at result observation";
+        }
+        return;
+      }
+      let next: NativeInstanceResultObservation;
+      try {
+        // Synchronous snapshot of this exact event, before later middleware.
+        next = observeNativeInstanceResult(expected, event, record.resultObservation);
+      } catch (error) {
+        if (writeAllowed()) {
+          record.resultObservationError ??= boundedMessage(`native result observation failed: ${errorMessage(error)}`);
+        }
+        return;
+      }
+      if (!writeAllowed()) return;
+      record.resultObservation = next;
+      record.taskResultObserved = true;
+      assessResultLifecycleConflict(record);
     } catch {
       // Observations never gate.
     }
   });
 
-  const onWorkEnding = (context: NativeContext): void => {
+  const onWorkEnding = (context: NativeContext, hook: InstancedWorkObservationHook): void => {
     try {
       const root = moduleRoot;
+      if (root === null || factory.disposed || root.factoryId !== factory.id) return;
       const facts = readHostFacts(context);
-      if (root === null || facts.agentKind !== "main" || factory.disposed) return;
-      if (root.factoryId !== factory.id) return;
+      // A foreign main session/cwd with the same agent id is not this work's
+      // end: it must neither refresh nor invalidate the real owner root.
+      if (!matchesOwnerIdentity(root, facts)) return;
+      refreshWorkObservations(factory, root, context, hook);
+      if (!ownsRoot(factory, root)) return;
       invalidatePending(root, "the parent work ended before an admission published");
       invalidateUnboundAdmissions(
         root,
@@ -2868,8 +3253,8 @@ export function createInstancedNativeEntry(
       // Work-ending observation must not break host cleanup.
     }
   };
-  pi.on("agent_end", (_event, context) => onWorkEnding(context));
-  pi.on("session_stop", (_event, context) => onWorkEnding(context));
+  pi.on("agent_end", (_event, context) => onWorkEnding(context, "agent_end"));
+  pi.on("session_stop", (_event, context) => onWorkEnding(context, "session_stop"));
 
   for (const eventName of ["session_switch", "session_branch", "session_tree", "session_clear"] as const) {
     pi.on(eventName, (_event, context) => {
