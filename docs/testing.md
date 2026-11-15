@@ -102,6 +102,10 @@ The original automatic grade passed 17 of 18 checks but failed because the grade
 
 Focused checks use `bun test test/unit/native-handoff.test.ts`. The focused run passed 21 tests and 301 assertions with type checking, including adversarial identity, reservation, capacity, metadata and inspection cases. Final `bun run check` also passed type checking, 789 unit tests (42 files, 34,825 assertions) and 15 human-review simulations (155 assertions), exit 0. These checks exercise the pure store only; no OMP host run, tool registration, child read/result wiring or final report adoption was executed.
 
+### Native main handoff adapter checks
+
+Focused checks run `bun test test/unit/native-handoff-entry.test.ts` with `test/unit/native-handoff.test.ts`; the adapter work added 29 entry tests and one core matcher test. The combined run passed 51 tests and 563 assertions with type checking. Final `bun run check` passed 819 unit tests (43 files, 35,087 assertions) and 15 human-review simulations (155 assertions), exit 0. Principal regressions cover real temporary-file captures through fake ports, exact issued references, same-call concurrency and terminal replay, foreign scope, pre-effect and mid-I/O cancellation/close/dispose/work change, same-call reentry, unknown/getter/proxy/`__proto__` shapes, original-plan repair, live-file adoption, encoded limits and an honest response after a post-commit failure. These checks use fake ports and did not run the new adapter in OMP; they do not claim host binding, an actual child tool execution or report publication.
+
 ## Commands
 
 ```sh

@@ -1563,3 +1563,41 @@ describe("native handoff repair feedback and direct tool-call identity", () => {
     expect(store.lookupAdoption(adoption.adoptionId)?.outcome).toBe("fail");
   });
 });
+
+describe("historical capture binding matcher", () => {
+  test("matches only the exact issued capture, work and producer references", async () => {
+    const root = await workspace();
+    const store = openNativeHandoffStore({});
+    const work = {};
+    const producer = {};
+    const capture = await initial(store, root, {
+      work,
+      producer,
+      producerFacts: facts("producer"),
+      proposalCall: {},
+      proposalFacts: facts("proposal"),
+    });
+
+    expect(store.matchesCaptureBinding(capture.capture, work, producer)).toBe(true);
+    expect(store.matchesCaptureBinding({ ...capture.capture }, work, producer)).toBe(false);
+    expect(store.matchesCaptureBinding(capture.capture, {}, producer)).toBe(false);
+    expect(store.matchesCaptureBinding(capture.capture, work, {})).toBe(false);
+    expect(store.matchesCaptureBinding(null as never, work, producer)).toBe(false);
+
+    const otherStore = openNativeHandoffStore({});
+    expect(otherStore.matchesCaptureBinding(capture.capture, work, producer)).toBe(false);
+
+    const accessed: string[] = [];
+    const hostile = new Proxy({}, {
+      get(_target, key) {
+        accessed.push(String(key));
+        throw new Error("capture handle getter must not run");
+      },
+    });
+    expect(store.matchesCaptureBinding(hostile as never, work, producer)).toBe(false);
+    expect(accessed).toEqual([]);
+
+    store.invalidate("historical test");
+    expect(store.matchesCaptureBinding(capture.capture, work, producer)).toBe(true);
+  });
+});

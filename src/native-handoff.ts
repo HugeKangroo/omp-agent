@@ -470,6 +470,17 @@ export interface NativeHandoffStore {
   lookupAdoption(adoptionId: string): HandoffAdoptionView | null;
   /** Pure historical path/bytes/sha256 match; no live file read or currentness claim. */
   matchAdoption(adoption: HandoffAdoption, file: HandoffLiveFileFacts): boolean;
+  /**
+   * Pure historical binding check for an issued capture handle. The capture
+   * must belong to this store and retain the exact stored work/producer object
+   * references. This says nothing about the current chain head, offer state,
+   * active work or host authenticity.
+   */
+  matchesCaptureBinding(
+    capture: HandoffCapture,
+    work: HandoffWorkRef,
+    producer: HandoffProducerRef,
+  ): boolean;
   invalidate(reason?: string): void;
   dispose(): void;
 }
@@ -2114,6 +2125,19 @@ class NativeHandoffStoreImpl implements NativeHandoffStore {
     }
     if (!sameLiveFile(record.file, parsed)) return false;
     return matchesNativeTextCheckReceipt(record.receipt.a1, record.capture.snapshot, record.capture.plan);
+  }
+
+  matchesCaptureBinding(
+    capture: HandoffCapture,
+    work: HandoffWorkRef,
+    producer: HandoffProducerRef,
+  ): boolean {
+    if (typeof capture !== "object" || capture === null) return false;
+    const record = this.#captureHandles.get(capture);
+    if (record === undefined) return false;
+    // Exact opaque object identity only. No caller property is read, no host
+    // callback runs and no state/head/currentness is consulted.
+    return record.workRef === work && record.producerRef === producer;
   }
 
   invalidate(reason?: string): void {
