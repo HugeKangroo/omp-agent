@@ -35,6 +35,20 @@ The distribution includes the isolated execution launcher and the lazy human-rev
 
 Human review is off unless the JSON explicitly contains `"humanReview": "local-main-tui-v1"`. No automatic semantic contract is installed by this entry. Insufficient verification coverage stays insufficient; final acceptance still requires the existing acceptance mechanism and its evidence. The entry preserves ordinary OMP capabilities and model selection. Its guarantees apply to managed calls, not to every native or third-party tool side effect.
 
+## Explicit native work observation
+
+`src/native-entry.ts` is an independently loaded experimental entry. OMP owns planning, the model/tool loop, native execution and authorization. The entry contributes proportional checking guidance, bounded main-session observations and the `agent_work` tool; it does not create a managed TaskOwner or replace OMP scheduling. The package default remains `daily-entry.ts`. An existing or subsequently published managed owner disables the native observer.
+
+`agent_work inspect` exposes observed work and calls. `report` selects completed calls from that work, records a model-declared outcome (`completed`, `insufficient` or `blocked`) and limitations, and optionally observes workspace-relative UTF-8 files. Tool results are observations after extension middleware, not an untouched execution attestation. Check purposes and interpretation remain model claims. A file digest identifies the bytes read during that observation; it does not tie the bytes causally to a check, establish future integrity, or confer managed candidate/acceptance status.
+
+Ingress and prompt preparation are separate lifecycle events. Preparation reentry must preserve the existing work and reminder; ambiguous new input cannot silently acquire a known association. Tool preflight establishes an observation binding, not execution success. Late results, identity conflicts and reused IDs are withheld where attribution cannot be established. Reports recheck live context and selected observations after awaited file reads. Clearing or navigating a session invalidates the current association. This is bounded observational consistency, not an atomic snapshot or a new authority system.
+
+A request that used tools but did not report may receive one time-bounded advisory continuation. Ordinary no-tool conversation does not trigger an extra round. Work completion and report state remain separate from strict acceptance, allowing subsequent ordinary requests to proceed. The entry neither persists/restores observations nor guarantees queued-input attribution, subagent-wide policy inheritance, sandboxing, semantic correctness or a strict total-cost ceiling.
+
+### Planned definition and instance boundary
+
+Configurable Agent definitions, independent instances and cross-instance Flow are not implemented by this observation entry. A daily storage instance or native work observation is not an Agent instance. The next increment will first validate the selected OMP version's native Agent Markdown and Skills loading, including the separate main-session adaptation, then add definition-version binding and bounded task/artifact handoffs. Common principles and selectable methods will remain distinct from host permissions and task parameters. OMP will retain execution ownership; optional Harness² delegation will retain its own internal workflow. There is no plan to duplicate either scheduler or introduce profession-specific kernel branches.
+
 ## Task and execution boundaries
 
 Task identity and requirement sources come from host-observed conversation events. Model arguments can select existing objects and provide optimistic version guards; they cannot create host authority.

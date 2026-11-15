@@ -1,6 +1,20 @@
 # Testing
 
-The verified local development environment uses macOS, OMP 18.18.0, and Bun 1.4.0.
+The managed-entry integration suites pin macOS, OMP 18.18.0, and Bun 1.4.0. Validation of the explicitly loaded native entry uses a separate OMP 18.20.2 admission; it does not extend the older suites' support matrix.
+
+## Native work observation entry
+
+Run the focused regressions with `bun test ./test/unit/native-entry.test.ts`. They cover sequential requests, preparation reentry, ambiguous ingress, call and report routing identity, sticky conflicts, bounded retention and ID memory, live session/workspace changes, disposal, output-file consistency, cancellation, and report checks after asynchronous reads. The normal project `check` also runs these tests.
+
+The native entry is observational. Its tests do not establish semantic task acceptance, execution isolation, policy inheritance across subagents, durable recovery, or quality/cost improvements over an unmodified agent. The existing default entry and managed verification/acceptance behavior remain separately tested.
+
+A separate actual OMP 18.20.2 check used a zero-prompt native-tool baseline and two sequential requests in one main session with a local deterministic provider. The passing journey used 14 provider requests and 11 tool calls. It preserved the native catalog, observed the actual system guidance, continued the same work after one stop reminder, retained an initial failed file check before repair, rejected an old work's check selection, and matched reported digests against real files. Both requests completed and settled; both processes exited normally after EOF, without signal fallback. Successful native shell result observations did not expose an exit-code field, so reports retained `null` rather than inventing zero.
+
+Earlier failed attempts remain part of the record: the private fixture first mishandled the host's user-message wrapper and system-prompt representation, and a subsequent actual run exposed a product bug in stop-reminder preparation. The product now binds only its own issued reminder to the current work, with context, ingress and deadline checks. This is a bounded host-integration result, not evidence of general model quality.
+
+Two sequential real-model development samples were then run with DeepSeek Flash. The initial run completed normally in 91.44 seconds with 14 tool calls and a reported cost of $0.01449. Independent review passed the data result but rejected the source-constrained document for an unsupported extra premise; its self-check did not detect the semantic error. After a general evidence-guidance change, the same inputs were rerun as a seen regression: normal completion in 153.99 seconds, 22 tool calls, reported cost $0.02445, and the document still failed that content criterion. Both failures and their original artifacts remain recorded. The guidance change has not demonstrated a quality improvement, and the overall content-quality gate remains open.
+
+The seen regression also retained one native tool argument-schema rejection before recovery. That rejection occurred before the extension's observation hook, so it remains in the host evidence rather than appearing as an observed plugin result. The two requests shared a session and workspace. These runs do not establish Agent-instance isolation, unseen-task performance, separate-agent review quality, or general semantic correctness. A model-declared `completed` report is not an independent quality verdict. The current final check passes 545 unit tests and 15 human-review simulations; those engineering checks do not overturn the content failures.
 
 ## Commands
 

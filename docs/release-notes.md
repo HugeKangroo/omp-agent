@@ -1,5 +1,11 @@
 # Release notes
 
+## Experimental native work observation entry
+
+Added `src/native-entry.ts` for explicit loading alongside OMP's native model and tool loop. It provides proportional checking guidance, bounded `agent_work inspect/report` observations, and at most one advisory finalization reminder per work. Ordinary work completion is distinct from strict managed acceptance.
+
+Reports separate model claims, observed tool results and file digests. Conflicted or reused call identities and stale contexts cannot provide current evidence. The entry adds no native execution permissions, managed owner, sandbox, semantic verifier or restart recovery. The package default remains `daily-entry.ts`; use the native entry independently. Validation details and limitations are recorded in [Testing](testing.md).
+
 ## Frozen-candidate method transfer validation
 
 Recorded one independently selected method task after freezing the generic candidate, tools, guidance, model and budgets. Actual generated content, numerical checks, provenance, final paths and cleanup passed bounded independent review. Five recovered errors remain, so strict zero-error acceptance failed; host verification remained `insufficient` and did not accept the task. This documentation-only increment does not change defaults or establish full Alpha readiness. See the testing record for scope, usage and wording limitations.
