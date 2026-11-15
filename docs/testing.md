@@ -16,6 +16,18 @@ Two sequential real-model development samples were then run with DeepSeek Flash.
 
 The seen regression also retained one native tool argument-schema rejection before recovery. That rejection occurred before the extension's observation hook, so it remains in the host evidence rather than appearing as an observed plugin result. The two requests shared a session and workspace. These runs do not establish Agent-instance isolation, unseen-task performance, separate-agent review quality, or general semantic correctness. A model-declared `completed` report is not an independent quality verdict. The current final check passes 545 unit tests and 15 human-review simulations; those engineering checks do not overturn the content failures.
 
+## Native Agent definition compatibility (OMP 18.20.2)
+
+One bounded compatibility suite used the fixed `omp/18.20.2` executable, an isolated profile and a file-local deterministic provider. The profile disabled async task execution (`async.enabled:false`), structured task output (`task.structured:false`), retries, model fallback and unrelated discovery providers; definitions used `blocking:true` and single `task` calls. The positive run stayed within its 1-parent, 2-native-child, 30-provider-request, 30-tool-call and 120-second limits. It started 2 real native children, made 7 provider requests and 4 observed tool calls, and shut down all 3 sessions. It observed project Agent Markdown selection by name, definition body/model/tool delivery, and project Skill delivery: the autoloaded Skill body reached the selected child, while the main session saw only its catalog description. The `--append-system-prompt` file also reached the actual main provider context, but that is host prompt input, not a native Agent selector.
+
+The supplementary run used a separate limit of one parent, five task calls, four children, 14 provider requests, 14 observed tool calls and 120 seconds, with `task.maxConcurrency:1` and `task.workerThreads:0`. It made 5 task calls, started 4 child sessions, made 9 provider requests and 5 observed tool calls, and shut down all 4 children. The parent closed normally on EOF with exit 0 and no signal; retained definition, Skill, module and source snapshots matched, and observed prompt content hashes matched the retained segments. The supplemental ledger's `childStarts=3` counts only children that reached the provider; the observer recorded 4 session starts, including one that failed before model resolution. That is counter scope, not a product budget feature.
+
+The import probe found `parseAgent`, `discoverAgents`/`getAgent`, and `loadSkills`/`loadSkillsFromDir` available; `parseAgent`, `discoverAgents` and `loadSkills` were actually called. The package-root `discoverSkills` export was observed but not invoked. Import/export availability is not a behavioral gate by itself.
+
+The initial suite is not a budget pass. Its cumulative limits were 8 parents, 6 native child starts, 30 provider requests, 30 tool calls and 240 seconds; the suite totaled 15 child starts and 48 provider requests after a fixture-state reset loop. The looping failed attempt also left its final started child without an observed shutdown. The initial grading failure and failed attempts remain recorded; the later repaired positive collection does not erase them. The prior content-quality failure also remains.
+
+The local provider made no paid-model calls. No packet capture or network-denial instrumentation was used, so total process-wide network isolation is not claimed. These checks do not establish semantic quality, reliability rates, Agent-instance isolation, recovery or human-TUI behavior.
+
 ## Commands
 
 ```sh

@@ -45,9 +45,27 @@ Ingress and prompt preparation are separate lifecycle events. Preparation reentr
 
 A request that used tools but did not report may receive one time-bounded advisory continuation. Ordinary no-tool conversation does not trigger an extra round. Work completion and report state remain separate from strict acceptance, allowing subsequent ordinary requests to proceed. The entry neither persists/restores observations nor guarantees queued-input attribution, subagent-wide policy inheritance, sandboxing, semantic correctness or a strict total-cost ceiling.
 
+### Native definition compatibility (OMP 18.20.2)
+
+Compatibility evidence is bounded to the fixed OMP 18.20.2 binary and an isolated profile. OMP natively parses project Agent Markdown, lists definitions through the `task` tool, and lets a task select one by exact name. In the positive cases, the selected child received the definition body, requested model and declared tool set, and its valid `autoloadSkills` entry delivered the project Skill body. The tested main session received Skill catalog descriptions, without the full body.
+
+The supported `--append-system-prompt` file/CLI path injects host prompt input into the main session. It does not parse Agent frontmatter and is not a native main-session Agent selector; no `--agent` selection was observed. `@oh-my-pi/pi-coding-agent` package imports expose `parseAgent` from `task/agents`, `discoverAgents`/`getAgent` from `task/discovery`, and `loadSkills`/`loadSkillsFromDir` from the package root and `extensibility/skills`. `parseAgent`, `discoverAgents` and `loadSkills` were actually invoked; the package-root `discoverSkills` export was observed but not invoked. Import availability alone is not behavioral proof.
+
+| Observed input | Native behavior |
+| --- | --- |
+| Missing Agent name | Rejected before child creation with `Unknown agent`, the exact requested name, available names and both searched directories. |
+| Unknown model selector | Child session starts with `model:null`, makes zero provider requests, then the task wrapper reports `failed (exit 1)` / `No model selected`; the outer tool result's `isError` remains false. No successful fallback was observed. |
+| Unknown tool name | Removed from the child's effective tool set; the child runs with the remaining valid tools. |
+| Unknown `autoloadSkills` name | Silently skipped; the child runs without that Skill body or name. |
+| Duplicate Agent name | Project definition wins; its body and tools are delivered and the user definition is ignored. |
+
+These outcomes are specific to this fixed binary/profile and exact fixture cases, not a general fail-closed guarantee or product budget feature. Task status, child lifecycle and outer `isError` must be checked separately: the unknown-model child failed late although the outer error flag was false.
+
+The proposed minimum extension remains pending: preflight the exact selected definition content and hash, then bind an immutable definition snapshot to the task or instance. No definition registry, main-session selector, collision rejection, fallback reporting or failed-child preflight is implemented. This section records host compatibility evidence only; it adds no new framework or product feature, and the default daily entry, explicit native observation entry, scopes and other defaults are unchanged.
+
 ### Planned definition and instance boundary
 
-Configurable Agent definitions, independent instances and cross-instance Flow are not implemented by this observation entry. A daily storage instance or native work observation is not an Agent instance. The next increment will first validate the selected OMP version's native Agent Markdown and Skills loading, including the separate main-session adaptation, then add definition-version binding and bounded task/artifact handoffs. Common principles and selectable methods will remain distinct from host permissions and task parameters. OMP will retain execution ownership; optional Harness² delegation will retain its own internal workflow. There is no plan to duplicate either scheduler or introduce profession-specific kernel branches.
+Configurable Agent definitions, independent instances and cross-instance Flow are not implemented by this observation entry. A daily storage instance or native work observation is not an Agent instance. Compatibility of the fixed OMP 18.20.2 Agent Markdown, task and Skills paths is recorded above. Main-session definition binding remains unavailable through the observed CLI, and definition-version binding and bounded task/artifact handoffs remain pending. The proposed next increment would add selected-definition preflight and immutable snapshot/binding before those handoffs. Common principles and selectable methods will remain distinct from host permissions and task parameters. OMP will retain execution ownership; optional Harness² delegation will retain its own internal workflow. There is no plan to duplicate either scheduler or introduce profession-specific kernel branches.
 
 ## Task and execution boundaries
 

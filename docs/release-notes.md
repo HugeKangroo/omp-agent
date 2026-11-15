@@ -1,5 +1,13 @@
 # Release notes
 
+## Native Agent definition compatibility documentation
+
+Documented fixed-version compatibility evidence for native OMP Agent Markdown, task subagents and project Skills on OMP 18.20.2. A native project definition can be selected through `task`, with observed definition body, model and tool delivery; an explicitly autoloaded project Skill body reached the selected child. The main `--append-system-prompt` path remains host prompt input, not an Agent selector; main-session definition binding is not available through the observed CLI.
+
+The record also captures version-specific negative behavior: a missing Agent is rejected before child creation, an unknown model fails after the child starts without a successful fallback, unknown tools and autoload Skills are silently skipped, and a project definition shadows a user duplicate. The proposed definition preflight and immutable snapshot/binding extension remains pending.
+
+This is documentation of bounded host compatibility only. It adds no product entry, definition feature, default change, isolation/recovery guarantee or general fail-closed claim, and it does not supersede the retained content-quality failure. The package default, explicit native observation entry and their scopes are unchanged. See [Architecture](architecture.md) and [Testing](testing.md).
+
 ## Experimental native work observation entry
 
 Added `src/native-entry.ts` for explicit loading alongside OMP's native model and tool loop. It provides proportional checking guidance, bounded `agent_work inspect/report` observations, and at most one advisory finalization reminder per work. Ordinary work completion is distinct from strict managed acceptance.
