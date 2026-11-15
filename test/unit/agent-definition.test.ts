@@ -17,6 +17,7 @@ import {
   DEFINITION_SNAPSHOT_SCHEMA,
   DefinitionError,
   loadDefinitionSnapshot,
+  loadNativeChildDefinitionSnapshot,
   MAX_DEFINITION_BYTES,
   MAX_INITIAL_TEXT_BYTES,
   MAX_SKILL_BYTES,
@@ -147,6 +148,8 @@ function makeOptions(
     tools: parsedTools(fake.frontmatter.tools),
     model: parsedModel(fake.frontmatter.model),
     autoloadSkills: parsedSkills(fake.frontmatter.autoloadSkills),
+    blocking: fake.frontmatter.blocking,
+    structured: fake.frontmatter.structured,
   };
   return {
     definitionPath,
@@ -193,6 +196,41 @@ function genericFake(name: string, body: string, extra: Partial<FakeDefinition> 
     body,
     ...extra,
   };
+}
+
+function childFrontmatter(name: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    name,
+    description: `Child definition ${name}`,
+    blocking: true,
+    structured: false,
+    tools: ["read", "write"],
+    model: "prov/model-a",
+    ...overrides,
+  };
+}
+
+function childFake(
+  name: string,
+  body: string,
+  overrides: Record<string, unknown> = {},
+  extra: Partial<FakeDefinition> = {},
+): FakeDefinition {
+  return {
+    frontmatter: childFrontmatter(name, overrides),
+    body,
+    ...extra,
+  };
+}
+
+async function writeChildDefinition(root: string, name: string, body: string): Promise<string> {
+  const filePath = path.join(root, `${name}.md`);
+  await writeFile(
+    filePath,
+    `---\nname: ${name}\ndescription: Child definition ${name}\nblocking: true\nstructured: false\ntools:\n  - read\n  - write\nmodel: prov/model-a\n---\n${body}\n`,
+    "utf8",
+  );
+  return filePath;
 }
 
 describe("loadDefinitionSnapshot", () => {
@@ -364,6 +402,220 @@ describe("loadDefinitionSnapshot", () => {
     expect(first.definition.body).not.toBe(second.definition.body);
     expect(first.version).not.toBe(second.version);
     expect(first.workspaceRoot).toBe(second.workspaceRoot);
+  });
+});
+
+describe("loadNativeChildDefinitionSnapshot", () => {
+  test("preserves full child raw text and parsed profile fields", async () => {
+    const root = await tempRoot();
+    const definitionPath = await writeChildDefinition(root, "child-valid", "Do child work.");
+    const fake = childFake("child-valid", "Do child work.");
+    const snapshot = await loadNativeChildDefinitionSnapshot(makeOptions(definitionPath, root, fake));
+
+    expect(snapshot.schema).toBe(DEFINITION_SNAPSHOT_SCHEMA);
+    expect(snapshot.version).toMatch(/^definition-snapshot-v1:sha256:[0-9a-f]{64}$/);
+    expect(snapshot.definition.name).toBe("child-valid");
+    expect(snapshot.definition.body).toBe("Do child work.");
+    expect(snapshot.definition.rawContent).toContain("blocking: true");
+    expect(snapshot.definition.rawContent).toContain("structured: false");
+    expect(snapshot.definition.sha256).toBe(sha256(await Bun.file(definitionPath).bytes()));
+    expect(snapshot.definition.frontmatter).toEqual(childFrontmatter("child-valid"));
+    expect(snapshot.definition.frontmatter.blocking).toBe(true);
+    expect(snapshot.definition.frontmatter.structured).toBe(false);
+    expect(snapshot.definition.requestedTools).toEqual(["read", "write"]);
+    expect(snapshot.definition.effectiveTools).toEqual(["read", "write"]);
+    expect(snapshot.definition.model).toEqual({
+      selector: "prov/model-a",
+      selectorKind: "provider-id",
+      provider: "prov",
+      id: "model-a",
+    });
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(Object.isFrozen(snapshot.definition.frontmatter)).toBe(true);
+    expect(snapshot.getStatus().version).toBe(snapshot.version);
+  });
+
+  test("keeps the default D1 loader rejecting child profile fields", async () => {
+    const root = await tempRoot();
+    const definitionPath = await writeChildDefinition(root, "child-d1", "Do child work.");
+    const error = await captureError(loadDefinitionSnapshot(makeOptions(
+      definitionPath,
+      root,
+      childFake("child-d1", "Do child work."),
+    )));
+    expect(error.code).toBe("unsupported-fields");
+    expect(error.fields).toEqual(["blocking", "structured"]);
+  });
+
+  test("requires literal blocking true and structured false", async () => {
+    const root = await tempRoot();
+    const definitionPath = await writeDefinition(root, "child-literals", "Child body.");
+    const cases: { label: string; frontmatter: Record<string, unknown> }[] = [];
+
+    const missingBlocking = childFrontmatter("child-literals");
+    delete missingBlocking.blocking;
+    cases.push({ label: "missing blocking", frontmatter: missingBlocking });
+
+    const missingStructured = childFrontmatter("child-literals");
+    delete missingStructured.structured;
+    cases.push({ label: "missing structured", frontmatter: missingStructured });
+
+    for (const value of [null, "true", 1, false]) {
+      cases.push({
+        label: `blocking ${JSON.stringify(value)}`,
+        frontmatter: childFrontmatter("child-literals", { blocking: value }),
+      });
+    }
+    for (const value of [null, "false", 0, true]) {
+      cases.push({
+        label: `structured ${JSON.stringify(value)}`,
+        frontmatter: childFrontmatter("child-literals", { structured: value }),
+      });
+    }
+
+    for (const entry of cases) {
+      const error = await captureError(loadNativeChildDefinitionSnapshot(makeOptions(
+        definitionPath,
+        root,
+        { frontmatter: entry.frontmatter, body: "Child body." },
+      )));
+      expect(error.code, entry.label).toBe("invalid-child-profile");
+      expect(error.message.length, entry.label).toBeLessThan(400);
+    }
+  });
+
+  test("fails on native parser disagreement for child profile flags", async () => {
+    const root = await tempRoot();
+    const definitionPath = await writeDefinition(root, "child-parser", "Child body.");
+
+    for (const parsed of [
+      { blocking: false },
+      { blocking: undefined },
+      { structured: true },
+      { structured: undefined },
+    ]) {
+      const error = await captureError(loadNativeChildDefinitionSnapshot(makeOptions(
+        definitionPath,
+        root,
+        childFake("child-parser", "Child body.", {}, { parsed }),
+      )));
+      expect(error.code).toBe("parser-disagreement");
+    }
+  });
+
+  test("requires explicit tools and one explicitly declared model", async () => {
+    const root = await tempRoot();
+    const definitionPath = await writeDefinition(root, "child-selection", "Child body.");
+
+    const missingTools = childFrontmatter("child-selection");
+    delete missingTools.tools;
+    const noTools = await captureError(loadNativeChildDefinitionSnapshot(makeOptions(
+      definitionPath,
+      root,
+      { frontmatter: missingTools, body: "Child body." },
+    )));
+    expect(noTools.code).toBe("invalid-child-profile");
+
+    const missingModel = childFrontmatter("child-selection");
+    delete missingModel.model;
+    const noModel = await captureError(loadNativeChildDefinitionSnapshot(makeOptions(
+      definitionPath,
+      root,
+      { frontmatter: missingModel, body: "Child body." },
+    )));
+    expect(noModel.code).toBe("invalid-child-profile");
+
+    const csv = await loadNativeChildDefinitionSnapshot(makeOptions(
+      definitionPath,
+      root,
+      childFake("child-selection", "Child body.", { tools: "read, write" }),
+    ));
+    expect(csv.definition.requestedTools).toEqual(["read", "write"]);
+
+    const none = await loadNativeChildDefinitionSnapshot(makeOptions(
+      definitionPath,
+      root,
+      childFake("child-selection", "Child body.", { tools: [] }),
+    ));
+    expect(none.definition.requestedTools).toEqual([]);
+    expect(none.definition.effectiveTools).toEqual([]);
+
+    const multiple = await captureError(loadNativeChildDefinitionSnapshot(makeOptions(
+      definitionPath,
+      root,
+      childFake("child-selection", "Child body.", { model: ["prov/one", "prov/two"] }),
+    )));
+    expect(multiple.code).toBe("multiple-models");
+  });
+
+  test("keeps child extras and existing tool or Skill failures unchanged", async () => {
+    const root = await tempRoot();
+    const definitionPath = await writeDefinition(root, "child-extra", "Child body.");
+
+    const extra = await captureError(loadNativeChildDefinitionSnapshot(makeOptions(
+      definitionPath,
+      root,
+      childFake("child-extra", "Child body.", { spawns: "*" }),
+    )));
+    expect(extra.code).toBe("unsupported-fields");
+    expect(extra.fields).toEqual(["spawns"]);
+
+    const unknownTool = await captureError(loadNativeChildDefinitionSnapshot(makeOptions(
+      definitionPath,
+      root,
+      childFake("child-extra", "Child body.", { tools: ["read", "network"] }),
+      { availableTools: ["read", "write"] },
+    )));
+    expect(unknownTool.code).toBe("unknown-tool");
+    expect(unknownTool.fields).toEqual(["network"]);
+
+    const missingSkill = await captureError(loadNativeChildDefinitionSnapshot(makeOptions(
+      definitionPath,
+      root,
+      childFake("child-extra", "Child body.", { autoloadSkills: ["absent"] }),
+    )));
+    expect(missingSkill.code).toBe("skill-missing");
+  });
+
+  test("body and Skill changes create a new version while the old child snapshot stays frozen", async () => {
+    const root = await tempRoot();
+    const skill = await writeSkill(root, "child-skill");
+    const definitionPath = await writeChildDefinition(root, "child-versioned", "First child body.");
+    const fake = childFake(
+      "child-versioned",
+      "First child body.",
+      { autoloadSkills: ["child-skill"] },
+      { skillDocs: new Map([[skill.filePath, skill.doc]]) },
+    );
+    const options = makeOptions(definitionPath, root, fake, { availableSkills: [skill.metadata] });
+    const first = await loadNativeChildDefinitionSnapshot(options);
+    const firstVersion = first.version;
+    const firstSkillBody = first.skills[0]!.body;
+
+    await writeChildDefinition(root, "child-versioned", "Second child body.");
+    fake.body = "Second child body.";
+    await writeFile(
+      skill.filePath,
+      `---\nname: child-skill\ndescription: ${skill.metadata.description}\n---\nSecond Skill body.\n`,
+      "utf8",
+    );
+    skill.doc.body = "Second Skill body.";
+    const second = await loadNativeChildDefinitionSnapshot(makeOptions(
+      definitionPath,
+      root,
+      fake,
+      { availableSkills: [skill.metadata] },
+    ));
+
+    expect(second.version).not.toBe(firstVersion);
+    expect(first.version).toBe(firstVersion);
+    expect(first.definition.body).toBe("First child body.");
+    expect(first.definition.rawContent).toContain("First child body.");
+    expect(first.skills[0]!.body).toBe(firstSkillBody);
+    expect(first.skills[0]!.rawContent).toContain("Instructions for child-skill.");
+    expect(second.definition.body).toBe("Second child body.");
+    expect(second.skills[0]!.body).toBe("Second Skill body.");
+    expect(first.getStatus().version).toBe(firstVersion);
   });
 });
 

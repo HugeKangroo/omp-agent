@@ -1,5 +1,15 @@
 # Release notes
 
+## Native child snapshot and text primitives
+
+Added `src/native-child-text.ts`, with pure selected Role-frame and autoloaded Skill verifiers. Full selected body comparison uses an injected native renderer and checks the known unique Role/Coop/Completion shape, exact Skill name/path/content/provenance/count/order, and bounded extras. It performs no IO, prompt mutation, authority or dispatch; callers must act on false results. Nineteen focused tests pass.
+
+Added `loadNativeChildDefinitionSnapshot` in `agent-definition.ts` with 7 tests (31 snapshot tests total). It uses the same bounded loader and frozen version but accepts only native-child `blocking:true`/`structured:false` extras plus explicit `tools`/`model`; the main loader still rejects those fields. This validates the requested declaration, not effective host-profile enforcement. Product instance entry, registry and result binding remain unimplemented.
+
+One bounded fixed-profile fixture run used 3 native parents and 3 children, 7 provider ingress records, 3 task tool calls, 0 child tool calls and about 6 seconds. Positive Role/Skill full text passed with an unchanged prompt. Body drift was refused four times in the same child before lifecycle failure, and Skill drift was refused in context with the lifecycle aborted and parent result cancelled; both had zero child provider ingress. Native still-live result text is not provider-dispatch evidence, and shutdown observed during EOF cleanup is not proof of immediate refusal-time termination. All parents exited normally with exit 0 and gone process groups. Internal attempted-turn counts are not provider requests. This is pure verifier fixture integration, not child snapshot entry integration or real-model quality; older failures remain open.
+
+Scoped settings were read in the same cases through `findScopedSettings()` and `registry.lookup().get(instance)`: same-cwd parent and child received distinct objects, and parent `compaction.midTurnEnabled=false` versus native-child true isolated correctly. The global settings singleton was unused. This proves a read port, not product profile enforcement, and changes no global configuration, default entry or default policy. Scope is initial text only, without lifecycle, recovery, late-result or artifact isolation or a full D2 claim. The current check passes type checking, 615 unit tests and 15 human-review simulations; the prior 589-test result remains historical.
+
 ## Native child compatibility note
 
 Documented bounded compatibility evidence on the fixed macOS/OMP 18.20.2/Bun 1.4.0 probe: one RPC parent, two native same-definition children, 6 local deterministic provider requests, 4 all-session tool calls and shutdown of all 3 sessions. The record establishes the native lifecycle parent-call → child-session link, retained prompt segments with one instance marker, per-child input/model/Skill/tool set and matching parent results. Spawn keys differed from child ids, so association relied on native lifecycle records rather than names, order or format guesses.

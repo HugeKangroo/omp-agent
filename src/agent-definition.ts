@@ -28,6 +28,15 @@ import {
  * is accepted: an exact `provider/id` must resolve to the same identity, while
  * a bare or `@role` native selector keeps its original spelling and records the
  * resolved identity. Thinking/routing suffixes are rejected, not dropped.
+ *
+ * `loadNativeChildDefinitionSnapshot` is a separate fixed profile for the
+ * initial native child definition. It additionally admits only `blocking` and
+ * `structured`, requires literal `blocking: true` / `structured: false` in the
+ * raw frontmatter and the same values from native parseAgent, and requires
+ * explicit `tools` and exactly one explicit `model`. This validates requested
+ * declarations and initial text only; effective host task settings, runtime
+ * model/tool binding, abort authority, isolation and full native text remain
+ * checks for the later entry.
  */
 
 export const DEFINITION_SNAPSHOT_SCHEMA = "omp-agent.definition-snapshot.v1";
@@ -41,6 +50,8 @@ export const MAX_INITIAL_TEXT_BYTES = 1024 * 1024;
 const MAX_ERROR_MESSAGE_CHARS = 320;
 const MAX_PATH_CHARS = 4096;
 const SUPPORTED_DEFINITION_FIELDS = new Set(["name", "description", "tools", "model", "autoloadSkills"]);
+const NATIVE_CHILD_DEFINITION_FIELDS = new Set([...SUPPORTED_DEFINITION_FIELDS, "blocking", "structured"]);
+type SnapshotProfile = "default" | "native-child";
 
 export type DefinitionErrorCode =
   | "invalid-options"
@@ -55,6 +66,7 @@ export type DefinitionErrorCode =
   | "native-parse-failed"
   | "invalid-definition"
   | "unsupported-fields"
+  | "invalid-child-profile"
   | "parser-disagreement"
   | "missing-name"
   | "missing-description"
@@ -107,6 +119,8 @@ export interface NativeParsedAgent {
   readonly tools?: unknown;
   readonly model?: unknown;
   readonly autoloadSkills?: unknown;
+  readonly blocking?: unknown;
+  readonly structured?: unknown;
 }
 
 export interface NativeFrontmatterResult {
@@ -634,6 +648,30 @@ function parseTools(
   return { requested, effective: [...requested].sort() };
 }
 
+function assertNativeChildProfile(
+  frontmatter: Record<string, unknown>,
+  parsedAgent: NativeParsedAgent,
+): void {
+  if (!hasOwn(frontmatter, "blocking") || frontmatter.blocking !== true) {
+    throw new DefinitionError("invalid-child-profile", "Child profile requires literal blocking: true in frontmatter.");
+  }
+  if (!hasOwn(frontmatter, "structured") || frontmatter.structured !== false) {
+    throw new DefinitionError("invalid-child-profile", "Child profile requires literal structured: false in frontmatter.");
+  }
+  if (!hasOwn(frontmatter, "tools")) {
+    throw new DefinitionError("invalid-child-profile", "Child profile requires an explicit tools declaration.");
+  }
+  if (!hasOwn(frontmatter, "model")) {
+    throw new DefinitionError("invalid-child-profile", "Child profile requires exactly one explicit model selector.");
+  }
+  if (parsedAgent.blocking !== true) {
+    throw new DefinitionError("parser-disagreement", "Native parser did not report blocking: true for the child profile.");
+  }
+  if (parsedAgent.structured !== false) {
+    throw new DefinitionError("parser-disagreement", "Native parser did not report structured: false for the child profile.");
+  }
+}
+
 function parseModel(
   rawFrontmatter: Record<string, unknown>,
   parsedModel: unknown,
@@ -915,6 +953,27 @@ function makeStatus(
 export async function loadDefinitionSnapshot(
   options: LoadDefinitionSnapshotOptions,
 ): Promise<DefinitionSnapshot> {
+  return loadDefinitionSnapshotForProfile(options, "default");
+}
+
+/**
+ * Loads the initial text snapshot for the fixed native child profile.
+ *
+ * This validates requested declarations only. It does not prove the host's
+ * effective `task.structured` setting, runtime model/tool binding, abort
+ * behavior, authority or isolation; the later entry must still check host
+ * settings, effective model/tools and the full native text.
+ */
+export async function loadNativeChildDefinitionSnapshot(
+  options: LoadDefinitionSnapshotOptions,
+): Promise<DefinitionSnapshot> {
+  return loadDefinitionSnapshotForProfile(options, "native-child");
+}
+
+async function loadDefinitionSnapshotForProfile(
+  options: LoadDefinitionSnapshotOptions,
+  profile: SnapshotProfile,
+): Promise<DefinitionSnapshot> {
   if (!isRecord(options)) {
     throw new DefinitionError("invalid-options", "Definition snapshot options are required.");
   }
@@ -960,7 +1019,8 @@ export async function loadDefinitionSnapshot(
     throw new DefinitionError("invalid-definition", "Native frontmatter parser returned an unsupported result.");
   }
   const frontmatter = frontmatterResult.frontmatter;
-  const unsupported = Object.keys(frontmatter).filter((key) => !SUPPORTED_DEFINITION_FIELDS.has(key)).sort();
+  const supportedFields = profile === "native-child" ? NATIVE_CHILD_DEFINITION_FIELDS : SUPPORTED_DEFINITION_FIELDS;
+  const unsupported = Object.keys(frontmatter).filter((key) => !supportedFields.has(key)).sort();
   if (unsupported.length > 0) {
     throw new DefinitionError(
       "unsupported-fields",
@@ -978,6 +1038,7 @@ export async function loadDefinitionSnapshot(
   if (!isRecord(parsedAgent)) {
     throw new DefinitionError("invalid-definition", "Native Agent parser returned an unsupported result.");
   }
+  if (profile === "native-child") assertNativeChildProfile(frontmatter, parsedAgent);
 
   const name = nonEmptyString(parsedAgent.name, "Agent name", "missing-name");
   const description = nonEmptyString(parsedAgent.description, "Agent description", "missing-description");
