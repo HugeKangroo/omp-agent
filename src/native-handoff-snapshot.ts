@@ -24,6 +24,10 @@ import {
   NATIVE_TEXT_CHECK_SCHEMA_VERSION,
 } from "./native-snapshot-checker.ts";
 import type { NativeContext, NativeToolResult } from "./native-entry.ts";
+import {
+  readActualAbortSignal as readSharedActualAbortSignal,
+  type ActualAbortRead,
+} from "./native-abort.ts";
 import { clonePlain, deepFreeze, sha256Hex } from "./native-work.ts";
 
 /**
@@ -419,14 +423,6 @@ function consumeNativePromise(value: unknown): boolean {
   }
 }
 
-const ACTUAL_ABORTED_GETTER = (() => {
-  try {
-    return Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get ?? null;
-  } catch {
-    return null;
-  }
-})();
-
 const ACTUAL_ADD_EVENT_LISTENER = (() => {
   try {
     return EventTarget.prototype.addEventListener;
@@ -443,26 +439,12 @@ const ACTUAL_REMOVE_EVENT_LISTENER = (() => {
   }
 })();
 
-type ActualAbortRead =
-  | { readonly ok: true; readonly aborted: boolean }
-  | { readonly ok: false; readonly reason: string };
-
+/** Adapt only the missing-signal wording; actual reads stay shared. */
 function readActualAbortSignal(signal: unknown): ActualAbortRead {
   if (signal === undefined || signal === null) {
     return { ok: false, reason: "the actual child AbortSignal is missing" };
   }
-  if (ACTUAL_ABORTED_GETTER === null) {
-    return { ok: false, reason: "the host AbortSignal aborted getter is unavailable" };
-  }
-  try {
-    const aborted: unknown = Reflect.apply(ACTUAL_ABORTED_GETTER, signal, []);
-    if (typeof aborted !== "boolean") {
-      return { ok: false, reason: "the host AbortSignal aborted state is unreadable" };
-    }
-    return { ok: true, aborted };
-  } catch {
-    return { ok: false, reason: "the supplied signal is not a readable actual host AbortSignal" };
-  }
+  return readSharedActualAbortSignal(signal);
 }
 
 function isActualSubContext(context: unknown): boolean {

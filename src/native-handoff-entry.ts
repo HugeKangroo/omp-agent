@@ -31,6 +31,7 @@ import {
 } from "./native-work.ts";
 import type { NativeContext, NativeToolResult } from "./native-entry.ts";
 import type { NativeHandoffReportCoreFacts } from "./native-instance-report.ts";
+import { readActualAbortSignal } from "./native-abort.ts";
 
 /**
  * Bounded `agent_handoff` main-tool adapter and root-owned operation
@@ -684,14 +685,6 @@ function consumeNativePromise(value: unknown): boolean {
   }
 }
 
-const ACTUAL_ABORTED_GETTER = (() => {
-  try {
-    return Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get ?? null;
-  } catch {
-    return null;
-  }
-})();
-
 const ACTUAL_ADD_EVENT_LISTENER = (() => {
   try {
     return EventTarget.prototype.addEventListener;
@@ -720,29 +713,6 @@ function isActualMainContext(context: unknown): boolean {
       && (context as NativeContext).agent?.kind === "main";
   } catch {
     return false;
-  }
-}
-
-type ActualAbortRead =
-  | { readonly ok: true; readonly aborted: boolean }
-  | { readonly ok: false; readonly reason: string };
-
-/** Brand-check one actual host AbortSignal through the captured native getter. */
-function readActualAbortSignal(signal: unknown): ActualAbortRead {
-  if (signal === undefined || signal === null) {
-    return { ok: false, reason: "the actual host AbortSignal is missing" };
-  }
-  if (ACTUAL_ABORTED_GETTER === null) {
-    return { ok: false, reason: "the host AbortSignal aborted getter is unavailable" };
-  }
-  try {
-    const aborted: unknown = Reflect.apply(ACTUAL_ABORTED_GETTER, signal, []);
-    if (typeof aborted !== "boolean") {
-      return { ok: false, reason: "the host AbortSignal aborted state is unreadable" };
-    }
-    return { ok: true, aborted };
-  } catch {
-    return { ok: false, reason: "the supplied signal is not a readable actual host AbortSignal" };
   }
 }
 

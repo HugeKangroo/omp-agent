@@ -13,6 +13,7 @@ import {
   type NativeHarnessOutcome,
   type NativeHarnessTermination,
 } from "./native-harness-delegation.ts";
+import { readActualAbortSignal } from "./native-abort.ts";
 import { deepFreeze } from "./native-work.ts";
 
 /**
@@ -31,14 +32,6 @@ export const MAX_NATIVE_HARNESS_TOOL_RESULT_BYTES = 16 * 1024;
 const MAX_TOOL_CALL_ID_CHARS = 256;
 const MAX_REASON_CHARS = 320;
 const MAX_LIMITATIONS = 6;
-
-const ACTUAL_ABORTED_GETTER = (() => {
-  try {
-    return Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get ?? null;
-  } catch {
-    return null;
-  }
-})();
 
 const AGENT_HARNESS_PARAMETERS = {
   type: "object",
@@ -235,26 +228,6 @@ function parseTaskInput(value: unknown): { readonly ok: true; readonly task: str
     return { ok: false, reason: `agent_harness task exceeds ${NATIVE_HARNESS_MAX_TASK_BYTES} UTF-8 bytes` };
   }
   return { ok: true, task };
-}
-
-function readActualAbortSignal(signal: unknown):
-  | { readonly ok: true; readonly aborted: boolean }
-  | { readonly ok: false; readonly reason: string } {
-  if (signal === undefined || signal === null) {
-    return { ok: false, reason: "the actual host AbortSignal is missing" };
-  }
-  if (ACTUAL_ABORTED_GETTER === null) {
-    return { ok: false, reason: "the host AbortSignal aborted getter is unavailable" };
-  }
-  try {
-    const aborted: unknown = Reflect.apply(ACTUAL_ABORTED_GETTER, signal, []);
-    if (typeof aborted !== "boolean") {
-      return { ok: false, reason: "the host AbortSignal aborted state is unreadable" };
-    }
-    return { ok: true, aborted };
-  } catch {
-    return { ok: false, reason: "the supplied signal is not a readable actual host AbortSignal" };
-  }
 }
 
 function isActualMainContext(context: unknown): boolean {

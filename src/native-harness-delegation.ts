@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readActualAbortSignal } from "./native-abort.ts";
 import type {
   CallResultExpectationRegistration,
   NativeCallCheckPreparation,
@@ -901,14 +902,6 @@ function consumeNativePromise(value: unknown): boolean {
   }
 }
 
-const ACTUAL_ABORTED_GETTER = (() => {
-  try {
-    return Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get ?? null;
-  } catch {
-    return null;
-  }
-})();
-
 const ACTUAL_ADD_EVENT_LISTENER = (() => {
   try {
     return EventTarget.prototype.addEventListener;
@@ -924,28 +917,6 @@ const ACTUAL_REMOVE_EVENT_LISTENER = (() => {
     return null;
   }
 })();
-
-type ActualAbortRead =
-  | { readonly ok: true; readonly aborted: boolean }
-  | { readonly ok: false; readonly reason: string };
-
-function readActualAbortSignal(signal: unknown): ActualAbortRead {
-  if (signal === undefined || signal === null) {
-    return { ok: false, reason: "the actual host AbortSignal is missing" };
-  }
-  if (ACTUAL_ABORTED_GETTER === null) {
-    return { ok: false, reason: "the host AbortSignal aborted getter is unavailable" };
-  }
-  try {
-    const aborted: unknown = Reflect.apply(ACTUAL_ABORTED_GETTER, signal, []);
-    if (typeof aborted !== "boolean") {
-      return { ok: false, reason: "the host AbortSignal aborted state is unreadable" };
-    }
-    return { ok: true, aborted };
-  } catch {
-    return { ok: false, reason: "the supplied signal is not a readable actual host AbortSignal" };
-  }
-}
 
 function isActualMainContext(context: unknown): boolean {
   try {

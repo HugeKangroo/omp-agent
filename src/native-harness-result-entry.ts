@@ -28,6 +28,7 @@ import type {
   NativeHarnessRootResolution,
 } from "./native-harness-entry.ts";
 import { fingerprintExpectedCallResult } from "./native-result-expectation.ts";
+import { readActualAbortSignal } from "./native-abort.ts";
 import { deepFreeze } from "./native-work.ts";
 
 /**
@@ -256,14 +257,6 @@ interface EncodedWire {
   readonly failed: boolean;
 }
 
-const ACTUAL_ABORTED_GETTER = (() => {
-  try {
-    return Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get ?? null;
-  } catch {
-    return null;
-  }
-})();
-
 const CONDITION_SCHEMA = {
   oneOf: [
     {
@@ -480,26 +473,6 @@ function boundedId(value: unknown): string | null {
     return null;
   }
   return value;
-}
-
-function readActualAbortSignal(signal: unknown):
-  | { readonly ok: true; readonly aborted: boolean }
-  | { readonly ok: false; readonly reason: string } {
-  if (signal === undefined || signal === null) {
-    return { ok: false, reason: "the actual host AbortSignal is missing" };
-  }
-  if (ACTUAL_ABORTED_GETTER === null) {
-    return { ok: false, reason: "the host AbortSignal aborted getter is unavailable" };
-  }
-  try {
-    const aborted: unknown = Reflect.apply(ACTUAL_ABORTED_GETTER, signal, []);
-    if (typeof aborted !== "boolean") {
-      return { ok: false, reason: "the host AbortSignal aborted state is unreadable" };
-    }
-    return { ok: true, aborted };
-  } catch {
-    return { ok: false, reason: "the supplied signal is not a readable actual host AbortSignal" };
-  }
 }
 
 function isActualMainContext(context: unknown): boolean {
