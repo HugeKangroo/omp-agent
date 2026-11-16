@@ -1,6 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Buffer } from "node:buffer";
 import path from "node:path";
+import { readActualAbortSignal } from "./native-abort.ts";
 import {
   loadNativeChildDefinitionSnapshot,
   type DefinitionModelRef,
@@ -81,6 +82,12 @@ import {
   type NativeHarnessBackendHost,
   type NativeHarnessBackendHostConfig,
 } from "./native-harness-backend.ts";
+import {
+  createNativeHarnessAccountingSession,
+  type NativeHarnessAccountingSession,
+  type NativeHarnessAccountingSessionResult,
+} from "./native-harness-accounting-session.ts";
+import type { NativeHarnessAccountingIdentity } from "./native-harness-accounting.ts";
 import {
   createNativeHarnessDelegation,
   NATIVE_HARNESS_TOOL,
@@ -291,6 +298,12 @@ export interface InstancedHarnessConfig {
   readonly policy?: NativeHarnessDelegationPolicy;
   /** Explicit host opt-in: true only registers readonly native history. */
   readonly history?: boolean;
+  /**
+   * Explicit host opt-in: true binds the admitted source root to the existing
+   * durable accounting owner/session association. It never enables the source
+   * tool or creates a second controller, ledger or recovery path.
+   */
+  readonly durableAccounting?: boolean;
 }
 
 export type InstancedHarnessBackendFactory = (
@@ -669,6 +682,18 @@ interface HarnessTrackedCall {
   refs: number;
 }
 
+/**
+ * One lazy accounting-owner association leaf under the original Harness root.
+ * The holder stores only the immutable limits text used for its single leaf and
+ * that leaf; it owns no context, signal, balance, operation queue or recovery
+ * action. A pending leaf is retained across work endings and is only disposed
+ * by root failure/close.
+ */
+interface HarnessAccountingHolder {
+  session: NativeHarnessAccountingSession | null;
+  limitsText: string | null;
+}
+
 interface HarnessRootState {
   readonly coordinator: NativeHarnessDelegationCoordinator;
   readonly backend: NativeHarnessBackendHost;
@@ -677,6 +702,8 @@ interface HarnessRootState {
   readonly calls: Map<string, HarnessTrackedCall>;
   readonly mainTools: readonly string[];
   readonly mainModel: DefinitionModelRef;
+  /** Present only when the host explicitly enabled durableAccounting. */
+  readonly accounting: HarnessAccountingHolder | null;
 }
 
 interface HistoryRootState {
@@ -1080,13 +1107,21 @@ function copyHarnessBackendConfig(value: unknown): NativeHarnessBackendHostConfi
 
 function readHarnessConfig(value: unknown): InstancedHarnessConfig | null {
   if (value === undefined) return null;
-  const fields = readOwnDataFields(value, ["backend", "policy", "history"], ["backend"]);
+  const fields = readOwnDataFields(
+    value,
+    ["backend", "policy", "history", "durableAccounting"],
+    ["backend"],
+  );
   if (fields === null) {
-    throw new Error("harness options must be an exact own-data object with backend, an optional policy and an optional history boolean.");
+    throw new Error("harness options must be an exact own-data object with backend, an optional policy, history boolean and durableAccounting boolean.");
   }
   const rawHistory = fields.get("history");
   if (rawHistory !== undefined && typeof rawHistory !== "boolean") {
     throw new Error("harness.history must be an explicit boolean.");
+  }
+  const rawDurableAccounting = fields.get("durableAccounting");
+  if (rawDurableAccounting !== undefined && typeof rawDurableAccounting !== "boolean") {
+    throw new Error("harness.durableAccounting must be an explicit boolean.");
   }
   const backend = copyHarnessBackendConfig(fields.get("backend"));
   const rawPolicy = fields.get("policy");
@@ -1111,6 +1146,7 @@ function readHarnessConfig(value: unknown): InstancedHarnessConfig | null {
     backend,
     ...(policy === undefined ? {} : { policy }),
     ...(rawHistory === undefined ? {} : { history: rawHistory }),
+    ...(rawDurableAccounting === undefined ? {} : { durableAccounting: rawDurableAccounting }),
   });
 }
 
@@ -1445,12 +1481,22 @@ function closeHandoffRoot(root: RootState, reason: string): void {
 }
 
 /**
- * Root close/failure disposes only the root's own Harness coordinator. The
- * underlying native controls and the 2A lifetime ledger are never replaced.
+ * Root close/failure disposes only the root's own Harness coordinator and, if
+ * durable accounting was enabled, its one lazy association leaf. The underlying
+ * native controls, owner files and the 2A lifetime ledger are never replaced,
+ * deleted or refunded.
  */
 function closeHarnessRoot(root: RootState): void {
   const harness = root.harness;
   if (harness === null) return;
+  const accounting = harness.accounting;
+  if (accounting !== null && accounting.session !== null) {
+    try {
+      accounting.session.dispose();
+    } catch {
+      // Association disposal is local and must not break root cleanup.
+    }
+  }
   try {
     harness.coordinator.dispose();
   } catch {
@@ -2953,6 +2999,286 @@ function harnessStartupCurrent(
     && root.epoch === startupEpoch;
 }
 
+function harnessAccountingRootCurrent(
+  factory: FactoryContext,
+  root: RootState,
+  holder: HarnessAccountingHolder,
+  coordinator: NativeHarnessDelegationCoordinator,
+  admittedRootToken: symbol,
+  admittedEpoch: number,
+): boolean {
+  return !factory.disposed
+    && moduleRoot === root
+    && root.factoryId === factory.id
+    && factory.rootToken !== null
+    && root.token === factory.rootToken
+    && root.token === admittedRootToken
+    && root.open
+    && root.phase === "ready"
+    && root.epoch === admittedEpoch
+    && root.harness !== null
+    && root.harness.coordinator === coordinator
+    && root.harness.accounting === holder;
+}
+
+/**
+ * One fresh actual-context gate for durable association. The ALS identity is
+ * checked before any host refresh; the existing D1/settings/model/tools gate is
+ * reused verbatim, and the same pure root/holder identity is checked again
+ * after its host callbacks complete.
+ */
+function harnessAccountingGate(
+  factory: FactoryContext,
+  root: RootState,
+  pi: DefinedOmpApi,
+  holder: HarnessAccountingHolder,
+  coordinator: NativeHarnessDelegationCoordinator,
+  admittedRootToken: symbol,
+  admittedEpoch: number,
+  context: NativeContext,
+): string | null {
+  if (!harnessAccountingRootCurrent(factory, root, holder, coordinator, admittedRootToken, admittedEpoch)) {
+    return "the durable accounting root association changed";
+  }
+  const harness = root.harness;
+  if (harness === null) return "the root Harness authority is unavailable";
+  if (harness.scope.getStore() !== context) {
+    return "no actual main execute context is scoped for this durable association";
+  }
+  const failure = harnessContextFailure(factory, root, pi, harness, context);
+  if (failure !== null) return failure;
+  if (!harnessAccountingRootCurrent(factory, root, holder, coordinator, admittedRootToken, admittedEpoch)) {
+    return "the durable accounting root association changed during revalidation";
+  }
+  if (harness.scope.getStore() !== context) {
+    return "the actual main execute context changed during durable revalidation";
+  }
+  return null;
+}
+
+function harnessAccountingFailureError(result: NativeHarnessAccountingSessionResult): Error {
+  if (result.state === "confirmed") {
+    return new Error("durable accounting association unexpectedly confirmed");
+  }
+  const detail = result.reasons.map((entry) => `${entry.code}: ${entry.detail}`).join("; ");
+  return new Error(boundedMessage(
+    `durable accounting association ${result.state}${detail.length === 0 ? "" : `: ${detail}`}`,
+  ));
+}
+
+function harnessAccountingOwnerCurrent(
+  factory: FactoryContext,
+  root: RootState,
+  pi: DefinedOmpApi,
+  holder: HarnessAccountingHolder,
+  coordinator: NativeHarnessDelegationCoordinator,
+  admittedRootToken: symbol,
+  admittedEpoch: number,
+  context: unknown,
+): boolean {
+  if (holder.session === null) return false;
+  if (!harnessAccountingRootCurrent(factory, root, holder, coordinator, admittedRootToken, admittedEpoch)) {
+    return false;
+  }
+  const harness = root.harness;
+  if (harness === null || harness.scope.getStore() !== context) return false;
+  try {
+    return harnessAccountingGate(
+      factory,
+      root,
+      pi,
+      holder,
+      coordinator,
+      admittedRootToken,
+      admittedEpoch,
+      context as NativeContext,
+    ) === null;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Fixed original-root association closure. It runs synchronously up to the
+ * leaf's bounded ensure promise and never awaits outside the coordinator's
+ * established runWithContext/Slot path. The lazy leaf is created once with the
+ * original normalized limits text and is retained across work endings.
+ */
+function associateHarnessAccounting(
+  factory: FactoryContext,
+  root: RootState,
+  pi: DefinedOmpApi,
+  holder: HarnessAccountingHolder,
+  coordinator: NativeHarnessDelegationCoordinator,
+  admittedRootToken: symbol,
+  admittedEpoch: number,
+  storageRoot: string,
+  context: NativeContext,
+  signal: AbortSignal,
+  deadlineAt: number,
+  limitsText: string,
+): Promise<NativeHarnessAccountingIdentity> {
+  const workEpoch = root.workEpoch;
+  let session: NativeHarnessAccountingSession;
+  try {
+    const gate = harnessAccountingGate(
+      factory,
+      root,
+      pi,
+      holder,
+      coordinator,
+      admittedRootToken,
+      admittedEpoch,
+      context,
+    );
+    if (gate !== null) throw new Error(gate);
+    // The host gate may synchronously end the original work while the root is
+    // still open and ready. Finish the deadline clock and actual-signal reads,
+    // then compare the captured work epoch and pure root identity before the
+    // first ensure is started.
+    let currentTime: number;
+    try {
+      currentTime = Date.now();
+    } catch {
+      throw new Error("the durable accounting clock is unavailable");
+    }
+    if (!Number.isFinite(currentTime)) {
+      throw new Error("the durable accounting clock is unreadable");
+    }
+    const actualSignal = readActualAbortSignal(signal);
+    if (!actualSignal.ok) {
+      throw new Error(`the durable accounting signal is unreadable: ${actualSignal.reason}`);
+    }
+    if (actualSignal.aborted) {
+      throw new Error("the durable accounting signal aborted before association");
+    }
+    const harness = root.harness;
+    if (!harnessAccountingRootCurrent(
+      factory,
+      root,
+      holder,
+      coordinator,
+      admittedRootToken,
+      admittedEpoch,
+    )
+      || harness === null
+      || harness.coordinator !== coordinator
+      || harness.accounting !== holder
+      || harness.scope.getStore() !== context
+      || root.workEpoch !== workEpoch
+      || !(currentTime < deadlineAt)
+      || (holder.session === null ? holder.limitsText !== null : holder.limitsText !== limitsText)) {
+      throw new Error("the durable accounting association was invalidated before ensure");
+    }
+    if (factory.appendEntry === undefined) {
+      throw new Error("durable accounting requires the actual host appendEntry capability");
+    }
+    if (holder.session === null) {
+      if (holder.limitsText !== null) {
+        throw new Error("the durable accounting owner holder is inconsistent");
+      }
+      let leaf: NativeHarnessAccountingSession | null = null;
+      leaf = createNativeHarnessAccountingSession({
+        storageRoot,
+        limitsText,
+        appendEntry: factory.appendEntry,
+        isOwnerCurrent(actualContext: unknown): boolean {
+          return holder.session === leaf
+            && harnessAccountingOwnerCurrent(
+              factory,
+              root,
+              pi,
+              holder,
+              coordinator,
+              admittedRootToken,
+              admittedEpoch,
+              actualContext,
+            );
+        },
+      });
+      holder.session = leaf;
+      holder.limitsText = limitsText;
+      session = leaf;
+    } else {
+      if (holder.limitsText !== limitsText) {
+        throw new Error("durable accounting limits changed within the owning root");
+      }
+      session = holder.session;
+    }
+  } catch (error) {
+    return Promise.reject(
+      error instanceof Error ? error : new Error(boundedMessage(`durable accounting association failed: ${errorMessage(error)}`)),
+    );
+  }
+
+  let ensured: Promise<NativeHarnessAccountingSessionResult>;
+  try {
+    ensured = session.ensure(context, signal, deadlineAt);
+  } catch (error) {
+    return Promise.reject(
+      error instanceof Error ? error : new Error(boundedMessage(`durable accounting association failed: ${errorMessage(error)}`)),
+    );
+  }
+  return ensured.then((result) => {
+    // Complete every host/ALS/D1/model/tool callback first. The captured
+    // original deadline clock is then read once; neither host code nor the
+    // clock runs again before the identity is returned.
+    const gate = harnessAccountingGate(
+      factory,
+      root,
+      pi,
+      holder,
+      coordinator,
+      admittedRootToken,
+      admittedEpoch,
+      context,
+    );
+    if (gate !== null) throw new Error(gate);
+    let currentTime: number;
+    try {
+      currentTime = Date.now();
+    } catch {
+      throw new Error("the durable accounting clock is unavailable");
+    }
+    if (!Number.isFinite(currentTime)) {
+      throw new Error("the durable accounting clock is unreadable");
+    }
+    // Read only the captured intrinsic AbortSignal getter. This checks the
+    // actual original Slot signal and cannot be replaced by an own property.
+    const actualSignal = readActualAbortSignal(signal);
+    if (!actualSignal.ok) {
+      throw new Error(`the durable accounting signal is unreadable: ${actualSignal.reason}`);
+    }
+    if (actualSignal.aborted) {
+      throw new Error("the durable accounting signal aborted before delivery");
+    }
+    // Last is the complete pure original-root/epoch/work/holder/session/limits
+    // identity gate. No host callback, clock read or await follows it.
+    const harness = root.harness;
+    if (!harnessAccountingRootCurrent(
+      factory,
+      root,
+      holder,
+      coordinator,
+      admittedRootToken,
+      admittedEpoch,
+    )
+      || harness === null
+      || harness.coordinator !== coordinator
+      || harness.accounting !== holder
+      || harness.scope.getStore() !== context
+      || root.workEpoch !== workEpoch
+      || !(currentTime < deadlineAt)
+      || holder.session !== session
+      || holder.limitsText !== limitsText) {
+      throw new Error("the durable accounting association was invalidated before delivery");
+    }
+    if (result.state !== "confirmed") throw harnessAccountingFailureError(result);
+    return result.identity;
+  });
+}
+
+
 function admitHarnessRoot(
   factory: FactoryContext,
   root: RootState,
@@ -2975,6 +3301,9 @@ function admitHarnessRoot(
   // Captured once from this admission. The owner predicate is pure local
   // identity/state and never reads host context, active tools, model or settings.
   const admittedRootToken = root.token;
+  const admittedEpoch = root.epoch;
+  const accountingHolder: HarnessAccountingHolder | null =
+    config.durableAccounting === true ? { session: null, limitsText: null } : null;
   const coordinator = createNativeHarnessDelegation({
     native: factory.definitionEntry.nativeEntry,
     ...(config.policy === undefined ? {} : { policy: config.policy }),
@@ -2995,6 +3324,32 @@ function admitHarnessRoot(
       return backend.prepare(request, preparedContext);
     },
     runner: backend.runner,
+    ...(accountingHolder === null ? {} : {
+      accounting: {
+        storageRoot: config.backend.storageRoot,
+        associate(
+          actualContext: NativeContext,
+          actualSignal: AbortSignal,
+          deadlineAt: number,
+          limitsText: string,
+        ): Promise<NativeHarnessAccountingIdentity> {
+          return associateHarnessAccounting(
+            factory,
+            root,
+            pi,
+            accountingHolder,
+            coordinator,
+            admittedRootToken,
+            admittedEpoch,
+            config.backend.storageRoot,
+            actualContext,
+            actualSignal,
+            deadlineAt,
+            limitsText,
+          );
+        },
+      },
+    }),
     output: {
       capture(backendValue, guard, signal) {
         return captureNativeHarnessOutput(backendValue, guard, signal);
@@ -3031,6 +3386,7 @@ function admitHarnessRoot(
     calls: new Map(),
     mainTools,
     mainModel,
+    accounting: accountingHolder,
   };
   if (!harnessStartupCurrent(factory, root, startupEpoch)) {
     root.harness = null;
@@ -3041,6 +3397,8 @@ function admitHarnessRoot(
 
 const HISTORY_CONFIGURATION_PROJECTION_SCHEMA =
   "omp-agent.native-harness-history-config.v1" as const;
+const HISTORY_CONFIGURATION_PROJECTION_SCHEMA_V2 =
+  "omp-agent.native-harness-history-config.v2" as const;
 const CONFIGURED_LOWERING_KEYS = [
   "maxRetainedOperations",
   "maxConcurrent",
@@ -3076,13 +3434,16 @@ function historyConfigurationSha256(
 ): string | null {
   try {
     const policy = config.policy;
+    const durableAccounting = config.durableAccounting === true;
     const configured: Record<string, number | null> = {};
     for (const key of CONFIGURED_LOWERING_KEYS) {
       const value = policy?.[key];
       configured[key] = typeof value === "number" && Number.isFinite(value) ? value : null;
     }
     return sha256Hex(JSON.stringify({
-      schema: HISTORY_CONFIGURATION_PROJECTION_SCHEMA,
+      schema: durableAccounting
+        ? HISTORY_CONFIGURATION_PROJECTION_SCHEMA_V2
+        : HISTORY_CONFIGURATION_PROJECTION_SCHEMA,
       model: config.backend.model,
       ompCommand: config.backend.ompCommand,
       inputFiles: [...config.backend.inputFiles],
@@ -3091,6 +3452,7 @@ function historyConfigurationSha256(
         backendSourceId,
         sourceIntegrity: "build-label-only",
       },
+      ...(durableAccounting ? { durableAccounting: true } : {}),
     }));
   } catch {
     return null;
@@ -6795,7 +7157,8 @@ export function createInstancedNativeEntry(
   const harnessBackendFactory = readHarnessBackendFactory(options.harnessBackendFactory);
   const historyConfigured = harnessConfig?.history === true;
   let historyEnabled = historyConfigured;
-  const appendEntry = historyConfigured ? readAppendEntry(pi) : undefined;
+  const durableAccounting = harnessConfig?.durableAccounting === true;
+  const appendEntry = historyConfigured || durableAccounting ? readAppendEntry(pi) : undefined;
   const startupTimeoutMs = clampTimeout(options.startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, MAX_STARTUP_TIMEOUT_MS);
   const d1TimeoutMs = Math.max(1, Math.floor(startupTimeoutMs / 2));
   const admissionTimeoutMs = clampTimeout(options.admissionTimeoutMs, DEFAULT_ADMISSION_TIMEOUT_MS, MAX_ADMISSION_TIMEOUT_MS);

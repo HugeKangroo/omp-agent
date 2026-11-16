@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -53,6 +53,11 @@ import {
 import { NATIVE_HARNESS_RESULT_TOOL } from "../../src/native-harness-checks.ts";
 import { NATIVE_HARNESS_HISTORY_TOOL } from "../../src/native-harness-history-entry.ts";
 import type { NativeHarnessOutputCapture } from "../../src/native-harness-output.ts";
+import {
+  NATIVE_HARNESS_RECOVERY_SEED_SCHEMA,
+  NATIVE_HARNESS_RECOVERY_SOURCE_FILE,
+  NATIVE_HARNESS_RECOVERY_SOURCE_PROFILE,
+} from "../../src/native-harness-recovery-source.ts";
 import type { NativeContext, NativeToolResult } from "../../src/native-entry.ts";
 import { clearPublishedTaskOwner, publishTaskOwner } from "../../src/task-entry-port.ts";
 import type { Runner, WorkerRequest, WorkerResult } from "../../vendor/harness2/index.ts";
@@ -262,7 +267,14 @@ class TestSession {
   constructor(
     root: string,
     workspace: string,
-    options: { readonly sessionId?: string; readonly noopEnsure?: boolean } = {},
+    options: {
+      readonly sessionId?: string;
+      readonly noopEnsure?: boolean;
+      /** Held actual ensureOnDisk promise for cancellation/pending coverage. */
+      readonly ensureGate?: Promise<void>;
+      /** Durable accounting needs the actual append receiver to persist. */
+      readonly persistAppend?: boolean;
+    } = {},
   ) {
     this.dir = path.join(root, "sessions");
     this.sessionId = options.sessionId ?? "session-root";
@@ -273,10 +285,14 @@ class TestSession {
     this.branch = [{ id: "base-1", parentId: null, type: "custom", customType: "fixture-base", data: {} }];
     this.leafId = "base-1";
     this.noopEnsure = options.noopEnsure === true;
+    this.ensureGate = options.ensureGate ?? null;
+    this.persistAppend = options.persistAppend === true;
     this.write();
   }
 
   private readonly noopEnsure: boolean;
+  private readonly ensureGate: Promise<void> | null;
+  private readonly persistAppend: boolean;
 
   readonly manager = {
     getSessionId: () => this.sessionId,
@@ -286,8 +302,14 @@ class TestSession {
     getSessionFile: () => this.file,
     getLeafId: () => this.leafId,
     getBranch: () => this.branch.slice(),
-    ensureOnDisk: (): void => {
+    getEntries: () => this.branch.slice(),
+    ensureOnDisk: (): void | Promise<void> => {
       this.ensureCalls += 1;
+      if (this.ensureGate !== null) {
+        return this.ensureGate.then(() => {
+          if (!this.noopEnsure) this.write();
+        });
+      }
       if (!this.noopEnsure) this.write();
     },
   };
@@ -302,6 +324,7 @@ class TestSession {
     const id = this.nextId();
     this.branch.push({ id, parentId: this.leafId, type: "custom", customType, data });
     this.leafId = id;
+    if (this.persistAppend) this.write();
   }
 
   observeToolResult(event: Record<string, unknown>): void {
@@ -878,6 +901,7 @@ interface ActualHarnessCaptureFixture {
   readonly sourceRoot: string;
   readonly storageRoot: string;
   readonly backendConfigs: NativeHarnessBackendHostConfig[];
+  readonly preparedContexts: NativeContext[];
   readonly session: TestSession | null;
 }
 
@@ -886,8 +910,10 @@ async function startActualHarnessCapture(
     readonly candidateText?: string;
     readonly mainTools?: readonly string[];
     readonly history?: boolean;
+    readonly durableAccounting?: boolean;
     readonly session?: TestSession;
     readonly noopEnsure?: boolean;
+    readonly ensureGate?: Promise<void>;
   } = {},
 ): Promise<ActualHarnessCaptureFixture> {
   const mainTools = options.mainTools ?? HARNESS_MAIN_TOOLS;
@@ -900,9 +926,15 @@ async function startActualHarnessCapture(
   await writeFile(path.join(sourceRoot, "a.txt"), "alpha\n", { mode: 0o600 });
   const runner = actualHarnessRunner(options.candidateText);
   const backendConfigs: NativeHarnessBackendHostConfig[] = [];
-  const session = options.history === true
-    ? options.session ?? new TestSession(dir, sourceRoot, { noopEnsure: options.noopEnsure === true })
-    : options.session ?? null;
+  const preparedContexts: NativeContext[] = [];
+  const persistent = options.history === true || options.durableAccounting === true;
+  const session = options.session ?? (persistent
+    ? new TestSession(dir, sourceRoot, {
+      noopEnsure: options.noopEnsure === true,
+      persistAppend: options.durableAccounting === true,
+      ...(options.ensureGate === undefined ? {} : { ensureGate: options.ensureGate }),
+    })
+    : null);
   const harness: InstancedHarnessConfig = {
     backend: {
       model: "fixture/main",
@@ -911,6 +943,9 @@ async function startActualHarnessCapture(
       inputFiles: ["a.txt"],
     },
     ...(options.history === undefined ? {} : { history: options.history }),
+    ...(options.durableAccounting === undefined
+      ? {}
+      : { durableAccounting: options.durableAccounting }),
   };
   const root = await startRoot({
     workspace: sourceRoot,
@@ -921,10 +956,25 @@ async function startActualHarnessCapture(
     ...(session === null ? {} : { session }),
     harnessBackendFactory(config) {
       backendConfigs.push(config);
-      return createNativeHarnessBackend(config, { deterministicRunner: runner.runner });
+      const backend = createNativeHarnessBackend(config, { deterministicRunner: runner.runner });
+      return {
+        ...backend,
+        prepare(request: NativeHarnessPrepareRequest, context: NativeContext) {
+          preparedContexts.push(context);
+          return backend.prepare(request, context);
+        },
+      };
     },
   });
-  return { root, runner, sourceRoot, storageRoot, backendConfigs, session };
+  return {
+    root,
+    runner,
+    sourceRoot,
+    storageRoot,
+    backendConfigs,
+    preparedContexts,
+    session,
+  };
 }
 
 interface ActualHarnessExecution {
@@ -1146,6 +1196,88 @@ function historyPayload(wire: NativeToolResult): Record<string, any> {
   expect(wire.content).toHaveLength(1);
   expect(wire.content[0]?.type).toBe("text");
   return wire.details as Record<string, any>;
+}
+
+const DURABLE_LOCATOR_CUSTOM_TYPE = "native-harness-accounting-owner.v1";
+
+interface DurableAssociationSnapshot {
+  readonly entries: Record<string, any>[];
+  readonly locator: Record<string, any>;
+  readonly owner: Record<string, any>;
+}
+
+/** Reads the actual JSONL locator and the exact owner checkpoint it names. */
+async function readDurableAssociation(
+  session: TestSession,
+  storageRoot: string,
+): Promise<DurableAssociationSnapshot> {
+  const text = await readFile(session.file, "utf8");
+  const entries = text
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as Record<string, any>);
+  const locatorEntries = entries.filter((entry) =>
+    entry.type === "custom" && entry.customType === DURABLE_LOCATOR_CUSTOM_TYPE);
+  expect(locatorEntries).toHaveLength(1);
+  const locator = locatorEntries[0]!.data as Record<string, any>;
+  expect(typeof locator.ownerRelativePath).toBe("string");
+  const owner = JSON.parse(
+    await readFile(path.join(storageRoot, locator.ownerRelativePath), "utf8"),
+  ) as Record<string, any>;
+  return { entries, locator, owner };
+}
+
+interface DurableRunFacts {
+  readonly run: Record<string, any>;
+  readonly stageCosts: readonly number[];
+  readonly costSum: number;
+}
+
+async function readDurableRunFacts(
+  storageRoot: string,
+  admission: Record<string, any>,
+): Promise<DurableRunFacts> {
+  const prepared = admission.prepared as Record<string, any> | null;
+  expect(prepared).not.toBeNull();
+  expect(typeof admission.runId).toBe("string");
+  const runPath = path.join(
+    storageRoot,
+    prepared!.storeRelativeRoot as string,
+    "runs",
+    admission.runId as string,
+    "run.json",
+  );
+  const run = JSON.parse(await readFile(runPath, "utf8")) as Record<string, any>;
+  const stages = run.stages as Record<string, any>;
+  const stageCosts: number[] = [];
+  for (const stage of Object.values(stages ?? {})) {
+    const value = stage?.result?.usage?.costUsd;
+    if (typeof value === "number" && Number.isFinite(value)) stageCosts.push(value);
+  }
+  const costSum = Math.round(stageCosts.reduce((sum, value) => sum + value, 0) * 1e9) / 1e9;
+  return { run, stageCosts, costSum };
+}
+
+interface DurableSourceFacts {
+  readonly root: string;
+  readonly text: string;
+  readonly sha256: string;
+}
+
+async function readDurableSourceFacts(
+  storageRoot: string,
+  admission: Record<string, any>,
+): Promise<DurableSourceFacts> {
+  const prepared = admission.prepared as Record<string, any> | null;
+  expect(prepared).not.toBeNull();
+  const relative = prepared!.preparedRelativeRoot as string;
+  expect(path.isAbsolute(relative)).toBe(false);
+  const root = path.resolve(storageRoot, relative);
+  expect(root.startsWith(`${storageRoot}${path.sep}`)).toBe(true);
+  const bytes = await readFile(path.join(root, NATIVE_HARNESS_RECOVERY_SOURCE_FILE));
+  const text = bytes.toString("utf8");
+  expect(text.includes("\r")).toBe(false);
+  return { root, text, sha256: createHash("sha256").update(bytes).digest("hex") };
 }
 
 async function resultPreflight(
@@ -7585,4 +7717,520 @@ describe("actual instanced Harness history composition", () => {
     const listed = fixture.root.entry.harnessHistoryList?.(fixture.root.host.context, { limit: 16 });
     expect(listed?.rows).toHaveLength(1);
   }, 30_000);
+});
+
+describe("actual instanced Harness durable accounting composition", () => {
+  test("config matrix keeps registration and startup inert; malformed booleans refuse", async () => {
+    const dir = await realpath(await mkdtemp(path.join(tmpdir(), "omp-a2b3-matrix-")));
+    actualHarnessDirs.push(dir);
+    const session = new TestSession(dir, WORKSPACE);
+    const factoryCalls: NativeHarnessBackendHostConfig[] = [];
+    const harnessBackendFactory: InstancedHarnessBackendFactory = (config) => {
+      factoryCalls.push(config);
+      return createFakeHarness().host;
+    };
+    const backend = harnessBackendConfig({ storageRoot: path.join(dir, "store") });
+
+    const legacy = await startRoot({
+      harness: { backend, durableAccounting: false },
+      harnessBackendFactory,
+      session,
+    });
+    expect(factoryCalls).toHaveLength(0);
+    expect(session.ensureCalls).toBe(0);
+    expect(session.appendCalls).toBe(0);
+    expect(legacy.entry.harnessInspect?.(legacy.host.context)?.coordinator).toBeNull();
+
+    const unselected = await startRoot({
+      harness: { backend, durableAccounting: true },
+      harnessBackendFactory,
+      session,
+    });
+    expect(factoryCalls).toHaveLength(0);
+    expect(session.ensureCalls).toBe(0);
+    expect(session.appendCalls).toBe(0);
+    expect(unselected.host.tools.has(NATIVE_HARNESS_HISTORY_TOOL)).toBe(false);
+    expect(unselected.entry.harnessHistoryStatus).toBeUndefined();
+    expect(unselected.entry.harnessInspect?.(unselected.host.context)?.coordinator).toBeNull();
+
+    const resultOnly = await startRoot({
+      main: mainSnapshot(WORKSPACE, RESULT_ONLY_MAIN_TOOLS),
+      mainTools: RESULT_ONLY_MAIN_TOOLS,
+      hostActiveTools: RESULT_ONLY_MAIN_TOOLS,
+      harness: { backend, durableAccounting: true },
+      harnessBackendFactory,
+      session,
+    });
+    expect(factoryCalls).toHaveLength(0);
+    expect(session.ensureCalls).toBe(0);
+    expect(session.appendCalls).toBe(0);
+    expect(resultOnly.entry.harnessInspect?.(resultOnly.host.context)?.coordinator).toBeNull();
+
+    const historyOnly = await startRoot({
+      main: mainSnapshot(WORKSPACE, ["read"]),
+      mainTools: ["read"],
+      hostActiveTools: ["read"],
+      harness: { backend, durableAccounting: true, history: true },
+      harnessBackendFactory,
+      session,
+    });
+    expect(factoryCalls).toHaveLength(0);
+    expect(session.ensureCalls).toBe(0);
+    expect(session.appendCalls).toBe(0);
+    expect(historyOnly.host.tools.get(NATIVE_HARNESS_HISTORY_TOOL)?.defaultInactive).toBe(true);
+    expect(historyOnly.entry.harnessInspect?.(historyOnly.host.context)?.coordinator).toBeNull();
+
+    expect(() => createInstancedNativeEntry(new Host({ activeTools: HARNESS_MAIN_TOOLS }).pi, {
+      harness: {
+        backend: harnessBackendConfig(),
+        durableAccounting: "true" as unknown as boolean,
+      },
+    })).toThrow(/durableAccounting must be an explicit boolean/);
+  }, 30_000);
+
+  test("selected durable source uses the real session owner, reserve, backend source and settlement", async () => {
+    const fixture = await startActualHarnessCapture({
+      history: false,
+      durableAccounting: true,
+    });
+    const session = fixture.session!;
+    await beginWork(fixture.root, "durable selected work");
+    const tool = fixture.root.host.tools.get(NATIVE_HARNESS_TOOL)!;
+    const foreign = ownerContext({
+      agentId: "Other",
+      sessionId: "session-root",
+      cwd: fixture.sourceRoot,
+    });
+    const foreignResult = await tool.execute(
+      "durable-foreign",
+      { task: "foreign must not associate" },
+      new AbortController().signal,
+      undefined,
+      foreign,
+    );
+    expectHarnessRefused(foreignResult, /owning main root/);
+    const child = ownerContext({
+      agentKind: "sub",
+      agentId: "Child",
+      sessionId: "session-child",
+      cwd: fixture.sourceRoot,
+    });
+    const childResult = await tool.execute(
+      "durable-child",
+      { task: "child must not associate" },
+      new AbortController().signal,
+      undefined,
+      child,
+    );
+    expectHarnessRefused(childResult, /owning actual main root/);
+    expect(session.ensureCalls).toBe(0);
+    expect(session.appendCalls).toBe(0);
+    expect(fixture.root.entry.getStatus().phase).toBe("ready");
+
+    const source = await executeActualHarness(
+      fixture.root,
+      "durable-source-1",
+      "bounded durable task",
+    );
+    expect(harnessDetails(source.result).outcome).toBe("backend-completed");
+    await observeActualHarness(fixture.root, source);
+
+    const inspection = fixture.root.entry.harnessInspect?.(fixture.root.host.context);
+    expect(inspection?.coordinator?.accounting?.observation).toBe("observed");
+    expect(inspection?.coordinator?.accounting?.lastCheckpoint?.accountedUsd).toBeGreaterThan(0);
+    const operation = inspection?.coordinator?.operations[0];
+    expect(operation?.association?.toolCallId).toBe("durable-source-1");
+    expect(typeof operation?.runId).toBe("string");
+    expect(operation?.runId?.length).toBeGreaterThan(0);
+    expect(operation?.cost.observedUsd).toBeGreaterThan(0);
+    expect(fixture.preparedContexts).toHaveLength(1);
+    expect(fixture.preparedContexts[0]).toBe(fixture.root.host.context);
+    expect(fixture.backendConfigs).toHaveLength(1);
+    expect(fixture.backendConfigs[0]!.storageRoot).toBe(fixture.storageRoot);
+
+    expect(session.appendCalls).toBe(1);
+    expect(session.ensureCalls).toBeGreaterThanOrEqual(1);
+    const association = await readDurableAssociation(session, fixture.storageRoot);
+    expect(association.locator.schema).toBe("omp-agent.native-harness-accounting-owner-locator.v1");
+    expect(association.owner.ownerId).toBe(association.locator.ownerId);
+    expect(association.owner.selectorSha256).toBe(association.locator.selectorSha256);
+    expect(association.owner.limits).toEqual(inspection?.coordinator?.limits);
+    expect(association.owner.revision).toBe(4);
+    expect(association.owner.admissions).toHaveLength(1);
+    const admission = association.owner.admissions[0] as Record<string, any>;
+    expect(typeof admission.admissionId).toBe("string");
+    expect(admission.runId).toBe(operation?.runId);
+    expect(admission.reserveRevision).toBe(1);
+    expect(admission.deadlineAt).toBeGreaterThan(admission.admittedAt);
+    expect(admission.settlement).toMatchObject({ mode: "known", concurrencyHeld: false });
+    expect(admission.prepared).not.toBeNull();
+    const prepared = admission.prepared as Record<string, any>;
+    expect(path.isAbsolute(prepared.preparedRelativeRoot)).toBe(false);
+    expect(path.isAbsolute(prepared.storeRelativeRoot)).toBe(false);
+    expect(path.resolve(fixture.storageRoot, prepared.preparedRelativeRoot)
+      .startsWith(`${fixture.storageRoot}${path.sep}`)).toBe(true);
+    expect(path.resolve(fixture.storageRoot, prepared.storeRelativeRoot)
+      .startsWith(`${fixture.storageRoot}${path.sep}`)).toBe(true);
+    expect(prepared.inputManifestSha256).toMatch(/^[0-9a-f]{64}$/);
+    expect(prepared.sourceDescriptorSha256).toMatch(/^[0-9a-f]{64}$/);
+
+    const sourceFacts = await readDurableSourceFacts(fixture.storageRoot, admission);
+    expect(sourceFacts.sha256).toBe(prepared.sourceDescriptorSha256);
+    expect(sourceFacts.text.length).toBeGreaterThan(0);
+    const runFacts = await readDurableRunFacts(fixture.storageRoot, admission);
+    expect(runFacts.run.id).toBe(admission.runId);
+    expect(runFacts.run.recoveryOrigin.runId).toBe(admission.runId);
+    expect(runFacts.run.recoveryOrigin.seed).toEqual({
+      schema: NATIVE_HARNESS_RECOVERY_SEED_SCHEMA,
+      profile: NATIVE_HARNESS_RECOVERY_SOURCE_PROFILE,
+      accountingOwnerId: association.owner.ownerId,
+      admissionId: admission.admissionId,
+      accountingOwnerRevision: admission.reserveRevision,
+      sourceAssociationSha256: admission.sourceAssociationSha256,
+      sourceDescriptorSha256: prepared.sourceDescriptorSha256,
+      inputManifestSha256: prepared.inputManifestSha256,
+      admittedAt: admission.admittedAt,
+      deadlineAt: admission.deadlineAt,
+      allocatedCostUsd: admission.allocatedUsd,
+    });
+    expect(runFacts.stageCosts).toHaveLength(3);
+    expect(runFacts.costSum).toBeCloseTo(0.03, 9);
+    expect(admission.settlement.observedUsd).toBe(runFacts.costSum);
+    expect(inspection?.coordinator?.accounting?.lastCheckpoint).toMatchObject({
+      activeOperations: 0,
+      retainedOperations: 1,
+      accountedUsd: runFacts.costSum,
+      observedUsd: runFacts.costSum,
+      unknownUsd: 0,
+    });
+    expect(fixture.root.host.tools.has(NATIVE_HARNESS_HISTORY_TOOL)).toBe(false);
+    expect(fixture.root.entry.harnessHistoryStatus).toBeUndefined();
+  }, 60_000);
+
+  test("later work and a fresh same-session root reuse the one owner and retain prior admissions", async () => {
+    const fixture = await startActualHarnessCapture({ durableAccounting: true });
+    const session = fixture.session!;
+    await beginWork(fixture.root, "durable first work");
+    const firstSource = await executeActualHarness(
+      fixture.root,
+      "durable-first-source",
+      "first durable task",
+    );
+    expect(harnessDetails(firstSource.result).outcome).toBe("backend-completed");
+    await observeActualHarness(fixture.root, firstSource);
+    const firstInspection = fixture.root.entry.harnessInspect?.(fixture.root.host.context);
+    const firstAssociation = await readDurableAssociation(session, fixture.storageRoot);
+    const firstOwner = firstAssociation.owner;
+    const firstAdmission = firstOwner.admissions[0] as Record<string, any>;
+    const firstAdmissionId = firstAdmission.admissionId as string;
+    const firstRunFacts = await readDurableRunFacts(fixture.storageRoot, firstAdmission);
+    expect(firstRunFacts.stageCosts).toHaveLength(3);
+    expect(firstRunFacts.costSum).toBeCloseTo(0.03, 9);
+    expect(firstOwner.revision).toBe(4);
+    expect(firstOwner.admissions).toHaveLength(1);
+    expect(firstAdmission.settlement).toMatchObject({
+      mode: "known",
+      observedUsd: firstRunFacts.costSum,
+      concurrencyHeld: false,
+    });
+    expect(firstInspection?.coordinator?.accounting?.lastCheckpoint).toMatchObject({
+      activeOperations: 0,
+      retainedOperations: 1,
+      unknownUsd: 0,
+    });
+    expect(firstInspection?.coordinator?.accounting?.lastCheckpoint?.accountedUsd)
+      .toBeCloseTo(firstRunFacts.costSum, 9);
+    expect(firstInspection?.coordinator?.accounting?.lastCheckpoint?.observedUsd)
+      .toBeCloseTo(firstRunFacts.costSum, 9);
+    expect(session.appendCalls).toBe(1);
+
+    await fixture.root.host.emit("agent_end", {});
+    await beginWork(fixture.root, "durable second work");
+    const secondSource = await executeActualHarness(
+      fixture.root,
+      "durable-second-source",
+      "second durable task",
+    );
+    expect(harnessDetails(secondSource.result).outcome).toBe("backend-completed");
+    await observeActualHarness(fixture.root, secondSource);
+    const sameRootInspection = fixture.root.entry.harnessInspect?.(fixture.root.host.context);
+    const secondAssociation = await readDurableAssociation(session, fixture.storageRoot);
+    const secondOwner = secondAssociation.owner;
+    const secondAdmission = secondOwner.admissions[1] as Record<string, any>;
+    const secondRunFacts = await readDurableRunFacts(fixture.storageRoot, secondAdmission);
+    expect(secondRunFacts.stageCosts).toHaveLength(3);
+    expect(secondRunFacts.costSum).toBeCloseTo(0.03, 9);
+    expect(secondOwner.revision).toBe(8);
+    expect(secondOwner.admissions).toHaveLength(2);
+    expect(secondOwner.admissions[0]).toEqual(firstAdmission);
+    expect(secondOwner.ownerId).toBe(firstOwner.ownerId);
+    expect(secondOwner.selectorSha256).toBe(firstOwner.selectorSha256);
+    expect(secondOwner.createdAt).toBe(firstOwner.createdAt);
+    expect(secondOwner.limits).toEqual(firstOwner.limits);
+    expect(secondAdmission.settlement).toMatchObject({
+      mode: "known",
+      observedUsd: secondRunFacts.costSum,
+      concurrencyHeld: false,
+    });
+    expect(sameRootInspection?.coordinator?.accounting?.lastCheckpoint).toMatchObject({
+      activeOperations: 0,
+      retainedOperations: 2,
+      unknownUsd: 0,
+    });
+    expect(sameRootInspection?.coordinator?.accounting?.lastCheckpoint?.accountedUsd)
+      .toBeCloseTo(firstRunFacts.costSum + secondRunFacts.costSum, 9);
+    expect(sameRootInspection?.coordinator?.accounting?.lastCheckpoint?.observedUsd)
+      .toBeCloseTo(firstRunFacts.costSum + secondRunFacts.costSum, 9);
+    expect(session.appendCalls).toBe(1);
+    expect(fixture.root.entry.getStatus().phase).toBe("ready");
+
+    fixture.root.entry.dispose();
+    const second = await startRoot({
+      workspace: fixture.sourceRoot,
+      session,
+      main: makeSnapshot({
+        name: "main",
+        body: "MAIN_DEFINITION_BODY",
+        version: "main-v2",
+        tools: HARNESS_MAIN_TOOLS,
+        model: MAIN_MODEL,
+        selectorNull: true,
+        workspace: fixture.sourceRoot,
+      }),
+      mainTools: HARNESS_MAIN_TOOLS,
+      hostActiveTools: HARNESS_MAIN_TOOLS,
+      children: [childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1", { workspace: fixture.sourceRoot })],
+      harness: {
+        backend: {
+          model: "fixture/main",
+          ompCommand: "/usr/bin/fake-omp",
+          storageRoot: fixture.storageRoot,
+          inputFiles: ["a.txt"],
+        },
+        durableAccounting: true,
+      },
+      harnessBackendFactory(config) {
+        return createNativeHarnessBackend(config, { deterministicRunner: fixture.runner.runner });
+      },
+    });
+    await beginWork(second, "durable fresh root work");
+    const thirdSource = await executeActualHarness(
+      second,
+      "durable-third-source",
+      "third durable task",
+    );
+    expect(harnessDetails(thirdSource.result).outcome).toBe("backend-completed");
+    await observeActualHarness(second, thirdSource);
+
+    const finalInspection = second.entry.harnessInspect?.(second.host.context);
+    const finalOperation = finalInspection?.coordinator?.operations[0];
+    expect(finalOperation?.association?.toolCallId).toBe("durable-third-source");
+    expect(finalOperation?.state).toBe("settled");
+    expect(finalOperation?.outcome).toBe("backend-completed");
+    expect(session.appendCalls).toBe(1);
+    const finalAssociation = await readDurableAssociation(session, fixture.storageRoot);
+    const finalOwner = finalAssociation.owner;
+    expect(finalOwner.revision).toBe(12);
+    expect(finalOwner.admissions).toHaveLength(3);
+    expect(finalOwner.admissions[0]).toEqual(firstAdmission);
+    expect(finalOwner.ownerId).toBe(firstOwner.ownerId);
+    expect(finalOwner.selectorSha256).toBe(firstOwner.selectorSha256);
+    expect(finalOwner.createdAt).toBe(firstOwner.createdAt);
+    expect(finalOwner.limits).toEqual(firstOwner.limits);
+    const finalAdmission = finalOwner.admissions[2] as Record<string, any>;
+    const finalRunFacts = await readDurableRunFacts(fixture.storageRoot, finalAdmission);
+    expect(finalRunFacts.stageCosts).toHaveLength(3);
+    expect(finalRunFacts.costSum).toBeCloseTo(0.03, 9);
+    expect(finalAdmission.settlement).toMatchObject({
+      mode: "known",
+      observedUsd: finalRunFacts.costSum,
+      concurrencyHeld: false,
+    });
+    const totalCost = firstRunFacts.costSum + secondRunFacts.costSum + finalRunFacts.costSum;
+    expect(finalInspection?.coordinator?.accounting?.lastCheckpoint).toMatchObject({
+      activeOperations: 0,
+      retainedOperations: 3,
+      unknownUsd: 0,
+    });
+    expect(finalInspection?.coordinator?.accounting?.lastCheckpoint?.accountedUsd)
+      .toBeCloseTo(totalCost, 9);
+    expect(finalInspection?.coordinator?.accounting?.lastCheckpoint?.observedUsd)
+      .toBeCloseTo(totalCost, 9);
+    expect(finalOwner.admissions.some(
+      (admission: Record<string, any>) => admission.admissionId === firstAdmissionId,
+    )).toBe(true);
+    expect(second.entry.getStatus().phase).toBe("ready");
+  }, 90_000);
+
+  test("missing append capability refuses durable association without dispatch; false keeps legacy", async () => {
+    const durableFake = createFakeHarness();
+    const durableHarness = harnessFixture(durableFake);
+    const durable = await startRoot({
+      ...harnessMainOptions(),
+      harness: { ...durableHarness.harness, durableAccounting: true },
+      harnessBackendFactory: durableHarness.factory,
+    });
+    await beginWork(durable, "durable missing append work");
+    const refused = await executeHarness(
+      durable,
+      "durable-missing-append",
+      "must not dispatch",
+      new AbortController().signal,
+    );
+    const refusedDetails = harnessDetails(refused);
+    expect(refusedDetails.outcome).toBe("refused");
+    expect(String(refusedDetails.reason)).toMatch(/appendEntry/);
+    expect(refusedDetails.runId).toBeNull();
+    expect(refusedDetails.executionState).toBe("not-started");
+    expect(durableFake.prepareRequests).toHaveLength(0);
+    expect(durableFake.events).toEqual([]);
+    expect(durable.entry.harnessInspect?.(durable.host.context)?.coordinator?.accounting?.observation)
+      .toBe("unloaded");
+    expect(durable.entry.getStatus().phase).toBe("ready");
+    durable.entry.dispose();
+
+    const legacyFake = createFakeHarness();
+    const legacyHarness = harnessFixture(legacyFake);
+    const legacy = await startRoot({
+      ...harnessMainOptions(),
+      harness: { ...legacyHarness.harness, durableAccounting: false },
+      harnessBackendFactory: legacyHarness.factory,
+    });
+    await beginWork(legacy, "legacy missing append work");
+    const completed = await executeHarness(
+      legacy,
+      "legacy-missing-append",
+      "legacy task",
+      new AbortController().signal,
+    );
+    expect(harnessDetails(completed).outcome).toBe("backend-completed");
+    expect(legacyFake.events).toEqual(["prepare", "create", "execute"]);
+    expect(legacy.entry.harnessInspect?.(legacy.host.context)?.coordinator?.accounting)
+      .toBeUndefined();
+  }, 30_000);
+
+  test("held ensure is cancelled by the original session_stop without late reserve or dispatch", async () => {
+    const gate = deferred<void>();
+    const fixture = await startActualHarnessCapture({
+      durableAccounting: true,
+      ensureGate: gate.promise,
+    });
+    const session = fixture.session!;
+    await beginWork(fixture.root, "durable held work");
+    const controller = new AbortController();
+    const running = startHarness(fixture.root, "durable-held", "held task", controller.signal);
+    await waitFor(() => session.ensureCalls >= 1);
+    expect(session.appendCalls).toBe(0);
+
+    const changed = await executeHarness(
+      fixture.root,
+      "durable-held",
+      "held task",
+      new AbortController().signal,
+    );
+    expectHarnessRefused(changed, /different invocation signal/);
+    expect(session.ensureCalls).toBe(1);
+
+    await fixture.root.host.emit("session_stop", {});
+    gate.resolve();
+    const result = await running;
+    const details = harnessDetails(result);
+    expect(["refused", "cancelled"]).toContain(details.outcome);
+    expect(details.executionState).toBe("not-started");
+    expect(details.runId).toBeNull();
+    expect(controller.signal.aborted).toBe(false);
+    expect(session.appendCalls).toBe(0);
+    expect(fixture.runner.requests).toHaveLength(0);
+    expect(fixture.preparedContexts).toHaveLength(0);
+    expect(fixture.root.entry.getStatus().phase).toBe("ready");
+  }, 60_000);
+
+  test("root disposal during the held ensure cancels the original Slot without writing through a fresh root", async () => {
+    const gate = deferred<void>();
+    const fixture = await startActualHarnessCapture({
+      durableAccounting: true,
+      ensureGate: gate.promise,
+    });
+    const session = fixture.session!;
+    await beginWork(fixture.root, "durable disposal work");
+    const controller = new AbortController();
+    let running: Promise<NativeToolResult> | null = null;
+    try {
+      running = startHarness(fixture.root, "durable-disposed", "disposed task", controller.signal);
+      await waitFor(() => session.ensureCalls >= 1);
+      expect(session.appendCalls).toBe(0);
+
+      fixture.root.entry.dispose();
+      expect(fixture.root.entry.getStatus().phase).toBe("closed");
+
+      const replacementConfigs: NativeHarnessBackendHostConfig[] = [];
+      const replacementContexts: NativeContext[] = [];
+      const replacement = await startRoot({
+        workspace: fixture.sourceRoot,
+        main: mainSnapshot(fixture.sourceRoot, HARNESS_MAIN_TOOLS),
+        mainTools: HARNESS_MAIN_TOOLS,
+        hostActiveTools: HARNESS_MAIN_TOOLS,
+        children: [childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1", { workspace: fixture.sourceRoot })],
+        session,
+        harness: {
+          backend: {
+            model: "fixture/main",
+            ompCommand: "/usr/bin/fake-omp",
+            storageRoot: fixture.storageRoot,
+            inputFiles: ["a.txt"],
+          },
+          durableAccounting: true,
+        },
+        harnessBackendFactory(config) {
+          replacementConfigs.push(config);
+          const backend = createNativeHarnessBackend(config, { deterministicRunner: fixture.runner.runner });
+          return {
+            ...backend,
+            prepare(request: NativeHarnessPrepareRequest, context: NativeContext) {
+              replacementContexts.push(context);
+              return backend.prepare(request, context);
+            },
+          };
+        },
+      });
+      expect(replacement.host.bus).not.toBe(fixture.root.host.bus);
+      expect(replacement.entry.getStatus().phase).toBe("ready");
+
+      gate.resolve();
+      const result = await running;
+      const details = harnessDetails(result);
+      expect(details.resultKind).toBe("live");
+      expect(details.outcome).toBe("cancelled");
+      expect(details.executionState).toBe("not-started");
+      expect(details.termination).toBe("disposed");
+      expect(details.runId).toBeNull();
+      expect(result.isError).not.toBe(true);
+      expect(controller.signal.aborted).toBe(false);
+      expect(details.cancellation).toBe("none");
+      expect(details.limitations.some((item) =>
+        item.includes("Cancellation resolution is only a request"))).toBe(true);
+
+      expect(session.appendCalls).toBe(0);
+      expect(fixture.runner.requests).toHaveLength(0);
+      expect(fixture.preparedContexts).toHaveLength(0);
+      expect(replacementConfigs).toHaveLength(1);
+      expect(replacementContexts).toHaveLength(0);
+      expect(await readdir(fixture.storageRoot)).toEqual([]);
+      const journal = (await readFile(session.file, "utf8"))
+        .split("\n")
+        .filter((line) => line.length > 0)
+        .map((line) => JSON.parse(line) as Record<string, any>);
+      expect(journal.filter((entry) =>
+        entry.type === "custom" && entry.customType === DURABLE_LOCATOR_CUSTOM_TYPE)).toHaveLength(0);
+
+      expect(replacement.entry.getStatus().phase).toBe("ready");
+      expect(records(replacement)).toHaveLength(0);
+      const replacementInspection = replacement.entry.harnessInspect?.(replacement.host.context);
+      expect(replacementInspection?.coordinator?.accounting?.observation).toBe("unloaded");
+      expect(replacementInspection?.coordinator?.operations).toHaveLength(0);
+    } finally {
+      gate.resolve();
+      if (running !== null) await running.catch(() => undefined);
+    }
+  }, 60_000);
 });
