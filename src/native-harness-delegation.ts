@@ -1,0 +1,2353 @@
+import type {
+  NativeCallCheckPreparation,
+  NativeContext,
+  NativeEntryControls,
+  NativeWorkCallReference,
+  NativeWorkCallInspection,
+} from "./native-entry.ts";
+import { deepFreeze } from "./native-work.ts";
+import type {
+  Runner,
+  WorkerRequest,
+  WorkerResult,
+} from "../vendor/harness2/index.ts";
+
+/**
+ * Host-only, default-off, one-shot Harness2 delegation coordinator.
+ *
+ * This module owns no OMP entry, tool registration, task owner, scheduler,
+ * graph, candidate acceptance, apply or recovery path. It reuses the existing
+ * native call controls for actual main-call authority and the trusted Harness2
+ * Controller/Runner supplied by the caller. The 2A ports are protocol tests,
+ * not proof of the real OMP host composition.
+ */
+
+export const NATIVE_HARNESS_DELEGATION_SCHEMA = "omp-agent.native-harness-delegation.v1";
+export const NATIVE_HARNESS_DELEGATION_SNAPSHOT_SCHEMA = "omp-agent.native-harness-delegation-snapshot.v1";
+export const NATIVE_HARNESS_TOOL = "agent_harness";
+export const NATIVE_HARNESS_MAX_TASK_BYTES = 16 * 1024;
+export const NATIVE_HARNESS_MAX_OPERATIONS = 16;
+export const NATIVE_HARNESS_MAX_CONCURRENCY = 1;
+export const NATIVE_HARNESS_MAX_PER_RUN_USD = 1;
+export const NATIVE_HARNESS_MAX_LIFETIME_USD = 5;
+export const NATIVE_HARNESS_MAX_DURATION_MS = 300_000;
+export const NATIVE_HARNESS_MAX_CLEANUP_GRACE_MS = 30_000;
+const MAX_TOOL_CALL_ID_CHARS = 256;
+const MAX_RUN_ID_CHARS = 256;
+const MAX_REASON_CHARS = 320;
+const MAX_LIMITATION_CHARS = 240;
+const MAX_LIMITATIONS = 6;
+const MAX_INFLIGHT_WORKERS = 4;
+const USD_EPSILON = 1e-9;
+
+/** Fixed precision for public USD accounting; the epsilon comparisons stay conservative. */
+function money(value: number): number {
+  return Math.round(value * 1e9) / 1e9;
+}
+
+const DEFAULT_POLICY = Object.freeze({
+  maxRetainedOperations: NATIVE_HARNESS_MAX_OPERATIONS,
+  maxConcurrent: NATIVE_HARNESS_MAX_CONCURRENCY,
+  perRunUsd: NATIVE_HARNESS_MAX_PER_RUN_USD,
+  lifetimeUsd: NATIVE_HARNESS_MAX_LIFETIME_USD,
+  maxDurationMs: NATIVE_HARNESS_MAX_DURATION_MS,
+  cleanupGraceMs: NATIVE_HARNESS_MAX_CLEANUP_GRACE_MS,
+});
+
+export class NativeHarnessDelegationError extends Error {
+  override name = "NativeHarnessDelegationError";
+}
+
+export interface NativeHarnessDelegationPolicy {
+  readonly maxRetainedOperations?: number;
+  readonly maxConcurrent?: number;
+  readonly perRunUsd?: number;
+  readonly lifetimeUsd?: number;
+  readonly maxDurationMs?: number;
+  readonly cleanupGraceMs?: number;
+}
+
+export interface NativeHarnessDelegationLimits {
+  readonly maxRetainedOperations: number;
+  readonly maxConcurrent: number;
+  readonly perRunUsd: number;
+  readonly lifetimeUsd: number;
+  readonly maxDurationMs: number;
+  readonly cleanupGraceMs: number;
+}
+
+/** Stable diagnostic facts. This is not an authority token. */
+export interface NativeHarnessAssociation {
+  readonly observationId: string;
+  readonly generation: number;
+  readonly sessionId: string;
+  readonly workspaceRoot: string;
+  readonly toolCallId: string;
+  readonly toolName: typeof NATIVE_HARNESS_TOOL;
+}
+
+export interface NativeHarnessAdmittedBudget {
+  readonly maxCostUsd: number;
+  readonly deadlineAt: number;
+  readonly maxDurationMs: number;
+}
+
+/** Narrow backend supplied by trusted 2B composition. Create is called once. */
+export interface NativeHarnessBackend {
+  create(task: string): Promise<unknown>;
+  execute(runId: string): Promise<unknown>;
+  cancel(runId: string): Promise<unknown>;
+  /** Optional bounded status observation; never used to create or resume a run. */
+  get?(runId: string): Promise<unknown>;
+}
+
+export interface NativeHarnessPrepareRequest {
+  readonly association: NativeHarnessAssociation;
+  readonly budget: NativeHarnessAdmittedBudget;
+  readonly signal: AbortSignal;
+  readonly runner: Runner;
+  /**
+   * Synchronous authority guard. The prepare callback must call it at every
+   * preparation effect and must not retain it after returning.
+   */
+  readonly guard: () => void;
+}
+
+export type NativeHarnessPrepareResult =
+  | { readonly ok: true; readonly backend: NativeHarnessBackend }
+  | { readonly ok: false; readonly reason: string };
+
+export type NativeHarnessBackendStatus =
+  | "queued"
+  | "running"
+  | "interrupted"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "applied";
+
+export type NativeHarnessOutcome =
+  | "refused"
+  | "backend-completed"
+  | "backend-failed"
+  | "backend-cancelled"
+  | "cancelled"
+  | "timed-out"
+  | "incomplete"
+  | "unknown";
+
+export type NativeHarnessExecutionState = "not-started" | "settled" | "pending-unknown";
+export type NativeHarnessCancellationState = "none" | "requested" | "request-failed";
+export type NativeHarnessTermination =
+  | "none"
+  | "cancelled"
+  | "deadline"
+  | "disposed"
+  | "authority-lost"
+  | "backend-failed";
+
+export interface NativeHarnessDelegationCost {
+  readonly allocatedUsd: number;
+  readonly observedUsd: number | null;
+  readonly unknownUsd: number;
+  readonly overspendUsd: number;
+}
+
+export interface NativeHarnessDelegationResult {
+  readonly schema: typeof NATIVE_HARNESS_DELEGATION_SCHEMA;
+  readonly tool: typeof NATIVE_HARNESS_TOOL;
+  readonly authority: "non-authoritative";
+  readonly resultKind: "refused" | "live" | "historical";
+  readonly historical: boolean;
+  readonly authorityFresh: boolean;
+  readonly outcome: NativeHarnessOutcome;
+  readonly taskAccepted: false;
+  readonly semanticAcceptance: "not-evaluated";
+  readonly association: NativeHarnessAssociation | null;
+  readonly runId: string | null;
+  readonly backendStatus: NativeHarnessBackendStatus | null;
+  readonly executionState: NativeHarnessExecutionState;
+  readonly termination: NativeHarnessTermination;
+  readonly cancellation: NativeHarnessCancellationState;
+  readonly cancelError: string | null;
+  readonly deadlineAt: number | null;
+  readonly elapsedMs: number;
+  readonly cost: NativeHarnessDelegationCost;
+  readonly limitations: readonly string[];
+  readonly reason: string | null;
+}
+
+export interface NativeHarnessSnapshotOperation {
+  readonly association: NativeHarnessAssociation | null;
+  readonly runId: string | null;
+  readonly state: "running" | "settled";
+  readonly outcome: NativeHarnessOutcome | null;
+  readonly authorityFresh: boolean | null;
+  readonly executionState: NativeHarnessExecutionState;
+  readonly termination: NativeHarnessTermination;
+  readonly cancellation: NativeHarnessCancellationState;
+  readonly deadlineAt: number;
+  readonly elapsedMs: number;
+  readonly cost: NativeHarnessDelegationCost;
+  readonly concurrencyHeld: boolean;
+  readonly historical: boolean;
+}
+
+export interface NativeHarnessDelegationSnapshot {
+  readonly schema: typeof NATIVE_HARNESS_DELEGATION_SNAPSHOT_SCHEMA;
+  readonly enabled: boolean;
+  readonly disposed: boolean;
+  readonly limits: NativeHarnessDelegationLimits;
+  readonly retainedOperations: number;
+  readonly activeOperations: number;
+  readonly lifetime: {
+    readonly limitUsd: number;
+    readonly accountedUsd: number;
+    readonly observedUsd: number;
+    readonly unknownUsd: number;
+    readonly overspendUsd: number;
+    readonly budgetBlocked: boolean;
+  };
+  readonly operations: readonly NativeHarnessSnapshotOperation[];
+}
+
+export interface NativeHarnessDelegationOptions {
+  readonly native: NativeEntryControls;
+  readonly policy?: NativeHarnessDelegationPolicy;
+  /** Fresh actual main execute context supplier. */
+  readonly getContext: () => NativeContext;
+  /** Trusted preparation, possibly async. Must not create a run. */
+  readonly prepare: (
+    request: NativeHarnessPrepareRequest,
+    context: NativeContext,
+  ) => NativeHarnessPrepareResult | Promise<NativeHarnessPrepareResult>;
+  readonly runner: Runner;
+  readonly now?: () => number;
+  /** Defaults false. True only creates an inert enabled coordinator. */
+  readonly enabled?: boolean;
+}
+
+export interface NativeHarnessDelegationCoordinator {
+  readonly enabled: boolean;
+  readonly disposed: boolean;
+  /**
+   * A tool execute adapter may pass string task or `{ task }`. The actual call
+   * id and signal are host-supplied; no parent/model/budget/path selector is
+   * accepted from the model.
+   */
+  invoke(actualToolCallId: unknown, input: unknown, signal: unknown): Promise<NativeHarnessDelegationResult>;
+  /** Idempotent local cancellation request for one retained operation. */
+  cancel(actualToolCallId: unknown): boolean;
+  /** Idempotent local disposal; never disposes the native controls/owner. */
+  dispose(): void;
+  inspect(): NativeHarnessDelegationSnapshot;
+}
+
+type NativeCallCapture = ReturnType<NativeEntryControls["captureCall"]>;
+type NativeCaptureResult =
+  | {
+      readonly ok: true;
+      readonly ref: NativeWorkCallReference;
+      readonly association: NativeHarnessAssociation;
+    }
+  | { readonly ok: false; readonly reason: string };
+
+interface NativeCallPort {
+  readonly receiver: NativeEntryControls;
+  readonly captureCall: (this: NativeEntryControls, selector: unknown, context: NativeContext) => NativeCallCapture;
+  readonly prepareCallCheck: (this: NativeEntryControls, ref: unknown, context: NativeContext) => NativeCallCheckPreparation;
+}
+
+interface RunnerPort {
+  readonly receiver: Runner;
+  readonly run: (this: Runner, request: WorkerRequest) => Promise<WorkerResult>;
+}
+
+interface BackendPort {
+  readonly receiver: NativeHarnessBackend;
+  readonly create: (this: NativeHarnessBackend, task: string) => unknown;
+  readonly execute: (this: NativeHarnessBackend, runId: string) => unknown;
+  readonly cancel: (this: NativeHarnessBackend, runId: string) => unknown;
+  readonly get: ((this: NativeHarnessBackend, runId: string) => unknown) | null;
+}
+
+type SlotCancelReason =
+  | "invocation-aborted"
+  | "deadline-expired"
+  | "disposed"
+  | "cancel-requested"
+  | "authority-lost"
+  | "budget-refused";
+
+interface Slot {
+  readonly toolCallId: string;
+  readonly originalRef: NativeWorkCallReference;
+  readonly association: NativeHarnessAssociation;
+  readonly task: string;
+  readonly invocationSignal: AbortSignal;
+  readonly signal: AbortSignal;
+  readonly admittedAt: number;
+  readonly deadlineAt: number;
+  readonly abortController: AbortController;
+  readonly cleanupExpired: ReturnType<typeof deferred<void>>;
+  readonly promise: Promise<NativeHarnessDelegationResult>;
+  readonly resolve: (result: NativeHarnessDelegationResult) => void;
+  readonly abortListener: () => void;
+  deadlineTimer: ReturnType<typeof setTimeout> | null;
+  cleanupTimer: ReturnType<typeof setTimeout> | null;
+  state: "running" | "settled";
+  concurrencyHeld: boolean;
+  reservationActive: boolean;
+  cancelRequested: boolean;
+  cancelReason: SlotCancelReason | null;
+  cancelState: NativeHarnessCancellationState;
+  cancelError: string | null;
+  cancelSettled: boolean;
+  cancelPromise: Promise<void> | null;
+  backend: BackendPort | null;
+  prepareOpen: boolean;
+  guardCalls: number;
+  backendEffectStarted: boolean;
+  createStarted: boolean;
+  createSettled: boolean;
+  executionStarted: boolean;
+  executionSettled: boolean;
+  dispatchClosed: boolean;
+  runId: string | null;
+  backendStatus: NativeHarnessBackendStatus | null;
+  executionError: string | null;
+  workerPromises: Set<Promise<WorkerResult>>;
+  workerDispatches: number;
+  workerCount: number;
+  workerAllKnownCompleted: boolean;
+  workerUnknownUsage: boolean;
+  observedCostUsd: number;
+  observedAny: boolean;
+  runnerAccountedUsd: number;
+  runnerInflightUsd: number;
+  overspendUsd: number;
+  lateSettlementObserved: boolean;
+  response: NativeHarnessDelegationResult | null;
+  finalOutcome: NativeHarnessOutcome | null;
+  finalAuthorityFresh: boolean | null;
+  finalExecutionState: NativeHarnessExecutionState;
+  finalTermination: NativeHarnessTermination;
+  finalCost: NativeHarnessDelegationCost | null;
+}
+
+interface CoordinatorState {
+  readonly native: NativeCallPort;
+  readonly limits: NativeHarnessDelegationLimits;
+  readonly getContext: () => NativeContext;
+  readonly prepare: (
+    request: NativeHarnessPrepareRequest,
+    context: NativeContext,
+  ) => NativeHarnessPrepareResult | Promise<NativeHarnessPrepareResult>;
+  readonly runner: RunnerPort;
+  readonly now: () => number;
+  readonly enabled: boolean;
+  disposed: boolean;
+  readonly slots: Map<string, Slot>;
+  admissionInProgress: boolean;
+  revalidationInProgress: boolean;
+  activeOperations: number;
+  lifetimeAccountedUsd: number;
+  lifetimeObservedUsd: number;
+  lifetimeUnknownUsd: number;
+  lifetimeOverspendUsd: number;
+  budgetBlocked: boolean;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isOpaqueRef(value: unknown): value is object {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function boundedString(value: unknown, max: number, minimum = 1): string | null {
+  if (typeof value !== "string" || value.length < minimum || value.length > max) return null;
+  if (/[\x00-\x1f\x7f]/.test(value)) return null;
+  return value;
+}
+
+function boundedReason(value: unknown, fallback: string): string {
+  let text: string;
+  if (typeof value === "string") {
+    text = value;
+  } else {
+    try {
+      if (value instanceof Error && typeof value.message === "string") text = value.message;
+      else text = String(value);
+    } catch {
+      text = fallback;
+    }
+  }
+  const normalized = text.replace(/[^\x20-\x7e]+/g, "?").replace(/\s+/g, " ").trim();
+  if (normalized.length === 0) return fallback;
+  return normalized.length <= MAX_REASON_CHARS
+    ? normalized
+    : `${normalized.slice(0, MAX_REASON_CHARS - 3)}...`;
+}
+
+function boundedLimitation(value: string): string {
+  const normalized = value.replace(/[^\x20-\x7e]+/g, "?").replace(/\s+/g, " ").trim();
+  return normalized.length <= MAX_LIMITATION_CHARS
+    ? normalized
+    : `${normalized.slice(0, MAX_LIMITATION_CHARS - 3)}...`;
+}
+
+type StrictFields = ReadonlyMap<string, unknown>;
+
+/** Strict own data fields; accessors, symbols, extra keys and exotic prototypes are refused. */
+function readStrictFields(
+  value: unknown,
+  allowed: readonly string[],
+  required: readonly string[],
+): StrictFields | null {
+  if (!isRecord(value)) return null;
+  let prototype: object | null;
+  let keys: (string | symbol)[];
+  try {
+    prototype = Object.getPrototypeOf(value);
+    keys = Reflect.ownKeys(value);
+  } catch {
+    return null;
+  }
+  if (prototype !== Object.prototype && prototype !== null) return null;
+  if (keys.length > allowed.length || keys.some((key) => typeof key !== "string")) return null;
+  const fields = new Map<string, unknown>();
+  for (const key of keys) {
+    if (typeof key !== "string" || !allowed.includes(key)) return null;
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      return null;
+    }
+    if (
+      descriptor === undefined
+      || !("value" in descriptor)
+      || descriptor.get !== undefined
+      || descriptor.set !== undefined
+      || descriptor.enumerable !== true
+    ) {
+      return null;
+    }
+    fields.set(key, descriptor.value);
+  }
+  for (const key of required) {
+    if (!fields.has(key)) return null;
+  }
+  return fields;
+}
+
+const NATIVE_PROMISE_THEN = Promise.prototype.then;
+
+/** Brand-consume a native Promise without reading an arbitrary `then`. */
+function consumeNativePromise(value: unknown): boolean {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return false;
+  try {
+    Reflect.apply(NATIVE_PROMISE_THEN, value, [() => undefined, () => undefined]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const ACTUAL_ABORTED_GETTER = (() => {
+  try {
+    return Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get ?? null;
+  } catch {
+    return null;
+  }
+})();
+
+const ACTUAL_ADD_EVENT_LISTENER = (() => {
+  try {
+    return EventTarget.prototype.addEventListener;
+  } catch {
+    return null;
+  }
+})();
+
+const ACTUAL_REMOVE_EVENT_LISTENER = (() => {
+  try {
+    return EventTarget.prototype.removeEventListener;
+  } catch {
+    return null;
+  }
+})();
+
+type ActualAbortRead =
+  | { readonly ok: true; readonly aborted: boolean }
+  | { readonly ok: false; readonly reason: string };
+
+function readActualAbortSignal(signal: unknown): ActualAbortRead {
+  if (signal === undefined || signal === null) {
+    return { ok: false, reason: "the actual host AbortSignal is missing" };
+  }
+  if (ACTUAL_ABORTED_GETTER === null) {
+    return { ok: false, reason: "the host AbortSignal aborted getter is unavailable" };
+  }
+  try {
+    const aborted: unknown = Reflect.apply(ACTUAL_ABORTED_GETTER, signal, []);
+    if (typeof aborted !== "boolean") {
+      return { ok: false, reason: "the host AbortSignal aborted state is unreadable" };
+    }
+    return { ok: true, aborted };
+  } catch {
+    return { ok: false, reason: "the supplied signal is not a readable actual host AbortSignal" };
+  }
+}
+
+function isActualMainContext(context: unknown): boolean {
+  try {
+    return typeof context === "object"
+      && context !== null
+      && (context as NativeContext).agent?.kind === "main";
+  } catch {
+    return false;
+  }
+}
+
+function readCallable(value: unknown, key: string): Function | null {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return null;
+  let current: object | null = value as object;
+  for (let depth = 0; current !== null && depth < 4; depth++) {
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(current, key);
+    } catch {
+      return null;
+    }
+    if (descriptor !== undefined) {
+      if (!("value" in descriptor) || typeof descriptor.value !== "function") return null;
+      return descriptor.value;
+    }
+    try {
+      current = Object.getPrototypeOf(current);
+    } catch {
+      return null;
+    }
+    if (current === Object.prototype || current === Function.prototype) return null;
+  }
+  return null;
+}
+
+function readLimit(
+  value: unknown,
+  fallback: number,
+  name: string,
+  minimum: number,
+  maximum: number,
+  integer: boolean,
+): number {
+  if (value === undefined) return fallback;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new NativeHarnessDelegationError(`${name} must be a finite number.`);
+  }
+  if (integer && !Number.isSafeInteger(value)) {
+    throw new NativeHarnessDelegationError(`${name} must be a safe integer.`);
+  }
+  if (value < minimum || value > maximum) {
+    throw new NativeHarnessDelegationError(`${name} must be between ${minimum} and ${maximum}.`);
+  }
+  return value;
+}
+
+function normalizePolicy(value: unknown): NativeHarnessDelegationLimits {
+  let fields: StrictFields;
+  if (value === undefined) {
+    fields = new Map();
+  } else {
+    const read = readStrictFields(
+      value,
+      ["maxRetainedOperations", "maxConcurrent", "perRunUsd", "lifetimeUsd", "maxDurationMs", "cleanupGraceMs"],
+      [],
+    );
+    if (read === null) {
+      throw new NativeHarnessDelegationError("Delegation policy must be a plain own-data object.");
+    }
+    fields = read;
+  }
+  const maxRetainedOperations = readLimit(
+    fields.get("maxRetainedOperations"),
+    DEFAULT_POLICY.maxRetainedOperations,
+    "maxRetainedOperations",
+    1,
+    NATIVE_HARNESS_MAX_OPERATIONS,
+    true,
+  );
+  const maxConcurrent = readLimit(
+    fields.get("maxConcurrent"),
+    DEFAULT_POLICY.maxConcurrent,
+    "maxConcurrent",
+    1,
+    NATIVE_HARNESS_MAX_CONCURRENCY,
+    true,
+  );
+  const perRunUsd = readLimit(
+    fields.get("perRunUsd"),
+    DEFAULT_POLICY.perRunUsd,
+    "perRunUsd",
+    Number.MIN_VALUE,
+    NATIVE_HARNESS_MAX_PER_RUN_USD,
+    false,
+  );
+  if (!(perRunUsd > 0)) {
+    throw new NativeHarnessDelegationError("perRunUsd must be positive and finite.");
+  }
+  const lifetimeUsd = readLimit(
+    fields.get("lifetimeUsd"),
+    DEFAULT_POLICY.lifetimeUsd,
+    "lifetimeUsd",
+    perRunUsd,
+    NATIVE_HARNESS_MAX_LIFETIME_USD,
+    false,
+  );
+  const maxDurationMs = readLimit(
+    fields.get("maxDurationMs"),
+    DEFAULT_POLICY.maxDurationMs,
+    "maxDurationMs",
+    Number.MIN_VALUE,
+    NATIVE_HARNESS_MAX_DURATION_MS,
+    false,
+  );
+  const cleanupGraceMs = readLimit(
+    fields.get("cleanupGraceMs"),
+    DEFAULT_POLICY.cleanupGraceMs,
+    "cleanupGraceMs",
+    Number.MIN_VALUE,
+    NATIVE_HARNESS_MAX_CLEANUP_GRACE_MS,
+    false,
+  );
+  return Object.freeze({
+    maxRetainedOperations,
+    maxConcurrent,
+    perRunUsd,
+    lifetimeUsd,
+    maxDurationMs,
+    cleanupGraceMs,
+  });
+}
+
+function deferred<T>(): {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((yes) => {
+    resolve = yes;
+  });
+  return { promise, resolve };
+}
+
+function associationOf(reference: NativeWorkCallReference): NativeHarnessAssociation {
+  return deepFreeze({
+    observationId: reference.observationId,
+    generation: reference.generation,
+    sessionId: reference.sessionId,
+    workspaceRoot: reference.workspaceRoot,
+    toolCallId: reference.toolCallId,
+    toolName: reference.toolName,
+  }) as NativeHarnessAssociation;
+}
+
+function sameAssociation(left: NativeHarnessAssociation, right: NativeHarnessAssociation): boolean {
+  return left.observationId === right.observationId
+    && left.generation === right.generation
+    && left.sessionId === right.sessionId
+    && left.workspaceRoot === right.workspaceRoot
+    && left.toolCallId === right.toolCallId
+    && left.toolName === right.toolName;
+}
+
+function zeroCost(): NativeHarnessDelegationCost {
+  return Object.freeze({
+    allocatedUsd: 0,
+    observedUsd: 0,
+    unknownUsd: 0,
+    overspendUsd: 0,
+  });
+}
+
+function limitationsFor(extra: readonly string[] = []): readonly string[] {
+  const base = [
+    "Backend completion is not task acceptance or semantic verification.",
+    "2A does not apply candidates, recover runs, or prove process-group exit or OS isolation.",
+    "Authority is only as current as the actual OMP main call and native controls; injected ports are not host proof.",
+  ];
+  const all = [...base, ...extra].slice(0, MAX_LIMITATIONS).map((item) => boundedLimitation(item));
+  return deepFreeze(all);
+}
+
+function refusedResult(
+  reason: string,
+  association: NativeHarnessAssociation | null = null,
+): NativeHarnessDelegationResult {
+  return deepFreeze({
+    schema: NATIVE_HARNESS_DELEGATION_SCHEMA,
+    tool: NATIVE_HARNESS_TOOL,
+    authority: "non-authoritative" as const,
+    resultKind: "refused" as const,
+    historical: false,
+    authorityFresh: false,
+    outcome: "refused" as const,
+    taskAccepted: false as const,
+    semanticAcceptance: "not-evaluated" as const,
+    association: association === null ? null : associationOf(association as NativeWorkCallReference),
+    runId: null,
+    backendStatus: null,
+    executionState: "not-started" as const,
+    termination: "none" as const,
+    cancellation: "none" as const,
+    cancelError: null,
+    deadlineAt: null,
+    elapsedMs: 0,
+    cost: zeroCost(),
+    limitations: limitationsFor(),
+    reason: boundedReason(reason, "the delegation invocation was refused"),
+  });
+}
+
+function historicalResult(cached: NativeHarnessDelegationResult): NativeHarnessDelegationResult {
+  return deepFreeze({
+    ...cached,
+    resultKind: "historical" as const,
+    historical: true,
+    authorityFresh: true,
+  });
+}
+
+function parseTaskInput(value: unknown): { readonly ok: true; readonly task: string } | { readonly ok: false; readonly reason: string } {
+  let task: unknown;
+  if (typeof value === "string") {
+    task = value;
+  } else {
+    const fields = readStrictFields(value, ["task"], ["task"]);
+    if (fields === null) {
+      return { ok: false, reason: "agent_harness input must be a task string or a plain object with only an own data task field" };
+    }
+    task = fields.get("task");
+  }
+  if (typeof task !== "string" || task.trim().length === 0) {
+    return { ok: false, reason: "agent_harness task must be a nonempty string" };
+  }
+  if (task.includes("\0")) {
+    return { ok: false, reason: "agent_harness task must not contain NUL" };
+  }
+  if (new TextEncoder().encode(task).byteLength > NATIVE_HARNESS_MAX_TASK_BYTES) {
+    return { ok: false, reason: `agent_harness task exceeds ${NATIVE_HARNESS_MAX_TASK_BYTES} UTF-8 bytes` };
+  }
+  return { ok: true, task };
+}
+
+function readClock(now: () => number): number | null {
+  try {
+    const value = now();
+    if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || !Number.isSafeInteger(value)) {
+      return null;
+    }
+    return value;
+  } catch {
+    return null;
+  }
+}
+
+function readNativeCapture(
+  native: NativeCallPort,
+  toolCallId: string,
+  context: NativeContext,
+): NativeCaptureResult {
+  let capture: NativeCallCapture;
+  try {
+    capture = Reflect.apply(native.captureCall, native.receiver, [
+      { toolCallId, toolName: NATIVE_HARNESS_TOOL },
+      context,
+    ]);
+  } catch (error) {
+    return { ok: false, reason: `native capture threw: ${boundedReason(error, "unreadable failure")}` };
+  }
+  if (!capture.ok) {
+    return { ok: false, reason: nativeInspectionReason(capture.inspection) };
+  }
+  if (capture.inspection.state !== "current" || capture.inspection.evidenceState !== "available") {
+    return { ok: false, reason: nativeInspectionReason(capture.inspection) };
+  }
+  const ref = capture.ref;
+  let association: NativeHarnessAssociation;
+  try {
+    association = associationOf(ref);
+  } catch {
+    return { ok: false, reason: "native capture returned unreadable association facts" };
+  }
+  if (association.toolCallId !== toolCallId || association.toolName !== NATIVE_HARNESS_TOOL) {
+    return { ok: false, reason: "native capture returned a different actual tool call" };
+  }
+  return { ok: true, ref, association };
+}
+
+function nativeInspectionReason(inspection: NativeWorkCallInspection): string {
+  return `native call authority is ${inspection.state}: ${inspection.reason}`;
+}
+
+function readMainContext(state: CoordinatorState): { readonly ok: true; readonly context: NativeContext } | { readonly ok: false; readonly reason: string } {
+  let context: unknown;
+  try {
+    context = state.getContext();
+  } catch (error) {
+    return { ok: false, reason: `the actual main context threw: ${boundedReason(error, "unreadable failure")}` };
+  }
+  if (consumeNativePromise(context)) {
+    return { ok: false, reason: "the actual main context must be synchronous" };
+  }
+  if (!isActualMainContext(context)) {
+    return { ok: false, reason: "the actual execute context is unavailable, stale or not a main context" };
+  }
+  return { ok: true, context: context as NativeContext };
+}
+
+/**
+ * Fresh host reads, then a fresh native prepared check, then its pure check
+ * last. No authority callback runs after the pure gate before a caller effect.
+ */
+function authorityGate(
+  slot: Slot,
+  mode: "effect" | "replay",
+  contextSink?: (context: NativeContext) => void,
+): string | null {
+  const state = slotState(slot);
+  if (state === null) return "the delegation coordinator state is unavailable";
+  if (state.disposed) return "the delegation coordinator was disposed";
+  if (!state.enabled) return "the delegation coordinator is disabled";
+  if (mode === "effect") {
+    if (slot.state !== "running") return "the delegation operation is already settled";
+    if (slot.cancelRequested) return `the delegation operation was cancelled (${slot.cancelReason ?? "requested"})`;
+  }
+  const firstTime = readClock(state.now);
+  if (firstTime === null) return "the delegation clock is unavailable";
+  if (firstTime >= slot.deadlineAt) return "the original delegation deadline expired";
+  const firstSignal = readActualAbortSignal(slot.invocationSignal);
+  if (!firstSignal.ok) return firstSignal.reason;
+  if (firstSignal.aborted) return "the original invocation signal was aborted";
+
+  const main = readMainContext(state);
+  if (!main.ok) return main.reason;
+
+  let check: NativeCallCheckPreparation;
+  try {
+    check = Reflect.apply(state.native.prepareCallCheck, state.native.receiver, [
+      slot.originalRef,
+      main.context,
+    ]);
+  } catch (error) {
+    return `native call revalidation threw: ${boundedReason(error, "unreadable failure")}`;
+  }
+  if (!check.ok) return nativeInspectionReason(check.inspection);
+  if (check.inspection.state !== "current" || check.inspection.evidenceState !== "available") {
+    return nativeInspectionReason(check.inspection);
+  }
+
+  // Re-read mutable local/host facts after context and native callbacks.
+  if (state.disposed) return "the delegation coordinator was disposed";
+  if (mode === "effect" && slot.cancelRequested) {
+    return `the delegation operation was cancelled (${slot.cancelReason ?? "requested"})`;
+  }
+  const secondTime = readClock(state.now);
+  if (secondTime === null) return "the delegation clock is unavailable";
+  if (secondTime >= slot.deadlineAt) return "the original delegation deadline expired";
+  // The clock is a host callback and may have reentered disposal/cancellation.
+  // This local gate has no callbacks and runs after all callback facts.
+  if (state.disposed) return "the delegation coordinator was disposed";
+  if (!state.enabled) return "the delegation coordinator is disabled";
+  if (mode === "effect" && slot.state !== "running") {
+    return "the delegation operation is already settled";
+  }
+  if (mode === "effect" && slot.cancelRequested) {
+    return `the delegation operation was cancelled (${slot.cancelReason ?? "requested"})`;
+  }
+  const secondSignal = readActualAbortSignal(slot.invocationSignal);
+  if (!secondSignal.ok) return secondSignal.reason;
+  if (secondSignal.aborted) return "the original invocation signal was aborted";
+
+  contextSink?.(main.context);
+
+  // Exactly the captured pure check is last before the caller's effect.
+  let raw: unknown;
+  try {
+    raw = check.revalidate();
+  } catch (error) {
+    return `native call pure revalidation threw: ${boundedReason(error, "unreadable failure")}`;
+  }
+  if (raw === null) return null;
+  if (typeof raw === "string") return boundedReason(raw, "native call pure revalidation refused");
+  if (consumeNativePromise(raw)) return "native call pure revalidation returned a promise";
+  return "native call pure revalidation returned an invalid result";
+}
+
+const slotStates = new WeakMap<object, CoordinatorState>();
+
+function slotState(slot: Slot): CoordinatorState | null {
+  return slotStates.get(slot) ?? null;
+}
+
+function beginCancellation(slot: Slot, reason: SlotCancelReason): void {
+  if (slot.state !== "running" || slot.cancelRequested) return;
+  slot.cancelRequested = true;
+  slot.cancelReason = reason;
+  try {
+    slot.abortController.abort(new Error(`delegation ${reason}`));
+  } catch {
+    // The local signal is already aborted or unavailable; state still changed.
+  }
+  slot.cleanupTimer = setTimeout(() => {
+    slot.cleanupExpired.resolve(undefined);
+  }, slotState(slot)?.limits.cleanupGraceMs ?? DEFAULT_POLICY.cleanupGraceMs);
+  if (slot.runId !== null) requestBackendCancel(slot);
+}
+
+function requestBackendCancel(slot: Slot): void {
+  if (slot.runId === null || slot.backend === null) return;
+  if (slot.cancelState !== "none") return;
+  slot.cancelState = "requested";
+  let raw: unknown;
+  try {
+    raw = Reflect.apply(slot.backend.cancel, slot.backend.receiver, [slot.runId]);
+  } catch (error) {
+    slot.cancelState = "request-failed";
+    slot.cancelSettled = true;
+    slot.cancelError = boundedReason(error, "the backend cancellation request failed");
+    return;
+  }
+  if (!consumeNativePromise(raw)) {
+    slot.cancelSettled = true;
+    return;
+  }
+  slot.cancelPromise = (raw as Promise<unknown>).then(
+    () => {
+      slot.cancelSettled = true;
+    },
+    (error) => {
+      slot.cancelSettled = true;
+      slot.cancelState = "request-failed";
+      slot.cancelError = boundedReason(error, "the backend cancellation request failed");
+    },
+  );
+}
+
+type WaitOutcome<T> =
+  | { readonly kind: "value"; readonly value: T }
+  | { readonly kind: "error"; readonly error: unknown }
+  | { readonly kind: "expired" };
+
+/**
+ * Wait for a port while allowing cleanup grace to bound an abandoned wait.
+ * The underlying settlement handlers remain attached after expiry.
+ */
+async function awaitWithCleanup<T>(slot: Slot, promise: Promise<T>): Promise<WaitOutcome<T>> {
+  let settled = false;
+  const observed = promise.then(
+    (value) => {
+      settled = true;
+      return { kind: "value" as const, value };
+    },
+    (error) => {
+      settled = true;
+      return { kind: "error" as const, error };
+    },
+  );
+  const expired = slot.cleanupExpired.promise.then(() => ({ kind: "expired" as const }));
+  const first = await Promise.race([observed, expired]);
+  if (first.kind === "expired") {
+    if (settled) return await observed;
+    return { kind: "expired" };
+  }
+  return first;
+}
+
+function callBackendCreate(slot: Slot, backend: BackendPort): Promise<unknown> {
+  try {
+    const raw = Reflect.apply(backend.create, backend.receiver, [slot.task]);
+    if (!consumeNativePromise(raw)) {
+      return Promise.reject(new NativeHarnessDelegationError("backend create did not return a native Promise"));
+    }
+    return raw as Promise<unknown>;
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+function callBackendExecute(slot: Slot, backend: BackendPort, runId: string): Promise<unknown> {
+  try {
+    const raw = Reflect.apply(backend.execute, backend.receiver, [runId]);
+    if (!consumeNativePromise(raw)) {
+      return Promise.reject(new NativeHarnessDelegationError("backend execute did not return a native Promise"));
+    }
+    return raw as Promise<unknown>;
+  } catch (error) {
+    return Promise.reject(error);
+  }
+}
+
+function readBackendRunId(value: unknown): string | null {
+  const fields = readStrictFields(value, ["runId"], ["runId"]);
+  if (fields === null) return null;
+  return boundedString(fields.get("runId"), MAX_RUN_ID_CHARS);
+}
+
+const BACKEND_STATUSES: ReadonlySet<string> = new Set([
+  "queued",
+  "running",
+  "interrupted",
+  "completed",
+  "failed",
+  "cancelled",
+  "applied",
+]);
+
+function readBackendStatus(value: unknown): NativeHarnessBackendStatus | null {
+  if (!isRecord(value)) return null;
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(value, "status");
+  } catch {
+    return null;
+  }
+  if (descriptor === undefined || !("value" in descriptor) || typeof descriptor.value !== "string") return null;
+  return BACKEND_STATUSES.has(descriptor.value)
+    ? descriptor.value as NativeHarnessBackendStatus
+    : null;
+}
+
+interface WorkerFacts {
+  readonly status: string | null;
+  readonly costUsd: number | null;
+  readonly estimated: boolean;
+  readonly validUsage: boolean;
+  readonly knownCompleted: boolean;
+}
+
+function readWorkerFacts(value: unknown): WorkerFacts {
+  if (!isRecord(value)) {
+    return { status: null, costUsd: null, estimated: false, validUsage: false, knownCompleted: false };
+  }
+  let statusDescriptor: PropertyDescriptor | undefined;
+  let estimatedDescriptor: PropertyDescriptor | undefined;
+  let usageDescriptor: PropertyDescriptor | undefined;
+  try {
+    statusDescriptor = Object.getOwnPropertyDescriptor(value, "status");
+    estimatedDescriptor = Object.getOwnPropertyDescriptor(value, "usageEstimated");
+    usageDescriptor = Object.getOwnPropertyDescriptor(value, "usage");
+  } catch {
+    return { status: null, costUsd: null, estimated: false, validUsage: false, knownCompleted: false };
+  }
+  const status = statusDescriptor !== undefined
+    && "value" in statusDescriptor
+    && typeof statusDescriptor.value === "string"
+    ? statusDescriptor.value
+    : null;
+  let estimated = false;
+  let estimatedReadable = true;
+  if (estimatedDescriptor !== undefined) {
+    if (!("value" in estimatedDescriptor)) estimatedReadable = false;
+    else estimated = estimatedDescriptor.value === true;
+  }
+  let costUsd: number | null = null;
+  if (usageDescriptor !== undefined && "value" in usageDescriptor && isRecord(usageDescriptor.value)) {
+    let costDescriptor: PropertyDescriptor | undefined;
+    try {
+      costDescriptor = Object.getOwnPropertyDescriptor(usageDescriptor.value, "costUsd");
+    } catch {
+      costDescriptor = undefined;
+    }
+    if (costDescriptor !== undefined
+      && "value" in costDescriptor
+      && typeof costDescriptor.value === "number"
+      && Number.isFinite(costDescriptor.value)
+      && costDescriptor.value >= 0) {
+      costUsd = costDescriptor.value;
+    }
+  }
+  const validUsage = costUsd !== null && estimatedReadable && !estimated;
+  return {
+    status,
+    costUsd,
+    estimated,
+    validUsage,
+    knownCompleted: validUsage && status === "completed",
+  };
+}
+
+function readWorkerRequest(request: unknown): { readonly ok: true; readonly request: Record<string, unknown> } | { readonly ok: false; readonly reason: string } {
+  if (!isRecord(request)) return { ok: false, reason: "worker request is not an object" };
+  let prototype: object | null;
+  let keys: (string | symbol)[];
+  try {
+    prototype = Object.getPrototypeOf(request);
+    keys = Reflect.ownKeys(request);
+  } catch {
+    return { ok: false, reason: "worker request could not be inspected" };
+  }
+  if (prototype !== Object.prototype && prototype !== null) {
+    return { ok: false, reason: "worker request uses an unsupported prototype" };
+  }
+  if (keys.some((key) => typeof key !== "string")) {
+    return { ok: false, reason: "worker request contains symbol properties" };
+  }
+  const copy: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const key of keys as string[]) {
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(request, key);
+    } catch {
+      return { ok: false, reason: "worker request could not be inspected" };
+    }
+    if (descriptor === undefined || !("value" in descriptor)) {
+      return { ok: false, reason: "worker request contains an accessor property" };
+    }
+    Object.defineProperty(copy, key, {
+      value: descriptor.value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  return { ok: true, request: copy };
+}
+
+function combineSignals(
+  slot: Slot,
+  workerSignal: unknown,
+): { readonly ok: true; readonly signal: AbortSignal; readonly cleanup: () => void } | { readonly ok: false; readonly reason: string } {
+  if (workerSignal !== undefined && workerSignal !== null) {
+    const read = readActualAbortSignal(workerSignal);
+    if (!read.ok) return { ok: false, reason: `worker signal is invalid: ${read.reason}` };
+  }
+  const sources: AbortSignal[] = [slot.signal];
+  if (workerSignal !== undefined && workerSignal !== null) sources.push(workerSignal as AbortSignal);
+  if (ACTUAL_ADD_EVENT_LISTENER === null || ACTUAL_REMOVE_EVENT_LISTENER === null) {
+    return { ok: false, reason: "host abort listeners are unavailable" };
+  }
+  const controller = new AbortController();
+  const listeners: Array<{ readonly source: AbortSignal; readonly listener: () => void }> = [];
+  for (const source of sources) {
+    const read = readActualAbortSignal(source);
+    if (!read.ok) {
+      cleanup();
+      return { ok: false, reason: read.reason };
+    }
+    if (read.aborted) {
+      controller.abort(new Error("delegation combined signal aborted"));
+      break;
+    }
+    const listener = () => {
+      try {
+        controller.abort(new Error("delegation combined signal aborted"));
+      } catch {
+        // Already aborted.
+      }
+    };
+    try {
+      Reflect.apply(ACTUAL_ADD_EVENT_LISTENER, source, ["abort", listener, { once: true }]);
+      listeners.push({ source, listener });
+    } catch (error) {
+      cleanup();
+      return { ok: false, reason: `worker signal listener failed: ${boundedReason(error, "unreadable failure")}` };
+    }
+  }
+  // A signal can abort between the first and second attach.
+  for (const source of sources) {
+    const read = readActualAbortSignal(source);
+    if (read.ok && read.aborted) controller.abort(new Error("delegation combined signal aborted"));
+  }
+  return {
+    ok: true,
+    signal: controller.signal,
+    cleanup(): void {
+      cleanup();
+    },
+  };
+
+  function cleanup(): void {
+    for (const item of listeners) {
+      try {
+        Reflect.apply(ACTUAL_REMOVE_EVENT_LISTENER as EventTarget["removeEventListener"], item.source, ["abort", item.listener]);
+      } catch {
+        // Best-effort listener removal only.
+      }
+    }
+  }
+}
+
+function recordDispatchResult(
+  slot: Slot,
+  requestedUsd: number,
+  facts: WorkerFacts | null,
+): void {
+  const state = slotState(slot);
+  slot.runnerInflightUsd = Math.max(0, slot.runnerInflightUsd - requestedUsd);
+  if (facts !== null && facts.knownCompleted && !slot.cancelRequested) {
+    const cost = facts.costUsd as number;
+    slot.runnerAccountedUsd = money(slot.runnerAccountedUsd + cost);
+    slot.observedCostUsd = money(slot.observedCostUsd + cost);
+    slot.observedAny = true;
+    if (cost > requestedUsd + USD_EPSILON) {
+      slot.overspendUsd = money(slot.overspendUsd + cost - requestedUsd);
+      if (state !== null) state.budgetBlocked = true;
+    }
+    return;
+  }
+  slot.workerAllKnownCompleted = false;
+  slot.workerUnknownUsage = true;
+  const cost = facts?.costUsd ?? null;
+  if (cost !== null && !facts?.estimated) {
+    slot.observedCostUsd = money(slot.observedCostUsd + cost);
+    slot.observedAny = true;
+  }
+  const charged = Math.max(requestedUsd, cost ?? 0);
+  slot.runnerAccountedUsd = money(slot.runnerAccountedUsd + charged);
+  if (charged > requestedUsd + USD_EPSILON) {
+    slot.overspendUsd = money(slot.overspendUsd + charged - requestedUsd);
+    if (state !== null) state.budgetBlocked = true;
+  }
+}
+
+function dispatchWorker(slot: Slot, requestValue: WorkerRequest): Promise<WorkerResult> {
+  const state = slotState(slot);
+  if (state === null) return Promise.reject(new NativeHarnessDelegationError("delegation state is unavailable"));
+  if (slot.dispatchClosed) {
+    return Promise.reject(new NativeHarnessDelegationError(
+      "worker dispatch is closed because backend execution already settled",
+    ));
+  }
+  if (!slot.executionStarted || slot.state !== "running") {
+    return Promise.reject(new NativeHarnessDelegationError("worker dispatch is not active"));
+  }
+  if (slot.workerPromises.size >= MAX_INFLIGHT_WORKERS) {
+    return Promise.reject(new NativeHarnessDelegationError("worker dispatch exceeds the in-flight bound"));
+  }
+  const read = readWorkerRequest(requestValue);
+  if (!read.ok) return Promise.reject(new NativeHarnessDelegationError(read.reason));
+  const request = read.request;
+  if (request.runId !== slot.runId) {
+    return Promise.reject(new NativeHarnessDelegationError("worker request runId is not the actual created run"));
+  }
+  const requestedUsd = request.maxCostUsd;
+  if (typeof requestedUsd !== "number" || !Number.isFinite(requestedUsd) || requestedUsd <= 0) {
+    return Promise.reject(new NativeHarnessDelegationError("worker request maxCostUsd must be positive and finite"));
+  }
+  const timeoutMs = request.timeoutMs;
+  if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+    return Promise.reject(new NativeHarnessDelegationError("worker request timeoutMs must be positive and finite"));
+  }
+  const remainingReservation = state.limits.perRunUsd - slot.runnerAccountedUsd - slot.runnerInflightUsd;
+  if (state.budgetBlocked || requestedUsd > remainingReservation + USD_EPSILON) {
+    return Promise.reject(new NativeHarnessDelegationError(
+      "worker request allocation exceeds the operation's remaining delegation reservation",
+    ));
+  }
+  const time = readClock(state.now);
+  if (time === null) return Promise.reject(new NativeHarnessDelegationError("delegation clock is unavailable"));
+  const remainingDeadlineMs = slot.deadlineAt - time;
+  if (remainingDeadlineMs <= 0) {
+    beginCancellation(slot, "deadline-expired");
+    return Promise.reject(new NativeHarnessDelegationError("the original delegation deadline expired"));
+  }
+  const effectiveTimeoutMs = Math.min(timeoutMs, remainingDeadlineMs);
+  const combined = combineSignals(slot, request.signal);
+  if (!combined.ok) return Promise.reject(new NativeHarnessDelegationError(combined.reason));
+
+  // Reserve the dispatch locally before the final pure gate; release on refusal.
+  slot.runnerInflightUsd += requestedUsd;
+  const gate = authorityGate(slot, "effect");
+  if (gate !== null) {
+    slot.runnerInflightUsd = Math.max(0, slot.runnerInflightUsd - requestedUsd);
+    combined.cleanup();
+    // Losing authority must still clean up the already bound actual run. This
+    // only requests cancellation of this operation's run; it never dispatches.
+    beginCancellation(slot, cancelReasonForGate(gate));
+    return Promise.reject(new NativeHarnessDelegationError(gate));
+  }
+  // The Controller or a reentrant callback may have aborted its worker signal
+  // while the authority getters/pure gate ran. Never dispatch an already
+  // aborted combined signal; read the captured native getter only, no callback.
+  const combinedAbort = readActualAbortSignal(combined.signal);
+  if (!combinedAbort.ok || combinedAbort.aborted) {
+    slot.runnerInflightUsd = Math.max(0, slot.runnerInflightUsd - requestedUsd);
+    combined.cleanup();
+    return Promise.reject(new NativeHarnessDelegationError(
+      combinedAbort.ok
+        ? "the combined worker signal was aborted before dispatch"
+        : combinedAbort.reason,
+    ));
+  }
+
+  request.timeoutMs = effectiveTimeoutMs;
+  request.signal = combined.signal;
+  slot.workerDispatches += 1;
+  slot.workerCount += 1;
+
+  let tracked: Promise<WorkerResult> | null = null;
+  let settledBeforeTracking = false;
+  const promise = (async (): Promise<WorkerResult> => {
+    try {
+      const result = await Reflect.apply(state.runner.run, state.runner.receiver, [request as unknown as WorkerRequest]);
+      recordDispatchResult(slot, requestedUsd, readWorkerFacts(result));
+      return result;
+    } catch (error) {
+      recordDispatchResult(slot, requestedUsd, null);
+      throw error;
+    } finally {
+      combined.cleanup();
+      // A synchronous Runner throw runs this finally before the returned
+      // promise can be assigned to `tracked`. Never retain an already settled
+      // promise in the in-flight set, or it would consume the dispatch bound
+      // forever.
+      if (tracked === null) settledBeforeTracking = true;
+      else slot.workerPromises.delete(tracked);
+    }
+  })();
+  tracked = promise;
+  if (!settledBeforeTracking) slot.workerPromises.add(promise);
+  // Keep a rejection handler attached even when a cleanup grace abandons the wait.
+  void promise.catch(() => undefined);
+  return promise;
+}
+
+function makeGuardedRunner(slot: Slot): Runner {
+  return Object.freeze({
+    run(request: WorkerRequest): Promise<WorkerResult> {
+      return dispatchWorker(slot, request);
+    },
+  });
+}
+
+function readPreparedBackend(raw: unknown): { readonly ok: true; readonly backend: BackendPort } | { readonly ok: false; readonly reason: string } {
+  const fields = readStrictFields(raw, ["ok", "backend", "reason"], ["ok"]);
+  if (fields === null) return { ok: false, reason: "trusted prepare returned an unreadable result" };
+  if (fields.get("ok") !== true) {
+    const reason = fields.get("reason");
+    return {
+      ok: false,
+      reason: boundedReason(reason, "trusted prepare refused the delegation"),
+    };
+  }
+  const backend = fields.get("backend");
+  if (!isOpaqueRef(backend)) return { ok: false, reason: "trusted prepare returned no backend object" };
+  const create = readCallable(backend, "create");
+  const execute = readCallable(backend, "execute");
+  const cancel = readCallable(backend, "cancel");
+  const get = readCallable(backend, "get");
+  if (create === null || execute === null || cancel === null) {
+    return { ok: false, reason: "trusted prepare backend is missing create, execute or cancel" };
+  }
+  return {
+    ok: true,
+    backend: {
+      receiver: backend as NativeHarnessBackend,
+      create: create as BackendPort["create"],
+      execute: execute as BackendPort["execute"],
+      cancel: cancel as BackendPort["cancel"],
+      get: get as BackendPort["get"] | null,
+    },
+  };
+}
+
+type PrepareOutcome =
+  | { readonly kind: "backend"; readonly backend: BackendPort }
+  | { readonly kind: "failed"; readonly reason: string }
+  | { readonly kind: "expired" };
+
+async function invokePrepare(slot: Slot, context: NativeContext | null): Promise<PrepareOutcome> {
+  const state = slotState(slot);
+  if (state === null) return { kind: "failed", reason: "delegation state is unavailable" };
+  if (context === null) return { kind: "failed", reason: "the gated main context is unavailable" };
+  const guard = (): void => {
+    if (!slot.prepareOpen) {
+      throw new NativeHarnessDelegationError("the preparation guard is no longer open");
+    }
+    slot.guardCalls += 1;
+    const problem = authorityGate(slot, "effect");
+    if (problem !== null) throw new NativeHarnessDelegationError(problem);
+  };
+  const request: NativeHarnessPrepareRequest = Object.freeze({
+    association: slot.association,
+    budget: Object.freeze({
+      maxCostUsd: state.limits.perRunUsd,
+      deadlineAt: slot.deadlineAt,
+      maxDurationMs: state.limits.maxDurationMs,
+    }),
+    signal: slot.signal,
+    runner: makeGuardedRunner(slot),
+    guard,
+  });
+  slot.prepareOpen = true;
+  let raw: unknown;
+  try {
+    // The context came from the immediately preceding fresh gate; no host
+    // callback runs between that gate's pure check and this preparation call.
+    raw = state.prepare(request, context);
+  } catch (error) {
+    slot.prepareOpen = false;
+    return { kind: "failed", reason: `trusted prepare threw: ${boundedReason(error, "unreadable failure")}` };
+  }
+
+  let value: unknown;
+  if (consumeNativePromise(raw)) {
+    const promise = raw as Promise<unknown>;
+    void promise.catch(() => undefined);
+    const waited = await awaitWithCleanup(slot, promise);
+    // The guard is open only while preparation can still affect delegation.
+    // At cancellation/deadline grace expiry a late backend must not create.
+    slot.prepareOpen = false;
+    if (waited.kind === "expired") return { kind: "expired" };
+    if (waited.kind === "error") {
+      return {
+        kind: "failed",
+        reason: `trusted prepare rejected: ${boundedReason(waited.error, "unreadable failure")}`,
+      };
+    }
+    value = waited.value;
+  } else {
+    slot.prepareOpen = false;
+    value = raw;
+  }
+  if (slot.guardCalls === 0) {
+    return { kind: "failed", reason: "trusted prepare did not call the authority guard" };
+  }
+  const backend = readPreparedBackend(value);
+  return backend.ok
+    ? { kind: "backend", backend: backend.backend }
+    : { kind: "failed", reason: backend.reason };
+}
+
+function outcomeFor(
+  slot: Slot,
+  backendStatus: NativeHarnessBackendStatus | null,
+  finalGate: string | null,
+): NativeHarnessOutcome {
+  if (finalGate !== null) {
+    if (slot.cancelReason === "deadline-expired") return "timed-out";
+    if (slot.cancelReason === "authority-lost") return "incomplete";
+    if (slot.cancelRequested) return "cancelled";
+    return "incomplete";
+  }
+  if (backendStatus === "completed") return "backend-completed";
+  if (backendStatus === "failed") return "backend-failed";
+  if (backendStatus === "cancelled") return "backend-cancelled";
+  if (slot.cancelReason === "deadline-expired") return "timed-out";
+  if (slot.cancelRequested) return "cancelled";
+  return "incomplete";
+}
+
+function cancelReasonForGate(gate: string): SlotCancelReason {
+  if (gate.includes("deadline")) return "deadline-expired";
+  if (gate.includes("aborted") || gate.includes("cancelled")) return "invocation-aborted";
+  if (gate.includes("disposed")) return "disposed";
+  return "authority-lost";
+}
+
+function terminationFor(
+  slot: Slot,
+  finalGate: string | null,
+  backendStatus: NativeHarnessBackendStatus | null,
+): NativeHarnessTermination {
+  if (slot.cancelReason === "disposed") return "disposed";
+  if (slot.cancelReason === "deadline-expired") return "deadline";
+  if (slot.cancelReason === "authority-lost") return "authority-lost";
+  if (slot.cancelReason === "invocation-aborted"
+    || slot.cancelReason === "cancel-requested"
+    || slot.cancelReason === "budget-refused") return "cancelled";
+  if (finalGate !== null) return "authority-lost";
+  if (backendStatus === "failed") return "backend-failed";
+  return "none";
+}
+
+function settleLifetime(slot: Slot, knownObserved: boolean, observedUsd: number, noDispatch: boolean): void {
+  const state = slotState(slot);
+  if (state === null || !slot.reservationActive) return;
+  slot.reservationActive = false;
+  if (noDispatch) {
+    state.lifetimeAccountedUsd = money(Math.max(0, state.lifetimeAccountedUsd - state.limits.perRunUsd));
+    return;
+  }
+  if (knownObserved) {
+    // Admission reserved one inclusive whole-run allocation, not a base plus
+    // observed subtotal. Replace the reservation with the observed subtotal:
+    // the observed amount must not be added on top of the already-inclusive
+    // allocation.
+    state.lifetimeAccountedUsd = money(state.lifetimeAccountedUsd + observedUsd - state.limits.perRunUsd);
+    state.lifetimeObservedUsd = money(state.lifetimeObservedUsd + observedUsd);
+    const extra = Math.max(0, observedUsd - state.limits.perRunUsd);
+    if (extra > 0) {
+      state.lifetimeOverspendUsd = money(state.lifetimeOverspendUsd + extra);
+      state.budgetBlocked = true;
+    }
+    if (state.lifetimeAccountedUsd < 0) state.lifetimeAccountedUsd = 0;
+    return;
+  }
+  const extra = Math.max(0, observedUsd - state.limits.perRunUsd);
+  state.lifetimeAccountedUsd = money(state.lifetimeAccountedUsd + extra);
+  state.lifetimeObservedUsd = money(state.lifetimeObservedUsd + observedUsd);
+  state.lifetimeUnknownUsd = money(state.lifetimeUnknownUsd + state.limits.perRunUsd);
+  if (extra > 0) {
+    state.lifetimeOverspendUsd = money(state.lifetimeOverspendUsd + extra);
+    state.budgetBlocked = true;
+  }
+}
+
+function finishSlot(
+  slot: Slot,
+  args: {
+    readonly outcome: NativeHarnessOutcome;
+    readonly reason: string | null;
+    readonly authorityFresh: boolean;
+    readonly executionState: NativeHarnessExecutionState;
+    readonly termination: NativeHarnessTermination;
+    readonly backendStatus: NativeHarnessBackendStatus | null;
+    readonly knownObservedCost: boolean;
+    readonly noDispatch: boolean;
+    readonly releaseConcurrency: boolean;
+    readonly finishedAt?: number;
+    readonly extraLimitations?: readonly string[];
+  },
+): void {
+  if (slot.state !== "running") return;
+  const state = slotState(slot);
+  if (state === null) return;
+  const finishedAt = args.finishedAt ?? readClock(state.now) ?? slot.admittedAt;
+  const elapsedMs = Math.max(0, Math.min(Number.MAX_SAFE_INTEGER, finishedAt - slot.admittedAt));
+  const observedUsd = args.noDispatch
+    ? 0
+    : slot.observedAny
+      ? money(slot.observedCostUsd)
+      : null;
+  const unknownUsd = args.knownObservedCost || args.noDispatch ? 0 : state.limits.perRunUsd;
+  const overspendUsd = observedUsd !== null ? money(Math.max(0, observedUsd - state.limits.perRunUsd)) : 0;
+  const cost: NativeHarnessDelegationCost = Object.freeze({
+    allocatedUsd: args.noDispatch ? 0 : state.limits.perRunUsd,
+    observedUsd,
+    unknownUsd,
+    overspendUsd,
+  });
+  const extra = [...(args.extraLimitations ?? [])];
+  if (args.executionState === "pending-unknown") {
+    extra.push("Cleanup did not settle within the grace window; concurrency and cost allocation remain retained.");
+  }
+  if (slot.cancelRequested) {
+    extra.push("Cancellation resolution is only a request; process-group exit and OS isolation are not proven.");
+  }
+  const result: NativeHarnessDelegationResult = deepFreeze({
+    schema: NATIVE_HARNESS_DELEGATION_SCHEMA,
+    tool: NATIVE_HARNESS_TOOL,
+    authority: "non-authoritative" as const,
+    resultKind: "live" as const,
+    historical: false,
+    authorityFresh: args.authorityFresh,
+    outcome: args.outcome,
+    taskAccepted: false as const,
+    semanticAcceptance: "not-evaluated" as const,
+    association: slot.association,
+    runId: slot.runId,
+    backendStatus: args.backendStatus,
+    executionState: args.executionState,
+    termination: args.termination,
+    cancellation: slot.cancelState,
+    cancelError: slot.cancelError,
+    deadlineAt: slot.deadlineAt,
+    elapsedMs,
+    cost,
+    limitations: limitationsFor(extra),
+    reason: args.reason === null ? null : boundedReason(args.reason, "delegation incomplete"),
+  });
+
+  settleLifetime(slot, args.knownObservedCost, observedUsd ?? 0, args.noDispatch);
+  slot.state = "settled";
+  slot.response = result;
+  slot.finalOutcome = args.outcome;
+  slot.finalAuthorityFresh = args.authorityFresh;
+  slot.finalExecutionState = args.executionState;
+  slot.finalTermination = args.termination;
+  slot.finalCost = cost;
+  slot.prepareOpen = false;
+  if (slot.deadlineTimer !== null) {
+    clearTimeout(slot.deadlineTimer);
+    slot.deadlineTimer = null;
+  }
+  if (args.executionState !== "pending-unknown" && slot.cleanupTimer !== null) {
+    clearTimeout(slot.cleanupTimer);
+    slot.cleanupTimer = null;
+  }
+  try {
+    Reflect.apply(ACTUAL_REMOVE_EVENT_LISTENER as EventTarget["removeEventListener"], slot.invocationSignal, [
+      "abort",
+      slot.abortListener,
+    ]);
+  } catch {
+    // Host listener removal is best effort.
+  }
+  if (args.releaseConcurrency && slot.concurrencyHeld) {
+    slot.concurrencyHeld = false;
+    state.activeOperations = Math.max(0, state.activeOperations - 1);
+  }
+  slot.resolve(result);
+}
+
+function releasedAfterNoExecution(slot: Slot): boolean {
+  if (!slot.cancelRequested) return true;
+  return slot.cancelSettled && slot.cancelState !== "request-failed";
+}
+
+function cancelledWithoutExecutionOutcome(slot: Slot): NativeHarnessOutcome {
+  if (slot.cancelReason === "deadline-expired") return "timed-out";
+  if (slot.cancelReason === "authority-lost") return "incomplete";
+  return "cancelled";
+}
+
+function cancelledWithoutExecutionReason(slot: Slot): string {
+  if (slot.cancelReason === "authority-lost") {
+    return "authority was lost after a run was created; execution was not dispatched and cancellation was requested";
+  }
+  if (slot.cancelReason === "deadline-expired") {
+    return "the original delegation deadline expired after a run was created; execution was not dispatched";
+  }
+  return "delegation was cancelled after a run was created but before worker execution";
+}
+
+async function finishCancelledWithoutExecution(slot: Slot): Promise<void> {
+  const state = slotState(slot);
+  if (state === null) return;
+  if (slot.cancelSettled) {
+    finishSlot(slot, {
+      outcome: cancelledWithoutExecutionOutcome(slot),
+      reason: cancelledWithoutExecutionReason(slot),
+      authorityFresh: false,
+      executionState: "not-started",
+      termination: terminationFor(slot, null, null),
+      backendStatus: slot.backendStatus,
+      knownObservedCost: false,
+      noDispatch: false,
+      releaseConcurrency: releasedAfterNoExecution(slot),
+    });
+    return;
+  }
+  if (slot.cancelPromise !== null) {
+    const waited = await awaitWithCleanup(slot, slot.cancelPromise);
+    if (waited.kind === "expired") {
+      finishSlot(slot, {
+        outcome: cancelledWithoutExecutionOutcome(slot),
+        reason: "the cancellation request did not resolve within the cleanup grace window",
+        authorityFresh: false,
+        executionState: "pending-unknown",
+        termination: terminationFor(slot, null, null),
+        backendStatus: slot.backendStatus,
+        knownObservedCost: false,
+        noDispatch: false,
+        releaseConcurrency: false,
+      });
+      return;
+    }
+    finishSlot(slot, {
+      outcome: cancelledWithoutExecutionOutcome(slot),
+      reason: slot.cancelError ?? cancelledWithoutExecutionReason(slot),
+      authorityFresh: false,
+      executionState: "not-started",
+      termination: terminationFor(slot, null, null),
+      backendStatus: slot.backendStatus,
+      knownObservedCost: false,
+      noDispatch: false,
+      releaseConcurrency: releasedAfterNoExecution(slot),
+    });
+    return;
+  }
+  if (slot.cancelState === "request-failed") {
+    finishSlot(slot, {
+      outcome: cancelledWithoutExecutionOutcome(slot),
+      reason: slot.cancelError ?? "the backend cancellation request failed",
+      authorityFresh: false,
+      executionState: "not-started",
+      termination: terminationFor(slot, null, null),
+      backendStatus: slot.backendStatus,
+      knownObservedCost: false,
+      noDispatch: false,
+      releaseConcurrency: false,
+    });
+    return;
+  }
+  // No runId or backend, so there is no cancellation target and no worker.
+  finishSlot(slot, {
+    outcome: cancelledWithoutExecutionOutcome(slot),
+    reason: "delegation was cancelled before backend run creation",
+    authorityFresh: false,
+    executionState: "not-started",
+    termination: terminationFor(slot, null, null),
+    backendStatus: null,
+    knownObservedCost: false,
+    noDispatch: true,
+    releaseConcurrency: true,
+  });
+}
+
+async function awaitExecution(
+  slot: Slot,
+  execution: Promise<unknown>,
+): Promise<
+  | { readonly kind: "expired" }
+  | { readonly kind: "settled"; readonly execution: WaitOutcome<unknown> }
+> {
+  const first = await awaitWithCleanup(slot, execution);
+  // Once the underlying execution promise settles (or its wait expires), the
+  // port has no legitimate reason to dispatch another worker. Closing
+  // admission makes the set below monotonically shrink.
+  slot.dispatchClosed = true;
+  if (first.kind === "expired") {
+    if (!slot.cancelRequested) beginCancellation(slot, "deadline-expired");
+    return { kind: "expired" };
+  }
+  // Runner.run resolves after its cleanup, but a port may return execute before
+  // a worker promise settles. Do not publish success until the set is actually
+  // empty; admission is closed above, and every wait is still bounded by the
+  // original deadline plus cleanup grace. Exhaustion can only mean the grace
+  // window expired, which runSlot reports as pending-unknown with capacity and
+  // allocation retained.
+  while (slot.workerPromises.size > 0) {
+    const workers = [...slot.workerPromises];
+    const waited = await awaitWithCleanup(slot, Promise.allSettled(workers).then(() => undefined));
+    if (waited.kind === "expired") {
+      if (!slot.cancelRequested) beginCancellation(slot, "deadline-expired");
+      return { kind: "expired" };
+    }
+  }
+  return { kind: "settled", execution: first };
+}
+
+async function runSlot(slot: Slot): Promise<void> {
+  const state = slotState(slot);
+  if (state === null) return;
+  try {
+    let prepareContext: NativeContext | null = null;
+    const beforePrepare = authorityGate(slot, "effect", (context) => {
+      prepareContext = context;
+    });
+    if (beforePrepare !== null) {
+      finishSlot(slot, {
+        outcome: "refused",
+        reason: beforePrepare,
+        authorityFresh: false,
+        executionState: "not-started",
+        termination: terminationFor(slot, beforePrepare, null),
+        backendStatus: null,
+        knownObservedCost: false,
+        noDispatch: true,
+        releaseConcurrency: true,
+      });
+      return;
+    }
+
+    const prepared = await invokePrepare(slot, prepareContext);
+    if (prepared.kind === "expired") {
+      finishSlot(slot, {
+        outcome: "unknown",
+        reason: "trusted preparation did not settle within the cleanup grace window; no run was created",
+        authorityFresh: false,
+        executionState: "pending-unknown",
+        termination: terminationFor(slot, null, null),
+        backendStatus: null,
+        knownObservedCost: false,
+        noDispatch: false,
+        releaseConcurrency: false,
+      });
+      return;
+    }
+    if (prepared.kind === "failed") {
+      finishSlot(slot, {
+        outcome: "refused",
+        reason: prepared.reason,
+        authorityFresh: false,
+        executionState: "not-started",
+        termination: terminationFor(slot, prepared.reason, null),
+        backendStatus: null,
+        knownObservedCost: false,
+        noDispatch: true,
+        releaseConcurrency: true,
+      });
+      return;
+    }
+    slot.backend = prepared.backend;
+
+    if (slot.cancelRequested) {
+      await finishCancelledWithoutExecution(slot);
+      return;
+    }
+    const afterPrepare = authorityGate(slot, "effect");
+    if (afterPrepare !== null) {
+      finishSlot(slot, {
+        outcome: "refused",
+        reason: afterPrepare,
+        authorityFresh: false,
+        executionState: "not-started",
+        termination: terminationFor(slot, afterPrepare, null),
+        backendStatus: null,
+        knownObservedCost: false,
+        noDispatch: true,
+        releaseConcurrency: true,
+      });
+      return;
+    }
+
+    slot.backendEffectStarted = true;
+    slot.createStarted = true;
+    const createPromise = callBackendCreate(slot, prepared.backend);
+    void createPromise.catch(() => undefined);
+    const created = await awaitWithCleanup(slot, createPromise);
+    if (created.kind === "expired") {
+      // A late create still yields an actual runId and a cancel request, but it
+      // must never upgrade this already-returned unknown result or dispatch.
+      void createPromise.then(
+        (value) => {
+          const runId = readBackendRunId(value);
+          if (runId === null) return;
+          if (slot.runId === null) slot.runId = runId;
+          if (slot.cancelRequested) requestBackendCancel(slot);
+        },
+        () => undefined,
+      );
+      finishSlot(slot, {
+        outcome: "unknown",
+        reason: "backend run creation did not settle within the cleanup grace window",
+        authorityFresh: false,
+        executionState: "pending-unknown",
+        termination: terminationFor(slot, null, null),
+        backendStatus: null,
+        knownObservedCost: false,
+        noDispatch: false,
+        releaseConcurrency: false,
+      });
+      return;
+    }
+    if (created.kind === "error") {
+      slot.createSettled = true;
+      finishSlot(slot, {
+        outcome: slot.cancelReason === "deadline-expired" ? "timed-out" : slot.cancelRequested ? "cancelled" : "unknown",
+        reason: `backend run creation failed: ${boundedReason(created.error, "unreadable failure")}`,
+        authorityFresh: false,
+        executionState: "not-started",
+        termination: terminationFor(slot, null, null),
+        backendStatus: null,
+        knownObservedCost: false,
+        noDispatch: false,
+        releaseConcurrency: true,
+      });
+      return;
+    }
+    slot.createSettled = true;
+    const runId = readBackendRunId(created.value);
+    if (runId === null) {
+      finishSlot(slot, {
+        outcome: slot.cancelRequested ? "cancelled" : "unknown",
+        reason: "backend run creation returned no valid bounded runId",
+        authorityFresh: false,
+        executionState: "not-started",
+        termination: terminationFor(slot, null, null),
+        backendStatus: null,
+        knownObservedCost: false,
+        noDispatch: false,
+        releaseConcurrency: false,
+      });
+      return;
+    }
+    slot.runId = runId;
+
+    if (slot.cancelRequested) {
+      requestBackendCancel(slot);
+      await finishCancelledWithoutExecution(slot);
+      return;
+    }
+
+    const beforeExecute = authorityGate(slot, "effect");
+    if (beforeExecute !== null) {
+      beginCancellation(slot, cancelReasonForGate(beforeExecute));
+      requestBackendCancel(slot);
+      await finishCancelledWithoutExecution(slot);
+      return;
+    }
+    if (slot.cancelRequested) {
+      requestBackendCancel(slot);
+      await finishCancelledWithoutExecution(slot);
+      return;
+    }
+
+    slot.executionStarted = true;
+    const execution = callBackendExecute(slot, prepared.backend, runId);
+    void execution.catch(() => undefined);
+    const waited = await awaitExecution(slot, execution);
+    if (waited.kind === "expired") {
+      void execution.then(
+        () => {
+          slot.lateSettlementObserved = true;
+        },
+        () => {
+          slot.lateSettlementObserved = true;
+        },
+      );
+      finishSlot(slot, {
+        outcome: "unknown",
+        reason: "backend execution or worker cleanup did not settle within the cleanup grace window",
+        authorityFresh: false,
+        executionState: "pending-unknown",
+        termination: terminationFor(slot, null, null),
+        backendStatus: null,
+        knownObservedCost: false,
+        noDispatch: false,
+        releaseConcurrency: false,
+      });
+      return;
+    }
+
+    let executionError: string | null = null;
+    if (waited.execution.kind === "error") {
+      executionError = boundedReason(waited.execution.error, "backend execution failed");
+    } else if (waited.execution.kind === "value") {
+      slot.backendStatus = readBackendStatus(waited.execution.value);
+    } else {
+      executionError = "backend execution ended in an unreadable state";
+    }
+    slot.executionSettled = true;
+    slot.executionError = executionError;
+
+    // All callback facts, including the finish clock, are read before the
+    // final fresh/pure gate. Nothing invokes a host callback between that gate
+    // and result publication.
+    const finishedAt = readClock(state.now) ?? slot.admittedAt;
+    const finalGate = authorityGate(slot, "effect");
+    const backendStatus = slot.backendStatus;
+    const authorityFresh = finalGate === null;
+    // Native freshness is an authority fact, not a usage fact. Execution and
+    // every accepted worker have settled here; when the backend completed with
+    // fully known worker usage and no cancellation, the observed subtotal is
+    // known even if the final native gate rejects (for example navigation).
+    const knownObservedCost = backendStatus === "completed"
+      && slot.workerCount > 0
+      && slot.workerAllKnownCompleted
+      && !slot.workerUnknownUsage
+      && !slot.cancelRequested
+      && slot.executionSettled
+      && slot.workerPromises.size === 0;
+    const outcome = outcomeFor(slot, backendStatus, finalGate);
+    const termination = terminationFor(slot, finalGate, backendStatus);
+    finishSlot(slot, {
+      outcome,
+      reason: finalGate ?? executionError ?? (backendStatus === "completed"
+        ? "the Harness2 backend reported completion; task acceptance was not evaluated"
+        : `backend status ${backendStatus ?? "unknown"}`),
+      authorityFresh,
+      executionState: "settled",
+      termination,
+      backendStatus,
+      knownObservedCost,
+      noDispatch: false,
+      releaseConcurrency: true,
+      finishedAt,
+    });
+  } catch (error) {
+    finishSlot(slot, {
+      outcome: "unknown",
+      reason: `delegation failed unexpectedly: ${boundedReason(error, "unreadable failure")}`,
+      authorityFresh: false,
+      executionState: "pending-unknown",
+      termination: terminationFor(slot, null, null),
+      backendStatus: null,
+      knownObservedCost: false,
+      noDispatch: !slot.backendEffectStarted,
+      releaseConcurrency: false,
+    });
+  }
+}
+
+function createSlot(
+  state: CoordinatorState,
+  toolCallId: string,
+  originalRef: NativeWorkCallReference,
+  association: NativeHarnessAssociation,
+  task: string,
+  invocationSignal: AbortSignal,
+  admittedAt: number,
+): Slot {
+  const abortController = new AbortController();
+  const pending = deferred<NativeHarnessDelegationResult>();
+  const cleanupExpired = deferred<void>();
+  const deadlineAt = admittedAt + state.limits.maxDurationMs;
+  const slot: Slot = {
+    toolCallId,
+    originalRef,
+    association,
+    task,
+    invocationSignal,
+    signal: abortController.signal,
+    admittedAt,
+    deadlineAt,
+    abortController,
+    cleanupExpired,
+    promise: pending.promise,
+    resolve: pending.resolve,
+    abortListener: () => undefined,
+    deadlineTimer: null,
+    cleanupTimer: null,
+    state: "running",
+    concurrencyHeld: true,
+    reservationActive: true,
+    cancelRequested: false,
+    cancelReason: null,
+    cancelState: "none",
+    cancelError: null,
+    cancelSettled: false,
+    cancelPromise: null,
+    backend: null,
+    prepareOpen: false,
+    guardCalls: 0,
+    backendEffectStarted: false,
+    createStarted: false,
+    createSettled: false,
+    executionStarted: false,
+    executionSettled: false,
+    dispatchClosed: false,
+    runId: null,
+    backendStatus: null,
+    executionError: null,
+    workerPromises: new Set(),
+    workerDispatches: 0,
+    workerCount: 0,
+    workerAllKnownCompleted: true,
+    workerUnknownUsage: false,
+    observedCostUsd: 0,
+    observedAny: false,
+    runnerAccountedUsd: 0,
+    runnerInflightUsd: 0,
+    overspendUsd: 0,
+    lateSettlementObserved: false,
+    response: null,
+    finalOutcome: null,
+    finalAuthorityFresh: null,
+    finalExecutionState: "not-started",
+    finalTermination: "none",
+    finalCost: null,
+  };
+  // The listener is assigned after the slot exists so it can identify itself.
+  const listener = () => beginCancellation(slot, "invocation-aborted");
+  (slot as { abortListener: () => void }).abortListener = listener;
+  try {
+    if (ACTUAL_ADD_EVENT_LISTENER === null) throw new Error("abort listener unavailable");
+    Reflect.apply(ACTUAL_ADD_EVENT_LISTENER, invocationSignal, ["abort", listener, { once: true }]);
+  } catch {
+    // A missing listener is caught by the sealed signal and deadline checks.
+  }
+  slot.deadlineTimer = setTimeout(() => {
+    beginCancellation(slot, "deadline-expired");
+  }, state.limits.maxDurationMs);
+  slotStates.set(slot, state);
+  return slot;
+}
+
+function currentCost(slot: Slot, state: CoordinatorState): NativeHarnessDelegationCost {
+  if (slot.finalCost !== null) return slot.finalCost;
+  const observedUsd = slot.observedAny ? money(slot.observedCostUsd) : null;
+  return Object.freeze({
+    allocatedUsd: state.limits.perRunUsd,
+    observedUsd,
+    unknownUsd: state.limits.perRunUsd,
+    overspendUsd: observedUsd === null ? 0 : money(Math.max(0, observedUsd - state.limits.perRunUsd)),
+  });
+}
+
+function buildSnapshot(state: CoordinatorState): NativeHarnessDelegationSnapshot {
+  const now = readClock(state.now) ?? 0;
+  const operations: NativeHarnessSnapshotOperation[] = [];
+  for (const slot of state.slots.values()) {
+    operations.push(Object.freeze({
+      association: slot.association,
+      runId: slot.runId,
+      state: slot.state,
+      outcome: slot.state === "settled" ? slot.finalOutcome : null,
+      authorityFresh: slot.state === "settled" ? slot.finalAuthorityFresh : null,
+      executionState: slot.state === "settled" ? slot.finalExecutionState : "pending-unknown",
+      termination: slot.state === "settled" ? slot.finalTermination : (slot.cancelRequested ? "cancelled" : "none"),
+      cancellation: slot.cancelState,
+      deadlineAt: slot.deadlineAt,
+      elapsedMs: Math.max(0, now - slot.admittedAt),
+      cost: currentCost(slot, state),
+      concurrencyHeld: slot.concurrencyHeld,
+      historical: slot.state === "settled",
+    }));
+  }
+  return deepFreeze({
+    schema: NATIVE_HARNESS_DELEGATION_SNAPSHOT_SCHEMA,
+    enabled: state.enabled,
+    disposed: state.disposed,
+    limits: state.limits,
+    retainedOperations: state.slots.size,
+    activeOperations: state.activeOperations,
+    lifetime: {
+      limitUsd: state.limits.lifetimeUsd,
+      accountedUsd: state.lifetimeAccountedUsd,
+      observedUsd: state.lifetimeObservedUsd,
+      unknownUsd: state.lifetimeUnknownUsd,
+      overspendUsd: state.lifetimeOverspendUsd,
+      budgetBlocked: state.budgetBlocked,
+    },
+    operations,
+  });
+}
+
+function handleExisting(
+  state: CoordinatorState,
+  slot: Slot,
+  toolCallId: string,
+  task: string,
+  signal: AbortSignal,
+): Promise<NativeHarnessDelegationResult> {
+  if (task !== slot.task) {
+    return Promise.resolve(refusedResult(
+      "the same actual agent_harness call was reused with a different task",
+      slot.association,
+    ));
+  }
+  if (signal !== slot.invocationSignal) {
+    return Promise.resolve(refusedResult(
+      "the same actual agent_harness call was reused with a different invocation signal",
+      slot.association,
+    ));
+  }
+  const main = readMainContext(state);
+  if (!main.ok) return Promise.resolve(refusedResult(main.reason, slot.association));
+  const capture = readNativeCapture(state.native, toolCallId, main.context);
+  if (!capture.ok) return Promise.resolve(refusedResult(capture.reason, slot.association));
+  if (!sameAssociation(capture.association, slot.association)) {
+    return Promise.resolve(refusedResult(
+      "the same actual agent_harness call id now has an incompatible native association",
+      slot.association,
+    ));
+  }
+  const gate = authorityGate(slot, "replay");
+  if (gate !== null) return Promise.resolve(refusedResult(gate, slot.association));
+  if (slot.state === "running") return slot.promise;
+  if (slot.response === null) {
+    return Promise.resolve(refusedResult(
+      "the retained delegation operation has no settled result",
+      slot.association,
+    ));
+  }
+  return Promise.resolve(historicalResult(slot.response));
+}
+
+function admitNew(
+  state: CoordinatorState,
+  toolCallId: string,
+  task: string,
+  signal: AbortSignal,
+  capture: Extract<NativeCaptureResult, { ok: true }>,
+  admittedAt: number,
+): Promise<NativeHarnessDelegationResult> {
+  state.lifetimeAccountedUsd += state.limits.perRunUsd;
+  state.activeOperations += 1;
+  const slot = createSlot(
+    state,
+    toolCallId,
+    capture.ref,
+    capture.association,
+    task,
+    signal,
+    admittedAt,
+  );
+  state.slots.set(toolCallId, slot);
+  void runSlot(slot);
+  return slot.promise;
+}
+
+function canAdmit(state: CoordinatorState): string | null {
+  if (state.disposed) return "the delegation coordinator was disposed";
+  if (!state.enabled) return "the delegation coordinator is disabled";
+  if (state.slots.size >= state.limits.maxRetainedOperations) {
+    return "the bounded delegation retention is exhausted; no tombstone was evicted";
+  }
+  if (state.activeOperations >= state.limits.maxConcurrent) {
+    return "the bounded delegation concurrency is already reserved";
+  }
+  if (state.budgetBlocked) return "a prior observed cost overspend stopped further delegation dispatch";
+  if (state.lifetimeAccountedUsd + state.limits.perRunUsd > state.limits.lifetimeUsd + USD_EPSILON) {
+    return "the lifetime delegation budget is exhausted or reserved";
+  }
+  return null;
+}
+
+export function createNativeHarnessDelegation(
+  options: NativeHarnessDelegationOptions,
+): NativeHarnessDelegationCoordinator {
+  const fields = readStrictFields(
+    options,
+    ["native", "policy", "getContext", "prepare", "runner", "now", "enabled"],
+    ["native", "getContext", "prepare", "runner"],
+  );
+  if (fields === null) {
+    throw new NativeHarnessDelegationError(
+      "Delegation options must be a plain own-data object with native, getContext, prepare and runner.",
+    );
+  }
+  const nativeValue = fields.get("native");
+  if (!isOpaqueRef(nativeValue)) {
+    throw new NativeHarnessDelegationError("Delegation native controls must be an opaque object.");
+  }
+  const captureCall = readCallable(nativeValue, "captureCall");
+  const prepareCallCheck = readCallable(nativeValue, "prepareCallCheck");
+  if (captureCall === null || prepareCallCheck === null) {
+    throw new NativeHarnessDelegationError("Delegation native controls are missing captureCall or prepareCallCheck.");
+  }
+  const getContext = fields.get("getContext");
+  const prepare = fields.get("prepare");
+  const runnerValue = fields.get("runner");
+  if (typeof getContext !== "function" || typeof prepare !== "function") {
+    throw new NativeHarnessDelegationError("Delegation getContext and prepare must be functions.");
+  }
+  if (!isOpaqueRef(runnerValue)) {
+    throw new NativeHarnessDelegationError("Delegation runner must be an object with a run method.");
+  }
+  const runnerRun = readCallable(runnerValue, "run");
+  if (runnerRun === null) throw new NativeHarnessDelegationError("Delegation runner is missing run.");
+  const nowValue = fields.get("now");
+  if (nowValue !== undefined && typeof nowValue !== "function") {
+    throw new NativeHarnessDelegationError("Delegation now must be a function when present.");
+  }
+  const enabledValue = fields.get("enabled");
+  if (enabledValue !== undefined && typeof enabledValue !== "boolean") {
+    throw new NativeHarnessDelegationError("Delegation enabled must be a boolean when present.");
+  }
+  const limits = normalizePolicy(fields.get("policy"));
+  const state: CoordinatorState = {
+    native: {
+      receiver: nativeValue as NativeEntryControls,
+      captureCall: captureCall as NativeCallPort["captureCall"],
+      prepareCallCheck: prepareCallCheck as NativeCallPort["prepareCallCheck"],
+    },
+    limits,
+    getContext: getContext as () => NativeContext,
+    prepare: prepare as CoordinatorState["prepare"],
+    runner: {
+      receiver: runnerValue as Runner,
+      run: runnerRun as RunnerPort["run"],
+    },
+    now: (nowValue as (() => number) | undefined) ?? Date.now,
+    enabled: enabledValue === true,
+    disposed: false,
+    slots: new Map(),
+    admissionInProgress: false,
+    revalidationInProgress: false,
+    activeOperations: 0,
+    lifetimeAccountedUsd: 0,
+    lifetimeObservedUsd: 0,
+    lifetimeUnknownUsd: 0,
+    lifetimeOverspendUsd: 0,
+    budgetBlocked: false,
+  };
+
+  const coordinator: NativeHarnessDelegationCoordinator = Object.freeze({
+    get enabled(): boolean {
+      return state.enabled;
+    },
+    get disposed(): boolean {
+      return state.disposed;
+    },
+    invoke(actualToolCallId: unknown, input: unknown, signal: unknown): Promise<NativeHarnessDelegationResult> {
+      if (state.disposed) {
+        return Promise.resolve(refusedResult("the delegation coordinator was disposed"));
+      }
+      if (!state.enabled) {
+        return Promise.resolve(refusedResult("the delegation coordinator is disabled"));
+      }
+      const toolCallId = boundedString(actualToolCallId, MAX_TOOL_CALL_ID_CHARS);
+      if (toolCallId === null) {
+        return Promise.resolve(refusedResult("the actual agent_harness tool call id is unavailable"));
+      }
+      const parsedTask = parseTaskInput(input);
+      if (!parsedTask.ok) return Promise.resolve(refusedResult(parsedTask.reason));
+      const signalRead = readActualAbortSignal(signal);
+      if (!signalRead.ok) return Promise.resolve(refusedResult(signalRead.reason));
+      if (signalRead.aborted) {
+        return Promise.resolve(refusedResult("the delegation invocation was cancelled before admission"));
+      }
+      const invocationSignal = signal as AbortSignal;
+
+      const existing = state.slots.get(toolCallId);
+      if (existing !== undefined) {
+        if (state.revalidationInProgress) {
+          return Promise.resolve(refusedResult(
+            "reentrant delegation revalidation was refused before recursion",
+            existing.association,
+          ));
+        }
+        state.revalidationInProgress = true;
+        try {
+          return handleExisting(state, existing, toolCallId, parsedTask.task, invocationSignal);
+        } finally {
+          state.revalidationInProgress = false;
+        }
+      }
+      if (state.admissionInProgress) {
+        return Promise.resolve(refusedResult(
+          "reentrant delegation admission was refused before any new run was reserved",
+        ));
+      }
+
+      const preAdmission = canAdmit(state);
+      if (preAdmission !== null) return Promise.resolve(refusedResult(preAdmission));
+      const admittedAt = readClock(state.now);
+      if (admittedAt === null) {
+        return Promise.resolve(refusedResult("the delegation clock is unavailable"));
+      }
+      state.admissionInProgress = true;
+      try {
+        const main = readMainContext(state);
+        if (!main.ok) return Promise.resolve(refusedResult(main.reason));
+        const capture = readNativeCapture(state.native, toolCallId, main.context);
+        if (!capture.ok) return Promise.resolve(refusedResult(capture.reason));
+
+        // Capture and getContext callbacks are trusted but can still reenter;
+        // a reentrant admission is refused by the lock above, and all facts are
+        // re-read synchronously before reservation.
+        const after = canAdmit(state);
+        if (after !== null) return Promise.resolve(refusedResult(after, capture.association));
+        const afterSignal = readActualAbortSignal(invocationSignal);
+        if (!afterSignal.ok) return Promise.resolve(refusedResult(afterSignal.reason, capture.association));
+        if (afterSignal.aborted) {
+          return Promise.resolve(refusedResult("the delegation invocation was cancelled before reservation", capture.association));
+        }
+        const raced = state.slots.get(toolCallId);
+        if (raced !== undefined) {
+          return handleExisting(state, raced, toolCallId, parsedTask.task, invocationSignal);
+        }
+        return admitNew(state, toolCallId, parsedTask.task, invocationSignal, capture, admittedAt);
+      } finally {
+        state.admissionInProgress = false;
+      }
+    },
+    cancel(actualToolCallId: unknown): boolean {
+      const toolCallId = boundedString(actualToolCallId, MAX_TOOL_CALL_ID_CHARS);
+      if (toolCallId === null) return false;
+      const slot = state.slots.get(toolCallId);
+      if (slot === undefined || slot.state !== "running" || slot.cancelRequested) return false;
+      beginCancellation(slot, "cancel-requested");
+      return true;
+    },
+    dispose(): void {
+      if (state.disposed) return;
+      state.disposed = true;
+      for (const slot of state.slots.values()) {
+        if (slot.state === "running") beginCancellation(slot, "disposed");
+      }
+    },
+    inspect(): NativeHarnessDelegationSnapshot {
+      return buildSnapshot(state);
+    },
+  });
+  return coordinator;
+}
