@@ -3,12 +3,13 @@
  *
  * This is a library wrapper, not an OMP extension or CLI entry. It exposes the
  * controller, the actual API-key RPC runner, the capability probe, the pure
- * bounded run/events history decoders and the types needed to construct
- * requests and read results. Importing this module starts no process and reads
- * no credential.
+ * bounded run/events history decoders, the pure bounded creation-origin text
+ * decoder and the types needed to construct requests and read results.
+ * Importing this module starts no process and reads no credential. No writable
+ * RunStore is exported.
  */
 export { HarnessController } from "./upstream/src/controller.ts";
-export { decodeRunEventsText, decodeRunHistoryText } from "./upstream/src/store.ts";
+export { decodeRunEventsText, decodeRunHistoryText, decodeRunRecoveryOriginText } from "./upstream/src/store.ts";
 export { OmpRpcRunner, probeRpcCapabilities } from "./upstream/src/runner.ts";
 export type { OmpRpcRunnerOptions } from "./upstream/src/runner.ts";
 export type {
@@ -17,6 +18,8 @@ export type {
   RunConfig,
   RunEvent,
   RunRecord,
+  RunRecoveryOrigin,
+  RunRecoverySeed,
   Runner,
   WorkerRequest,
   WorkerResult,

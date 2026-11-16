@@ -27,7 +27,7 @@ const VENDOR_ROOT = path.join(REPO_ROOT, "vendor/harness2");
 const SOURCE_MANIFEST = path.join(VENDOR_ROOT, "SOURCE.json");
 const UPSTREAM_REPOSITORY = "https://github.com/HugeKangroo/omp-harness2";
 const UPSTREAM_BASE_COMMIT = "6d5cd6386c8a085d0070cfb660ddbc5c7f76b92e";
-const EXPECTED_SOURCE_ID = "074cabe55a52d95e7de26d795ff1a347cfd3c427b1736bbeb2d6dfb79a99c63a";
+const EXPECTED_SOURCE_ID = "f7c8fd263d52abe2a4f0e75a48e7a9f3aebf4f9f27ed3045bf200add0bb567fa";
 const UPSTREAM_MODULES = [
   "adaptation.ts",
   "approval-channel.ts",
@@ -68,12 +68,14 @@ const EXPECTED_MODIFIED_FILES = [
   "vendor/harness2/upstream/src/evolution.ts",
   "vendor/harness2/upstream/src/runner.ts",
   "vendor/harness2/upstream/src/store.ts",
+  "vendor/harness2/upstream/src/types.ts",
 ].sort();
 const EXPECTED_EDITED_ORIGINALS: Record<string, string> = {
   "vendor/harness2/upstream/src/controller.ts": "711967e2e61220953e00412dbfcf3dac623202f0cd01d9e1fcfd002113582d92",
   "vendor/harness2/upstream/src/evolution.ts": "706d229570950eb074844472ada15237477ed9d86ffb8b4443f9601861f16985",
   "vendor/harness2/upstream/src/runner.ts": "589cde36411bcb71ea06a2c628b4fa28dbbc36f44d1431043452e98d9f829f24",
   "vendor/harness2/upstream/src/store.ts": "d3cc63d6a8a5dd10e073987927febac1fa69f076b9beeba9e08c2e198df472c8",
+  "vendor/harness2/upstream/src/types.ts": "b3e0f123e816beb0ea1bb29522a3bc9aa7c9afde29bce02aa11548508cde7842",
 };
 
 type SourceFileKind = "upstream-source" | "license" | "wrapper" | "provenance";
@@ -367,6 +369,7 @@ describe("G5-1 vendored Harness² source capsule", () => {
       "OmpRpcRunner",
       "decodeRunEventsText",
       "decodeRunHistoryText",
+      "decodeRunRecoveryOriginText",
       "probeRpcCapabilities",
     ]);
     expect(typeof vendored.HarnessController).toBe("function");

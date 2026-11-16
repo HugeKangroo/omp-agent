@@ -2,7 +2,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdir, open, readdir, rename, rm } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
-import { CANDIDATE_IDS, STAGE_IDS, type HarnessBundle, type LibraryEntry, type RunEvent, type RunRecord } from "./types.ts";
+import { CANDIDATE_IDS, STAGE_IDS, type HarnessBundle, type LibraryEntry, type RunEvent, type RunRecord, type RunRecoveryOrigin, type RunRecoverySeed } from "./types.ts";
 import { validateAdaptationPolicy } from "./adaptation";
 import { validateOmpProfileAuth } from "./omp-profile";
 import { validateEvolution } from "./evolution";
@@ -30,6 +30,126 @@ function nonempty(value: unknown): value is string { return typeof value === "st
 function timestamp(value: unknown): boolean { return typeof value === "string" && Number.isFinite(Date.parse(value)); }
 function finite(value: unknown): boolean { return typeof value === "number" && Number.isFinite(value) && value >= 0; }
 function invariant(ok: unknown, field: string): asserts ok { if (!ok) throw new Error(`Invalid stored field: ${field}`); }
+
+const RECOVERY_SEED_SCHEMA = "omp-agent.native-harness-recovery-seed.v1";
+const RECOVERY_ORIGIN_SCHEMA = "omp-agent.native-harness-recovery-origin.v1";
+const RECOVERY_PROFILE = "native-auto-scoped-files.v1";
+const RECOVERY_SEED_MAX_BYTES = 4096;
+const RECOVERY_ORIGIN_MAX_BYTES = 8192;
+const RECOVERY_RUN_MAX_BYTES = 256 * 1024;
+const RECOVERY_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const RECOVERY_SHA256 = /^[a-f0-9]{64}$/;
+const RECOVERY_SEED_KEYS = Object.freeze([
+  "accountingOwnerId",
+  "accountingOwnerRevision",
+  "admissionId",
+  "admittedAt",
+  "allocatedCostUsd",
+  "deadlineAt",
+  "inputManifestSha256",
+  "profile",
+  "schema",
+  "sourceAssociationSha256",
+  "sourceDescriptorSha256",
+].sort());
+const RECOVERY_ORIGIN_KEYS = Object.freeze([
+  "createdAt",
+  "nonce",
+  "recordIdentitySha256",
+  "runId",
+  "schema",
+  "seed",
+].sort());
+
+function exactKeys(value: Record<string, unknown>, expected: readonly string[], field: string): void {
+  const keys = Object.keys(value).sort();
+  invariant(keys.length === expected.length && keys.every((key, index) => key === expected[index]), `${field} fields`);
+}
+function validateRecoverySeed(value: unknown): asserts value is RunRecoverySeed {
+  invariant(object(value), "run.recoveryOrigin.seed");
+  exactKeys(value, RECOVERY_SEED_KEYS, "run.recoveryOrigin.seed");
+  invariant(value.schema === RECOVERY_SEED_SCHEMA && value.profile === RECOVERY_PROFILE, "recovery seed schema/profile");
+  invariant(typeof value.accountingOwnerId === "string" && RECOVERY_UUID.test(value.accountingOwnerId), "recovery seed accountingOwnerId");
+  invariant(typeof value.admissionId === "string" && RECOVERY_UUID.test(value.admissionId), "recovery seed admissionId");
+  invariant(Number.isSafeInteger(value.accountingOwnerRevision) && (value.accountingOwnerRevision as number) >= 0, "recovery seed accountingOwnerRevision");
+  for (const field of ["sourceAssociationSha256", "sourceDescriptorSha256", "inputManifestSha256"] as const) {
+    invariant(typeof value[field] === "string" && RECOVERY_SHA256.test(value[field] as string), `recovery seed ${field}`);
+  }
+  const admittedAt = value.admittedAt;
+  const deadlineAt = value.deadlineAt;
+  invariant(Number.isSafeInteger(admittedAt) && (admittedAt as number) > 0, "recovery seed admittedAt");
+  invariant(Number.isSafeInteger(deadlineAt) && (deadlineAt as number) > 0, "recovery seed deadlineAt");
+  const window = (deadlineAt as number) - (admittedAt as number);
+  invariant(window > 0 && window <= 300000, "recovery seed admission interval");
+  const allocated = value.allocatedCostUsd;
+  invariant(typeof allocated === "number" && Number.isFinite(allocated) && allocated > 0 && allocated <= 1, "recovery seed allocatedCostUsd");
+}
+function validateRecoveryOriginShape(value: unknown, expectedRunId: string): asserts value is RunRecoveryOrigin {
+  invariant(object(value), "run.recoveryOrigin");
+  exactKeys(value, RECOVERY_ORIGIN_KEYS, "run.recoveryOrigin");
+  invariant(value.schema === RECOVERY_ORIGIN_SCHEMA, "recovery origin schema");
+  invariant(typeof value.nonce === "string" && RECOVERY_UUID.test(value.nonce), "recovery origin nonce");
+  invariant(typeof value.runId === "string" && value.runId === expectedRunId, "recovery origin run ID");
+  validId(value.runId as string);
+  invariant(timestamp(value.createdAt), "recovery origin createdAt");
+  invariant(typeof value.recordIdentitySha256 === "string" && RECOVERY_SHA256.test(value.recordIdentitySha256), "recovery origin record identity");
+  validateRecoverySeed(value.seed);
+}
+function buildRecoveryRecordIdentity(record: RunRecord): string {
+  return createHash("sha256").update(canonical({
+    id: record.id,
+    createdAt: record.createdAt,
+    workspace: record.workspace,
+    task: record.task,
+    config: record.config,
+    baseHarness: record.baseHarness,
+    libraryEntries: record.libraryEntries,
+  }), "utf8").digest("hex");
+}
+function freezeRecoverySeed(seed: RunRecoverySeed): RunRecoverySeed {
+  return Object.freeze({
+    schema: seed.schema,
+    profile: seed.profile,
+    accountingOwnerId: seed.accountingOwnerId,
+    admissionId: seed.admissionId,
+    accountingOwnerRevision: seed.accountingOwnerRevision,
+    sourceAssociationSha256: seed.sourceAssociationSha256,
+    sourceDescriptorSha256: seed.sourceDescriptorSha256,
+    inputManifestSha256: seed.inputManifestSha256,
+    admittedAt: seed.admittedAt,
+    deadlineAt: seed.deadlineAt,
+    allocatedCostUsd: seed.allocatedCostUsd,
+  });
+}
+function freezeRecoveryOrigin(origin: RunRecoveryOrigin): RunRecoveryOrigin {
+  return Object.freeze({
+    schema: origin.schema,
+    nonce: origin.nonce,
+    runId: origin.runId,
+    createdAt: origin.createdAt,
+    recordIdentitySha256: origin.recordIdentitySha256,
+    seed: freezeRecoverySeed(origin.seed),
+  });
+}
+/** Fixed-shape encoded origin bound, applied to the embedded origin object. */
+function assertRecoveryOriginEncodedSize(origin: RunRecoveryOrigin): void {
+  if (Buffer.byteLength(JSON.stringify(origin), "utf8") > RECOVERY_ORIGIN_MAX_BYTES) {
+    throw new RangeError(`Recovery origin exceeds the ${RECOVERY_ORIGIN_MAX_BYTES}-byte profile.`);
+  }
+}
+/** Raw seed text is read once and decoded by this private fixed-shape codec. */
+function decodeRunRecoverySeedText(raw: string): RunRecoverySeed {
+  if (typeof raw !== "string") throw new StoreCorruptionError("Corrupt recovery seed: expected UTF-8 text.");
+  if (Buffer.byteLength(raw, "utf8") > RECOVERY_SEED_MAX_BYTES) {
+    throw new RangeError(`Recovery seed text exceeds the ${RECOVERY_SEED_MAX_BYTES}-byte profile.`);
+  }
+  let value: unknown;
+  try { value = JSON.parse(raw); }
+  catch { throw new StoreCorruptionError("Corrupt recovery seed: invalid JSON. No fallback was applied."); }
+  try { validateRecoverySeed(value); }
+  catch (error) { throw new StoreCorruptionError(`Corrupt recovery seed: ${(error as Error).message}. No fallback was applied.`); }
+  return freezeRecoverySeed(value);
+}
 
 function validateHarness(value: unknown): asserts value is HarnessBundle {
   invariant(object(value), "harness");
@@ -134,6 +254,14 @@ function validateRun(value: unknown, id?: string): asserts value is RunRecord {
       if (value.winner !== undefined) invariant(value.winner === exploration.selection.winner, "run winner matches selection");
     }
   }
+  if (Object.hasOwn(value, "recoveryOrigin")) {
+    invariant(value.recoveryOrigin !== undefined, "run.recoveryOrigin present");
+    validateRecoveryOriginShape(value.recoveryOrigin, value.id);
+    const origin = value.recoveryOrigin as RunRecoveryOrigin;
+    invariant(origin.createdAt === value.createdAt, "recovery origin createdAt agrees with run");
+    invariant(origin.recordIdentitySha256 === buildRecoveryRecordIdentity(value as unknown as RunRecord), "recovery origin record identity agrees with run");
+    assertRecoveryOriginEncodedSize(origin);
+  }
 }
 function validateEvent(value: unknown, id?: string): asserts value is RunEvent {
   invariant(object(value) && value.schemaVersion === 1 && nonempty(value.runId), "event version/runId");
@@ -226,6 +354,34 @@ export function decodeRunEventsText(raw: string, expectedRunId: string): RunEven
   return lines.map((line, index) =>
     parse<RunEvent>(line, `events.jsonl:${index + 1}`, value => validateEvent(value, expectedRunId)));
 }
+
+/**
+ * Pure readonly decoder for one already-read `recoveryOrigin` text. It checks
+ * only the fixed origin/seed shape and the expected run ID; it cannot verify
+ * `recordIdentitySha256`, which requires the surrounding actual RunRecord.
+ * Oversize text is refused before JSON.parse; malformed JSON, unknown/absent
+ * fields, an unsafe number or a mismatched run ID is StoreCorruptionError.
+ * A BOM is not stripped, defaults are not invented and no backup is consulted.
+ */
+export function decodeRunRecoveryOriginText(raw: string, expectedRunId: string): RunRecoveryOrigin {
+  if (typeof raw !== "string") throw new StoreCorruptionError("Corrupt recovery origin: expected UTF-8 text.");
+  try { validId(expectedRunId); }
+  catch { throw new StoreCorruptionError("Corrupt recovery origin: invalid expected run ID."); }
+  if (Buffer.byteLength(raw, "utf8") > RECOVERY_ORIGIN_MAX_BYTES) {
+    throw new RangeError(`Recovery origin text exceeds the ${RECOVERY_ORIGIN_MAX_BYTES}-byte profile.`);
+  }
+  let value: unknown;
+  try { value = JSON.parse(raw); }
+  catch { throw new StoreCorruptionError("Corrupt recovery origin: invalid JSON. No fallback was applied."); }
+  try { validateRecoveryOriginShape(value, expectedRunId); }
+  catch (error) { throw new StoreCorruptionError(`Corrupt recovery origin: ${(error as Error).message}. No fallback was applied.`); }
+  return freezeRecoveryOrigin(value as RunRecoveryOrigin);
+}
+/** Presence of the origin key, even in otherwise malformed parseable JSON. */
+function declaresRunRecoveryOrigin(raw: string): boolean {
+  try { const value: unknown = JSON.parse(raw); return object(value) && Object.hasOwn(value, "recoveryOrigin"); }
+  catch { return false; }
+}
 async function serialized<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const previous = queues.get(key) ?? Promise.resolve();
   const pending = previous.catch(() => {}).then(fn);
@@ -304,10 +460,60 @@ export class RunStore {
   constructor(root: string) { this.root = resolve(root); }
   runDir(id: string): string { return join(this.root, validId(id)); }
   async create(record: RunRecord): Promise<RunRecord> {
+    if (Object.hasOwn(record, "recoveryOrigin")) throw new StoreConflictError(`Recovery origin is store-issued; use createWithRecoveryOrigin: ${record.id}`);
     const created = structuredClone({ ...record, revision: 0 }); validateRun(created);
     return withWriteLock(this.runDir(created.id), async () => {
       if (await readRegular(join(this.runDir(created.id), "run.json")) !== undefined || await readRegular(join(this.runDir(created.id), "run.json.bak")) !== undefined) throw new StoreConflictError(`Run already exists: ${created.id}`);
       await atomicWrite(join(this.runDir(created.id), "run.json"), serialize(created)); return created;
+    });
+  }
+  /**
+   * Explicit creation of an initial native-auto run with a store-issued,
+   * immutable creation association. The seed is caller-declared historical
+   * data, not authority: this method checks only initial-record consistency
+   * and fresh-directory/atomic-write behavior. It never means the run is
+   * recoverable or eligible to resume.
+   */
+  async createWithRecoveryOrigin(record: RunRecord, seedText: string): Promise<RunRecord> {
+    if (Object.hasOwn(record, "recoveryOrigin")) throw new StoreConflictError(`Recovery origin is store-issued; supply seed text: ${record.id}`);
+    const owned = structuredClone(record); validateRun(owned);
+    const seed = decodeRunRecoverySeedText(seedText);
+    invariant(owned.schemaVersion === 1 && owned.status === "queued", "initial recovery run version/status");
+    invariant(owned.config.mode === "product" && owned.config.strategy === "auto", "initial recovery run product/auto");
+    invariant(owned.config.execution === undefined, "initial recovery run execution profile");
+    invariant(owned.config.maxCostUsd > 0 && owned.config.maxDurationMs > 0 && owned.config.stageTimeoutMs > 0, "initial recovery run budgets");
+    invariant(owned.config.maxCostUsd === seed.allocatedCostUsd, "initial recovery allocation matches config.maxCostUsd");
+    invariant(Object.keys(owned.stages).length === 0 && owned.snapshot === undefined && owned.winner === undefined && owned.evolution === undefined, "initial recovery run must be undispatched");
+    const createdAt = Date.parse(owned.createdAt);
+    invariant(createdAt >= seed.admittedAt && createdAt < seed.deadlineAt, "initial recovery run createdAt lies inside the original admission interval");
+
+    await privateDirectory(this.root);
+    const directory = this.runDir(owned.id);
+    try { await mkdir(directory, { mode: 0o700 }); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") throw new StoreConflictError(`Run directory already exists: ${owned.id}`);
+      throw error;
+    }
+    return withWriteLock(directory, async () => {
+      const path = join(directory, "run.json");
+      if (await readRegular(path) !== undefined || await readRegular(`${path}.bak`) !== undefined) throw new StoreConflictError(`Run already exists: ${owned.id}`);
+      const origin = freezeRecoveryOrigin({
+        schema: RECOVERY_ORIGIN_SCHEMA,
+        nonce: randomUUID(),
+        runId: owned.id,
+        createdAt: owned.createdAt,
+        recordIdentitySha256: buildRecoveryRecordIdentity(owned),
+        seed,
+      });
+      const created: RunRecord = { ...owned, revision: 0, recoveryOrigin: origin };
+      // validateRun applies the fixed 8192-byte embedded-origin profile here,
+      // before the initial primary exists.
+      validateRun(created);
+      const contents = serialize(created);
+      if (Buffer.byteLength(contents, "utf8") > RECOVERY_RUN_MAX_BYTES) {
+        throw new RangeError(`Initial recovery run exceeds the ${RECOVERY_RUN_MAX_BYTES}-byte profile.`);
+      }
+      await atomicWrite(path, contents); return created;
     });
   }
   async get(id: string): Promise<RunRecord | undefined> {
@@ -333,14 +539,30 @@ export class RunStore {
   }
   async save(record: RunRecord, expectedRevision: number): Promise<RunRecord> {
     validateRun(record); const next = structuredClone(record);
-    return withWriteLock(this.runDir(record.id), async () => {
-      const current = await this.get(record.id);
-      if (!current || current.revision !== expectedRevision || record.revision !== expectedRevision) throw new StoreConflictError(`Revision conflict for ${record.id}: expected ${expectedRevision}, found ${current?.revision ?? "missing"}`);
+    // Own the admitted ID/revision before the first await; later caller
+    // mutation cannot retarget this operation's lock, CAS or writes.
+    const id = next.id;
+    const admittedRevision = next.revision;
+    return withWriteLock(this.runDir(id), async () => {
+      const current = await this.get(id);
+      if (!current || current.revision !== expectedRevision || admittedRevision !== expectedRevision) throw new StoreConflictError(`Revision conflict for ${id}: expected ${expectedRevision}, found ${current?.revision ?? "missing"}`);
       if (current.revision >= Number.MAX_SAFE_INTEGER) throw new StoreConflictError("Revision counter exhausted");
+      if (current.recoveryOrigin !== undefined || next.recoveryOrigin !== undefined) {
+        if (current.recoveryOrigin === undefined || next.recoveryOrigin === undefined) {
+          throw new StoreConflictError(`Recovery origin cannot be added to or removed from run ${id}`);
+        }
+        if (canonical(current.recoveryOrigin) !== canonical(next.recoveryOrigin)) {
+          throw new StoreConflictError(`Recovery origin is immutable for run ${id}`);
+        }
+        if (buildRecoveryRecordIdentity(current) !== buildRecoveryRecordIdentity(next)) {
+          throw new StoreConflictError(`Protected run identity cannot change for marked run ${id}`);
+        }
+        next.recoveryOrigin = current.recoveryOrigin;
+      }
       next.revision = current.revision + 1; next.updatedAt = new Date().toISOString();
       next.createdAt = current.createdAt;
-      await atomicWrite(join(this.runDir(record.id), "run.json.bak"), serialize(current));
-      await atomicWrite(join(this.runDir(record.id), "run.json"), serialize(next)); return next;
+      await atomicWrite(join(this.runDir(id), "run.json.bak"), serialize(current));
+      await atomicWrite(join(this.runDir(id), "run.json"), serialize(next)); return next;
     });
   }
   async appendEvent(event: RunEvent): Promise<void> {
@@ -372,6 +594,7 @@ export class RunStore {
     validId(id);
     return withWriteLock(this.runDir(id), async () => {
       const path = join(this.runDir(id), "run.json"); const raw = await readRegular(path);
+      const declaresOrigin = raw !== undefined && declaresRunRecoveryOrigin(raw);
       if (raw !== undefined) {
         let valid = false;
         try { parse<RunRecord>(raw, path, value => validateRun(value, id)); valid = true; } catch (error) { if (!(error instanceof StoreCorruptionError)) throw error; }
@@ -380,6 +603,11 @@ export class RunStore {
       const backup = await readRegular(`${path}.bak`);
       if (backup === undefined) throw new StoreCorruptionError(`No backup available for ${id}`);
       const record = parse<RunRecord>(backup, `${path}.bak`, value => validateRun(value, id));
+      // A creation-bound marker is never recreated or erased by backup rollback,
+      // even when the current file is malformed after declaring that marker.
+      if (record.recoveryOrigin !== undefined || declaresOrigin) {
+        throw new StoreConflictError(`Run ${id} declares a creation-bound recovery origin; backup rollback is refused`);
+      }
       invariant(record.revision < Number.MAX_SAFE_INTEGER - 1, "recoverable revision");
       if (raw !== undefined) await atomicWrite(`${path}.corrupt.${randomUUID()}`, raw);
       record.revision += 2; record.updatedAt = new Date().toISOString();

@@ -154,9 +154,39 @@ export interface LibraryEntry {
   lesson: Lesson;
 }
 
+/** Initial historical facts supplied once, at original creation. These values
+ * are declarations recorded with the record; they are not proof of authority,
+ * source completeness or eligibility to resume. */
+export interface RunRecoverySeed {
+  schema: "omp-agent.native-harness-recovery-seed.v1";
+  profile: "native-auto-scoped-files.v1";
+  accountingOwnerId: string;
+  admissionId: string;
+  accountingOwnerRevision: number;
+  sourceAssociationSha256: string;
+  sourceDescriptorSha256: string;
+  inputManifestSha256: string;
+  admittedAt: number;
+  deadlineAt: number;
+  allocatedCostUsd: number;
+}
+
+/** Store-issued immutable creation association. Presence means only that the
+ * association was recorded with the initial record; it never means the run is
+ * recoverable, stopped, current, authorized or budget-complete. */
+export interface RunRecoveryOrigin {
+  schema: "omp-agent.native-harness-recovery-origin.v1";
+  nonce: string;
+  runId: string;
+  createdAt: string;
+  recordIdentitySha256: string;
+  seed: RunRecoverySeed;
+}
+
 export interface RunRecord {
   schemaVersion: 1 | 2;
   evolution?: import("./evolution").EvolutionState;
+  recoveryOrigin?: RunRecoveryOrigin;
   id: string;
   revision: number;
   createdAt: string;
