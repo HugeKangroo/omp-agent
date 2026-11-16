@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { AsyncLocalStorage } from "node:async_hooks";
 import type { NativeContext, NativeToolResult } from "../../src/native-entry.ts";
 import {
   createNativeHarnessEntry,
@@ -85,6 +86,15 @@ function sampleSnapshot(): NativeHarnessDelegationSnapshot {
     },
     retainedOperations: 0,
     activeOperations: 0,
+    output: {
+      retainedCaptures: 0,
+      retainedBytes: 0,
+      reservedBytes: 0,
+      active: false,
+      maxCaptures: 8,
+      maxBytes: 2 * 1024 * 1024,
+      reservationBytes: 1024 * 1024,
+    },
     lifetime: {
       limitUsd: 5,
       accountedUsd: 0,
@@ -97,26 +107,49 @@ function sampleSnapshot(): NativeHarnessDelegationSnapshot {
   };
 }
 
+interface Registration {
+  readonly toolCallId: string;
+  readonly response: NativeHarnessDelegationResult;
+  readonly projection: NativeToolResult;
+  readonly signal: unknown;
+}
+
 interface HarnessFixture {
   entry: NativeHarnessEntry;
   readonly invocations: Invocation[];
   readonly scopes: { context: NativeContext; toolCallId: string }[];
+  readonly registrations: Registration[];
+  readonly registrationContexts: (NativeContext | undefined)[];
+  readonly operationPromises: unknown[];
   result: NativeHarnessDelegationResult;
   refuse: string | null;
   throwCoordinator: boolean;
+  registerThrows: boolean;
+  legacyRegister: boolean;
+  invokePromise: Promise<NativeHarnessDelegationResult> | null;
   coordinatorCalls: number;
 }
 
-function fixture(): HarnessFixture {
+function fixture(options: { legacyRegister?: boolean } = {}): HarnessFixture {
   const invocations: Invocation[] = [];
   const scopes: { context: NativeContext; toolCallId: string }[] = [];
+  const registrations: Registration[] = [];
+  const registrationContexts: (NativeContext | undefined)[] = [];
+  const als = new AsyncLocalStorage<NativeContext>();
+  const operationPromises: unknown[] = [];
   const fixtureState: HarnessFixture = {
     entry: null as unknown as NativeHarnessEntry,
     invocations,
     scopes,
+    registrations,
+    registrationContexts,
+    operationPromises,
     result: sampleResult(),
     refuse: null,
     throwCoordinator: false,
+    registerThrows: false,
+    legacyRegister: options.legacyRegister === true,
+    invokePromise: null,
     coordinatorCalls: 0,
   };
   const coordinator = {
@@ -124,8 +157,21 @@ function fixture(): HarnessFixture {
       fixtureState.coordinatorCalls += 1;
       fixtureState.invocations.push({ toolCallId, input, signal });
       if (fixtureState.throwCoordinator) throw new Error("/private/secret path failure");
-      return Promise.resolve(fixtureState.result);
+      return fixtureState.invokePromise ?? Promise.resolve(fixtureState.result);
     },
+    ...(fixtureState.legacyRegister ? {} : {
+      registerToolResultProjection(
+        toolCallId: string,
+        response: NativeHarnessDelegationResult,
+        projection: NativeToolResult,
+        signal: unknown,
+      ) {
+        fixtureState.registrations.push({ toolCallId, response, projection, signal });
+        fixtureState.registrationContexts.push(als.getStore());
+        if (fixtureState.registerThrows) throw new Error("/private/secret registration failure");
+        return { ok: true, reason: null };
+      },
+    }),
     inspect(): NativeHarnessDelegationSnapshot {
       return sampleSnapshot();
     },
@@ -146,7 +192,9 @@ function fixture(): HarnessFixture {
           coordinator,
           runWithContext<T>(scoped: NativeContext, toolCallId: string, operation: () => Promise<T>): Promise<T> {
             fixtureState.scopes.push({ context: scoped, toolCallId });
-            return operation();
+            const promise = als.run(scoped, () => operation());
+            fixtureState.operationPromises.push(promise);
+            return promise;
           },
           diagnostics: () => ["backend-diagnostic"],
         },
@@ -245,6 +293,61 @@ describe("native harness tool adapter", () => {
     expect(details(result).semanticAcceptance).toBe("not-evaluated");
     expect(details(result).runId).toBe("run-1");
     expect(details(result).outcome).toBe("backend-completed");
+  });
+
+  test("registers the exact frozen wire while preserving the original invoke promise", async () => {
+    const state = fixture();
+    const controller = new AbortController();
+    const invokePromise = Promise.resolve(state.result);
+    state.invokePromise = invokePromise;
+    const result = await state.entry.tool.execute(
+      "actual-call-9",
+      { task: "implement the bounded task" },
+      controller.signal,
+      undefined,
+      MAIN_CONTEXT,
+    );
+    expect(state.operationPromises).toHaveLength(1);
+    expect(state.operationPromises[0]).toBe(invokePromise);
+    expect(state.registrations).toHaveLength(1);
+    const registration = state.registrations[0]!;
+    expect(registration.toolCallId).toBe("actual-call-9");
+    expect(registration.response).toBe(state.result);
+    expect(registration.projection).toBe(result);
+    expect(registration.signal).toBe(controller.signal);
+    expect(state.registrationContexts).toEqual([MAIN_CONTEXT]);
+    expect(Object.isFrozen(result)).toBe(true);
+    expect(Object.isFrozen(result.details)).toBe(true);
+    expect(Object.isFrozen(result.content)).toBe(true);
+    expect(result.isError).toBeUndefined();
+  });
+
+  test("registration refusal or a legacy coordinator leaves execution available", async () => {
+    const throwing = fixture();
+    throwing.registerThrows = true;
+    let result = await throwing.entry.tool.execute(
+      "call-1",
+      { task: "bounded task" },
+      new AbortController().signal,
+      undefined,
+      MAIN_CONTEXT,
+    );
+    expect(result.isError).toBeUndefined();
+    expect(details(result).resultKind).toBe("live");
+    expect(throwing.registrations).toHaveLength(1);
+    expect(result.content[0]!.text).not.toContain("registration failure");
+
+    const legacy = fixture({ legacyRegister: true });
+    result = await legacy.entry.tool.execute(
+      "call-2",
+      { task: "bounded task" },
+      new AbortController().signal,
+      undefined,
+      MAIN_CONTEXT,
+    );
+    expect(result.isError).toBeUndefined();
+    expect(details(result).resultKind).toBe("live");
+    expect(legacy.registrations).toHaveLength(0);
   });
 
   test("does not expose the coordinator association, workspace paths or backend raw result", async () => {

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -7,6 +8,7 @@ import {
   type NativeContext,
   type NativeEntryControls,
   type NativeOmpApi,
+  type NativeToolResult,
 } from "../../src/native-entry.ts";
 import {
   clearPublishedTaskOwner,
@@ -20,9 +22,25 @@ import {
   type NativeHarnessDelegationCoordinator,
   type NativeHarnessDelegationPolicy,
   type NativeHarnessDelegationResult,
+  type NativeHarnessOutputPort,
+  type NativeHarnessOutputSelection,
   type NativeHarnessPrepareRequest,
   type NativeHarnessPrepareResult,
 } from "../../src/native-harness-delegation.ts";
+import {
+  captureNativeHarnessOutput,
+  matchesNativeHarnessOutputCapture,
+  type NativeHarnessOutputCapture,
+} from "../../src/native-harness-output.ts";
+import {
+  createNativeHarnessBackend,
+  readNativeHarnessBackendCompletion,
+} from "../../src/native-harness-backend.ts";
+import { createNativeHarnessEntry } from "../../src/native-harness-entry.ts";
+import {
+  captureWorkspaceText,
+  type NativeWorkspaceTextSnapshot,
+} from "../../src/native-work.ts";
 import type {
   Runner,
   WorkerRequest,
@@ -234,6 +252,107 @@ function runnerFor(handler: (request: WorkerRequest) => Promise<WorkerResult>): 
   return { run: handler };
 }
 
+function projectionFor(result: NativeHarnessDelegationResult, text?: string): NativeToolResult {
+  return {
+    content: [{ type: "text", text: text ?? JSON.stringify(result) }],
+    details: result,
+    isError: false,
+  };
+}
+
+async function emitResult(
+  f: Fixture,
+  toolCallId: string,
+  toolResult: NativeToolResult,
+  overrides: Record<string, unknown> = {},
+): Promise<void> {
+  await f.host.emit("tool_result", {
+    toolCallId,
+    toolName: AGENT_HARNESS,
+    input: { task: WORK_TASK },
+    content: toolResult.content,
+    details: toolResult.details,
+    isError: false,
+    ...overrides,
+  }, f.ctx);
+}
+
+function actualOutputPort(owner: () => string | null = () => null): NativeHarnessOutputPort {
+  return {
+    capture(backend: unknown, guard: () => void, signal: AbortSignal) {
+      return captureNativeHarnessOutput(backend, guard, signal);
+    },
+    matches(backend: unknown, capture: unknown) {
+      return matchesNativeHarnessOutputCapture(backend, capture);
+    },
+    revalidateOwner() {
+      return owner();
+    },
+  };
+}
+
+function outputCandidateRunner(): Runner {
+  return runnerFor(async (request) => {
+    await mkdir(request.artifactDir, { recursive: true, mode: 0o700 });
+    const eventsPath = path.join(request.artifactDir, "worker-events.jsonl");
+    await writeFile(eventsPath, `${JSON.stringify({ type: "fixture", stage: request.stage })}\n`, { mode: 0o600 });
+    let text = "stage completed";
+    if (request.stage === "plan") {
+      text = JSON.stringify({
+        decision: "direct",
+        reason: "Bounded output capture planning.",
+        criteria: [{ id: "task", description: "Fulfill the requested bounded task.", kind: "requirement" }],
+        routes: [],
+      });
+    } else if (request.stage === "baseline") {
+      await writeFile(path.join(request.cwd, "candidate.txt"), "candidate 0\n", { mode: 0o600 });
+      text = "baseline completed";
+    }
+    return {
+      text,
+      usage: { inputTokens: 1, outputTokens: 1, costUsd: 0.01 },
+      startedAt: new Date().toISOString(),
+      endedAt: new Date().toISOString(),
+      eventsPath,
+      status: "completed",
+    };
+  });
+}
+
+function syntheticCapture(
+  snapshot: NativeWorkspaceTextSnapshot,
+  copies: number,
+  task: string,
+): NativeHarnessOutputCapture {
+  return {
+    schema: "omp-agent.native-harness-output-capture.v1",
+    captureId: `synthetic-${snapshot.captureId}`,
+    originKind: "harness2-native",
+    completionId: "synthetic-completion",
+    sourceId: "synthetic-source",
+    runId: "run-1",
+    taskSha256: createHash("sha256").update(task, "utf8").digest("hex"),
+    baseSnapshotId: "synthetic-base",
+    manifestSha256: "0".repeat(64),
+    winner: { candidate: "baseline", attempt: 1, artifactHash: "0".repeat(64), traceHash: "0".repeat(64) },
+    changes: Array.from({ length: copies }, () => ({
+      path: "candidate.txt",
+      kind: "add" as const,
+      mode: 0o600,
+      controllerHash: "0".repeat(64),
+      snapshot,
+    })),
+    sources: [],
+    baseInputs: [],
+    stages: [],
+    digest: "0".repeat(64),
+    observedAt: 1,
+    taskAccepted: false,
+    semanticAcceptance: "not-evaluated",
+    limitations: [],
+  };
+}
+
 interface Calls {
   prepare: number;
   guard: number;
@@ -279,6 +398,7 @@ interface Hooks {
   ) => Promise<unknown>;
   cancel?: (runId: string, calls: Calls) => unknown;
   runner?: Runner;
+  output?: NativeHarnessOutputPort;
 }
 
 interface Harness {
@@ -372,6 +492,7 @@ function setup(f: Fixture, hooks: Hooks = {}): Harness {
     prepare,
     runner,
     ...(hooks.now === undefined ? {} : { now: hooks.now }),
+    ...(hooks.output === undefined ? {} : { output: hooks.output }),
     enabled: hooks.enabled ?? true,
   });
   coordinators.push(coordinator);
@@ -1551,5 +1672,608 @@ describe("native Harness2 host-only delegation", () => {
     expect(snapshotText).not.toContain("SECRET-CONFIG");
     expect(snapshotText).not.toContain("SECRET-WORKER-TEXT");
     expect(new TextEncoder().encode(snapshotText).byteLength).toBeLessThan(16 * 1024);
+  });
+
+  test("missing or malformed output ports keep execution available", async () => {
+    const absent = await preparedFixture();
+    const absentHarness = setup(absent);
+    const absentSignal = new AbortController().signal;
+    const absentResult = await settle(absentHarness.coordinator.invoke("call-1", { task: WORK_TASK }, absentSignal));
+    expect(absentResult.outcome).toBe("backend-completed");
+    const absentRegistration = absentHarness.coordinator.registerToolResultProjection(
+      "call-1",
+      absentResult,
+      projectionFor(absentResult),
+      absentSignal,
+    );
+    expect(absentRegistration.ok).toBe(false);
+    const absentCapture = await settle(absentHarness.coordinator.captureOutput("call-1", new AbortController().signal));
+    expect(absentCapture.ok).toBe(false);
+    if (!absentCapture.ok) expect(absentCapture.code).toBe("output-unavailable");
+
+    const malformed = await preparedFixture();
+    const malformedHarness = setup(malformed, {
+      output: { capture: 1 } as unknown as NativeHarnessOutputPort,
+    });
+    const malformedResult = await settle(malformedHarness.coordinator.invoke(
+      "call-1",
+      { task: WORK_TASK },
+      new AbortController().signal,
+    ));
+    expect(malformedResult.outcome).toBe("backend-completed");
+    const malformedCapture = await settle(malformedHarness.coordinator.captureOutput(
+      "call-1",
+      new AbortController().signal,
+    ));
+    expect(malformedCapture.ok).toBe(false);
+    if (!malformedCapture.ok) expect(malformedCapture.code).toBe("output-unavailable");
+  });
+
+  test("a copied response, foreign id or changed projection cannot register a source", async () => {
+    const f = await preparedFixture();
+    const h = setup(f, { output: actualOutputPort() });
+    const signal = new AbortController().signal;
+    const result = await settle(h.coordinator.invoke("call-1", { task: WORK_TASK }, signal));
+    const copied = { ...result } as NativeHarnessDelegationResult;
+    const copiedRegistration = h.coordinator.registerToolResultProjection(
+      "call-1",
+      copied,
+      projectionFor(result),
+      signal,
+    );
+    expect(copiedRegistration.ok).toBe(false);
+    expect(copiedRegistration.reason).toContain("exact retained original result");
+    const foreignId = h.coordinator.registerToolResultProjection(
+      "call-foreign",
+      result,
+      projectionFor(result),
+      signal,
+    );
+    expect(foreignId.ok).toBe(false);
+    const wrongSignal = h.coordinator.registerToolResultProjection(
+      "call-1",
+      result,
+      projectionFor(result),
+      new AbortController().signal,
+    );
+    expect(wrongSignal.ok).toBe(false);
+  });
+
+  test("registration is pending until the real event; changed content prevents capture", async () => {
+    const f = await preparedFixture();
+    const h = setup(f, { output: actualOutputPort() });
+    const signal = new AbortController().signal;
+    const result = await settle(h.coordinator.invoke("call-1", { task: WORK_TASK }, signal));
+    const wire = projectionFor(result);
+    const first = h.coordinator.registerToolResultProjection("call-1", result, wire, signal);
+    const second = h.coordinator.registerToolResultProjection("call-1", result, wire, signal);
+    expect(first.ok).toBe(true);
+    expect(second.ok).toBe(true);
+    const pending = await settle(h.coordinator.captureOutput("call-1", new AbortController().signal));
+    expect(pending.ok).toBe(false);
+    if (!pending.ok) expect(pending.code).toBe("not-ready");
+
+    await emitResult(f, "call-1", wire);
+    await emitResult(f, "call-1", wire, { content: [{ type: "text", text: "changed" }] });
+    const conflicted = await settle(h.coordinator.captureOutput("call-1", new AbortController().signal));
+    expect(conflicted.ok).toBe(false);
+    if (!conflicted.ok) expect(conflicted.code).toBe("source-conflict");
+    expect(h.coordinator.inspect().operations[0]!.output.registered).toBe(true);
+  });
+
+  test("pure owner predicate refusals fail closed before any capture leaf call", async () => {
+    const f = await preparedFixture();
+    let mode: "null" | "string" | "promise" | "rejectPromise" | "throw" | "false" = "null";
+    let captureCalls = 0;
+    const port: NativeHarnessOutputPort = {
+      capture(backend: unknown, guard: () => void, signal: AbortSignal) {
+        captureCalls += 1;
+        return captureNativeHarnessOutput(backend, guard, signal);
+      },
+      matches(backend: unknown, capture: unknown) {
+        return matchesNativeHarnessOutputCapture(backend, capture);
+      },
+      revalidateOwner() {
+        if (mode === "string") return "the owner was replaced";
+        if (mode === "throw") throw new Error("owner callback exploded");
+        if (mode === "promise") return Promise.resolve(null) as unknown as string | null;
+        if (mode === "rejectPromise") return Promise.reject(new Error("owner rejection")) as unknown as string | null;
+        if (mode === "false") return false as unknown as string | null;
+        return null;
+      },
+    };
+    const h = setup(f, { output: port });
+    const signal = new AbortController().signal;
+    const result = await settle(h.coordinator.invoke("call-1", { task: WORK_TASK }, signal));
+    const wire = projectionFor(result);
+    expect(h.coordinator.registerToolResultProjection("call-1", result, wire, signal).ok).toBe(true);
+    await emitResult(f, "call-1", wire);
+    for (const next of ["string", "promise", "rejectPromise", "throw", "false"] as const) {
+      mode = next;
+      const refused = await settle(h.coordinator.captureOutput("call-1", new AbortController().signal));
+      expect(refused.ok).toBe(false);
+      if (!refused.ok) expect(refused.code).toBe("authority-lost");
+      expect(captureCalls).toBe(0);
+    }
+    mode = "null";
+    const accepted = await settle(h.coordinator.captureOutput("call-1", new AbortController().signal));
+    expect(accepted.ok).toBe(false);
+    if (!accepted.ok) expect(accepted.code).not.toBe("authority-lost");
+    expect(captureCalls).toBe(1);
+  });
+
+  test("a refused reentrant registration does not clear the outer registration lock", async () => {
+    const f = await preparedFixture();
+    let registrationStarted = false;
+    let reentered = false;
+    const nestedRegistrations: Array<
+      ReturnType<NativeHarnessDelegationCoordinator["registerToolResultProjection"]>
+    > = [];
+    let coordinatorRef: NativeHarnessDelegationCoordinator | null = null;
+    let sourceResult: NativeHarnessDelegationResult | null = null;
+    let sourceWire: NativeToolResult | null = null;
+    let sourceSignal: AbortSignal | null = null;
+    const h = setup(f, {
+      output: actualOutputPort(),
+      getContext() {
+        if (registrationStarted && !reentered && coordinatorRef !== null
+          && sourceResult !== null && sourceWire !== null && sourceSignal !== null) {
+          reentered = true;
+          const nested = coordinatorRef.registerToolResultProjection(
+            "call-1",
+            sourceResult,
+            sourceWire,
+            sourceSignal,
+          );
+          nestedRegistrations.push(nested);
+        }
+        return f.ctx;
+      },
+    });
+    coordinatorRef = h.coordinator;
+    const signal = new AbortController().signal;
+    const result = await settle(h.coordinator.invoke("call-1", { task: WORK_TASK }, signal));
+    const wire = projectionFor(result);
+    sourceResult = result;
+    sourceWire = wire;
+    sourceSignal = signal;
+    registrationStarted = true;
+    const registered = h.coordinator.registerToolResultProjection("call-1", result, wire, signal);
+    expect(registered.ok).toBe(true);
+    expect(reentered).toBe(true);
+    expect(nestedRegistrations).toHaveLength(1);
+    const nestedRefusal = nestedRegistrations[0]!;
+    expect(nestedRefusal.ok).toBe(false);
+    expect(nestedRefusal.reason).not.toBeNull();
+    if (nestedRefusal.reason !== null) {
+      expect(nestedRefusal.reason).toContain("already in progress");
+    }
+    expect(h.coordinator.inspect().operations[0]!.output.registered).toBe(true);
+  });
+
+  test("a rejected native matcher promise is observed and refused without unhandled rejection", async () => {
+    const f = await preparedFixture();
+    await writeFile(path.join(f.workspace, "tiny.txt"), "x", { mode: 0o600 });
+    const snapshot = await captureWorkspaceText(f.workspace, "tiny.txt");
+    const h = setup(f, {
+      output: {
+        async capture() {
+          return { ok: true as const, capture: syntheticCapture(snapshot, 1, WORK_TASK) };
+        },
+        matches() {
+          return Promise.reject(new Error("matcher rejection")) as unknown as boolean;
+        },
+        revalidateOwner() {
+          return null;
+        },
+      },
+    });
+    const signal = new AbortController().signal;
+    const result = await settle(h.coordinator.invoke("call-1", { task: WORK_TASK }, signal));
+    const wire = projectionFor(result);
+    expect(h.coordinator.registerToolResultProjection("call-1", result, wire, signal).ok).toBe(true);
+    await emitResult(f, "call-1", wire);
+    const selection = await settle(h.coordinator.captureOutput("call-1", new AbortController().signal));
+    expect(selection.ok).toBe(false);
+    if (!selection.ok) expect(selection.code).toBe("source-conflict");
+    const snapshotState = h.coordinator.inspect();
+    expect(snapshotState.output.retainedCaptures).toBe(0);
+    expect(snapshotState.output.reservedBytes).toBe(0);
+  });
+
+  test("same-slot reentrancy joins one capture; another signal or Slot cannot steal capacity", async () => {
+    const f = await preparedFixture();
+    await callHarness(f, "call-2");
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let captureCalls = 0;
+    const port: NativeHarnessOutputPort = {
+      capture(backend: unknown, guard: () => void, signal: AbortSignal) {
+        captureCalls += 1;
+        return gate.then(() => captureNativeHarnessOutput(backend, guard, signal));
+      },
+      matches(backend: unknown, capture: unknown) {
+        return matchesNativeHarnessOutputCapture(backend, capture);
+      },
+      revalidateOwner() {
+        return null;
+      },
+    };
+    const h = setup(f, {
+      output: port,
+      policy: { perRunUsd: 1, lifetimeUsd: 2 },
+    });
+    const signal1 = new AbortController().signal;
+    const result1 = await settle(h.coordinator.invoke("call-1", { task: WORK_TASK }, signal1));
+    const wire1 = projectionFor(result1);
+    expect(h.coordinator.registerToolResultProjection("call-1", result1, wire1, signal1).ok).toBe(true);
+    await emitResult(f, "call-1", wire1);
+
+    const signal2 = new AbortController().signal;
+    const result2 = await settle(h.coordinator.invoke("call-2", { task: WORK_TASK }, signal2));
+    const wire2 = projectionFor(result2);
+    expect(h.coordinator.registerToolResultProjection("call-2", result2, wire2, signal2).ok).toBe(true);
+    await emitResult(f, "call-2", wire2);
+
+    const sharedSignal = new AbortController().signal;
+    const first = h.coordinator.captureOutput("call-1", sharedSignal);
+    const joined = h.coordinator.captureOutput("call-1", sharedSignal);
+    expect(joined).toBe(first);
+    expect(captureCalls).toBe(1);
+    const otherSignal = await settle(h.coordinator.captureOutput("call-1", new AbortController().signal));
+    expect(otherSignal.ok).toBe(false);
+    if (!otherSignal.ok) expect(otherSignal.code).toBe("capacity");
+    const otherSlot = await settle(h.coordinator.captureOutput("call-2", new AbortController().signal));
+    expect(otherSlot.ok).toBe(false);
+    if (!otherSlot.ok) expect(otherSlot.code).toBe("capacity");
+    expect(h.coordinator.inspect().output.reservedBytes).toBe(1024 * 1024);
+    release();
+    const captured = await settle(first);
+    expect(captured.ok).toBe(false);
+    if (!captured.ok) expect(captured.code).not.toBe("capacity");
+    expect(captureCalls).toBe(1);
+    const snapshot = h.coordinator.inspect();
+    expect(snapshot.output.reservedBytes).toBe(0);
+    expect(snapshot.output.active).toBe(false);
+    expect(snapshot.output.retainedCaptures).toBe(0);
+    expect(snapshot.operations[0]!.output.state).toBe("failed");
+  });
+
+  test("retained capture count is bounded at eight with once-only accounting", async () => {
+    const f = await preparedFixture();
+    await writeFile(path.join(f.workspace, "tiny.txt"), "x", { mode: 0o600 });
+    const snapshot = await captureWorkspaceText(f.workspace, "tiny.txt");
+    const h = setup(f, {
+      policy: { perRunUsd: 0.5, lifetimeUsd: 5, maxRetainedOperations: 16 },
+      output: {
+        async capture() {
+          return { ok: true as const, capture: syntheticCapture(snapshot, 1, WORK_TASK) };
+        },
+        matches() {
+          return true;
+        },
+        revalidateOwner() {
+          return null;
+        },
+      },
+    });
+    const ids = Array.from({ length: 9 }, (_, index) => `call-${index + 1}`);
+    for (const id of ids) {
+      await callHarness(f, id);
+      const signal = new AbortController().signal;
+      const result = await settle(h.coordinator.invoke(id, { task: WORK_TASK }, signal));
+      const wire = projectionFor(result);
+      expect(h.coordinator.registerToolResultProjection(id, result, wire, signal).ok).toBe(true);
+      await emitResult(f, id, wire);
+    }
+    for (const id of ids.slice(0, 8)) {
+      const selected = await settle(h.coordinator.captureOutput(id, new AbortController().signal));
+      expect(selected.ok).toBe(true);
+    }
+    const ninth = await settle(h.coordinator.captureOutput(ids[8]!, new AbortController().signal));
+    expect(ninth.ok).toBe(false);
+    if (!ninth.ok) expect(ninth.code).toBe("capacity");
+    const snapshotState = h.coordinator.inspect();
+    expect(snapshotState.output.retainedCaptures).toBe(8);
+    expect(snapshotState.output.retainedBytes).toBe(8);
+    expect(snapshotState.output.reservedBytes).toBe(0);
+    expect(snapshotState.output.active).toBe(false);
+  });
+
+  test("retained plus reserved output bytes are bounded at two MiB", async () => {
+    const f = await preparedFixture();
+    const bytes = 250 * 1024;
+    await writeFile(path.join(f.workspace, "large.txt"), "a".repeat(bytes), { mode: 0o600 });
+    const snapshot = await captureWorkspaceText(f.workspace, "large.txt");
+    const h = setup(f, {
+      policy: { perRunUsd: 0.5, lifetimeUsd: 5 },
+      output: {
+        async capture() {
+          return { ok: true as const, capture: syntheticCapture(snapshot, 4, WORK_TASK) };
+        },
+        matches() {
+          return true;
+        },
+        revalidateOwner() {
+          return null;
+        },
+      },
+    });
+    for (const id of ["call-1", "call-2", "call-3"]) {
+      await callHarness(f, id);
+      const signal = new AbortController().signal;
+      const result = await settle(h.coordinator.invoke(id, { task: WORK_TASK }, signal));
+      const wire = projectionFor(result);
+      expect(h.coordinator.registerToolResultProjection(id, result, wire, signal).ok).toBe(true);
+      await emitResult(f, id, wire);
+    }
+    for (const id of ["call-1", "call-2"]) {
+      const selected = await settle(h.coordinator.captureOutput(id, new AbortController().signal));
+      expect(selected.ok).toBe(true);
+    }
+    const third = await settle(h.coordinator.captureOutput("call-3", new AbortController().signal));
+    expect(third.ok).toBe(false);
+    if (!third.ok) expect(third.code).toBe("capacity");
+    const snapshotState = h.coordinator.inspect();
+    expect(snapshotState.output.retainedCaptures).toBe(2);
+    expect(snapshotState.output.retainedBytes).toBe(bytes * 8);
+    expect(snapshotState.output.reservedBytes).toBe(0);
+  });
+
+  test("running same-signal joins revalidate scope and preserve the owner promise", async () => {
+    const f = await preparedFixture();
+    let currentContext: NativeContext = f.ctx;
+    let owner = "null";
+    const reentry: { value: Promise<NativeHarnessOutputSelection> | null } = { value: null };
+    let coordinatorRef: NativeHarnessDelegationCoordinator | null = null;
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const sharedSignal = new AbortController().signal;
+    const h = setup(f, {
+      getContext: () => currentContext,
+      output: {
+        capture(backend: unknown, guard: () => void, signal: AbortSignal) {
+          if (coordinatorRef !== null) {
+            // Synchronous leaf reentry must observe the already-installed promise.
+            reentry.value = coordinatorRef.captureOutput("call-1", sharedSignal);
+          }
+          return gate.then(() => captureNativeHarnessOutput(backend, guard, signal));
+        },
+        matches(backend: unknown, capture: unknown) {
+          return matchesNativeHarnessOutputCapture(backend, capture);
+        },
+        revalidateOwner() {
+          if (owner === "string") return "the owner was replaced";
+          return null;
+        },
+      },
+    });
+    coordinatorRef = h.coordinator;
+    const signal = new AbortController().signal;
+    const result = await settle(h.coordinator.invoke("call-1", { task: WORK_TASK }, signal));
+    const wire = projectionFor(result);
+    expect(h.coordinator.registerToolResultProjection("call-1", result, wire, signal).ok).toBe(true);
+    await emitResult(f, "call-1", wire);
+
+    const first = h.coordinator.captureOutput("call-1", sharedSignal);
+    expect(reentry.value).not.toBeNull();
+    expect(reentry.value).toBe(first);
+
+    currentContext = { ...f.ctx, agent: { kind: "sub" } };
+    const foreign = await settle(h.coordinator.captureOutput("call-1", sharedSignal));
+    expect(foreign).not.toBe(first);
+    expect(foreign.ok).toBe(false);
+    if (!foreign.ok) expect(foreign.code).toBe("authority-lost");
+
+    currentContext = f.ctx;
+    owner = "string";
+    const ownerRefused = await settle(h.coordinator.captureOutput("call-1", sharedSignal));
+    expect(ownerRefused.ok).toBe(false);
+    if (!ownerRefused.ok) expect(ownerRefused.code).toBe("authority-lost");
+
+    owner = "null";
+    const legitimate = h.coordinator.captureOutput("call-1", sharedSignal);
+    expect(legitimate).toBe(first);
+    expect(h.coordinator.inspect().output.reservedBytes).toBe(1024 * 1024);
+    release();
+    const settled = await settle(first);
+    expect(settled.ok).toBe(false);
+    if (!settled.ok) expect(settled.code).not.toBe("capacity");
+    expect(h.coordinator.inspect().output.reservedBytes).toBe(0);
+  });
+
+  test("cancel during capture aborts only the capture; admitted failure is terminal", async () => {
+    const f = await preparedFixture();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const h = setup(f, {
+      output: {
+        capture(backend: unknown, guard: () => void, signal: AbortSignal) {
+          return gate.then(() => captureNativeHarnessOutput(backend, guard, signal));
+        },
+        matches(backend: unknown, capture: unknown) {
+          return matchesNativeHarnessOutputCapture(backend, capture);
+        },
+        revalidateOwner() {
+          return null;
+        },
+      },
+    });
+    const signal = new AbortController().signal;
+    const result = await settle(h.coordinator.invoke("call-1", { task: WORK_TASK }, signal));
+    const wire = projectionFor(result);
+    expect(h.coordinator.registerToolResultProjection("call-1", result, wire, signal).ok).toBe(true);
+    await emitResult(f, "call-1", wire);
+    const inFlight = h.coordinator.captureOutput("call-1", new AbortController().signal);
+    expect(h.coordinator.cancel("call-1")).toBe(true);
+    expect(h.calls.cancel).toBe(0);
+    expect(h.coordinator.inspect().output.reservedBytes).toBe(1024 * 1024);
+    release();
+    const cancelled = await settle(inFlight);
+    expect(cancelled.ok).toBe(false);
+    if (!cancelled.ok) expect(cancelled.code).toBe("cancelled");
+    expect(h.calls.cancel).toBe(0);
+    const repeated = await settle(h.coordinator.captureOutput("call-1", new AbortController().signal));
+    expect(repeated).toBe(cancelled);
+    expect(h.coordinator.inspect().output.reservedBytes).toBe(0);
+    expect(h.coordinator.inspect().output.retainedCaptures).toBe(0);
+    expect(h.coordinator.inspect().operations[0]!.output.state).toBe("failed");
+    expect(h.coordinator.cancel("call-1")).toBe(false);
+  });
+
+  test("an admitted leaf failure remains terminal after capacity is restored", async () => {
+    const f = await preparedFixture();
+    let captureCalls = 0;
+    const h = setup(f, {
+      output: {
+        async capture() {
+          captureCalls += 1;
+          return { ok: false as const, code: "changed" as const, reason: "source changed" };
+        },
+        matches() {
+          return true;
+        },
+        revalidateOwner() {
+          return null;
+        },
+      },
+    });
+    const signal = new AbortController().signal;
+    const result = await settle(h.coordinator.invoke("call-1", { task: WORK_TASK }, signal));
+    const wire = projectionFor(result);
+    expect(h.coordinator.registerToolResultProjection("call-1", result, wire, signal).ok).toBe(true);
+    await emitResult(f, "call-1", wire);
+    const failed = await settle(h.coordinator.captureOutput("call-1", new AbortController().signal));
+    expect(failed.ok).toBe(false);
+    if (!failed.ok) expect(failed.code).toBe("source-conflict");
+    const restored = await settle(h.coordinator.captureOutput("call-1", new AbortController().signal));
+    expect(restored).toBe(failed);
+    expect(captureCalls).toBe(1);
+    expect(h.coordinator.inspect().output.reservedBytes).toBe(0);
+    expect(h.coordinator.inspect().output.retainedCaptures).toBe(0);
+    expect(h.coordinator.inspect().operations[0]!.output.state).toBe("failed");
+  });
+
+  test("actual native controls, backend, runner and output leaf register and capture once", async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.workspace, "a.txt"), "alpha\n", { mode: 0o600 });
+    await startWork(f, "capture the bounded output");
+    await callHarness(f);
+    const storageRoot = path.join(f.root, "private");
+    await mkdir(storageRoot, { mode: 0o700 });
+    const runner = outputCandidateRunner();
+    const factory = createNativeHarnessBackend({
+      model: "deepseek/deepseek-chat",
+      ompCommand: "/usr/bin/fake-omp",
+      storageRoot,
+      inputFiles: ["a.txt"],
+    }, { deterministicRunner: runner });
+    let preparedBackend: NativeHarnessBackend | null = null;
+    const h = setup(f, {
+      runner,
+      output: actualOutputPort(),
+      prepare(request, context, calls) {
+        calls.guard += 1;
+        request.guard();
+        return factory.prepare(request, context).then((prepared) => {
+          if (prepared.ok) preparedBackend = prepared.backend;
+          return prepared;
+        });
+      },
+    });
+    const scopes: string[] = [];
+    const entry = createNativeHarnessEntry({
+      resolveRoot() {
+        return {
+          ok: true,
+          root: {
+            coordinator: h.coordinator,
+            runWithContext<T>(_context: NativeContext, toolCallId: string, operation: () => Promise<T>): Promise<T> {
+              scopes.push(toolCallId);
+              return operation();
+            },
+            diagnostics: () => [],
+          },
+        };
+      },
+    });
+    const signal = new AbortController().signal;
+    const toolResult = await entry.tool.execute(
+      "call-1",
+      { task: WORK_TASK },
+      signal,
+      undefined,
+      f.ctx,
+    );
+    expect(toolResult.isError).toBeUndefined();
+    expect(scopes).toEqual(["call-1"]);
+    expect(Object.isFrozen(toolResult)).toBe(true);
+    expect(Object.isFrozen(toolResult.details)).toBe(true);
+    const projected = toolResult.details as Record<string, unknown>;
+    expect(projected.resultKind).toBe("live");
+    expect(projected.taskAccepted).toBe(false);
+
+    await f.host.emit("tool_result", {
+      toolCallId: "call-1",
+      toolName: AGENT_HARNESS,
+      input: { task: WORK_TASK },
+      content: toolResult.content,
+      details: toolResult.details,
+      isError: false,
+    }, f.ctx);
+
+    const captureSignal = new AbortController().signal;
+    const first = h.coordinator.captureOutput("call-1", captureSignal);
+    const joined = h.coordinator.captureOutput("call-1", captureSignal);
+    expect(joined).toBe(first);
+    const selection = await settle(first) as NativeHarnessOutputSelection;
+    expect(selection.ok).toBe(true);
+    if (!selection.ok) return;
+    expect(selection.observation).toBe("captured-now");
+    expect(selection.filesystemFreshness).toBe("observed-during-capture");
+    expect(selection.capture.changes).toHaveLength(1);
+    expect(selection.capture.changes[0]!.path).toBe("candidate.txt");
+    expect(selection.capture.changes[0]!.snapshot.text).toBe("candidate 0\n");
+    expect(selection.taskSha256).toBe(createHash("sha256").update(WORK_TASK, "utf8").digest("hex"));
+    expect(selection.expectedResultSha256).toMatch(/^[a-f0-9]{64}$/);
+    expect(selection.observedResultSha256).toBe(selection.expectedResultSha256);
+    expect(selection.taskAccepted).toBe(false);
+    expect(selection.semanticAcceptance).toBe("not-evaluated");
+    expect(preparedBackend).not.toBeNull();
+    expect(matchesNativeHarnessOutputCapture(preparedBackend, selection.capture)).toBe(true);
+
+    const cached = await settle(h.coordinator.captureOutput("call-1", new AbortController().signal));
+    expect(cached.ok).toBe(true);
+    if (!cached.ok) return;
+    expect(cached.observation).toBe("cached-historical");
+    expect(cached.filesystemFreshness).toBe("not-rechecked");
+    expect(cached.capture).toBe(selection.capture);
+    expect(cached.capture.captureId).toBe(selection.capture.captureId);
+
+    const completion = readNativeHarnessBackendCompletion(preparedBackend);
+    if (!completion.ok) throw new Error(completion.reason);
+    await writeFile(
+      path.join(completion.completion.winner.cwd, "candidate.txt"),
+      "changed after capture\n",
+      { mode: 0o600 },
+    );
+    expect(selection.capture.changes[0]!.snapshot.text).toBe("candidate 0\n");
+    const snapshot = h.coordinator.inspect();
+    expect(snapshot.output.retainedCaptures).toBe(1);
+    expect(snapshot.output.retainedBytes).toBeGreaterThan(0);
+    expect(snapshot.output.reservedBytes).toBe(0);
+    expect(snapshot.output.active).toBe(false);
+    expect(snapshot.operations[0]!.output.registered).toBe(true);
+    expect(snapshot.operations[0]!.output.captureId).toBe(selection.capture.captureId);
+    expect(snapshot.operations[0]!.output.observedResultSha256).toBe(selection.observedResultSha256);
+    const snapshotText = JSON.stringify(snapshot);
+    expect(snapshotText).not.toContain("candidate 0");
+    expect(snapshotText).not.toContain(WORK_TASK);
   });
 });

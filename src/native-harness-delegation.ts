@@ -1,11 +1,17 @@
+import { createHash } from "node:crypto";
 import type {
+  CallResultExpectationRegistration,
   NativeCallCheckPreparation,
   NativeContext,
   NativeEntryControls,
   NativeWorkCallReference,
   NativeWorkCallInspection,
 } from "./native-entry.ts";
-import { deepFreeze } from "./native-work.ts";
+import type {
+  NativeHarnessOutputCapture,
+  NativeHarnessOutputCaptureResult,
+} from "./native-harness-output.ts";
+import { deepFreeze, isNativeWorkspaceTextSnapshot } from "./native-work.ts";
 import type {
   Runner,
   WorkerRequest,
@@ -32,6 +38,12 @@ export const NATIVE_HARNESS_MAX_PER_RUN_USD = 1;
 export const NATIVE_HARNESS_MAX_LIFETIME_USD = 5;
 export const NATIVE_HARNESS_MAX_DURATION_MS = 300_000;
 export const NATIVE_HARNESS_MAX_CLEANUP_GRACE_MS = 30_000;
+export const NATIVE_HARNESS_MAX_OUTPUT_CAPTURES = 8;
+export const NATIVE_HARNESS_MAX_OUTPUT_BYTES = 2 * 1024 * 1024;
+export const NATIVE_HARNESS_OUTPUT_RESERVATION_BYTES = 1024 * 1024;
+export const NATIVE_HARNESS_OUTPUT_CAPTURE_BUDGET_MS = 30_000;
+const MAX_OUTPUT_CHANGES = 8;
+const MAX_OUTPUT_CHANGE_BYTES = 1024 * 1024;
 const MAX_TOOL_CALL_ID_CHARS = 256;
 const MAX_RUN_ID_CHARS = 256;
 const MAX_REASON_CHARS = 320;
@@ -177,6 +189,71 @@ export interface NativeHarnessDelegationResult {
   readonly reason: string | null;
 }
 
+export type NativeHarnessOutputSelectionCode =
+  | "output-unavailable"
+  | "not-ready"
+  | "source-conflict"
+  | "authority-lost"
+  | "capacity"
+  | "cancelled"
+  | "deadline"
+  | "invalid-caller"
+  | "capture-failed";
+
+export interface NativeHarnessOutputSelectionFailure {
+  readonly ok: false;
+  readonly code: NativeHarnessOutputSelectionCode;
+  readonly reason: string;
+}
+
+export interface NativeHarnessOutputSelectionSuccess {
+  readonly ok: true;
+  readonly observation: "captured-now" | "cached-historical";
+  readonly filesystemFreshness: "observed-during-capture" | "not-rechecked";
+  readonly capture: NativeHarnessOutputCapture;
+  readonly association: NativeHarnessAssociation;
+  readonly runId: string;
+  readonly taskSha256: string;
+  readonly workPromptSha256: string;
+  readonly callInputSha256: string;
+  readonly expectedResultSha256: string;
+  readonly observedResultSha256: string;
+  readonly taskAccepted: false;
+  readonly semanticAcceptance: "not-evaluated";
+}
+
+export type NativeHarnessOutputSelection =
+  | NativeHarnessOutputSelectionSuccess
+  | NativeHarnessOutputSelectionFailure;
+
+/** Trusted host-only output port. Missing or malformed ports mean output unavailable. */
+export interface NativeHarnessOutputPort {
+  capture(
+    backend: unknown,
+    guard: () => void,
+    signal: AbortSignal,
+  ): Promise<NativeHarnessOutputCaptureResult>;
+  matches(backend: unknown, capture: unknown): boolean;
+  /** Pure, synchronous original-owner predicate: exactly null on success. */
+  revalidateOwner(): string | null;
+}
+
+export interface NativeHarnessSnapshotOutput {
+  readonly state: "idle" | "running" | "captured" | "failed";
+  readonly registered: boolean;
+  readonly registrationFailure: string | null;
+  readonly captureId: string | null;
+  readonly captureDigest: string | null;
+  readonly taskSha256: string | null;
+  readonly workPromptSha256: string | null;
+  readonly callInputSha256: string | null;
+  readonly expectedResultSha256: string | null;
+  readonly observedResultSha256: string | null;
+  readonly retainedBytes: number;
+  readonly code: NativeHarnessOutputSelectionCode | null;
+  readonly reason: string | null;
+}
+
 export interface NativeHarnessSnapshotOperation {
   readonly association: NativeHarnessAssociation | null;
   readonly runId: string | null;
@@ -191,6 +268,7 @@ export interface NativeHarnessSnapshotOperation {
   readonly cost: NativeHarnessDelegationCost;
   readonly concurrencyHeld: boolean;
   readonly historical: boolean;
+  readonly output: NativeHarnessSnapshotOutput;
 }
 
 export interface NativeHarnessDelegationSnapshot {
@@ -200,6 +278,15 @@ export interface NativeHarnessDelegationSnapshot {
   readonly limits: NativeHarnessDelegationLimits;
   readonly retainedOperations: number;
   readonly activeOperations: number;
+  readonly output: {
+    readonly retainedCaptures: number;
+    readonly retainedBytes: number;
+    readonly reservedBytes: number;
+    readonly active: boolean;
+    readonly maxCaptures: number;
+    readonly maxBytes: number;
+    readonly reservationBytes: number;
+  };
   readonly lifetime: {
     readonly limitUsd: number;
     readonly accountedUsd: number;
@@ -225,6 +312,8 @@ export interface NativeHarnessDelegationOptions {
   readonly now?: () => number;
   /** Defaults false. True only creates an inert enabled coordinator. */
   readonly enabled?: boolean;
+  /** Optional trusted host-only output leaf; missing/malformed means output unavailable. */
+  readonly output?: NativeHarnessOutputPort;
 }
 
 export interface NativeHarnessDelegationCoordinator {
@@ -236,6 +325,25 @@ export interface NativeHarnessDelegationCoordinator {
    * accepted from the model.
    */
   invoke(actualToolCallId: unknown, input: unknown, signal: unknown): Promise<NativeHarnessDelegationResult>;
+  /**
+   * Registers the tool wire projection created by the entry inside the actual
+   * execute scope. Idempotent for the exact retained source response; never
+   * changes execution history and never throws for unavailable output.
+   */
+  registerToolResultProjection(
+    actualSourceToolCallId: unknown,
+    actualDelegationResponse: unknown,
+    actualProjectedResult: unknown,
+    originalSignal: unknown,
+  ): { readonly ok: boolean; readonly reason: string | null };
+  /**
+   * Host-only capture of the frozen original output. Missing output support is
+   * returned as an `ok: false` selection rather than thrown.
+   */
+  captureOutput(
+    actualSourceToolCallId: unknown,
+    captureSignal: unknown,
+  ): Promise<NativeHarnessOutputSelection>;
   /** Idempotent local cancellation request for one retained operation. */
   cancel(actualToolCallId: unknown): boolean;
   /** Idempotent local disposal; never disposes the native controls/owner. */
@@ -256,6 +364,16 @@ interface NativeCallPort {
   readonly receiver: NativeEntryControls;
   readonly captureCall: (this: NativeEntryControls, selector: unknown, context: NativeContext) => NativeCallCapture;
   readonly prepareCallCheck: (this: NativeEntryControls, ref: unknown, context: NativeContext) => NativeCallCheckPreparation;
+  readonly registerCallResultExpectation:
+    | ((this: NativeEntryControls, ref: unknown, expected: { readonly input: unknown; readonly result: unknown }, context: NativeContext) => CallResultExpectationRegistration)
+    | null;
+}
+
+interface OutputPort {
+  readonly receiver: NativeHarnessOutputPort;
+  readonly capture: (this: NativeHarnessOutputPort, backend: unknown, guard: () => void, signal: AbortSignal) => Promise<NativeHarnessOutputCaptureResult>;
+  readonly matches: (this: NativeHarnessOutputPort, backend: unknown, capture: unknown) => boolean;
+  readonly revalidateOwner: (this: NativeHarnessOutputPort) => unknown;
 }
 
 interface RunnerPort {
@@ -278,6 +396,36 @@ type SlotCancelReason =
   | "cancel-requested"
   | "authority-lost"
   | "budget-refused";
+
+interface OutputRegistration {
+  readonly expectedSha256: string;
+  readonly expectedBytes: number;
+  readonly workPromptSha256: string;
+  readonly callInputSha256: string;
+  readonly taskSha256: string;
+  readonly runId: string;
+}
+
+interface SlotOutput {
+  registration: OutputRegistration | null;
+  registrationFailure: string | null;
+  registering: boolean;
+  state: "idle" | "running" | "captured" | "failed";
+  promise: Promise<NativeHarnessOutputSelection> | null;
+  requestSignal: AbortSignal | null;
+  controller: AbortController | null;
+  cleanup: (() => void) | null;
+  capture: NativeHarnessOutputCapture | null;
+  selection: NativeHarnessOutputSelectionSuccess | null;
+  failure: NativeHarnessOutputSelectionFailure | null;
+  guardFailure: NativeHarnessOutputSelectionFailure | null;
+  observedSha256: string | null;
+  observedBytes: number | null;
+  reservedBytes: number;
+  retainedBytes: number;
+  startedAt: number | null;
+  lastClock: number | null;
+}
 
 interface Slot {
   readonly toolCallId: string;
@@ -333,10 +481,12 @@ interface Slot {
   finalExecutionState: NativeHarnessExecutionState;
   finalTermination: NativeHarnessTermination;
   finalCost: NativeHarnessDelegationCost | null;
+  readonly output: SlotOutput;
 }
 
 interface CoordinatorState {
   readonly native: NativeCallPort;
+  readonly output: OutputPort | null;
   readonly limits: NativeHarnessDelegationLimits;
   readonly getContext: () => NativeContext;
   readonly prepare: (
@@ -356,6 +506,11 @@ interface CoordinatorState {
   lifetimeUnknownUsd: number;
   lifetimeOverspendUsd: number;
   budgetBlocked: boolean;
+  outputRetained: number;
+  outputBytes: number;
+  outputReservedBytes: number;
+  outputActive: Slot | null;
+  outputJoinValidating: boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -398,6 +553,61 @@ function boundedLimitation(value: string): string {
     : `${normalized.slice(0, MAX_LIMITATION_CHARS - 3)}...`;
 }
 
+function sha256Hex(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+function isHex64(value: unknown): value is string {
+  return typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+}
+
+function outputFailure(
+  code: NativeHarnessOutputSelectionCode,
+  reason: string,
+): NativeHarnessOutputSelectionFailure {
+  return deepFreeze({ ok: false as const, code, reason: boundedReason(reason, "output capture refused") });
+}
+
+/**
+ * New output diagnostics must not run arbitrary Error.message getters, `then`,
+ * `toString` or coercion while normalizing a refusal. Only a string value or an
+ * own data message field is read; everything else gets a constant fallback.
+ */
+function outputThrownReason(error: unknown, fallback: string): string {
+  if (typeof error === "string") return boundedReason(error, fallback);
+  const message = readOwnField(error, "message");
+  if (message.kind === "data" && typeof message.value === "string") {
+    return boundedReason(message.value, fallback);
+  }
+  return fallback;
+}
+
+function boundedOutputReason(value: string): string {
+  return boundedReason(value, "output unavailable")
+    .replace(/(?:[A-Za-z]:\\|\/)[^\s"'`<>]+/g, "[path]");
+}
+
+type OwnField =
+  | { readonly kind: "missing" }
+  | { readonly kind: "accessor" }
+  | { readonly kind: "data"; readonly value: unknown };
+
+/** One bounded own-data read; getters, proxies that throw and inherited fields fail closed. */
+function readOwnField(target: unknown, key: string): OwnField {
+  if (target === null || (typeof target !== "object" && typeof target !== "function")) {
+    return { kind: "missing" };
+  }
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(target, key);
+  } catch {
+    return { kind: "accessor" };
+  }
+  if (descriptor === undefined) return { kind: "missing" };
+  if (!("value" in descriptor)) return { kind: "accessor" };
+  return { kind: "data", value: descriptor.value };
+}
+
 type StrictFields = ReadonlyMap<string, unknown>;
 
 /** Strict own data fields; accessors, symbols, extra keys and exotic prototypes are refused. */
@@ -405,6 +615,7 @@ function readStrictFields(
   value: unknown,
   allowed: readonly string[],
   required: readonly string[],
+  accessorAsMissing?: string,
 ): StrictFields | null {
   if (!isRecord(value)) return null;
   let prototype: object | null;
@@ -433,6 +644,7 @@ function readStrictFields(
       || descriptor.set !== undefined
       || descriptor.enumerable !== true
     ) {
+      if (key === accessorAsMissing) continue;
       return null;
     }
     fields.set(key, descriptor.value);
@@ -534,6 +746,64 @@ function readCallable(value: unknown, key: string): Function | null {
     if (current === Object.prototype || current === Function.prototype) return null;
   }
   return null;
+}
+
+/** Malformed output ports are treated as unavailable, never as constructor failure. */
+function readOutputPort(value: unknown): OutputPort | null {
+  if (value === undefined) return null;
+  const fields = readStrictFields(value, ["capture", "matches", "revalidateOwner"], [
+    "capture",
+    "matches",
+    "revalidateOwner",
+  ]);
+  if (fields === null) return null;
+  const capture = fields.get("capture");
+  const matches = fields.get("matches");
+  const revalidateOwner = fields.get("revalidateOwner");
+  if (typeof capture !== "function" || typeof matches !== "function" || typeof revalidateOwner !== "function") {
+    return null;
+  }
+  return {
+    receiver: value as NativeHarnessOutputPort,
+    capture: capture as OutputPort["capture"],
+    matches: matches as OutputPort["matches"],
+    revalidateOwner: revalidateOwner as OutputPort["revalidateOwner"],
+  };
+}
+
+function ownerPredicateReason(output: OutputPort): string | null {
+  let raw: unknown;
+  try {
+    raw = Reflect.apply(output.revalidateOwner, output.receiver, []);
+  } catch (error) {
+    return `the trusted output owner predicate threw: ${outputThrownReason(error, "output operation failed")}`;
+  }
+  if (raw === null) return null;
+  if (typeof raw === "string") {
+    return boundedReason(raw, "the trusted output owner predicate refused the original owner");
+  }
+  // Observe a genuine native Promise (including a rejection) so it cannot
+  // surface as an unhandled rejection. Never read an arbitrary then/toString.
+  if (consumeNativePromise(raw)) {
+    return "the trusted output owner predicate returned a promise";
+  }
+  return "the trusted output owner predicate did not confirm the original owner";
+}
+
+function outputMatches(output: OutputPort, backend: unknown, capture: unknown): boolean {
+  let raw: unknown;
+  try {
+    raw = Reflect.apply(output.matches, output.receiver, [backend, capture]);
+  } catch {
+    return false;
+  }
+  if (raw === true) return true;
+  // A promise is invalid synchrony. Consuming only the captured intrinsic
+  // attaches rejection handlers without invoking an arbitrary `then`.
+  if (raw !== null && (typeof raw === "object" || typeof raw === "function")) {
+    consumeNativePromise(raw);
+  }
+  return false;
 }
 
 function readLimit(
@@ -891,6 +1161,1194 @@ const slotStates = new WeakMap<object, CoordinatorState>();
 
 function slotState(slot: Slot): CoordinatorState | null {
   return slotStates.get(slot) ?? null;
+}
+
+type ReadyCallCheck = Extract<NativeCallCheckPreparation, { readonly ok: true }>;
+type OutputCheckFailure = { readonly ok: false; readonly code: NativeHarnessOutputSelectionCode; readonly reason: string };
+
+interface PreparedOutputCheck {
+  readonly ok: true;
+  readonly check: ReadyCallCheck;
+  readonly inspection: NativeWorkCallInspection;
+  readonly context: NativeContext;
+  readonly workPromptSha256: string;
+  readonly callInputSha256: string;
+  readonly observedSha256: string | null;
+  readonly observedBytes: number | null;
+}
+
+function registrationFailure(reason: unknown): { readonly ok: false; readonly reason: string } {
+  return Object.freeze({
+    ok: false as const,
+    reason: outputThrownReason(reason, "output result registration refused"),
+  });
+}
+
+function registrationSuccess(): { readonly ok: true; readonly reason: null } {
+  return Object.freeze({ ok: true as const, reason: null });
+}
+
+function readRegistrationFingerprint(value: unknown):
+  | { readonly ok: true; readonly bytes: number; readonly sha256: string }
+  | { readonly ok: false; readonly reason: string } {
+  const fields = readStrictFields(value, ["ok", "fingerprint", "reason"], ["ok"]);
+  if (fields === null) {
+    return { ok: false, reason: "native result expectation registration returned an unreadable result" };
+  }
+  if (fields.get("ok") !== true) {
+    const reason = fields.get("reason");
+    return {
+      ok: false,
+      reason: typeof reason === "string" ? reason : "native result expectation registration refused",
+    };
+  }
+  const fingerprint = readStrictFields(fields.get("fingerprint"), ["bytes", "sha256"], ["bytes", "sha256"]);
+  if (fingerprint === null) {
+    return { ok: false, reason: "native result expectation registration returned no usable fingerprint" };
+  }
+  const bytes = fingerprint.get("bytes");
+  const sha256 = fingerprint.get("sha256");
+  if (typeof bytes !== "number" || !Number.isSafeInteger(bytes) || bytes < 1 || !isHex64(sha256)) {
+    return { ok: false, reason: "native result expectation registration returned an invalid fingerprint" };
+  }
+  return { ok: true, bytes, sha256 };
+}
+
+function sameInspectionAssociation(value: unknown, expected: NativeHarnessAssociation): boolean {
+  if (!isRecord(value)) return false;
+  try {
+    return value.observationId === expected.observationId
+      && value.generation === expected.generation
+      && value.sessionId === expected.sessionId
+      && value.workspaceRoot === expected.workspaceRoot
+      && value.toolCallId === expected.toolCallId
+      && value.toolName === expected.toolName;
+  } catch {
+    return false;
+  }
+}
+
+function inspectionReasonCode(_inspection: NativeWorkCallInspection): NativeHarnessOutputSelectionCode {
+  return "authority-lost";
+}
+
+function projectionConflict(inspection: NativeWorkCallInspection): boolean {
+  const projection = inspection.resultProjection;
+  return isRecord(projection)
+    && (projection.state === "conflicted" || projection.state === "unavailable");
+}
+
+function prepareOutputCheck(
+  slot: Slot,
+  state: CoordinatorState,
+  registration: OutputRegistration | null,
+  requireMatched: boolean,
+): PreparedOutputCheck | OutputCheckFailure {
+  // The original source invocation signal and deadline control execution only.
+  // A late abort after a successful settlement does not cancel this new read.
+  const main = readMainContext(state);
+  if (!main.ok) return { ok: false, code: "authority-lost", reason: main.reason };
+
+  let check: NativeCallCheckPreparation;
+  try {
+    check = Reflect.apply(state.native.prepareCallCheck, state.native.receiver, [
+      slot.originalRef,
+      main.context,
+    ]);
+  } catch (error) {
+    return {
+      ok: false,
+      code: "authority-lost",
+      reason: `native call revalidation threw: ${outputThrownReason(error, "output operation failed")}`,
+    };
+  }
+  if (!check.ok) {
+    return {
+      ok: false,
+      code: projectionConflict(check.inspection) ? "source-conflict" : inspectionReasonCode(check.inspection),
+      reason: nativeInspectionReason(check.inspection),
+    };
+  }
+  const inspection = check.inspection;
+  if (inspection.state !== "current" || inspection.evidenceState !== "available") {
+    return {
+      ok: false,
+      code: projectionConflict(inspection) ? "source-conflict" : inspectionReasonCode(inspection),
+      reason: nativeInspectionReason(inspection),
+    };
+  }
+  if (inspection.requestAttribution !== "matched-user-input") {
+    return {
+      ok: false,
+      code: "authority-lost",
+      reason: "the original source call is no longer associated with matched user input",
+    };
+  }
+  if (inspection.pendingInputCount !== 0 || inspection.pendingInputsDropped !== 0) {
+    return {
+      ok: false,
+      code: "authority-lost",
+      reason: "the original source work has queued or dropped inputs",
+    };
+  }
+  if (!sameInspectionAssociation(inspection.association, slot.association)) {
+    return {
+      ok: false,
+      code: "authority-lost",
+      reason: "the original source call now has an incompatible native association",
+    };
+  }
+  const workPromptSha256 = inspection.workPromptSha256;
+  const callInputSha256 = inspection.callInputSha256;
+  if (!isHex64(workPromptSha256) || !isHex64(callInputSha256)) {
+    return {
+      ok: false,
+      code: "output-unavailable",
+      reason: "the original source work prompt or call input digest is unavailable",
+    };
+  }
+  if (registration !== null) {
+    if (workPromptSha256 !== registration.workPromptSha256) {
+      return { ok: false, code: "source-conflict", reason: "the original native work prompt changed" };
+    }
+    if (callInputSha256 !== registration.callInputSha256) {
+      return { ok: false, code: "source-conflict", reason: "the original native call input changed" };
+    }
+  }
+  let observedSha256: string | null = null;
+  let observedBytes: number | null = null;
+  if (requireMatched) {
+    if (registration === null) {
+      return { ok: false, code: "not-ready", reason: "the source result projection is not registered" };
+    }
+    const projection = inspection.resultProjection;
+    if (!isRecord(projection)) {
+      return { ok: false, code: "not-ready", reason: "the source result projection is unavailable" };
+    }
+    if (projection.state === "unregistered" || projection.state === "pending") {
+      return {
+        ok: false,
+        code: "not-ready",
+        reason: "the actual source tool result has not been observed yet",
+      };
+    }
+    if (projection.state !== "matched") {
+      return {
+        ok: false,
+        code: "source-conflict",
+        reason: `the source result projection is ${String(projection.state)}`,
+      };
+    }
+    if (projection.expectedSha256 !== registration.expectedSha256
+      || projection.expectedBytes !== registration.expectedBytes) {
+      return {
+        ok: false,
+        code: "source-conflict",
+        reason: "the source result expectation fingerprint changed",
+      };
+    }
+    if (projection.observedSha256 !== registration.expectedSha256
+      || projection.observedBytes !== registration.expectedBytes
+      || !isHex64(projection.observedSha256)
+      || typeof projection.observedBytes !== "number"
+      || !Number.isSafeInteger(projection.observedBytes)
+      || projection.observedBytes < 0) {
+      return {
+        ok: false,
+        code: "source-conflict",
+        reason: "the observed source result fingerprint is not the registered expectation",
+      };
+    }
+    if (slot.output.observedSha256 !== null
+      && (slot.output.observedSha256 !== projection.observedSha256
+        || slot.output.observedBytes !== projection.observedBytes)) {
+      return {
+        ok: false,
+        code: "source-conflict",
+        reason: "the observed source result fingerprint changed for this capture",
+      };
+    }
+    observedSha256 = projection.observedSha256;
+    observedBytes = projection.observedBytes;
+  }
+  return {
+    ok: true,
+    check,
+    inspection,
+    context: main.context,
+    workPromptSha256,
+    callInputSha256,
+    observedSha256,
+    observedBytes,
+  };
+}
+
+function readRegisteredProjection(
+  inspection: NativeWorkCallInspection,
+  fingerprint: { readonly bytes: number; readonly sha256: string },
+  priorObservedSha256: string | null,
+  priorObservedBytes: number | null,
+): { readonly ok: true; readonly observedSha256: string | null; readonly observedBytes: number | null }
+  | { readonly ok: false; readonly reason: string } {
+  const projection = inspection.resultProjection;
+  if (!isRecord(projection)) return { ok: false, reason: "the native result projection is unavailable" };
+  if (projection.state === "pending") {
+    if (projection.expectedSha256 !== fingerprint.sha256
+      || projection.expectedBytes !== fingerprint.bytes) {
+      return { ok: false, reason: "the pending source result expectation is not the registered fingerprint" };
+    }
+    return { ok: true, observedSha256: null, observedBytes: null };
+  }
+  if (projection.state !== "matched") {
+    return { ok: false, reason: `the source result projection is ${String(projection.state)}` };
+  }
+  if (projection.expectedSha256 !== fingerprint.sha256
+    || projection.expectedBytes !== fingerprint.bytes
+    || projection.observedSha256 !== fingerprint.sha256
+    || projection.observedBytes !== fingerprint.bytes) {
+    return { ok: false, reason: "the matched source result fingerprint is not the registered fingerprint" };
+  }
+  if (priorObservedSha256 !== null
+    && (priorObservedSha256 !== projection.observedSha256
+      || priorObservedBytes !== projection.observedBytes)) {
+    return { ok: false, reason: "the source result fingerprint changed after registration" };
+  }
+  return {
+    ok: true,
+    observedSha256: projection.observedSha256,
+    observedBytes: projection.observedBytes,
+  };
+}
+
+function pureCheckReason(check: ReadyCallCheck): string | null {
+  let raw: unknown;
+  try {
+    raw = check.revalidate();
+  } catch (error) {
+    return `native call pure revalidation threw: ${outputThrownReason(error, "output operation failed")}`;
+  }
+  if (raw === null) return null;
+  if (typeof raw === "string") return boundedReason(raw, "native call pure revalidation refused");
+  // Any non-null non-string, including a Promise, refuses without reading an
+  // arbitrary `then` or `toString` from the pure-check result.
+  return "native call pure revalidation returned an invalid result";
+}
+
+function sourceSuccessProblem(slot: Slot, responseValue: unknown): string | null {
+  if (slot.response === null || responseValue !== slot.response) {
+    return "the delegation response is not the exact retained original result";
+  }
+  if (slot.state !== "settled") return "the delegation operation is not settled";
+  if (slot.finalOutcome !== "backend-completed") return "the retained delegation outcome is not backend completion";
+  if (slot.finalExecutionState !== "settled") return "the retained delegation execution is not settled";
+  if (slot.finalAuthorityFresh !== true) return "the retained delegation authority is not fresh";
+  if (slot.finalTermination !== "none") return "the retained delegation terminated abnormally";
+  if (!slot.backendEffectStarted || !slot.createSettled || !slot.executionStarted || !slot.executionSettled) {
+    return "the backend execution did not settle as a completed live run";
+  }
+  if (!slot.dispatchClosed || slot.workerPromises.size !== 0) {
+    return "the backend execution still has outstanding worker work";
+  }
+  if (slot.concurrencyHeld) return "the delegation execution concurrency is still held";
+  if (slot.cancelRequested || slot.cancelState !== "none" || slot.cancelError !== null) {
+    return "the delegation execution was cancelled or its cancellation was unresolved";
+  }
+  if (slot.backend === null || slot.runId === null) return "the delegation backend or run identity is unavailable";
+  const response = responseValue as NativeHarnessDelegationResult;
+  if (response.resultKind !== "live"
+    || response.historical
+    || response.authorityFresh !== true
+    || response.outcome !== "backend-completed"
+    || response.backendStatus !== "completed"
+    || response.executionState !== "settled"
+    || response.termination !== "none"
+    || response.cancellation !== "none"
+    || response.cancelError !== null) {
+    return "the original delegation result is not a successful settled live completion";
+  }
+  if (response.runId !== slot.runId || slot.backendStatus !== "completed" || !slot.executionSettled) {
+    return "the original delegation result does not match the retained run";
+  }
+  if (response.association === null || !sameAssociation(response.association, slot.association)) {
+    return "the original delegation result association changed";
+  }
+  return null;
+}
+
+function outputClockFailure(
+  state: CoordinatorState,
+  slot: Slot,
+  startedAt: number,
+): NativeHarnessOutputSelectionFailure | null {
+  const now = readClock(state.now);
+  if (now === null) {
+    return outputFailure("deadline", "the output capture clock is unavailable");
+  }
+  if (now < startedAt || (slot.output.lastClock !== null && now < slot.output.lastClock)) {
+    return outputFailure("deadline", "the output capture clock moved backwards");
+  }
+  slot.output.lastClock = now;
+  if (now - startedAt > NATIVE_HARNESS_OUTPUT_CAPTURE_BUDGET_MS) {
+    return outputFailure("deadline", "the output capture budget expired");
+  }
+  return null;
+}
+
+function outputLocalFailure(
+  state: CoordinatorState,
+  slot: Slot,
+  captureSignal: AbortSignal,
+): NativeHarnessOutputSelectionFailure | null {
+  if (state.disposed) return outputFailure("authority-lost", "the delegation coordinator was disposed");
+  if (!state.enabled) return outputFailure("authority-lost", "the delegation coordinator is disabled");
+  if (slot.output.state !== "running") {
+    return outputFailure("cancelled", "the output capture is no longer active");
+  }
+  if (state.outputActive !== slot) {
+    return outputFailure("cancelled", "the output capture reservation was replaced");
+  }
+  if (slot.output.reservedBytes !== NATIVE_HARNESS_OUTPUT_RESERVATION_BYTES) {
+    return outputFailure("cancelled", "the output capture reservation was released");
+  }
+  const signal = readActualAbortSignal(captureSignal);
+  if (!signal.ok) return outputFailure("invalid-caller", signal.reason);
+  if (signal.aborted) return outputFailure("cancelled", "the output capture signal was aborted");
+  return null;
+}
+
+function captureEntryGate(
+  state: CoordinatorState,
+  slot: Slot,
+  output: OutputPort,
+  registration: OutputRegistration,
+  captureSignal: AbortSignal,
+): { readonly ok: true; readonly now: number; readonly observedSha256: string; readonly observedBytes: number }
+  | NativeHarnessOutputSelectionFailure {
+  if (state.disposed) return outputFailure("authority-lost", "the delegation coordinator was disposed");
+  if (!state.enabled) return outputFailure("authority-lost", "the delegation coordinator is disabled");
+  const signal = readActualAbortSignal(captureSignal);
+  if (!signal.ok) return outputFailure("invalid-caller", signal.reason);
+  if (signal.aborted) return outputFailure("cancelled", "the output capture signal was aborted");
+  const before = readClock(state.now);
+  if (before === null) return outputFailure("not-ready", "the delegation clock is unavailable");
+  const prepared = prepareOutputCheck(slot, state, registration, true);
+  if (!prepared.ok) return outputFailure(prepared.code, prepared.reason);
+  const after = readClock(state.now);
+  if (after === null) return outputFailure("deadline", "the output capture clock is unavailable");
+  if (before !== null && after < before) return outputFailure("deadline", "the output capture clock moved backwards");
+  const source = sourceSuccessProblem(slot, slot.response);
+  if (source !== null) return outputFailure("source-conflict", source);
+  const owner = ownerPredicateReason(output);
+  if (owner !== null) return outputFailure("authority-lost", owner);
+  const signalAfter = readActualAbortSignal(captureSignal);
+  if (!signalAfter.ok) return outputFailure("invalid-caller", signalAfter.reason);
+  if (signalAfter.aborted) return outputFailure("cancelled", "the output capture signal was aborted");
+  const pure = pureCheckReason(prepared.check);
+  if (pure !== null) return outputFailure("source-conflict", pure);
+  if (state.disposed) return outputFailure("authority-lost", "the delegation coordinator was disposed");
+  if (slot.output.state !== "idle" || slot.output.registration !== registration) {
+    return outputFailure("not-ready", "the source output state changed during admission");
+  }
+  if (prepared.observedSha256 === null || prepared.observedBytes === null) {
+    return outputFailure("not-ready", "the actual source result has not been observed yet");
+  }
+  return {
+    ok: true,
+    now: after,
+    observedSha256: prepared.observedSha256,
+    observedBytes: prepared.observedBytes,
+  };
+}
+
+function captureGuardGate(
+  state: CoordinatorState,
+  slot: Slot,
+  output: OutputPort,
+  registration: OutputRegistration,
+  captureSignal: AbortSignal,
+  startedAt: number,
+): NativeHarnessOutputSelectionFailure | null {
+  const local = outputLocalFailure(state, slot, captureSignal);
+  if (local !== null) return local;
+  const clock = outputClockFailure(state, slot, startedAt);
+  if (clock !== null) return clock;
+  const prepared = prepareOutputCheck(slot, state, registration, true);
+  if (!prepared.ok) {
+    return outputFailure(prepared.code === "not-ready" ? "source-conflict" : prepared.code, prepared.reason);
+  }
+  const clockAfter = outputClockFailure(state, slot, startedAt);
+  if (clockAfter !== null) return clockAfter;
+  const source = sourceSuccessProblem(slot, slot.response);
+  if (source !== null) return outputFailure("source-conflict", source);
+  const owner = ownerPredicateReason(output);
+  if (owner !== null) return outputFailure("authority-lost", owner);
+  const signal = readActualAbortSignal(captureSignal);
+  if (!signal.ok) return outputFailure("invalid-caller", signal.reason);
+  if (signal.aborted) return outputFailure("cancelled", "the output capture signal was aborted");
+  const pure = pureCheckReason(prepared.check);
+  if (pure !== null) return outputFailure("source-conflict", pure);
+  return outputLocalFailure(state, slot, captureSignal)
+    ?? (prepared.observedSha256 === null || prepared.observedBytes === null
+      ? outputFailure("source-conflict", "the actual source result observation is unavailable")
+      : null);
+}
+
+function captureFinalGate(
+  state: CoordinatorState,
+  slot: Slot,
+  output: OutputPort,
+  registration: OutputRegistration,
+  capture: NativeHarnessOutputCapture,
+  captureSignal: AbortSignal,
+  startedAt: number,
+  observedSha256: string,
+  observedBytes: number,
+): NativeHarnessOutputSelectionFailure | null {
+  const clock = outputClockFailure(state, slot, startedAt);
+  if (clock !== null) return clock;
+  const backend = slot.backend?.receiver;
+  if (backend === undefined || !outputMatches(output, backend, capture)) {
+    return outputFailure("source-conflict", "the issued output capture is no longer bound to this backend");
+  }
+  const prepared = prepareOutputCheck(slot, state, registration, true);
+  if (!prepared.ok) {
+    return outputFailure(prepared.code === "not-ready" ? "source-conflict" : prepared.code, prepared.reason);
+  }
+  const clockAfter = outputClockFailure(state, slot, startedAt);
+  if (clockAfter !== null) return clockAfter;
+  if (prepared.observedSha256 !== observedSha256 || prepared.observedBytes !== observedBytes) {
+    return outputFailure("source-conflict", "the source result observation changed during capture");
+  }
+
+  // Final sequence, no host callback follows: pure owner predicate, actual
+  // capture signal, captured native pure revalidation, then local source state.
+  const owner = ownerPredicateReason(output);
+  if (owner !== null) return outputFailure("authority-lost", owner);
+  const signal = readActualAbortSignal(captureSignal);
+  if (!signal.ok) return outputFailure("invalid-caller", signal.reason);
+  if (signal.aborted) return outputFailure("cancelled", "the output capture signal was aborted before retention");
+  const pure = pureCheckReason(prepared.check);
+  if (pure !== null) return outputFailure("source-conflict", pure);
+  const local = outputLocalFailure(state, slot, captureSignal);
+  if (local !== null) return local;
+  if (slot.output.registration !== registration) {
+    return outputFailure("source-conflict", "the source result registration was replaced");
+  }
+  if (slot.output.guardFailure !== null) return slot.output.guardFailure;
+  const source = sourceSuccessProblem(slot, slot.response);
+  if (source !== null) return outputFailure("source-conflict", source);
+  return null;
+}
+
+function readCapturedOutput(
+  value: unknown,
+  slot: Slot,
+  output: OutputPort,
+  registration: OutputRegistration,
+): { readonly ok: true; readonly capture: NativeHarnessOutputCapture; readonly bytes: number }
+  | NativeHarnessOutputSelectionFailure {
+  const fields = readStrictFields(value, ["ok", "capture", "code", "reason"], ["ok"]);
+  if (fields === null) {
+    return outputFailure("capture-failed", "the trusted output capture returned an unreadable result");
+  }
+  if (fields.get("ok") !== true) {
+    const code = fields.get("code");
+    const reason = fields.get("reason");
+    const mapped: NativeHarnessOutputSelectionCode = code === "aborted"
+      ? "cancelled"
+      : code === "deadline"
+        ? "deadline"
+        : code === "authority-lost"
+          ? "authority-lost"
+          : code === "invalid-control"
+            ? "invalid-caller"
+            : code === "source-unavailable" || code === "changed" || code === "missing"
+              ? "source-conflict"
+              : "capture-failed";
+    return outputFailure(
+      mapped,
+      typeof reason === "string" ? reason : "the trusted output capture refused",
+    );
+  }
+  const captureValue = fields.get("capture");
+  if (!isRecord(captureValue)) {
+    return outputFailure("capture-failed", "the trusted output capture returned no capture object");
+  }
+  const runId = readOwnField(captureValue, "runId");
+  const taskSha256 = readOwnField(captureValue, "taskSha256");
+  const changes = readOwnField(captureValue, "changes");
+  if (runId.kind !== "data"
+    || taskSha256.kind !== "data"
+    || changes.kind !== "data"
+    || typeof runId.value !== "string"
+    || !isHex64(taskSha256.value)
+    || !Array.isArray(changes.value)) {
+    return outputFailure("capture-failed", "the trusted output capture has unreadable identity facts");
+  }
+  if (runId.value !== registration.runId || taskSha256.value !== registration.taskSha256) {
+    return outputFailure("source-conflict", "the issued output capture does not match the original run and task");
+  }
+  if (changes.value.length < 1 || changes.value.length > MAX_OUTPUT_CHANGES) {
+    return outputFailure("capture-failed", "the issued output capture change count is outside the bound");
+  }
+  let totalBytes = 0;
+  for (const change of changes.value) {
+    const snapshot = readOwnField(change, "snapshot");
+    if (snapshot.kind !== "data" || !isNativeWorkspaceTextSnapshot(snapshot.value)) {
+      return outputFailure("capture-failed", "the issued output capture contains a non-native snapshot");
+    }
+    const file = readOwnField(snapshot.value, "file");
+    const bytes = file.kind === "data" ? readOwnField(file.value, "bytes") : { kind: "missing" as const };
+    if (bytes.kind !== "data"
+      || typeof bytes.value !== "number"
+      || !Number.isSafeInteger(bytes.value)
+      || bytes.value < 0
+      || bytes.value > 256 * 1024) {
+      return outputFailure("capture-failed", "the issued output capture snapshot exceeds its byte bound");
+    }
+    totalBytes += bytes.value;
+    if (totalBytes > MAX_OUTPUT_CHANGE_BYTES) {
+      return outputFailure("capture-failed", "the issued output capture text exceeds the retained byte bound");
+    }
+  }
+  const backend = slot.backend?.receiver;
+  if (backend === undefined || !outputMatches(output, backend, captureValue)) {
+    return outputFailure("source-conflict", "the issued output capture is not bound to the original backend");
+  }
+  return { ok: true, capture: captureValue as unknown as NativeHarnessOutputCapture, bytes: totalBytes };
+}
+
+function releaseOutputReservation(state: CoordinatorState, slot: Slot): void {
+  const reserved = slot.output.reservedBytes;
+  if (reserved > 0) {
+    slot.output.reservedBytes = 0;
+    state.outputReservedBytes = Math.max(0, state.outputReservedBytes - reserved);
+  }
+  if (state.outputActive === slot) state.outputActive = null;
+}
+
+function retainOutputSuccess(
+  state: CoordinatorState,
+  slot: Slot,
+  registration: OutputRegistration,
+  capture: NativeHarnessOutputCapture,
+  bytes: number,
+  observedSha256: string,
+  observedBytes: number,
+): NativeHarnessOutputSelectionFailure | null {
+  if (state.outputBytes + bytes > NATIVE_HARNESS_MAX_OUTPUT_BYTES) {
+    return outputFailure("capacity", "the retained output byte budget would be exceeded");
+  }
+  const out = slot.output;
+  releaseOutputReservation(state, slot);
+  state.outputRetained += 1;
+  state.outputBytes += bytes;
+  out.retainedBytes = bytes;
+  out.capture = capture;
+  out.observedSha256 = observedSha256;
+  out.observedBytes = observedBytes;
+  out.state = "captured";
+  out.promise = null;
+  out.requestSignal = null;
+  out.controller = null;
+  out.cleanup = null;
+  out.failure = null;
+  out.selection = Object.freeze({
+    ok: true as const,
+    observation: "captured-now" as const,
+    filesystemFreshness: "observed-during-capture" as const,
+    capture,
+    association: slot.association,
+    runId: registration.runId,
+    taskSha256: registration.taskSha256,
+    workPromptSha256: registration.workPromptSha256,
+    callInputSha256: registration.callInputSha256,
+    expectedResultSha256: registration.expectedSha256,
+    observedResultSha256: observedSha256,
+    taskAccepted: false as const,
+    semanticAcceptance: "not-evaluated" as const,
+  });
+  return null;
+}
+
+function failOutput(
+  state: CoordinatorState,
+  slot: Slot,
+  failure: NativeHarnessOutputSelectionFailure,
+): void {
+  const out = slot.output;
+  releaseOutputReservation(state, slot);
+  out.state = "failed";
+  out.failure = failure;
+  out.promise = null;
+  out.requestSignal = null;
+  out.controller = null;
+  out.cleanup = null;
+  out.selection = null;
+  out.capture = null;
+  out.retainedBytes = 0;
+}
+
+function cancelOutputCapture(slot: Slot, reason: string): boolean {
+  const out = slot.output;
+  if (out.state !== "running" || out.controller === null || out.guardFailure !== null) return false;
+  out.guardFailure = outputFailure("cancelled", reason);
+  try {
+    out.controller.abort(new Error(reason));
+  } catch {
+    // The local capture signal is already aborted.
+  }
+  return true;
+}
+
+function createCaptureController(requestSignal: AbortSignal):
+  | { readonly ok: true; readonly controller: AbortController; readonly cleanup: () => void }
+  | { readonly ok: false; readonly reason: string } {
+  if (ACTUAL_ADD_EVENT_LISTENER === null || ACTUAL_REMOVE_EVENT_LISTENER === null) {
+    return { ok: false, reason: "host abort listeners are unavailable" };
+  }
+  const controller = new AbortController();
+  const listener = (): void => {
+    try {
+      controller.abort(new Error("output capture cancelled"));
+    } catch {
+      // Already aborted.
+    }
+  };
+  try {
+    Reflect.apply(ACTUAL_ADD_EVENT_LISTENER, requestSignal, ["abort", listener, { once: true }]);
+  } catch (error) {
+    return { ok: false, reason: `output capture listener failed: ${outputThrownReason(error, "output operation failed")}` };
+  }
+  const read = readActualAbortSignal(requestSignal);
+  if (!read.ok) {
+    try {
+      Reflect.apply(ACTUAL_REMOVE_EVENT_LISTENER, requestSignal, ["abort", listener]);
+    } catch {
+      // Best effort.
+    }
+    return { ok: false, reason: read.reason };
+  }
+  if (read.aborted) {
+    try {
+      controller.abort(new Error("output capture signal already aborted"));
+    } catch {
+      // Already aborted.
+    }
+  }
+  return {
+    ok: true,
+    controller,
+    cleanup(): void {
+      try {
+        Reflect.apply(ACTUAL_REMOVE_EVENT_LISTENER as EventTarget["removeEventListener"], requestSignal, ["abort", listener]);
+      } catch {
+        // Best-effort listener removal.
+      }
+    },
+  };
+}
+
+async function runOutputCapture(
+  state: CoordinatorState,
+  slot: Slot,
+  output: OutputPort,
+  registration: OutputRegistration,
+  controller: AbortController,
+  cleanup: () => void,
+  startedAt: number,
+  observedSha256: string,
+  observedBytes: number,
+): Promise<void> {
+  const out = slot.output;
+  let capture: NativeHarnessOutputCapture | null = null;
+  let retainedBytes = 0;
+  let failure: NativeHarnessOutputSelectionFailure | null = null;
+  try {
+    const guard = (): void => {
+      const gate = captureGuardGate(state, slot, output, registration, controller.signal, startedAt);
+      if (gate !== null) {
+        out.guardFailure = gate;
+        throw new NativeHarnessDelegationError(gate.reason);
+      }
+    };
+    let raw: unknown;
+    try {
+      raw = Reflect.apply(output.capture, output.receiver, [
+        slot.backend === null ? null : slot.backend.receiver,
+        guard,
+        controller.signal,
+      ]);
+    } catch (error) {
+      failure = out.guardFailure
+        ?? outputFailure("capture-failed", `the trusted output capture threw: ${outputThrownReason(error, "output operation failed")}`);
+    }
+    if (failure === null) {
+      if (!consumeNativePromise(raw)) {
+        failure = out.guardFailure
+          ?? outputFailure("capture-failed", "the trusted output capture did not return a native Promise");
+      } else {
+        let leaf: unknown;
+        try {
+          leaf = await (raw as Promise<unknown>);
+        } catch (error) {
+          failure = out.guardFailure
+            ?? outputFailure("capture-failed", `the trusted output capture rejected: ${outputThrownReason(error, "output operation failed")}`);
+        }
+        if (failure === null) {
+          const read = readCapturedOutput(leaf, slot, output, registration);
+          if (!read.ok) {
+            failure = out.guardFailure ?? read;
+          } else {
+            capture = read.capture;
+            retainedBytes = read.bytes;
+          }
+        }
+      }
+    }
+    if (failure === null && capture !== null) {
+      const final = captureFinalGate(
+        state,
+        slot,
+        output,
+        registration,
+        capture,
+        controller.signal,
+        startedAt,
+        observedSha256,
+        observedBytes,
+      );
+      if (final !== null) failure = final;
+    }
+  } catch (error) {
+    failure = out.guardFailure
+      ?? outputFailure("capture-failed", `the output capture failed unexpectedly: ${outputThrownReason(error, "output operation failed")}`);
+  } finally {
+    try {
+      cleanup();
+    } catch {
+      // Best effort.
+    }
+    if (failure === null && capture !== null) {
+      const retained = retainOutputSuccess(
+        state,
+        slot,
+        registration,
+        capture,
+        retainedBytes,
+        observedSha256,
+        observedBytes,
+      );
+      if (retained === null) return;
+      failure = retained;
+    }
+    failOutput(
+      state,
+      slot,
+      failure ?? outputFailure("capture-failed", "the output capture settled without a result"),
+    );
+  }
+}
+
+function captureOutputInternal(
+  state: CoordinatorState,
+  actualSourceToolCallId: unknown,
+  captureSignalValue: unknown,
+): Promise<NativeHarnessOutputSelection> {
+  try {
+    if (state.disposed) {
+      return Promise.resolve(outputFailure("authority-lost", "the delegation coordinator was disposed"));
+    }
+    if (!state.enabled) {
+      return Promise.resolve(outputFailure("authority-lost", "the delegation coordinator is disabled"));
+    }
+    const toolCallId = boundedString(actualSourceToolCallId, MAX_TOOL_CALL_ID_CHARS);
+    if (toolCallId === null) {
+      return Promise.resolve(outputFailure("invalid-caller", "the actual source tool call id is unavailable"));
+    }
+    const slot = state.slots.get(toolCallId);
+    if (slot === undefined) {
+      return Promise.resolve(outputFailure("not-ready", "no retained delegation operation has this source id"));
+    }
+    const out = slot.output;
+    if (out.state === "failed" && out.failure !== null) {
+      return Promise.resolve(out.failure);
+    }
+    if (out.state === "captured" && out.selection !== null) {
+      const cached = captureCachedOutput(state, slot, captureSignalValue);
+      return Promise.resolve(cached);
+    }
+    if (out.state === "running" && out.promise !== null) {
+      if (out.requestSignal !== captureSignalValue) {
+        return Promise.resolve(outputFailure(
+          "capacity",
+          "another output capture is already in flight for this delegation",
+        ));
+      }
+      const signal = readActualAbortSignal(captureSignalValue);
+      if (!signal.ok) return Promise.resolve(outputFailure("invalid-caller", signal.reason));
+      if (signal.aborted) {
+        return Promise.resolve(outputFailure("cancelled", "the output capture signal was aborted"));
+      }
+      if (state.disposed) {
+        return Promise.resolve(outputFailure("authority-lost", "the delegation coordinator was disposed"));
+      }
+      const output = state.output;
+      const registration = out.registration;
+      if (output === null || registration === null || out.startedAt === null) {
+        return Promise.resolve(outputFailure("not-ready", "the in-flight output capture is incomplete"));
+      }
+      // Sharing the owner promise still requires a fresh caller scope. The
+      // validation itself is bounded so a reentrant host callback cannot loop.
+      if (state.outputJoinValidating) {
+        return Promise.resolve(outputFailure(
+          "not-ready",
+          "reentrant output capture join validation was refused",
+        ));
+      }
+      state.outputJoinValidating = true;
+      try {
+        const admitted = captureGuardGate(
+          state,
+          slot,
+          output,
+          registration,
+          captureSignalValue as AbortSignal,
+          out.startedAt,
+        );
+        if (admitted !== null) return Promise.resolve(admitted);
+        if (out.state !== "running" || out.promise === null || out.requestSignal !== captureSignalValue) {
+          return Promise.resolve(outputFailure(
+            "not-ready",
+            "the in-flight output capture changed during join validation",
+          ));
+        }
+        return out.promise;
+      } catch (error) {
+        return Promise.resolve(outputFailure(
+          "authority-lost",
+          `the output capture join validation failed: ${outputThrownReason(error, "output operation failed")}`,
+        ));
+      } finally {
+        state.outputJoinValidating = false;
+      }
+    }
+    if (out.state !== "idle") {
+      return Promise.resolve(outputFailure("not-ready", "the source output state is unavailable"));
+    }
+    const signal = readActualAbortSignal(captureSignalValue);
+    if (!signal.ok) return Promise.resolve(outputFailure("invalid-caller", signal.reason));
+    if (signal.aborted) return Promise.resolve(outputFailure("cancelled", "the output capture signal was aborted"));
+    const output = state.output;
+    if (output === null) {
+      return Promise.resolve(outputFailure(
+        "output-unavailable",
+        "the trusted output port is not available",
+      ));
+    }
+    const registration = out.registration;
+    if (registration === null) {
+      return Promise.resolve(outputFailure(
+        "output-unavailable",
+        out.registrationFailure ?? "the actual source result projection is not registered",
+      ));
+    }
+    if (state.outputActive !== null) {
+      return Promise.resolve(outputFailure("capacity", "another output capture is already in flight"));
+    }
+    if (state.outputRetained >= NATIVE_HARNESS_MAX_OUTPUT_CAPTURES) {
+      return Promise.resolve(outputFailure("capacity", "the retained output capture count is exhausted"));
+    }
+    if (state.outputBytes + state.outputReservedBytes + NATIVE_HARNESS_OUTPUT_RESERVATION_BYTES
+      > NATIVE_HARNESS_MAX_OUTPUT_BYTES) {
+      return Promise.resolve(outputFailure("capacity", "the retained output byte budget is exhausted or reserved"));
+    }
+    const gate = captureEntryGate(state, slot, output, registration, captureSignalValue as AbortSignal);
+    if (!gate.ok) return Promise.resolve(gate);
+
+    // Gate callbacks may reenter and admit another Slot. Recheck the original
+    // local operation and all capacity facts immediately before reservation.
+    if (state.outputActive !== null) {
+      return Promise.resolve(outputFailure("capacity", "another output capture is already in flight"));
+    }
+    if (state.outputRetained >= NATIVE_HARNESS_MAX_OUTPUT_CAPTURES) {
+      return Promise.resolve(outputFailure("capacity", "the retained output capture count is exhausted"));
+    }
+    if (state.outputBytes + state.outputReservedBytes + NATIVE_HARNESS_OUTPUT_RESERVATION_BYTES
+      > NATIVE_HARNESS_MAX_OUTPUT_BYTES) {
+      return Promise.resolve(outputFailure("capacity", "the retained output byte budget is exhausted or reserved"));
+    }
+    if (state.disposed
+      || out.state !== "idle"
+      || out.registration !== registration
+      || state.slots.get(toolCallId) !== slot) {
+      return Promise.resolve(outputFailure("not-ready", "the source output state changed during admission"));
+    }
+    const combined = createCaptureController(captureSignalValue as AbortSignal);
+    if (!combined.ok) return Promise.resolve(outputFailure("invalid-caller", combined.reason));
+
+    // Reserve and install the exact deferred promise/state before the leaf can
+    // start any callback or I/O. Reentrant callers observe the same operation.
+    const settled = deferred<NativeHarnessOutputSelection>();
+    state.outputReservedBytes += NATIVE_HARNESS_OUTPUT_RESERVATION_BYTES;
+    state.outputActive = slot;
+    out.state = "running";
+    out.promise = settled.promise;
+    out.requestSignal = captureSignalValue as AbortSignal;
+    out.controller = combined.controller;
+    out.cleanup = combined.cleanup;
+    out.guardFailure = null;
+    out.reservedBytes = NATIVE_HARNESS_OUTPUT_RESERVATION_BYTES;
+    out.observedSha256 = gate.observedSha256;
+    out.observedBytes = gate.observedBytes;
+    out.startedAt = gate.now;
+    out.lastClock = gate.now;
+    void runOutputCapture(
+      state,
+      slot,
+      output,
+      registration,
+      combined.controller,
+      combined.cleanup,
+      gate.now,
+      gate.observedSha256,
+      gate.observedBytes,
+    ).then(
+      () => {
+        settled.resolve(
+          out.selection
+            ?? out.failure
+            ?? outputFailure("capture-failed", "the output capture settled without a result"),
+        );
+      },
+      (error) => {
+        const failure = outputFailure(
+          "capture-failed",
+          `the output capture task failed: ${outputThrownReason(error, "output operation failed")}`,
+        );
+        failOutput(state, slot, failure);
+        settled.resolve(failure);
+      },
+    );
+    return settled.promise;
+  } catch (error) {
+    return Promise.resolve(outputFailure(
+      "capture-failed",
+      `the output capture admission failed: ${outputThrownReason(error, "output operation failed")}`,
+    ));
+  }
+}
+
+function captureCachedOutput(
+  state: CoordinatorState,
+  slot: Slot,
+  captureSignalValue: unknown,
+): NativeHarnessOutputSelection {
+  const out = slot.output;
+  if (out.capture === null || out.selection === null || out.registration === null) {
+    return outputFailure("not-ready", "the retained output capture is unavailable");
+  }
+  if (state.disposed) return outputFailure("authority-lost", "the delegation coordinator was disposed");
+  if (!state.enabled) return outputFailure("authority-lost", "the delegation coordinator is disabled");
+  const signal = readActualAbortSignal(captureSignalValue);
+  if (!signal.ok) return outputFailure("invalid-caller", signal.reason);
+  if (signal.aborted) return outputFailure("cancelled", "the output capture signal was aborted");
+  const output = state.output;
+  if (output === null) return outputFailure("output-unavailable", "the trusted output port is not available");
+  const registration = out.registration;
+  const prepared = prepareOutputCheck(slot, state, registration, true);
+  if (!prepared.ok) {
+    return outputFailure(prepared.code === "not-ready" ? "source-conflict" : prepared.code, prepared.reason);
+  }
+  const backend = slot.backend?.receiver;
+  if (backend === undefined || !outputMatches(output, backend, out.capture)) {
+    return outputFailure("source-conflict", "the retained output capture is no longer bound to this backend");
+  }
+  const source = sourceSuccessProblem(slot, slot.response);
+  if (source !== null) return outputFailure("source-conflict", source);
+  if (prepared.observedSha256 !== out.selection.observedResultSha256) {
+    return outputFailure("source-conflict", "the source result observation changed after capture");
+  }
+  // All matcher/native reads are complete. Final pure owner/signal/native/local
+  // sequence; the retained historical snapshot is never mutated by refusal.
+  const owner = ownerPredicateReason(output);
+  if (owner !== null) return outputFailure("authority-lost", owner);
+  const signalAfter = readActualAbortSignal(captureSignalValue);
+  if (!signalAfter.ok) return outputFailure("invalid-caller", signalAfter.reason);
+  if (signalAfter.aborted) return outputFailure("cancelled", "the output capture signal was aborted");
+  const pure = pureCheckReason(prepared.check);
+  if (pure !== null) return outputFailure("source-conflict", pure);
+  if (state.disposed
+    || !state.enabled
+    || out.state !== "captured"
+    || out.capture !== out.selection.capture
+    || out.registration !== registration) {
+    return outputFailure("authority-lost", "the retained output capture state changed during the fresh check");
+  }
+  return Object.freeze({
+    ...out.selection,
+    observation: "cached-historical" as const,
+    filesystemFreshness: "not-rechecked" as const,
+  });
+}
+
+function registerToolResultProjectionInternal(
+  state: CoordinatorState,
+  actualSourceToolCallId: unknown,
+  actualDelegationResponse: unknown,
+  actualProjectedResult: unknown,
+  originalSignal: unknown,
+): { readonly ok: boolean; readonly reason: string | null } {
+  let slot: Slot | null = null;
+  let lockAcquired = false;
+  try {
+    if (state.disposed) return registrationFailure("the delegation coordinator was disposed");
+    if (!state.enabled) return registrationFailure("the delegation coordinator is disabled");
+    const toolCallId = boundedString(actualSourceToolCallId, MAX_TOOL_CALL_ID_CHARS);
+    if (toolCallId === null) return registrationFailure("the actual source tool call id is unavailable");
+    slot = state.slots.get(toolCallId) ?? null;
+    if (slot === null) return registrationFailure("no retained delegation operation has this source id");
+    const out = slot.output;
+    if (out.registering) return registrationFailure("source result registration is already in progress");
+    if (originalSignal !== slot.invocationSignal) {
+      return registrationFailure("the original invocation signal is not the retained source signal");
+    }
+    const signal = readActualAbortSignal(originalSignal);
+    if (!signal.ok) return registrationFailure(signal.reason);
+    if (signal.aborted) return registrationFailure("the original invocation signal was aborted at registration");
+    const source = sourceSuccessProblem(slot, actualDelegationResponse);
+    if (source !== null) {
+      out.registrationFailure = boundedReason(source, "output unavailable");
+      return registrationFailure(source);
+    }
+    if (out.state !== "idle") {
+      return registrationFailure("source output capture has already started");
+    }
+    const output = state.output;
+    if (output === null) {
+      out.registrationFailure = "the trusted output port is unavailable";
+      return registrationFailure(out.registrationFailure);
+    }
+    const register = state.native.registerCallResultExpectation;
+    if (register === null) {
+      out.registrationFailure = "native result expectation registration is unavailable";
+      return registrationFailure(out.registrationFailure);
+    }
+    out.registering = true;
+    lockAcquired = true;
+
+    const initial = prepareOutputCheck(slot, state, null, false);
+    if (!initial.ok) {
+      out.registrationFailure = boundedReason(initial.reason, "output unavailable");
+      return registrationFailure(initial.reason);
+    }
+    const initialPure = pureCheckReason(initial.check);
+    if (initialPure !== null) {
+      out.registrationFailure = boundedReason(initialPure, "output unavailable");
+      return registrationFailure(initialPure);
+    }
+    let rawRegistration: unknown;
+    try {
+      rawRegistration = Reflect.apply(register, state.native.receiver, [
+        slot.originalRef,
+        { input: { task: slot.task }, result: actualProjectedResult },
+        initial.context,
+      ]);
+    } catch (error) {
+      out.registrationFailure = outputThrownReason(error, "native result expectation registration threw");
+      return registrationFailure(out.registrationFailure);
+    }
+    const fingerprint = readRegistrationFingerprint(rawRegistration);
+    if (!fingerprint.ok) {
+      out.registrationFailure = boundedReason(fingerprint.reason, "output unavailable");
+      return registrationFailure(fingerprint.reason);
+    }
+
+    // Registration replaced the native expectation identity. The old prepared
+    // check is stale by design and must not authorize this commit.
+    const after = prepareOutputCheck(slot, state, null, false);
+    if (!after.ok) {
+      out.registrationFailure = boundedReason(after.reason, "output unavailable");
+      return registrationFailure(after.reason);
+    }
+    if (after.workPromptSha256 !== initial.workPromptSha256
+      || after.callInputSha256 !== initial.callInputSha256) {
+      out.registrationFailure = "the original source work prompt or call input changed during registration";
+      return registrationFailure(out.registrationFailure);
+    }
+    const projection = readRegisteredProjection(
+      after.inspection,
+      fingerprint,
+      out.observedSha256,
+      out.observedBytes,
+    );
+    if (!projection.ok) {
+      out.registrationFailure = boundedReason(projection.reason, "output unavailable");
+      return registrationFailure(projection.reason);
+    }
+    const owner = ownerPredicateReason(output);
+    if (owner !== null) {
+      out.registrationFailure = boundedReason(owner, "output unavailable");
+      return registrationFailure(owner);
+    }
+    const finalSignal = readActualAbortSignal(slot.invocationSignal);
+    if (!finalSignal.ok) {
+      out.registrationFailure = boundedReason(finalSignal.reason, "output unavailable");
+      return registrationFailure(finalSignal.reason);
+    }
+    if (finalSignal.aborted) {
+      out.registrationFailure = "the original invocation signal was aborted during registration";
+      return registrationFailure(out.registrationFailure);
+    }
+    const afterPure = pureCheckReason(after.check);
+    if (afterPure !== null) {
+      out.registrationFailure = boundedReason(afterPure, "output unavailable");
+      return registrationFailure(afterPure);
+    }
+    if (state.disposed
+      || !state.enabled
+      || slot.output.state !== "idle"
+      || slot.output.registering !== true
+      || slot.response === null
+      || sourceSuccessProblem(slot, slot.response) !== null) {
+      out.registrationFailure = "the original source state changed during registration";
+      return registrationFailure(out.registrationFailure);
+    }
+    const taskSha256 = sha256Hex(slot.task);
+    const existing = out.registration;
+    if (existing !== null) {
+      if (existing.expectedSha256 !== fingerprint.sha256
+        || existing.expectedBytes !== fingerprint.bytes
+        || existing.workPromptSha256 !== initial.workPromptSha256
+        || existing.callInputSha256 !== initial.callInputSha256
+        || existing.taskSha256 !== taskSha256
+        || existing.runId !== slot.runId) {
+        out.registrationFailure = "a different result projection was already registered for this source";
+        return registrationFailure(out.registrationFailure);
+      }
+      out.registrationFailure = null;
+      return registrationSuccess();
+    }
+    out.registration = Object.freeze({
+      expectedSha256: fingerprint.sha256,
+      expectedBytes: fingerprint.bytes,
+      workPromptSha256: initial.workPromptSha256,
+      callInputSha256: initial.callInputSha256,
+      taskSha256,
+      runId: slot.runId as string,
+    });
+    out.observedSha256 = projection.observedSha256;
+    out.observedBytes = projection.observedBytes;
+    out.registrationFailure = null;
+    return registrationSuccess();
+  } catch (error) {
+    if (slot !== null) {
+      slot.output.registrationFailure = outputThrownReason(error, "output unavailable");
+    }
+    return registrationFailure(error);
+  } finally {
+    if (slot !== null && lockAcquired) slot.output.registering = false;
+  }
 }
 
 function beginCancellation(slot: Slot, reason: SlotCancelReason): void {
@@ -2033,6 +3491,26 @@ function createSlot(
     finalExecutionState: "not-started",
     finalTermination: "none",
     finalCost: null,
+    output: {
+      registration: null,
+      registrationFailure: null,
+      registering: false,
+      state: "idle",
+      promise: null,
+      requestSignal: null,
+      controller: null,
+      cleanup: null,
+      capture: null,
+      selection: null,
+      failure: null,
+      guardFailure: null,
+      observedSha256: null,
+      observedBytes: null,
+      reservedBytes: 0,
+      retainedBytes: 0,
+      startedAt: null,
+      lastClock: null,
+    },
   };
   // The listener is assigned after the slot exists so it can identify itself.
   const listener = () => beginCancellation(slot, "invocation-aborted");
@@ -2065,6 +3543,8 @@ function buildSnapshot(state: CoordinatorState): NativeHarnessDelegationSnapshot
   const now = readClock(state.now) ?? 0;
   const operations: NativeHarnessSnapshotOperation[] = [];
   for (const slot of state.slots.values()) {
+    const out = slot.output;
+    const outputFailure = out.failure ?? out.guardFailure;
     operations.push(Object.freeze({
       association: slot.association,
       runId: slot.runId,
@@ -2079,6 +3559,23 @@ function buildSnapshot(state: CoordinatorState): NativeHarnessDelegationSnapshot
       cost: currentCost(slot, state),
       concurrencyHeld: slot.concurrencyHeld,
       historical: slot.state === "settled",
+      output: Object.freeze({
+        state: out.state,
+        registered: out.registration !== null,
+        registrationFailure: out.registrationFailure === null
+          ? null
+          : boundedOutputReason(out.registrationFailure),
+        captureId: out.capture === null ? null : out.capture.captureId,
+        captureDigest: out.capture === null ? null : out.capture.digest,
+        taskSha256: out.registration?.taskSha256 ?? null,
+        workPromptSha256: out.registration?.workPromptSha256 ?? null,
+        callInputSha256: out.registration?.callInputSha256 ?? null,
+        expectedResultSha256: out.registration?.expectedSha256 ?? null,
+        observedResultSha256: out.observedSha256,
+        retainedBytes: out.retainedBytes,
+        code: outputFailure?.code ?? null,
+        reason: outputFailure === null ? null : boundedOutputReason(outputFailure.reason),
+      }),
     }));
   }
   return deepFreeze({
@@ -2088,6 +3585,15 @@ function buildSnapshot(state: CoordinatorState): NativeHarnessDelegationSnapshot
     limits: state.limits,
     retainedOperations: state.slots.size,
     activeOperations: state.activeOperations,
+    output: {
+      retainedCaptures: state.outputRetained,
+      retainedBytes: state.outputBytes,
+      reservedBytes: state.outputReservedBytes,
+      active: state.outputActive !== null,
+      maxCaptures: NATIVE_HARNESS_MAX_OUTPUT_CAPTURES,
+      maxBytes: NATIVE_HARNESS_MAX_OUTPUT_BYTES,
+      reservationBytes: NATIVE_HARNESS_OUTPUT_RESERVATION_BYTES,
+    },
     lifetime: {
       limitUsd: state.limits.lifetimeUsd,
       accountedUsd: state.lifetimeAccountedUsd,
@@ -2186,8 +3692,9 @@ export function createNativeHarnessDelegation(
 ): NativeHarnessDelegationCoordinator {
   const fields = readStrictFields(
     options,
-    ["native", "policy", "getContext", "prepare", "runner", "now", "enabled"],
+    ["native", "policy", "getContext", "prepare", "runner", "now", "enabled", "output"],
     ["native", "getContext", "prepare", "runner"],
+    "output",
   );
   if (fields === null) {
     throw new NativeHarnessDelegationError(
@@ -2203,6 +3710,7 @@ export function createNativeHarnessDelegation(
   if (captureCall === null || prepareCallCheck === null) {
     throw new NativeHarnessDelegationError("Delegation native controls are missing captureCall or prepareCallCheck.");
   }
+  const registerCallResultExpectation = readCallable(nativeValue, "registerCallResultExpectation");
   const getContext = fields.get("getContext");
   const prepare = fields.get("prepare");
   const runnerValue = fields.get("runner");
@@ -2228,7 +3736,9 @@ export function createNativeHarnessDelegation(
       receiver: nativeValue as NativeEntryControls,
       captureCall: captureCall as NativeCallPort["captureCall"],
       prepareCallCheck: prepareCallCheck as NativeCallPort["prepareCallCheck"],
+      registerCallResultExpectation: registerCallResultExpectation as NativeCallPort["registerCallResultExpectation"],
     },
+    output: readOutputPort(fields.get("output")),
     limits,
     getContext: getContext as () => NativeContext,
     prepare: prepare as CoordinatorState["prepare"],
@@ -2248,6 +3758,11 @@ export function createNativeHarnessDelegation(
     lifetimeUnknownUsd: 0,
     lifetimeOverspendUsd: 0,
     budgetBlocked: false,
+    outputRetained: 0,
+    outputBytes: 0,
+    outputReservedBytes: 0,
+    outputActive: null,
+    outputJoinValidating: false,
   };
 
   const coordinator: NativeHarnessDelegationCoordinator = Object.freeze({
@@ -2330,19 +3845,47 @@ export function createNativeHarnessDelegation(
         state.admissionInProgress = false;
       }
     },
+    registerToolResultProjection(
+      actualSourceToolCallId: unknown,
+      actualDelegationResponse: unknown,
+      actualProjectedResult: unknown,
+      originalSignal: unknown,
+    ): { readonly ok: boolean; readonly reason: string | null } {
+      return registerToolResultProjectionInternal(
+        state,
+        actualSourceToolCallId,
+        actualDelegationResponse,
+        actualProjectedResult,
+        originalSignal,
+      );
+    },
+    captureOutput(
+      actualSourceToolCallId: unknown,
+      captureSignal: unknown,
+    ): Promise<NativeHarnessOutputSelection> {
+      return captureOutputInternal(state, actualSourceToolCallId, captureSignal);
+    },
     cancel(actualToolCallId: unknown): boolean {
       const toolCallId = boundedString(actualToolCallId, MAX_TOOL_CALL_ID_CHARS);
       if (toolCallId === null) return false;
       const slot = state.slots.get(toolCallId);
-      if (slot === undefined || slot.state !== "running" || slot.cancelRequested) return false;
-      beginCancellation(slot, "cancel-requested");
-      return true;
+      if (slot === undefined) return false;
+      let cancelled = false;
+      if (slot.state === "running" && !slot.cancelRequested) {
+        beginCancellation(slot, "cancel-requested");
+        cancelled = true;
+      }
+      // A settled source may still have an independent capture in flight.
+      // This aborts only that capture and never calls backend.cancel.
+      if (cancelOutputCapture(slot, "the output capture was cancelled")) cancelled = true;
+      return cancelled;
     },
     dispose(): void {
       if (state.disposed) return;
       state.disposed = true;
       for (const slot of state.slots.values()) {
         if (slot.state === "running") beginCancellation(slot, "disposed");
+        cancelOutputCapture(slot, "the output capture was disposed");
       }
     },
     inspect(): NativeHarnessDelegationSnapshot {

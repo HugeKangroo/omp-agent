@@ -296,30 +296,51 @@ function refusalPayload(reason: string): NativeHarnessToolResult {
   };
 }
 
-function encodeResult(payload: NativeHarnessToolResult, isError: boolean): NativeToolResult {
+interface EncodedProjection {
+  readonly wire: NativeToolResult;
+  /** False only for a synthetic fallback that must never be registered. */
+  readonly exact: boolean;
+}
+
+function encodeProjection(payload: NativeHarnessToolResult, isError: boolean): EncodedProjection {
   const text = JSON.stringify(payload);
   if (Buffer.byteLength(text, "utf8") > MAX_NATIVE_HARNESS_TOOL_RESULT_BYTES) {
     const fallback = refusalPayload("the bounded harness tool response did not fit");
     const fallbackText = JSON.stringify(fallback);
     return {
-      content: [{ type: "text", text: fallbackText }],
-      details: fallback,
-      isError: true,
+      wire: deepFreeze({
+        content: [{ type: "text", text: fallbackText }],
+        details: fallback,
+        isError: true,
+      }),
+      exact: false,
     };
   }
   return {
-    content: [{ type: "text", text }],
-    details: payload,
-    ...(isError ? { isError: true } : {}),
+    wire: deepFreeze({
+      content: [{ type: "text", text }],
+      details: payload,
+      ...(isError ? { isError: true } : {}),
+    }),
+    exact: true,
   };
+}
+
+function encodeResult(payload: NativeHarnessToolResult, isError: boolean): NativeToolResult {
+  return encodeProjection(payload, isError).wire;
 }
 
 function refusal(reason: string): NativeToolResult {
   return encodeResult(refusalPayload(reason), true);
 }
 
-function projectResult(result: NativeHarnessDelegationResult): NativeToolResult {
-  if (!isRecord(result)) return refusal("the harness coordinator returned an unreadable result");
+function projectResultWire(result: NativeHarnessDelegationResult): EncodedProjection {
+  if (!isRecord(result)) {
+    return {
+      wire: refusal("the harness coordinator returned an unreadable result"),
+      exact: false,
+    };
+  }
   const limitations = Array.isArray(result.limitations)
     ? result.limitations
       .filter((item): item is string => typeof item === "string")
@@ -360,7 +381,11 @@ function projectResult(result: NativeHarnessDelegationResult): NativeToolResult 
     limitations,
     reason: typeof result.reason === "string" ? publicText(result.reason, MAX_REASON_CHARS) : null,
   };
-  return encodeResult(payload, payload.resultKind === "refused");
+  return encodeProjection(payload, payload.resultKind === "refused");
+}
+
+function projectResult(result: NativeHarnessDelegationResult): NativeToolResult {
+  return projectResultWire(result).wire;
 }
 
 function readResolution(value: unknown): NativeHarnessRootResolution {
@@ -481,13 +506,47 @@ export function createNativeHarnessEntry(options: NativeHarnessEntryOptions): Na
       }
       if (!resolution.ok) return refusal(resolution.reason);
       const resolved = resolution.root;
+      let projection: NativeToolResult | null = null;
       try {
         const result = await resolved.runWithContext(
           context,
           actualToolCallId,
-          () => resolved.coordinator.invoke(actualToolCallId, parsed.task, signal),
+          () => {
+            // Return the exact coordinator promise. The projection/registration
+            // continuation is attached inside the scoped execute frame so ALS
+            // remains available, but it must not replace the tracked promise.
+            const invocation = resolved.coordinator.invoke(actualToolCallId, parsed.task, signal);
+            try {
+              void invocation.then(
+                (delegation) => {
+                  try {
+                    const encoded = projectResultWire(delegation);
+                    projection = encoded.wire;
+                    if (!encoded.exact) return;
+                    try {
+                      resolved.coordinator.registerToolResultProjection?.(
+                        actualToolCallId,
+                        delegation,
+                        encoded.wire,
+                        signal as AbortSignal,
+                      );
+                    } catch {
+                      // Output is unavailable; the valid execution result stands.
+                    }
+                  } catch {
+                    // Projection/registration diagnostics never replace execution.
+                  }
+                },
+                () => undefined,
+              );
+            } catch {
+              // A malformed coordinator promise cannot be registered; execution
+              // settlement still flows through the original promise.
+            }
+            return invocation;
+          },
         );
-        return projectResult(result);
+        return projection ?? projectResult(result);
       } catch {
         return refusal("the harness coordinator invocation failed");
       }
