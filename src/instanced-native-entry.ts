@@ -1,14 +1,11 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { Buffer } from "node:buffer";
-import { realpath } from "node:fs/promises";
 import path from "node:path";
 import {
   loadNativeChildDefinitionSnapshot,
   type DefinitionModelRef,
   type DefinitionSkillMetadata,
   type DefinitionSnapshot,
-  type ParseAgentPort,
-  type ParseFrontmatterPort,
   type ResolveModelPort,
 } from "./agent-definition.ts";
 import {
@@ -129,6 +126,15 @@ import {
   type NativeChildSkillExpectation,
 } from "./native-child-text.ts";
 import { deepFreeze, NATIVE_WORK_TOOL, sha256Hex } from "./native-work.ts";
+import {
+  checkOmpInstanceProfile,
+  loadOmpInstancePorts,
+  type OmpDiscoveredAgent,
+  type OmpInstancePorts,
+  type OmpSettingsResult,
+  type OmpSkillRenderInput,
+  type OmpSupportedSettings,
+} from "./omp-native-compat.ts";
 import { canonicalWorkspaceRoot, currentTaskOwner } from "./task-entry-port.ts";
 
 /**
@@ -152,13 +158,6 @@ export const AGENT_CHILD_DEFINITIONS_FLAG = "agent-child-definitions";
 export const AGENT_INSTANCES_STATUS_COMMAND = "agent-instances-status";
 
 const COMPANION_TOOLS = new Set<string>(DEFINITION_BINDING_COMPANION_TOOLS);
-const NATIVE_AGENTS_SPECIFIER = "@oh-my-pi/pi-coding-agent/task/agents";
-const NATIVE_DISCOVERY_SPECIFIER = "@oh-my-pi/pi-coding-agent/task/discovery";
-const NATIVE_UTILS_SPECIFIER = "@oh-my-pi/pi-utils";
-const NATIVE_SKILLS_SPECIFIER = "@oh-my-pi/pi-coding-agent/extensibility/skills";
-const NATIVE_SETTINGS_SPECIFIER = "@oh-my-pi/pi-coding-agent/config/settings";
-const NATIVE_REGISTRY_SPECIFIER = "@oh-my-pi/pi-coding-agent/config/registry";
-const ROLE_FRAME = "\u2042 Role\n{{agent}}\n\u2042 Coop";
 const HANDOFF_REF_PREFIX = "OMP_HANDOFF_REF_V1";
 const HANDOFF_TASK_PREFIX = "Complete assignment thoroughly:\n\n";
 
@@ -181,17 +180,6 @@ const DEFAULT_LIMITS: InstancedLimits = Object.freeze({
   maxRecords: 64,
   maxRetainedTextBytes: 8 * 1024 * 1024,
 });
-
-const SUPPORTED_SETTING_IDS = [
-  ["async.enabled", "boolean", "asyncEnabled"],
-  ["task.batch", "boolean", "taskBatch"],
-  ["task.speculativeLaunch", "boolean", "taskSpeculativeLaunch"],
-  ["task.workerThreads", "number", "taskWorkerThreads"],
-  ["task.structured", "boolean", "taskStructured"],
-] as const;
-
-type SettingId = typeof SUPPORTED_SETTING_IDS[number][0];
-type SettingType = typeof SUPPORTED_SETTING_IDS[number][1];
 
 export interface InstancedModel {
   readonly provider: string;
@@ -229,39 +217,12 @@ interface InstancedEventBus {
   on(event: string, handler: (data: unknown) => void): void;
 }
 
-export interface InstancedSupportedSettings {
-  readonly asyncEnabled: boolean;
-  readonly taskBatch: boolean;
-  readonly taskSpeculativeLaunch: boolean;
-  readonly taskWorkerThreads: number;
-  readonly taskStructured: boolean;
-}
-
-export type InstancedSettingsResult =
-  | { readonly ok: true; readonly settings: InstancedSupportedSettings }
-  | { readonly ok: false; readonly code: string; readonly message: string };
-
-export interface InstancedDiscoveredAgent {
-  readonly name: string;
-  readonly filePath: string;
-  readonly source: string;
-}
-
-export interface InstancedSkillRenderInput {
-  readonly name: string;
-  readonly filePath: string;
-  readonly baseDir: string;
-}
-
-export interface InstancedNativePorts {
-  readonly parseAgent: ParseAgentPort;
-  readonly parseFrontmatter: ParseFrontmatterPort;
-  readonly getActiveSkills: () => readonly unknown[];
-  readonly discoverAgents: (cwd: string) => Promise<readonly InstancedDiscoveredAgent[]>;
-  readonly renderRoleFrame: (body: string) => string;
-  readonly renderSkillMessage: (skill: InstancedSkillRenderInput, body: string) => unknown;
-  readonly readScopedSettings: () => InstancedSettingsResult;
-}
+/** Existing instanced caller surfaces; the fixed host projection lives in `omp-native-compat.ts`. */
+export type InstancedSupportedSettings = OmpSupportedSettings;
+export type InstancedSettingsResult = OmpSettingsResult;
+export type InstancedDiscoveredAgent = OmpDiscoveredAgent;
+export type InstancedSkillRenderInput = OmpSkillRenderInput;
+export type InstancedNativePorts = OmpInstancePorts;
 
 export interface InstancedChildSnapshotInput {
   readonly definitionPath: string;
@@ -1117,35 +1078,13 @@ async function withDeadline<T>(
   }
 }
 
-function checkSupportedSettings(result: InstancedSettingsResult):
-  | { readonly ok: true; readonly settings: InstancedSupportedSettings }
-  | { readonly ok: false; readonly message: string } {
-  if (!result.ok) return { ok: false, message: `${result.code}: ${result.message}` };
-  const settings = result.settings;
-  if (settings.asyncEnabled !== false) return { ok: false, message: "async.enabled must be false." };
-  if (settings.taskBatch !== false) return { ok: false, message: "task.batch must be false." };
-  if (settings.taskSpeculativeLaunch !== false) return { ok: false, message: "task.speculativeLaunch must be false." };
-  if (settings.taskWorkerThreads !== 0) return { ok: false, message: "task.workerThreads must be 0." };
-  if (settings.taskStructured !== false) return { ok: false, message: "task.structured must be false." };
-  return {
-    ok: true,
-    settings: {
-      asyncEnabled: false,
-      taskBatch: false,
-      taskSpeculativeLaunch: false,
-      taskWorkerThreads: 0,
-      taskStructured: false,
-    },
-  };
-}
-
 function readSupportedSettings(ports: InstancedNativePorts):
   | { readonly ok: true; readonly settings: InstancedSupportedSettings }
   | { readonly ok: false; readonly message: string } {
   try {
     const result = ports.readScopedSettings();
     if (!isRecord(result)) return { ok: false, message: "Scoped settings reader returned no result." };
-    return checkSupportedSettings(result as InstancedSettingsResult);
+    return checkOmpInstanceProfile(result as InstancedSettingsResult);
   } catch (error) {
     return { ok: false, message: `Scoped settings read failed: ${errorMessage(error)}` };
   }
@@ -1562,134 +1501,6 @@ function ensureChildSettings(factory: FactoryContext, root: RootState): boolean 
     return false;
   }
   return true;
-}
-
-async function importInstancedPorts(): Promise<InstancedNativePorts> {
-  // Literal specifiers are required for the fixed host rewrite. These modules
-  // are supplied at runtime and are deliberately absent from package deps.
-  const [agents, discovery, utils, skills, settings, registry] = await Promise.all([
-    // @ts-expect-error -- host-supplied runtime module; exports validated below.
-    import("@oh-my-pi/pi-coding-agent/task/agents"),
-    // @ts-expect-error -- host-supplied runtime module; exports validated below.
-    import("@oh-my-pi/pi-coding-agent/task/discovery"),
-    // @ts-expect-error -- host-supplied runtime module; exports validated below.
-    import("@oh-my-pi/pi-utils"),
-    // @ts-expect-error -- host-supplied runtime module; exports validated below.
-    import("@oh-my-pi/pi-coding-agent/extensibility/skills"),
-    // @ts-expect-error -- host-supplied runtime module; exports validated below.
-    import("@oh-my-pi/pi-coding-agent/config/settings"),
-    // @ts-expect-error -- host-supplied runtime module; exports validated below.
-    import("@oh-my-pi/pi-coding-agent/config/registry"),
-  ]);
-
-  const parseAgent = agents?.parseAgent;
-  const parseFrontmatter = utils?.parseFrontmatter;
-  const getActiveSkills = skills?.getActiveSkills;
-  const discoverAgentsNative = discovery?.discoverAgents;
-  const renderSkillPromptMessage = skills?.renderSkillPromptMessage;
-  const prompt = utils?.prompt;
-  const findScopedSettings = settings?.findScopedSettings;
-  const lookup = registry?.lookup;
-
-  if (typeof parseAgent !== "function") throw new Error(`${NATIVE_AGENTS_SPECIFIER} does not export parseAgent.`);
-  if (typeof parseFrontmatter !== "function") throw new Error(`${NATIVE_UTILS_SPECIFIER} does not export parseFrontmatter.`);
-  if (typeof getActiveSkills !== "function") throw new Error(`${NATIVE_SKILLS_SPECIFIER} does not export getActiveSkills.`);
-  if (typeof discoverAgentsNative !== "function") throw new Error(`${NATIVE_DISCOVERY_SPECIFIER} does not export discoverAgents.`);
-  if (typeof renderSkillPromptMessage !== "function") {
-    throw new Error(`${NATIVE_SKILLS_SPECIFIER} does not export renderSkillPromptMessage.`);
-  }
-  if (!isRecord(prompt) || typeof prompt.render !== "function") throw new Error(`${NATIVE_UTILS_SPECIFIER} does not export prompt.render.`);
-  if (typeof findScopedSettings !== "function") throw new Error(`${NATIVE_SETTINGS_SPECIFIER} does not export findScopedSettings.`);
-  if (typeof lookup !== "function") throw new Error(`${NATIVE_REGISTRY_SPECIFIER} does not export lookup.`);
-
-  const readScopedSettings = (): InstancedSettingsResult => {
-    const instance = findScopedSettings();
-    if (instance === undefined || instance === null) {
-      return { ok: false, code: "settings-instance-missing", message: "findScopedSettings() returned no active instance." };
-    }
-    const values: Record<string, boolean | number> = {};
-    for (const [id, expectedType, key] of SUPPORTED_SETTING_IDS) {
-      const handle = lookup(id);
-      if (!isRecord(handle) || handle.type !== expectedType || typeof handle.get !== "function") {
-        return { ok: false, code: "settings-handle-invalid", message: `Setting ${id} has no supported handle.` };
-      }
-      let value: unknown;
-      try {
-        value = (handle.get as (scope: unknown) => unknown)(instance);
-      } catch (error) {
-        return { ok: false, code: "settings-read-failed", message: `Setting ${id} read failed: ${errorMessage(error)}` };
-      }
-      if (expectedType === "boolean") {
-        if (typeof value !== "boolean") {
-          return { ok: false, code: "settings-type-invalid", message: `Setting ${id} is not a boolean.` };
-        }
-      } else if (typeof value !== "number" || !Number.isFinite(value)) {
-        return { ok: false, code: "settings-type-invalid", message: `Setting ${id} is not a finite number.` };
-      }
-      values[key] = value;
-    }
-    return {
-      ok: true,
-      settings: {
-        asyncEnabled: values.asyncEnabled as boolean,
-        taskBatch: values.taskBatch as boolean,
-        taskSpeculativeLaunch: values.taskSpeculativeLaunch as boolean,
-        taskWorkerThreads: values.taskWorkerThreads as number,
-        taskStructured: values.taskStructured as boolean,
-      },
-    };
-  };
-
-  const discoverAgents = async (cwd: string): Promise<readonly InstancedDiscoveredAgent[]> => {
-    const result = await (discoverAgentsNative as (cwd: string) => Promise<unknown>)(cwd);
-    if (!isRecord(result) || !Array.isArray(result.agents)) {
-      throw new Error("Native discoverAgents returned no supported agent list.");
-    }
-    const output: InstancedDiscoveredAgent[] = [];
-    for (const agent of result.agents) {
-      if (!isRecord(agent)
-        || typeof agent.name !== "string"
-        || agent.name.length === 0
-        || typeof agent.filePath !== "string"
-        || agent.filePath.length === 0
-        || typeof agent.source !== "string") {
-        throw new Error("Native discoverAgents returned an unsupported agent entry.");
-      }
-      try {
-        output.push({
-          name: agent.name,
-          filePath: await realpath(agent.filePath),
-          source: agent.source,
-        });
-      } catch {
-        // An unreadable unrelated definition is not an authority candidate.
-      }
-    }
-    return output;
-  };
-
-  return {
-    parseAgent: parseAgent as ParseAgentPort,
-    parseFrontmatter: parseFrontmatter as ParseFrontmatterPort,
-    getActiveSkills: () => (getActiveSkills as () => readonly unknown[])(),
-    discoverAgents,
-    renderRoleFrame: (body: string): string => {
-      const rendered = (prompt.render as (template: string, vars: Record<string, unknown>) => unknown)(ROLE_FRAME, { agent: body });
-      if (typeof rendered !== "string") {
-        throw new Error("Native prompt.render did not return the Role frame string.");
-      }
-      return rendered;
-    },
-    renderSkillMessage: (skill, body) => {
-      return (renderSkillPromptMessage as (
-        value: InstancedSkillRenderInput,
-        args: { readonly args: string },
-        content: string,
-        mode: "autoload",
-      ) => unknown)(skill, { args: "" }, body, "autoload");
-    },
-    readScopedSettings,
-  };
 }
 
 function injectDefaultInactive(tool: NativeTool): NativeTool {
@@ -6433,7 +6244,7 @@ export function createInstancedNativeEntry(
   if (options.nativePorts !== undefined) {
     portsPromise = Promise.resolve(options.nativePorts);
   } else {
-    portsPromise = importInstancedPorts();
+    portsPromise = loadOmpInstancePorts();
   }
   // Avoid an unhandled rejection when this optional entry never sees a root.
   void portsPromise.catch(() => undefined);

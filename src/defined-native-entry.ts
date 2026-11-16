@@ -3,8 +3,6 @@ import {
   type DefinitionModelRef,
   type DefinitionSkillMetadata,
   type DefinitionSnapshot,
-  type ParseAgentPort,
-  type ParseFrontmatterPort,
 } from "./agent-definition.ts";
 import {
   AGENT_DEFINITION_FLAG,
@@ -29,6 +27,10 @@ import {
 } from "./native-entry.ts";
 import type { NativeInstanceReportPort } from "./native-instance-report.ts";
 import { NATIVE_WORK_TOOL } from "./native-work.ts";
+import {
+  loadOmpDefinitionPorts,
+  type OmpDefinitionPorts,
+} from "./omp-native-compat.ts";
 import { canonicalWorkspaceRoot, currentTaskOwner } from "./task-entry-port.ts";
 
 /**
@@ -72,15 +74,11 @@ interface DefinedCommandContext extends DefinedNativeContext {
   readonly hasUI?: boolean;
 }
 
-export interface DefinedNativePorts {
-  readonly parseAgent: ParseAgentPort;
-  readonly parseFrontmatter: ParseFrontmatterPort;
-  /**
-   * Actual process-wide native Skill catalog, normally
-   * `@oh-my-pi/pi-coding-agent/extensibility/skills`.getActiveSkills.
-   */
-  readonly getActiveSkills: () => readonly unknown[];
-}
+/**
+ * Existing D1 caller surface; the fixed host projection lives in
+ * `omp-native-compat.ts`.
+ */
+export type DefinedNativePorts = OmpDefinitionPorts;
 
 /**
  * INTERNAL trusted-composition seam used only by the opt-in instanced entry.
@@ -158,10 +156,6 @@ const NAVIGATION_EVENTS = [
   "session_tree",
   "session_clear",
 ] as const;
-
-const NATIVE_AGENTS_SPECIFIER = "@oh-my-pi/pi-coding-agent/task/agents";
-const NATIVE_UTILS_SPECIFIER = "@oh-my-pi/pi-utils";
-const NATIVE_SKILLS_SPECIFIER = "@oh-my-pi/pi-coding-agent/extensibility/skills";
 
 function boundMessage(value: string): string {
   const normalized = value.replace(/[\x00-\x1f\x7f]+/g, " ").replace(/\s+/g, " ").trim();
@@ -373,38 +367,6 @@ function deferred<T>(): {
     reject = fail;
   });
   return { promise, resolve, reject };
-}
-
-async function importNativePorts(): Promise<DefinedNativePorts> {
-  // Literal specifiers are required: the fixed host rewrites literal module
-  // imports, while a specifier held in a variable bypasses that rewrite and
-  // fails to resolve. The modules are supplied by the host at runtime and are
-  // deliberately absent from this package's dependencies and declarations.
-  const [agents, utils, skills] = await Promise.all([
-    // @ts-expect-error -- host-supplied runtime module; exports validated below.
-    import("@oh-my-pi/pi-coding-agent/task/agents"),
-    // @ts-expect-error -- host-supplied runtime module; exports validated below.
-    import("@oh-my-pi/pi-utils"),
-    // @ts-expect-error -- host-supplied runtime module; exports validated below.
-    import("@oh-my-pi/pi-coding-agent/extensibility/skills"),
-  ]);
-  const parseAgent = agents.parseAgent;
-  const parseFrontmatter = utils.parseFrontmatter;
-  const getActiveSkills = skills.getActiveSkills;
-  if (typeof parseAgent !== "function") {
-    throw new Error(`${NATIVE_AGENTS_SPECIFIER} does not export parseAgent.`);
-  }
-  if (typeof parseFrontmatter !== "function") {
-    throw new Error(`${NATIVE_UTILS_SPECIFIER} does not export parseFrontmatter.`);
-  }
-  if (typeof getActiveSkills !== "function") {
-    throw new Error(`${NATIVE_SKILLS_SPECIFIER} does not export getActiveSkills.`);
-  }
-  return {
-    parseAgent: parseAgent as ParseAgentPort,
-    parseFrontmatter: parseFrontmatter as ParseFrontmatterPort,
-    getActiveSkills: () => (getActiveSkills as () => readonly unknown[])(),
-  };
 }
 
 function nativeLoader(portsPromise: Promise<DefinedNativePorts>): DefinitionLoader {
@@ -927,7 +889,7 @@ export function createDefinedNativeEntry(
     if (options.nativePorts !== undefined) {
       ports.resolve(options.nativePorts);
     } else {
-      void importNativePorts().then(
+      void loadOmpDefinitionPorts().then(
         (value) => ports.resolve(value),
         (error: unknown) => {
           const reason = `Native module import failed: ${errorMessage(error)}`;
