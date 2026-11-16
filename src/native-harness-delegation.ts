@@ -11,12 +11,13 @@ import type {
   NativeHarnessOutputCapture,
   NativeHarnessOutputCaptureResult,
 } from "./native-harness-output.ts";
-import { deepFreeze, isNativeWorkspaceTextSnapshot } from "./native-work.ts";
+import { deepFreeze, isNativeWorkspaceTextSnapshot, type NativeWorkspaceTextSnapshot } from "./native-work.ts";
 import {
   NATIVE_HARNESS_MAX_CHECK_ACTIONS,
   NATIVE_HARNESS_MAX_CHECK_CONDITIONS,
   NATIVE_HARNESS_MAX_CHECK_METADATA_BYTES,
   NATIVE_HARNESS_MAX_CHECK_PATHS,
+  NATIVE_HARNESS_MAX_CHECK_PATH_CHARS,
   NATIVE_HARNESS_RESULT_TOOL,
   createNativeHarnessCheckActionRecord,
   createNativeHarnessCheckFailure,
@@ -27,6 +28,8 @@ import {
   nativeHarnessCheckView,
   normalizeNativeHarnessCaptureInput,
   normalizeNativeHarnessCheckInput,
+  normalizeNativeHarnessInspectInput,
+  normalizeNativeHarnessReadInput,
   sameNativeHarnessCheckPlan,
   type NativeHarnessActionRecord,
   type NativeHarnessCaptureActionRecord,
@@ -256,6 +259,71 @@ export type NativeHarnessOutputSelection =
   | NativeHarnessOutputSelectionSuccess
   | NativeHarnessOutputSelectionFailure;
 
+/**
+ * One host-only historical read result. `snapshot` is the authentic original
+ * snapshot object retained by the capture; no text is copied or reread.
+ */
+export interface NativeHarnessReadSuccess {
+  readonly ok: true;
+  readonly action: "read";
+  readonly readToolCallId: string;
+  readonly sourceToolCallId: string;
+  readonly captureId: string;
+  readonly captureDigest: string;
+  readonly path: string;
+  readonly snapshot: NativeWorkspaceTextSnapshot;
+  readonly observation: "cached-historical";
+  readonly filesystemFreshness: "not-rechecked";
+  readonly taskAccepted: false;
+  readonly semanticAcceptance: "not-evaluated";
+}
+
+export type NativeHarnessReadSelection =
+  | NativeHarnessReadSuccess
+  | NativeHarnessOutputSelectionFailure;
+
+/** One captured change as a selector fact; no text, backend path or native ref. */
+export interface NativeHarnessCatalogFile {
+  readonly path: string;
+  readonly kind: "add" | "modify";
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly observedAt: number;
+}
+
+export interface NativeHarnessCatalogCapture {
+  readonly captureId: string;
+  readonly captureDigest: string;
+  readonly files: readonly NativeHarnessCatalogFile[];
+}
+
+export interface NativeHarnessCatalogRow {
+  readonly sourceToolCallId: string;
+  readonly outputState: "idle" | "captured";
+  readonly capture: NativeHarnessCatalogCapture | null;
+}
+
+/**
+ * Bounded selector catalog over this coordinator's retained source Slots.
+ * `scanComplete` covers the initial retained inventory only; it is not a claim
+ * about persisted runs, other roots or historical task coverage.
+ */
+export interface NativeHarnessOutputCatalogSuccess {
+  readonly ok: true;
+  readonly action: "inspect";
+  readonly scope: "retained-sources-in-this-root";
+  readonly scanComplete: true;
+  readonly retainedSources: number;
+  readonly returnedSources: number;
+  readonly excludedNotReady: number;
+  readonly excludedUnavailable: number;
+  readonly rows: readonly NativeHarnessCatalogRow[];
+}
+
+export type NativeHarnessOutputCatalog =
+  | NativeHarnessOutputCatalogSuccess
+  | NativeHarnessOutputSelectionFailure;
+
 /** Trusted host-only output port. Missing or malformed ports mean output unavailable. */
 export interface NativeHarnessOutputPort {
   capture(
@@ -389,6 +457,28 @@ export interface NativeHarnessDelegationCoordinator {
     input: unknown,
     actualSignal: unknown,
   ): Promise<NativeHarnessOutputSelection>;
+  /**
+   * Host-only synchronous historical read of one already captured change. The
+   * input is exactly `{ action: "read", sourceToolCallId, captureId,
+   * captureDigest, path }`; the actual read tool call and signal are
+   * host-supplied. Returns the authentic original snapshot object without any
+   * new capture, filesystem read or text copy.
+   */
+  readOutputForCall(
+    actualReadToolCallId: unknown,
+    input: unknown,
+    actualSignal: unknown,
+  ): NativeHarnessReadSelection;
+  /**
+   * Host-only synchronous catalog of this coordinator's retained source Slots.
+   * The input is exactly `{ action: "inspect" }`; the actual inspect call and
+   * signal are host-supplied. Row facts are copied selector metadata only.
+   */
+  inspectOutputsForCall(
+    actualInspectToolCallId: unknown,
+    input: unknown,
+    actualSignal: unknown,
+  ): NativeHarnessOutputCatalog;
   /**
    * Host-only synchronous check over one already captured output Slot. The
    * selectors must exactly match the retained capture and one changed path;
@@ -599,6 +689,7 @@ interface CoordinatorState {
   outputReservedBytes: number;
   outputActive: Slot | null;
   outputJoinValidating: boolean;
+  outputObservationInProgress: boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -2989,6 +3080,158 @@ function prepareCheckAction(
   return { check, inspection, context, inputSha256 };
 }
 
+interface PreparedActualCall {
+  readonly ref: NativeWorkCallReference;
+  readonly check: ReadyCallCheck;
+  readonly inspection: NativeWorkCallInspection;
+  readonly association: ActionAssociation;
+  readonly inputSha256: string;
+}
+
+function actualCallInspectionProblem(
+  inspection: NativeWorkCallInspection,
+  expectedInputSha256: string,
+): { readonly code: NativeHarnessOutputSelectionCode; readonly reason: string } | null {
+  if (inspection.requestAttribution !== "matched-user-input") {
+    return { code: "authority-lost", reason: "the actual output call is not associated with matched user input" };
+  }
+  if (inspection.pendingInputCount !== 0 || inspection.pendingInputsDropped !== 0) {
+    return { code: "authority-lost", reason: "the actual output call work has queued or dropped inputs" };
+  }
+  if (!isHex64(inspection.callInputSha256) || inspection.callInputSha256 !== expectedInputSha256) {
+    return {
+      code: "source-conflict",
+      reason: "the actual output call preflight input differs from the frozen normalized input",
+    };
+  }
+  return null;
+}
+
+interface PreparedActualCallCheck {
+  readonly check: ReadyCallCheck;
+  readonly inspection: NativeWorkCallInspection;
+}
+
+/** One native prepare against an already-captured actual call ref. */
+function prepareActualCallCheck(
+  state: CoordinatorState,
+  ref: NativeWorkCallReference,
+  context: NativeContext,
+  expectedInputSha256: string,
+): PreparedActualCallCheck | NativeHarnessOutputSelectionFailure {
+  let check: NativeCallCheckPreparation;
+  try {
+    check = Reflect.apply(state.native.prepareCallCheck, state.native.receiver, [ref, context]);
+  } catch (error) {
+    return outputFailure(
+      "authority-lost",
+      `native output call revalidation threw: ${outputThrownReason(error, "output operation failed")}`,
+    );
+  }
+  if (!check.ok) {
+    return outputFailure(
+      projectionConflict(check.inspection) ? "source-conflict" : "authority-lost",
+      nativeInspectionReason(check.inspection),
+    );
+  }
+  const after = check.inspection;
+  if (after.state !== "current" || after.evidenceState !== "available") {
+    return outputFailure(
+      projectionConflict(after) ? "source-conflict" : "authority-lost",
+      nativeInspectionReason(after),
+    );
+  }
+  const afterAdmission = actualCallInspectionProblem(after, expectedInputSha256);
+  if (afterAdmission !== null) return outputFailure(afterAdmission.code, afterAdmission.reason);
+  return { check, inspection: after };
+}
+
+/**
+ * Source-independent preparation of one genuine `agent_harness_result` call.
+ * The issued ref lives only in this invocation; no Slot, action record, cache
+ * or ledger entry is created here. All host reads finish before the caller's
+ * final pure sequence.
+ */
+function prepareActualToolCall(
+  state: CoordinatorState,
+  actualToolCallId: string,
+  expectedInputSha256: string,
+): PreparedActualCall | NativeHarnessOutputSelectionFailure {
+  const main = readMainContext(state);
+  if (!main.ok) return outputFailure("authority-lost", main.reason);
+  let capture: NativeCallCapture;
+  try {
+    capture = Reflect.apply(state.native.captureCall, state.native.receiver, [
+      { toolCallId: actualToolCallId, toolName: NATIVE_HARNESS_RESULT_TOOL },
+      main.context,
+    ]);
+  } catch (error) {
+    return outputFailure(
+      "authority-lost",
+      `native output call capture threw: ${outputThrownReason(error, "output operation failed")}`,
+    );
+  }
+  if (!capture.ok) return outputFailure("authority-lost", nativeInspectionReason(capture.inspection));
+  const inspection = capture.inspection;
+  if (inspection.state !== "current" || inspection.evidenceState !== "available") {
+    return outputFailure("authority-lost", nativeInspectionReason(inspection));
+  }
+  let association: ActionAssociation;
+  try {
+    association = actionAssociationOf(capture.ref);
+  } catch {
+    return outputFailure("authority-lost", "native output call capture returned unreadable association facts");
+  }
+  if (association.toolCallId !== actualToolCallId || association.toolName !== NATIVE_HARNESS_RESULT_TOOL) {
+    return outputFailure("invalid-caller", "native output call capture returned a different actual tool call");
+  }
+  const admission = actualCallInspectionProblem(inspection, expectedInputSha256);
+  if (admission !== null) return outputFailure(admission.code, admission.reason);
+
+  const prepared = prepareActualCallCheck(state, capture.ref, main.context, expectedInputSha256);
+  if (isOutputFailure(prepared)) return prepared;
+  if (!sameActionAssociation(prepared.inspection.association, association)) {
+    return outputFailure("source-conflict", "the actual output call association changed during preparation");
+  }
+  return {
+    ref: capture.ref,
+    check: prepared.check,
+    inspection: prepared.inspection,
+    association,
+    inputSha256: prepared.inspection.callInputSha256 as string,
+  };
+}
+
+/**
+ * Fresh actual main-context native prepare using the one original query ref.
+ * Never captures a replacement ref: an unavailable root, changed association
+ * or changed frozen input rejects the whole inspection.
+ */
+function refreshActualToolCall(
+  state: CoordinatorState,
+  original: PreparedActualCall,
+  expectedInputSha256: string,
+): PreparedActualCall | NativeHarnessOutputSelectionFailure {
+  const main = readMainContext(state);
+  if (!main.ok) return outputFailure("authority-lost", main.reason);
+  const prepared = prepareActualCallCheck(state, original.ref, main.context, expectedInputSha256);
+  if (isOutputFailure(prepared)) return prepared;
+  if (!sameActionAssociation(prepared.inspection.association, original.association)
+    || prepared.inspection.callInputSha256 !== expectedInputSha256) {
+    return outputFailure(
+      "source-conflict",
+      "the actual output call association or input changed during inspection",
+    );
+  }
+  return {
+    ref: original.ref,
+    check: prepared.check,
+    inspection: prepared.inspection,
+    association: original.association,
+    inputSha256: prepared.inspection.callInputSha256 as string,
+  };
+}
+
 /**
  * Authenticated admission point for one genuine check action. All host
  * inspection parsing (source revalidation, action capture, preflight input
@@ -3537,6 +3780,410 @@ function checkOutputInternal(
       "check-unavailable",
       `the host-only check failed unexpectedly: ${outputThrownReason(error, "check operation failed")}`,
     );
+  }
+}
+
+/**
+ * Copies only complete selector metadata from one authentic captured change.
+ * Returns null for a non-issued snapshot or an out-of-contract file fact, so
+ * the caller excludes the row instead of publishing a partial list.
+ */
+function catalogFiles(capture: NativeHarnessOutputCapture): readonly NativeHarnessCatalogFile[] | null {
+  if (capture.changes.length > MAX_OUTPUT_CHANGES) return null;
+  const files: NativeHarnessCatalogFile[] = [];
+  for (const change of capture.changes) {
+    if (change.kind !== "add" && change.kind !== "modify") return null;
+    if (!isNativeWorkspaceTextSnapshot(change.snapshot)) return null;
+    if (boundedString(change.path, NATIVE_HARNESS_MAX_CHECK_PATH_CHARS) === null) return null;
+    const file = change.snapshot.file;
+    if (file === null || typeof file !== "object") return null;
+    if (boundedString(file.relativePath, NATIVE_HARNESS_MAX_CHECK_PATH_CHARS) !== change.path) return null;
+    if (typeof file.bytes !== "number"
+      || !Number.isSafeInteger(file.bytes)
+      || file.bytes < 0
+      || file.bytes > MAX_OUTPUT_CHANGE_BYTES) {
+      return null;
+    }
+    if (!isHex64(file.sha256)) return null;
+    if (typeof file.observedAt !== "number" || !Number.isSafeInteger(file.observedAt) || file.observedAt < 0) {
+      return null;
+    }
+    files.push(Object.freeze({
+      path: change.path,
+      kind: change.kind,
+      bytes: file.bytes,
+      sha256: file.sha256,
+      observedAt: file.observedAt,
+    }));
+  }
+  return Object.freeze(files);
+}
+
+function readOutputForCallInternal(
+  state: CoordinatorState,
+  actualReadToolCallIdValue: unknown,
+  inputValue: unknown,
+  signalValue: unknown,
+): NativeHarnessReadSelection {
+  let busy = false;
+  try {
+    if (state.disposed) return outputFailure("authority-lost", "the delegation coordinator was disposed");
+    if (!state.enabled) return outputFailure("authority-lost", "the delegation coordinator is disabled");
+    if (state.outputObservationInProgress) {
+      return outputFailure("capacity", "another host output observation is already in progress");
+    }
+    state.outputObservationInProgress = true;
+    busy = true;
+
+    const readToolCallId = boundedString(actualReadToolCallIdValue, MAX_TOOL_CALL_ID_CHARS);
+    if (readToolCallId === null) {
+      return outputFailure("invalid-caller", "the actual read tool call id is unavailable");
+    }
+    const normalized = normalizeNativeHarnessReadInput(inputValue);
+    if (!normalized.ok) return outputFailureFromCheck(normalized);
+    const signal = readActualAbortSignal(signalValue);
+    if (!signal.ok) return outputFailure("invalid-caller", signal.reason);
+    if (signal.aborted) return outputFailure("cancelled", "the actual read signal was aborted before admission");
+
+    // A read call never borrows an existing source/capture/check ref identity.
+    if (state.slots.has(readToolCallId) || findRetainedAction(state, readToolCallId) !== null) {
+      return outputFailure("source-conflict", "the actual read tool call id is already retained by another action");
+    }
+    const input = normalized.input;
+    const slot = state.slots.get(input.sourceToolCallId);
+    if (slot === undefined) {
+      return outputFailure("not-ready", "no retained delegation operation has this source id");
+    }
+
+    const source = prepareCaptureSource(state, slot, true);
+    if (isOutputFailure(source)) return source;
+    const out = slot.output;
+    const capture = out.capture;
+    const selection = out.selection;
+    if (capture === null || selection === null) {
+      return outputFailure("source-conflict", "the retained historical capture is unavailable");
+    }
+    if (input.captureId !== capture.captureId || input.captureDigest !== capture.digest) {
+      return outputFailure("source-conflict", "the read selectors do not exactly match the retained source capture");
+    }
+    const change = capture.changes.find((record) => record.path === input.path);
+    if (change === undefined) {
+      return outputFailure("source-conflict", "the read path is not one of the retained capture changes");
+    }
+    if (!isNativeWorkspaceTextSnapshot(change.snapshot)) {
+      return outputFailure("source-conflict", "the selected read path has no authentic native snapshot");
+    }
+    const backend = slot.backend?.receiver;
+    if (backend === undefined || !outputMatches(source.output, backend, capture)) {
+      return outputFailure("source-conflict", "the retained output capture is no longer bound to this backend");
+    }
+    if (selection.capture !== capture) {
+      return outputFailure("source-conflict", "the retained capture selection identity changed");
+    }
+    if (source.prepared.observedSha256 === null
+      || source.prepared.observedSha256 !== selection.observedResultSha256) {
+      return outputFailure("source-conflict", "the source result observation changed after capture");
+    }
+
+    const actual = prepareActualToolCall(state, readToolCallId, normalized.digest);
+    if (isOutputFailure(actual)) return actual;
+    if (!sameActionWorkIdentity(slot, actual.association)) {
+      return outputFailure("source-conflict", "the read call does not belong to the original source work identity");
+    }
+
+    // Final sequence: pure original owner, actual read signal, prepared source
+    // pure revalidation, prepared read-call pure revalidation, then local
+    // exact identity only. No host data is read after the pure checks begin.
+    const owner = ownerPredicateReason(source.output);
+    if (owner !== null) return outputFailure("authority-lost", owner);
+    const finalSignal = readActualAbortSignal(signalValue);
+    if (!finalSignal.ok) return outputFailure("invalid-caller", finalSignal.reason);
+    if (finalSignal.aborted) return outputFailure("cancelled", "the actual read signal was aborted");
+    const sourcePure = pureCheckReason(source.prepared.check);
+    if (sourcePure !== null) return outputFailure("source-conflict", sourcePure);
+    const actualPure = pureCheckReason(actual.check);
+    if (actualPure !== null) return outputFailure("source-conflict", actualPure);
+
+    if (state.disposed) return outputFailure("authority-lost", "the delegation coordinator was disposed");
+    if (!state.enabled) return outputFailure("authority-lost", "the delegation coordinator is disabled");
+    if (state.slots.get(input.sourceToolCallId) !== slot) {
+      return outputFailure("source-conflict", "the original source Slot was replaced");
+    }
+    if (out.state !== "captured"
+      || out.capture !== capture
+      || out.selection !== selection
+      || out.registration !== source.registration
+      || change.path !== input.path) {
+      return outputFailure("source-conflict", "the retained historical capture changed during the read");
+    }
+    if (slot.toolCallId !== input.sourceToolCallId
+      || slot.association.observationId !== actual.association.observationId
+      || slot.association.generation !== actual.association.generation
+      || slot.association.sessionId !== actual.association.sessionId
+      || slot.association.workspaceRoot !== actual.association.workspaceRoot) {
+      return outputFailure("source-conflict", "the original source work identity changed during the read");
+    }
+    return Object.freeze({
+      ok: true as const,
+      action: "read" as const,
+      readToolCallId,
+      sourceToolCallId: input.sourceToolCallId,
+      captureId: capture.captureId,
+      captureDigest: capture.digest,
+      path: change.path,
+      snapshot: change.snapshot,
+      observation: "cached-historical" as const,
+      filesystemFreshness: "not-rechecked" as const,
+      taskAccepted: false as const,
+      semanticAcceptance: "not-evaluated" as const,
+    });
+  } catch (error) {
+    return outputFailure(
+      "output-unavailable",
+      `the host-only read failed unexpectedly: ${outputThrownReason(error, "output operation failed")}`,
+    );
+  } finally {
+    if (busy) state.outputObservationInProgress = false;
+  }
+}
+
+interface InspectedSourceCandidate {
+  readonly slot: Slot;
+  readonly key: string;
+  readonly outputState: "idle" | "captured";
+  readonly source: PreparedCaptureSource;
+  readonly capture: NativeHarnessOutputCapture | null;
+  readonly selection: NativeHarnessOutputSelectionSuccess | null;
+  readonly files: readonly NativeHarnessCatalogFile[] | null;
+}
+
+type InspectedSourceState = "not-ready" | "unavailable" | "idle" | "captured";
+
+/**
+ * Locally known running/failed/non-selectable states are not-ready. A
+ * successful settled source whose selectable evidence is missing or conflicted
+ * is unavailable. Neither classification exposes the source identity.
+ */
+function inspectSourceState(slot: Slot): InspectedSourceState {
+  if (slot.state !== "settled") return "not-ready";
+  if (sourceSuccessProblem(slot, slot.response) !== null) return "not-ready";
+  const out = slot.output;
+  if (out.actionBinding !== null) return "not-ready";
+  if (out.state === "idle") {
+    if (out.registrationFailure !== null) return "unavailable";
+    return out.registration === null ? "unavailable" : "idle";
+  }
+  if (out.state === "captured") {
+    if (out.capture === null
+      || out.selection === null
+      || out.registration === null
+      || out.registrationFailure !== null) {
+      return "unavailable";
+    }
+    return "captured";
+  }
+  return "not-ready";
+}
+
+function inspectRowLocalProblem(
+  state: CoordinatorState,
+  candidate: InspectedSourceCandidate,
+): boolean {
+  const slot = candidate.slot;
+  const out = slot.output;
+  if (state.slots.get(candidate.key) !== slot || slot.toolCallId !== candidate.key) return true;
+  if (out.registration !== candidate.source.registration || out.actionBinding !== null) return true;
+  if (candidate.outputState === "idle") {
+    return out.state !== "idle" || out.capture !== null;
+  }
+  return out.state !== "captured"
+    || out.capture !== candidate.capture
+    || out.selection !== candidate.selection;
+}
+
+function catalogRow(candidate: InspectedSourceCandidate): NativeHarnessCatalogRow {
+  if (candidate.outputState === "idle") {
+    return Object.freeze({
+      sourceToolCallId: candidate.key,
+      outputState: "idle" as const,
+      capture: null,
+    });
+  }
+  const capture = candidate.capture as NativeHarnessOutputCapture;
+  const files = candidate.files as readonly NativeHarnessCatalogFile[];
+  return Object.freeze({
+    sourceToolCallId: candidate.key,
+    outputState: "captured" as const,
+    capture: Object.freeze({
+      captureId: capture.captureId,
+      captureDigest: capture.digest,
+      files,
+    }),
+  });
+}
+
+function inspectOutputsForCallInternal(
+  state: CoordinatorState,
+  actualInspectToolCallIdValue: unknown,
+  inputValue: unknown,
+  signalValue: unknown,
+): NativeHarnessOutputCatalog {
+  let busy = false;
+  try {
+    if (state.disposed) return outputFailure("authority-lost", "the delegation coordinator was disposed");
+    if (!state.enabled) return outputFailure("authority-lost", "the delegation coordinator is disabled");
+    if (state.outputObservationInProgress) {
+      return outputFailure("capacity", "another host output observation is already in progress");
+    }
+    state.outputObservationInProgress = true;
+    busy = true;
+
+    const inspectToolCallId = boundedString(actualInspectToolCallIdValue, MAX_TOOL_CALL_ID_CHARS);
+    if (inspectToolCallId === null) {
+      return outputFailure("invalid-caller", "the actual inspect tool call id is unavailable");
+    }
+    const normalized = normalizeNativeHarnessInspectInput(inputValue);
+    if (!normalized.ok) return outputFailureFromCheck(normalized);
+    const signal = readActualAbortSignal(signalValue);
+    if (!signal.ok) return outputFailure("invalid-caller", signal.reason);
+    if (signal.aborted) return outputFailure("cancelled", "the actual inspect signal was aborted before admission");
+
+    if (state.slots.has(inspectToolCallId) || findRetainedAction(state, inspectToolCallId) !== null) {
+      return outputFailure("source-conflict", "the actual inspect tool call id is already retained by another action");
+    }
+    if (state.output === null) {
+      return outputFailure("output-unavailable", "the trusted output port is not available");
+    }
+    const actual = prepareActualToolCall(state, inspectToolCallId, normalized.digest);
+    if (isOutputFailure(actual)) return actual;
+
+    // Take the initial bounded inventory by original Slot reference before any
+    // per-row host callback. The final phase refuses any key/object change.
+    const inventory = Array.from(state.slots.entries());
+    const candidates: InspectedSourceCandidate[] = [];
+    let excludedNotReady = 0;
+    let excludedUnavailable = 0;
+    for (const [key, slot] of inventory) {
+      if (slot.toolCallId !== key || !sameActionWorkIdentity(slot, actual.association)) {
+        excludedUnavailable += 1;
+        continue;
+      }
+      const outputState = inspectSourceState(slot);
+      if (outputState === "not-ready") {
+        excludedNotReady += 1;
+        continue;
+      }
+      if (outputState === "unavailable") {
+        excludedUnavailable += 1;
+        continue;
+      }
+      const source = prepareCaptureSource(state, slot, outputState === "captured");
+      if (isOutputFailure(source)) {
+        if (source.code === "not-ready" || source.code === "capacity" || source.code === "cancelled") {
+          excludedNotReady += 1;
+        } else {
+          excludedUnavailable += 1;
+        }
+        continue;
+      }
+      const out = slot.output;
+      if (outputState === "captured") {
+        const capture = out.capture;
+        const selection = out.selection;
+        const backend = slot.backend?.receiver;
+        if (capture === null
+          || selection === null
+          || selection.capture !== capture
+          || backend === undefined
+          || !outputMatches(source.output, backend, capture)
+          || source.prepared.observedSha256 === null
+          || source.prepared.observedSha256 !== selection.observedResultSha256) {
+          excludedUnavailable += 1;
+          continue;
+        }
+        const files = catalogFiles(capture);
+        if (files === null) {
+          excludedUnavailable += 1;
+          continue;
+        }
+        candidates.push({
+          slot,
+          key,
+          outputState,
+          source,
+          capture,
+          selection,
+          files,
+        });
+        continue;
+      }
+      candidates.push({
+        slot,
+        key,
+        outputState,
+        source,
+        capture: null,
+        selection: null,
+        files: null,
+      });
+    }
+
+    // Refresh the actual inspection query after every row/matcher/copy
+    // callback, reusing the one original locally-issued ref. The refresh is a
+    // host read and may invalidate a prepared source, so every source pure gate
+    // below follows it.
+    const refreshed = refreshActualToolCall(state, actual, normalized.digest);
+    if (isOutputFailure(refreshed)) return refreshed;
+
+    // Final phase: pure owner, actual inspect signal, refreshed actual-call
+    // pure revalidation, then every prospective row's pure/local identity
+    // check. No host callback or caller input read follows this point.
+    const owner = ownerPredicateReason(state.output);
+    if (owner !== null) return outputFailure("authority-lost", owner);
+    const finalSignal = readActualAbortSignal(signalValue);
+    if (!finalSignal.ok) return outputFailure("invalid-caller", finalSignal.reason);
+    if (finalSignal.aborted) return outputFailure("cancelled", "the actual inspect signal was aborted");
+    const actualPure = pureCheckReason(refreshed.check);
+    if (actualPure !== null) return outputFailure("source-conflict", actualPure);
+
+    const rows: NativeHarnessCatalogRow[] = [];
+    for (const candidate of candidates) {
+      const sourcePure = pureCheckReason(candidate.source.prepared.check);
+      if (sourcePure !== null || inspectRowLocalProblem(state, candidate)) {
+        excludedUnavailable += 1;
+        continue;
+      }
+      rows.push(catalogRow(candidate));
+    }
+
+    if (state.disposed) return outputFailure("authority-lost", "the delegation coordinator was disposed");
+    if (!state.enabled) return outputFailure("authority-lost", "the delegation coordinator is disabled");
+    if (state.slots.size !== inventory.length) {
+      return outputFailure("source-conflict", "the retained source inventory changed during inspection");
+    }
+    for (const [key, slot] of inventory) {
+      if (state.slots.get(key) !== slot) {
+        return outputFailure("source-conflict", "the retained source inventory changed during inspection");
+      }
+    }
+    return Object.freeze({
+      ok: true as const,
+      action: "inspect" as const,
+      scope: "retained-sources-in-this-root" as const,
+      scanComplete: true as const,
+      retainedSources: inventory.length,
+      returnedSources: rows.length,
+      excludedNotReady,
+      excludedUnavailable,
+      rows: Object.freeze(rows),
+    });
+  } catch (error) {
+    return outputFailure(
+      "output-unavailable",
+      `the host-only inspection failed unexpectedly: ${outputThrownReason(error, "output operation failed")}`,
+    );
+  } finally {
+    if (busy) state.outputObservationInProgress = false;
   }
 }
 
@@ -5926,6 +6573,7 @@ export function createNativeHarnessDelegation(
     outputReservedBytes: 0,
     outputActive: null,
     outputJoinValidating: false,
+    outputObservationInProgress: false,
   };
 
   const coordinator: NativeHarnessDelegationCoordinator = Object.freeze({
@@ -6036,6 +6684,30 @@ export function createNativeHarnessDelegation(
       return captureOutputForCallInternal(
         state,
         actualActionToolCallId,
+        input,
+        actualSignal,
+      );
+    },
+    readOutputForCall(
+      actualReadToolCallId: unknown,
+      input: unknown,
+      actualSignal: unknown,
+    ): NativeHarnessReadSelection {
+      return readOutputForCallInternal(
+        state,
+        actualReadToolCallId,
+        input,
+        actualSignal,
+      );
+    },
+    inspectOutputsForCall(
+      actualInspectToolCallId: unknown,
+      input: unknown,
+      actualSignal: unknown,
+    ): NativeHarnessOutputCatalog {
+      return inspectOutputsForCallInternal(
+        state,
+        actualInspectToolCallId,
         input,
         actualSignal,
       );

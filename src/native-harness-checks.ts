@@ -160,6 +160,20 @@ export interface NativeHarnessCaptureInput {
   readonly sourceToolCallId: string;
 }
 
+/** Exact frozen five-field input for one historical read selector. */
+export interface NativeHarnessReadInput {
+  readonly action: "read";
+  readonly sourceToolCallId: string;
+  readonly captureId: string;
+  readonly captureDigest: string;
+  readonly path: string;
+}
+
+/** Exact frozen one-field input for one retained-source catalog inspection. */
+export interface NativeHarnessInspectInput {
+  readonly action: "inspect";
+}
+
 export type NativeHarnessCaptureActionState =
   | "pending"
   | "succeeded"
@@ -465,6 +479,149 @@ export function normalizeNativeHarnessCheckInput(value: unknown): NativeHarnessC
     return protocolFailure(`the frozen check input could not be fingerprinted: ${fingerprint.reason}`);
   }
   return Object.freeze({ ok: true as const, input, digest: fingerprint.sha256, plan });
+}
+
+const READ_INPUT_KEYS = Object.freeze([
+  "action",
+  "sourceToolCallId",
+  "captureId",
+  "captureDigest",
+  "path",
+] as const);
+const INSPECT_INPUT_KEYS = Object.freeze(["action"] as const);
+
+/**
+ * One exact-shape own-data read for the source-independent read/inspect
+ * inputs. Accessors, symbols, unknown keys, exotic prototypes and failed
+ * reflection are refused before a frozen input can exist.
+ */
+function readExactActionInput(
+  value: unknown,
+  keys: readonly string[],
+  shape: string,
+): Map<string, unknown> | NativeHarnessCheckFailure {
+  if (typeof value !== "object" || value === null) {
+    return protocolFailure(`the ${shape} input must be a plain object with exactly ${keys.length} own data fields`);
+  }
+  let array: boolean;
+  let prototype: object | null;
+  let ownKeys: (string | symbol)[];
+  try {
+    array = Array.isArray(value);
+    prototype = Object.getPrototypeOf(value);
+    ownKeys = Reflect.ownKeys(value);
+  } catch {
+    return protocolFailure(`the ${shape} input could not be inspected`);
+  }
+  if (array || (prototype !== Object.prototype && prototype !== null)) {
+    return protocolFailure(`the ${shape} input must be a plain object`);
+  }
+  if (ownKeys.length !== keys.length) {
+    return protocolFailure(`the ${shape} input must contain exactly ${keys.join(", ")}`);
+  }
+  const fields = new Map<string, unknown>();
+  for (const key of ownKeys) {
+    if (typeof key !== "string" || !keys.includes(key)) {
+      return protocolFailure(`the ${shape} input must contain only its ${keys.length} string data fields`);
+    }
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      return protocolFailure(`the ${shape} input fields could not be inspected`);
+    }
+    if (
+      descriptor === undefined
+      || !("value" in descriptor)
+      || descriptor.get !== undefined
+      || descriptor.set !== undefined
+      || descriptor.enumerable !== true
+    ) {
+      return protocolFailure(`the ${shape} input must contain only enumerable own data properties`);
+    }
+    fields.set(key, descriptor.value);
+  }
+  for (const key of keys) {
+    if (!fields.has(key)) {
+      return protocolFailure(`the ${shape} input must contain exactly ${keys.join(", ")}`);
+    }
+  }
+  return fields;
+}
+
+export type NativeHarnessReadNormalization =
+  | {
+    readonly ok: true;
+    readonly input: NativeHarnessReadInput;
+    readonly digest: string;
+  }
+  | NativeHarnessCheckFailure;
+
+export type NativeHarnessInspectNormalization =
+  | {
+    readonly ok: true;
+    readonly input: NativeHarnessInspectInput;
+    readonly digest: string;
+  }
+  | NativeHarnessCheckFailure;
+
+/**
+ * One exact-shape read and one canonical fingerprint for a historical read
+ * selector. The caller object is never reread; the frozen input is used for
+ * the native preflight comparison.
+ */
+export function normalizeNativeHarnessReadInput(value: unknown): NativeHarnessReadNormalization {
+  const fields = readExactActionInput(value, READ_INPUT_KEYS, "read");
+  if (!(fields instanceof Map)) return fields;
+  if (fields.get("action") !== "read") {
+    return protocolFailure('the read input action must be "read"');
+  }
+  const sourceToolCallId = boundedId(fields.get("sourceToolCallId"));
+  if (sourceToolCallId === null) {
+    return protocolFailure("the read input sourceToolCallId is not a bounded id");
+  }
+  const captureId = boundedId(fields.get("captureId"));
+  if (captureId === null) {
+    return protocolFailure("the read input captureId is not a bounded id");
+  }
+  const captureDigest = fields.get("captureDigest");
+  if (!hex64(captureDigest)) {
+    return protocolFailure("the read input captureDigest is not a 64-character lowercase hex digest");
+  }
+  const path = boundedPath(fields.get("path"));
+  if (path === null) {
+    return protocolFailure("the read input path is not a bounded relative path");
+  }
+  const input: NativeHarnessReadInput = Object.freeze({
+    action: "read" as const,
+    sourceToolCallId,
+    captureId,
+    captureDigest,
+    path,
+  });
+  const fingerprint = fingerprintNativeJson(input);
+  if (!fingerprint.ok) {
+    return protocolFailure(`the frozen read input could not be fingerprinted: ${fingerprint.reason}`);
+  }
+  return Object.freeze({ ok: true as const, input, digest: fingerprint.sha256 });
+}
+
+/**
+ * One exact-shape read and one canonical fingerprint for the source-independent
+ * inspect selector. It carries no source id, path or caller-supplied scope.
+ */
+export function normalizeNativeHarnessInspectInput(value: unknown): NativeHarnessInspectNormalization {
+  const fields = readExactActionInput(value, INSPECT_INPUT_KEYS, "inspect");
+  if (!(fields instanceof Map)) return fields;
+  if (fields.get("action") !== "inspect") {
+    return protocolFailure('the inspect input action must be "inspect"');
+  }
+  const input: NativeHarnessInspectInput = Object.freeze({ action: "inspect" as const });
+  const fingerprint = fingerprintNativeJson(input);
+  if (!fingerprint.ok) {
+    return protocolFailure(`the frozen inspect input could not be fingerprinted: ${fingerprint.reason}`);
+  }
+  return Object.freeze({ ok: true as const, input, digest: fingerprint.sha256 });
 }
 
 function encodedBytes(value: unknown): number {

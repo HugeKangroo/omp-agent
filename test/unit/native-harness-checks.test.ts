@@ -16,6 +16,7 @@ import {
   type NativeHarnessDelegationCoordinator,
   type NativeHarnessOutputPort,
   type NativeHarnessOutputSelection,
+  type NativeHarnessOutputSelectionCode,
   type NativeHarnessPrepareResult,
   type NativeHarnessDelegationResult,
 } from "../../src/native-harness-delegation.ts";
@@ -25,6 +26,8 @@ import {
   NATIVE_HARNESS_RESULT_TOOL,
   normalizeNativeHarnessCaptureInput,
   normalizeNativeHarnessCheckInput,
+  normalizeNativeHarnessInspectInput,
+  normalizeNativeHarnessReadInput,
   type NativeHarnessCheckOutcome,
   type NativeHarnessCheckSuccess,
 } from "../../src/native-harness-checks.ts";
@@ -126,6 +129,10 @@ async function callSource(f: Fixture, toolCallId: string): Promise<void> {
     toolName: "agent_harness",
     input: { task: WORK_TASK },
   }, f.ctx);
+}
+
+async function endWork(f: Fixture): Promise<void> {
+  await f.host.emit("agent_end", { messages: [], willContinue: false }, f.ctx);
 }
 
 function harnessBundle(): WorkerRequest["harness"] {
@@ -299,7 +306,7 @@ async function captureSource(f: Fixture, h: Harness, toolCallId: string): Promis
   await callSource(f, toolCallId);
   const signal = new AbortController().signal;
   const result = await settle(h.coordinator.invoke(toolCallId, { task: WORK_TASK }, signal));
-  expect(result.outcome).toBe("backend-completed");
+  expect(result.outcome, result.reason ?? "").toBe("backend-completed");
   const wire = projectionFor(result);
   const registered = h.coordinator.registerToolResultProjection(toolCallId, result, wire, signal);
   expect(registered.ok).toBe(true);
@@ -456,7 +463,7 @@ async function registeredSource(
   await callSource(f, toolCallId);
   const signal = new AbortController().signal;
   const result = await settle(h.coordinator.invoke(toolCallId, { task: WORK_TASK }, signal));
-  expect(result.outcome).toBe("backend-completed");
+  expect(result.outcome, result.reason ?? "").toBe("backend-completed");
   const wire = projectionFor(result);
   expect(h.coordinator.registerToolResultProjection(toolCallId, result, wire, signal).ok).toBe(true);
   await emitSourceResult(f, toolCallId, wire);
@@ -1867,5 +1874,887 @@ describe("host-only bounded checks over a captured Harness Slot", () => {
     if (!overflow.ok) expect(overflow.code).toBe("capacity");
     expect(h.captureCalls()).toBe(1);
     expect(h.coordinator.inspect().operations[0]!.output.retainedBytes).toBe(retainedBytes);
+  });
+});
+
+function readInput(
+  sourceToolCallId: string,
+  capture: NativeHarnessOutputCapture,
+  path = PATH_A,
+): Record<string, unknown> {
+  return {
+    action: "read",
+    sourceToolCallId,
+    captureId: capture.captureId,
+    captureDigest: capture.digest,
+    path,
+  };
+}
+
+async function preflightReadCall(
+  f: Fixture,
+  toolCallId: string,
+  raw: unknown,
+): Promise<void> {
+  const normalized = normalizeNativeHarnessReadInput(raw);
+  expect(normalized.ok).toBe(true);
+  if (!normalized.ok) throw new Error(normalized.reason);
+  await f.host.emit("tool_call", {
+    toolCallId,
+    toolName: NATIVE_HARNESS_RESULT_TOOL,
+    input: normalized.input,
+  }, f.ctx);
+}
+
+async function preflightInspectCall(
+  f: Fixture,
+  toolCallId: string,
+  raw: unknown,
+): Promise<void> {
+  const normalized = normalizeNativeHarnessInspectInput(raw);
+  expect(normalized.ok).toBe(true);
+  if (!normalized.ok) throw new Error(normalized.reason);
+  await f.host.emit("tool_call", {
+    toolCallId,
+    toolName: NATIVE_HARNESS_RESULT_TOOL,
+    input: normalized.input,
+  }, f.ctx);
+}
+
+async function capturedReadFixture(
+  text = "original historical text\n",
+): Promise<{ f: Fixture; h: Harness; source: CapturedSource }> {
+  const f = await fixture();
+  await writeFile(path.join(f.workspace, PATH_A), text, { mode: 0o600 });
+  const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+  const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+  const h = setup(f, { capture: () => capture });
+  await startWork(f);
+  const source = await captureSource(f, h, "source-1");
+  return { f, h, source };
+}
+
+function nativeRefToolCallId(ref: unknown): unknown {
+  if (typeof ref !== "object" || ref === null) return null;
+  try {
+    return (ref as { readonly toolCallId?: unknown }).toolCallId;
+  } catch {
+    return null;
+  }
+}
+
+describe("host-only historical read and bounded retained-source catalog", () => {
+  test("read returns the authentic original snapshot reference without new I/O or counts", async () => {
+    const text = "original historical text\n";
+    const { f, h, source } = await capturedReadFixture(text);
+    const original = source.capture.changes[0]!.snapshot;
+    const raw = readInput("source-1", source.capture);
+    await preflightReadCall(f, "read-1", raw);
+
+    const signal = new AbortController().signal;
+    const first = h.coordinator.readOutputForCall("read-1", raw, signal);
+    expect(first.ok).toBe(true);
+    if (!first.ok) throw new Error(first.reason);
+    expect(first.action).toBe("read");
+    expect(first.readToolCallId).toBe("read-1");
+    expect(first.sourceToolCallId).toBe("source-1");
+    expect(first.captureId).toBe(source.capture.captureId);
+    expect(first.captureDigest).toBe(source.capture.digest);
+    expect(first.path).toBe(PATH_A);
+    expect(first.snapshot).toBe(original);
+    expect(first.snapshot.text).toBe(text);
+    expect(first.snapshot.captureId).not.toBe(first.captureId);
+    expect(first.observation).toBe("cached-historical");
+    expect(first.filesystemFreshness).toBe("not-rechecked");
+    expect(first.taskAccepted).toBe(false);
+    expect(first.semanticAcceptance).toBe("not-evaluated");
+    expect(Object.isFrozen(first)).toBe(true);
+    expect(h.captureCalls()).toBe(1);
+    expect(h.executeCalls()).toBe(1);
+    const state = h.coordinator.inspect();
+    expect(state.output.retainedCaptures).toBe(1);
+    expect(state.operations[0]!.output.checks.actions).toBe(0);
+
+    await preflightReadCall(f, "read-2", raw);
+    const again = h.coordinator.readOutputForCall("read-2", raw, signal);
+    expect(again.ok).toBe(true);
+    if (!again.ok) throw new Error(again.reason);
+    expect(again.snapshot).toBe(original);
+    expect(h.captureCalls()).toBe(1);
+
+    await writeFile(path.join(f.workspace, PATH_A), "changed live file\n", { mode: 0o600 });
+    await preflightReadCall(f, "read-3", raw);
+    const historical = h.coordinator.readOutputForCall("read-3", raw, signal);
+    expect(historical.ok).toBe(true);
+    if (!historical.ok) throw new Error(historical.reason);
+    expect(historical.snapshot).toBe(original);
+    expect(historical.snapshot.text).toBe(text);
+    expect(historical.filesystemFreshness).toBe("not-rechecked");
+    expect(h.captureCalls()).toBe(1);
+    expect(h.coordinator.inspect().operations[0]!.output.checks.actions).toBe(0);
+  });
+
+  test("malformed, foreign, mismatched and unauthenticated reads refuse without mutation", async () => {
+    const { f, h, source } = await capturedReadFixture();
+    const raw = readInput("source-1", source.capture);
+    const signal = new AbortController().signal;
+    const refusals: readonly [Record<string, unknown>, NativeHarnessOutputSelectionCode][] = [
+      [{ ...raw, sourceToolCallId: "source-foreign" }, "not-ready"],
+      [{ ...raw, captureId: "capture-foreign" }, "source-conflict"],
+      [{ ...raw, captureDigest: "a".repeat(64) }, "source-conflict"],
+      [{ ...raw, path: "missing.txt" }, "source-conflict"],
+      [{ ...raw, snapshot: source.capture.changes[0]!.snapshot }, "source-conflict"],
+      [{ ...raw, extra: true }, "source-conflict"],
+    ];
+    for (const [input, code] of refusals) {
+      const refused = h.coordinator.readOutputForCall("read-refused", input, signal);
+      expect(refused.ok).toBe(false);
+      if (!refused.ok) expect(refused.code).toBe(code);
+    }
+
+    let getterCalls = 0;
+    const accessorInput = Object.defineProperty({}, "action", {
+      enumerable: true,
+      get() {
+        getterCalls += 1;
+        return "read";
+      },
+    });
+    const accessor = h.coordinator.readOutputForCall("read-malformed", accessorInput, signal);
+    expect(accessor.ok).toBe(false);
+    expect(getterCalls).toBe(0);
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    const revokedOutcome = h.coordinator.readOutputForCall("read-malformed", revoked.proxy, signal);
+    expect(revokedOutcome.ok).toBe(false);
+
+    // The actual preflight input must equal the frozen normalized input.
+    await preflightReadCall(f, "read-mismatch", { ...raw, path: "other.txt" });
+    const mismatch = h.coordinator.readOutputForCall("read-mismatch", raw, signal);
+    expect(mismatch.ok).toBe(false);
+    if (!mismatch.ok) expect(mismatch.code).toBe("source-conflict");
+
+    await preflightReadCall(f, "read-aborted", raw);
+    const aborted = new AbortController();
+    aborted.abort();
+    const abortedOutcome = h.coordinator.readOutputForCall("read-aborted", raw, aborted.signal);
+    expect(abortedOutcome.ok).toBe(false);
+    if (!abortedOutcome.ok) expect(abortedOutcome.code).toBe("cancelled");
+    const fake = h.coordinator.readOutputForCall("read-fake", raw, {});
+    expect(fake.ok).toBe(false);
+    if (!fake.ok) expect(fake.code).toBe("invalid-caller");
+
+    // Reusing a retained action id cannot borrow that record or its ref.
+    const actionRaw = captureActionInput("source-1");
+    await preflightCaptureAction(f, "cap-read-reuse", actionRaw);
+    const selected = await settle(h.coordinator.captureOutputForCall(
+      "cap-read-reuse",
+      actionRaw,
+      new AbortController().signal,
+    ));
+    expect(selected.ok).toBe(true);
+    await preflightReadCall(f, "cap-read-reuse-2", raw);
+    const reused = h.coordinator.readOutputForCall("cap-read-reuse", raw, signal);
+    expect(reused.ok).toBe(false);
+    if (!reused.ok) expect(reused.code).toBe("source-conflict");
+
+    expect(h.captureCalls()).toBe(1);
+    const state = h.coordinator.inspect();
+    expect(state.output.retainedCaptures).toBe(1);
+    expect(state.operations[0]!.output.checks.actions).toBe(1);
+    expect(source.capture.changes[0]!.snapshot.text).toBe("original historical text\n");
+  });
+
+  test("later callbacks invalidate the source or coordinator and refuse the read", async () => {
+    // Owner loss after preparation is refused by the final pure sequence.
+    {
+      const f = await fixture();
+      await writeFile(path.join(f.workspace, PATH_A), "owner text\n", { mode: 0o600 });
+      const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+      const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+      let owner: string | null = null;
+      let ownerCaptureCalls = 0;
+      const h = setup(f, {
+        capture: () => capture,
+        output: {
+          async capture() {
+            ownerCaptureCalls += 1;
+            return { ok: true as const, capture };
+          },
+          matches() {
+            return true;
+          },
+          revalidateOwner() {
+            return owner;
+          },
+        },
+      });
+      await startWork(f);
+      const source = await captureSource(f, h, "source-1");
+      owner = "the owner was lost";
+      const raw = readInput("source-1", source.capture);
+      await preflightReadCall(f, "read-owner", raw);
+      const refused = h.coordinator.readOutputForCall("read-owner", raw, new AbortController().signal);
+      expect(refused.ok).toBe(false);
+      if (!refused.ok) expect(refused.code).toBe("authority-lost");
+      expect(ownerCaptureCalls).toBe(1);
+      expect(h.coordinator.inspect().output.retainedCaptures).toBe(1);
+    }
+
+    // A read-call preparation callback invalidates the earlier source work.
+    {
+      const f = await fixture();
+      await writeFile(path.join(f.workspace, PATH_A), "stale text\n", { mode: 0o600 });
+      const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+      const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+      let armed = false;
+      let seen = 0;
+      let fired = false;
+      const h = setup(f, {
+        capture: () => capture,
+        getContext: () => {
+          if (armed) {
+            seen += 1;
+            if (seen >= 2 && !fired) {
+              fired = true;
+              void f.host.emit("session_switch", {}, f.ctx);
+            }
+          }
+          return f.ctx;
+        },
+      });
+      await startWork(f);
+      const source = await captureSource(f, h, "source-1");
+      const raw = readInput("source-1", source.capture);
+      await preflightReadCall(f, "read-stale", raw);
+      armed = true;
+      const refused = h.coordinator.readOutputForCall("read-stale", raw, new AbortController().signal);
+      armed = false;
+      expect(refused.ok).toBe(false);
+      expect(h.captureCalls()).toBe(1);
+      expect(h.coordinator.inspect().output.retainedCaptures).toBe(1);
+    }
+
+    // Reentrant read refuses busy; the outer read is unaffected.
+    {
+      const f = await fixture();
+      await writeFile(path.join(f.workspace, PATH_A), "reentrant text\n", { mode: 0o600 });
+      const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+      const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+      let coordinatorRef: NativeHarnessDelegationCoordinator | null = null;
+      let nested!: ReturnType<NativeHarnessDelegationCoordinator["readOutputForCall"]>;
+      let nesting = false;
+      let armed = false;
+      const h = setup(f, {
+        capture: () => capture,
+        getContext: () => {
+          if (armed && !nesting && coordinatorRef !== null) {
+            nesting = true;
+            try {
+              nested = coordinatorRef.readOutputForCall("read-nested", readRaw, signal);
+            } finally {
+              nesting = false;
+            }
+          }
+          return f.ctx;
+        },
+      });
+      coordinatorRef = h.coordinator;
+      await startWork(f);
+      const source = await captureSource(f, h, "source-1");
+      const readRaw = readInput("source-1", source.capture);
+      const signal = new AbortController().signal;
+      await preflightReadCall(f, "read-outer", readRaw);
+      armed = true;
+      const outer = h.coordinator.readOutputForCall("read-outer", readRaw, signal);
+      armed = false;
+      expect(outer.ok).toBe(true);
+      expect(nested).toBeDefined();
+      const nestedOutcome = nested;
+      expect(nestedOutcome.ok).toBe(false);
+      if (!nestedOutcome.ok) expect(nestedOutcome.reason).toContain("already in progress");
+    }
+
+    // A matcher callback after source preparation poisons the source
+    // projection; only the final combined pure gates can refuse it.
+    {
+      const f = await fixture();
+      await writeFile(path.join(f.workspace, PATH_A), "matcher text\n", { mode: 0o600 });
+      const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+      const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+      let poison = false;
+      let captureCount = 0;
+      const h = setup(f, {
+        output: {
+          async capture() {
+            captureCount += 1;
+            return { ok: true as const, capture };
+          },
+          matches() {
+            if (poison) {
+              poison = false;
+              void f.host.emit("tool_result", {
+                toolCallId: "source-1",
+                toolName: "agent_harness",
+                input: { task: WORK_TASK },
+                content: [{ type: "text", text: "changed after source preparation" }],
+                details: null,
+                isError: false,
+              }, f.ctx);
+            }
+            return true;
+          },
+          revalidateOwner() {
+            return null;
+          },
+        },
+      });
+      await startWork(f);
+      const source = await captureSource(f, h, "source-1");
+      const raw = readInput("source-1", source.capture);
+      await preflightReadCall(f, "read-matcher", raw);
+      poison = true;
+      const refused = h.coordinator.readOutputForCall(
+        "read-matcher",
+        raw,
+        new AbortController().signal,
+      );
+      expect(refused.ok).toBe(false);
+      if (!refused.ok) expect(refused.code).toBe("source-conflict");
+      expect(captureCount).toBe(1);
+      expect(h.coordinator.inspect().output.retainedCaptures).toBe(1);
+    }
+
+    // Disposal during a callback refuses the whole read and keeps history.
+    {
+      const f = await fixture();
+      await writeFile(path.join(f.workspace, PATH_A), "dispose text\n", { mode: 0o600 });
+      const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+      const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+      let armed = false;
+      let coordinatorRef: NativeHarnessDelegationCoordinator | null = null;
+      const h = setup(f, {
+        capture: () => capture,
+        getContext: () => {
+          if (armed && coordinatorRef !== null) {
+            armed = false;
+            coordinatorRef.dispose();
+          }
+          return f.ctx;
+        },
+      });
+      coordinatorRef = h.coordinator;
+      await startWork(f);
+      const source = await captureSource(f, h, "source-1");
+      const raw = readInput("source-1", source.capture);
+      await preflightReadCall(f, "read-dispose", raw);
+      armed = true;
+      const refused = h.coordinator.readOutputForCall("read-dispose", raw, new AbortController().signal);
+      expect(refused.ok).toBe(false);
+      if (!refused.ok) expect(refused.code).toBe("authority-lost");
+      expect(h.captureCalls()).toBe(1);
+    }
+  });
+
+  test("inspect authenticates with zero sources and refuses absent output support", async () => {
+    const f = await fixture();
+    await startWork(f);
+    const h = setup(f);
+    const raw = { action: "inspect" };
+    await preflightInspectCall(f, "inspect-empty", raw);
+    const catalog = h.coordinator.inspectOutputsForCall("inspect-empty", raw, new AbortController().signal);
+    expect(catalog.ok).toBe(true);
+    if (!catalog.ok) throw new Error(catalog.reason);
+    expect(catalog.action).toBe("inspect");
+    expect(catalog.scope).toBe("retained-sources-in-this-root");
+    expect(catalog.scanComplete).toBe(true);
+    expect(catalog.retainedSources).toBe(0);
+    expect(catalog.returnedSources).toBe(0);
+    expect(catalog.excludedNotReady).toBe(0);
+    expect(catalog.excludedUnavailable).toBe(0);
+    expect(catalog.rows).toEqual([]);
+    expect(Object.isFrozen(catalog)).toBe(true);
+    expect(Object.isFrozen(catalog.rows)).toBe(true);
+    expect(h.captureCalls()).toBe(0);
+
+    const malformed = h.coordinator.inspectOutputsForCall(
+      "inspect-malformed",
+      { action: "inspect", extra: true },
+      new AbortController().signal,
+    );
+    expect(malformed.ok).toBe(false);
+    if (!malformed.ok) expect(malformed.code).toBe("source-conflict");
+
+    const bareF = await fixture();
+    await startWork(bareF);
+    const bare = createNativeHarnessDelegation({
+      native: bareF.entry,
+      policy: {
+        maxRetainedOperations: 16,
+        maxConcurrent: 1,
+        perRunUsd: 1,
+        lifetimeUsd: 5,
+        maxDurationMs: 5000,
+        cleanupGraceMs: 20,
+      },
+      getContext: () => bareF.ctx,
+      prepare: (request): NativeHarnessPrepareResult => {
+        request.guard();
+        return {
+          ok: true,
+          backend: {
+            async create() {
+              return { runId: "run-1" };
+            },
+            async execute() {
+              return { status: "completed" };
+            },
+            async cancel() {
+              return undefined;
+            },
+          },
+        };
+      },
+      runner: runnerFor(async () => completedResult()),
+      enabled: true,
+    });
+    coordinators.push(bare);
+    await preflightInspectCall(bareF, "inspect-no-port", raw);
+    const absent = bare.inspectOutputsForCall(
+      "inspect-no-port",
+      raw,
+      new AbortController().signal,
+    );
+    expect(absent.ok).toBe(false);
+    if (!absent.ok) expect(absent.code).toBe("output-unavailable");
+  });
+
+  test("successful settled sources with missing or refused registration evidence are unavailable", async () => {
+    // A genuine successful source that never registered a result projection
+    // has no selector evidence: unavailable, never not-ready.
+    {
+      const f = await fixture();
+      await startWork(f);
+      const h = setup(f);
+      await callSource(f, "source-unregistered");
+      const signal = new AbortController().signal;
+      const result = await settle(h.coordinator.invoke(
+        "source-unregistered",
+        { task: WORK_TASK },
+        signal,
+      ));
+      expect(result.outcome).toBe("backend-completed");
+      const raw = { action: "inspect" };
+      await preflightInspectCall(f, "inspect-unregistered", raw);
+      const catalog = h.coordinator.inspectOutputsForCall(
+        "inspect-unregistered",
+        raw,
+        new AbortController().signal,
+      );
+      expect(catalog.ok).toBe(true);
+      if (!catalog.ok) throw new Error(catalog.reason);
+      expect(catalog.retainedSources).toBe(1);
+      expect(catalog.returnedSources).toBe(0);
+      expect(catalog.excludedNotReady).toBe(0);
+      expect(catalog.excludedUnavailable).toBe(1);
+      expect(catalog.returnedSources + catalog.excludedNotReady + catalog.excludedUnavailable)
+        .toBe(catalog.retainedSources);
+      expect(catalog.rows).toEqual([]);
+      expect(JSON.stringify(catalog)).not.toContain("source-unregistered");
+    }
+
+    // A successfully settled source whose cloned-source registration was
+    // refused has no selector evidence: unavailable, never not-ready and never
+    // promoted to a selectable row.
+    {
+      const f = await fixture();
+      await startWork(f);
+      const h = setup(f);
+      await callSource(f, "source-registration-failed");
+      const signal = new AbortController().signal;
+      const result = await settle(h.coordinator.invoke(
+        "source-registration-failed",
+        { task: WORK_TASK },
+        signal,
+      ));
+      expect(result.outcome).toBe("backend-completed");
+      const refused = h.coordinator.registerToolResultProjection(
+        "source-registration-failed",
+        { ...result },
+        projectionFor(result),
+        signal,
+      );
+      expect(refused.ok).toBe(false);
+      const raw = { action: "inspect" };
+      await preflightInspectCall(f, "inspect-registration-failed", raw);
+      const catalog = h.coordinator.inspectOutputsForCall(
+        "inspect-registration-failed",
+        raw,
+        new AbortController().signal,
+      );
+      expect(catalog.ok).toBe(true);
+      if (!catalog.ok) throw new Error(catalog.reason);
+      expect(catalog.retainedSources).toBe(1);
+      expect(catalog.returnedSources).toBe(0);
+      expect(catalog.excludedNotReady).toBe(0);
+      expect(catalog.excludedUnavailable).toBe(1);
+      expect(catalog.returnedSources + catalog.excludedNotReady + catalog.excludedUnavailable)
+        .toBe(catalog.retainedSources);
+      expect(catalog.rows).toEqual([]);
+      expect(JSON.stringify(catalog)).not.toContain("source-registration-failed");
+    }
+  });
+
+  test("a later-row prepare that loses main query context refuses the whole catalog", async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.workspace, PATH_A), "late context\n", { mode: 0o600 });
+    const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+    const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+    const queryId = "inspect-late-context";
+    let armed = false;
+    let fired = false;
+    let queryCaptures = 0;
+    let capturedQueryRef: unknown;
+    const queryPrepareRefs: unknown[] = [];
+    const observed: NativeEntryControls = {
+      ...f.entry,
+      captureCall(selector, context) {
+        const captured = f.entry.captureCall(selector, context);
+        if (captured.ok && selector.toolCallId === queryId) {
+          queryCaptures += 1;
+          capturedQueryRef = captured.ref;
+        }
+        return captured;
+      },
+      prepareCallCheck(ref, context) {
+        if (nativeRefToolCallId(ref) === queryId) queryPrepareRefs.push(ref);
+        if (armed && !fired && nativeRefToolCallId(ref) === "source-b") {
+          fired = true;
+          f.ctx.agent!.kind = "sub";
+        }
+        return f.entry.prepareCallCheck(ref, context);
+      },
+    };
+    const h = setup(f, { native: observed, capture: () => capture });
+    await startWork(f);
+    await captureSource(f, h, "source-a");
+    await registeredSource(f, h, "source-b");
+    const raw = { action: "inspect" };
+    await preflightInspectCall(f, queryId, raw);
+    armed = true;
+    const catalog = h.coordinator.inspectOutputsForCall(
+      queryId,
+      raw,
+      new AbortController().signal,
+    );
+    armed = false;
+    f.ctx.agent!.kind = "main";
+    expect(fired).toBe(true);
+    expect(catalog.ok).toBe(false);
+    if (!catalog.ok) expect(catalog.code).toBe("authority-lost");
+    expect(queryCaptures).toBe(1);
+    expect(capturedQueryRef).toBeDefined();
+    expect(queryPrepareRefs.length).toBeGreaterThan(0);
+    for (const ref of queryPrepareRefs) expect(ref).toBe(capturedQueryRef);
+  });
+
+  test("a final query refresh invalidates an earlier row while the query stays valid", async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.workspace, PATH_A), "refresh text\n", { mode: 0o600 });
+    const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+    const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+    const queryId = "inspect-refresh";
+    let fired = false;
+    let queryCaptures = 0;
+    let capturedQueryRef: unknown;
+    let queryPrepares = 0;
+    const queryPrepareRefs: unknown[] = [];
+    const observed: NativeEntryControls = {
+      ...f.entry,
+      captureCall(selector, context) {
+        const captured = f.entry.captureCall(selector, context);
+        if (captured.ok && selector.toolCallId === queryId) {
+          queryCaptures += 1;
+          capturedQueryRef = captured.ref;
+        }
+        return captured;
+      },
+      prepareCallCheck(ref, context) {
+        if (nativeRefToolCallId(ref) === queryId) {
+          queryPrepares += 1;
+          queryPrepareRefs.push(ref);
+          if (queryPrepares === 2 && !fired) {
+            fired = true;
+            void f.host.emit("tool_result", {
+              toolCallId: "source-a",
+              toolName: "agent_harness",
+              input: { task: WORK_TASK },
+              content: [{ type: "text", text: "changed after source preparation" }],
+              details: null,
+              isError: false,
+            }, f.ctx);
+          }
+        }
+        return f.entry.prepareCallCheck(ref, context);
+      },
+    };
+    const h = setup(f, { native: observed, capture: () => capture });
+    await startWork(f);
+    await captureSource(f, h, "source-a");
+    await registeredSource(f, h, "source-b");
+    const raw = { action: "inspect" };
+    await preflightInspectCall(f, queryId, raw);
+    const catalog = h.coordinator.inspectOutputsForCall(
+      queryId,
+      raw,
+      new AbortController().signal,
+    );
+    expect(fired).toBe(true);
+    expect(catalog.ok).toBe(true);
+    if (!catalog.ok) throw new Error(catalog.reason);
+    expect(catalog.retainedSources).toBe(2);
+    expect(catalog.returnedSources).toBe(1);
+    expect(catalog.excludedNotReady).toBe(0);
+    expect(catalog.excludedUnavailable).toBe(1);
+    expect(catalog.returnedSources + catalog.excludedNotReady + catalog.excludedUnavailable)
+      .toBe(catalog.retainedSources);
+    expect(catalog.rows).toHaveLength(1);
+    expect(catalog.rows[0]!.sourceToolCallId).toBe("source-b");
+    expect(queryCaptures).toBe(1);
+    expect(capturedQueryRef).toBeDefined();
+    expect(queryPrepareRefs).toHaveLength(2);
+    for (const ref of queryPrepareRefs) expect(ref).toBe(capturedQueryRef);
+  });
+
+  test("mixed idle, captured, running and stale sources reconcile without leaking selectors", async () => {
+    const f = await fixture();
+    const pathB = "other.txt";
+    await writeFile(path.join(f.workspace, PATH_A), "idle text\n", { mode: 0o600 });
+    await writeFile(path.join(f.workspace, pathB), "captured text\n", { mode: 0o600 });
+    const snapshotA = await captureWorkspaceText(f.workspace, PATH_A);
+    const snapshotB = await captureWorkspaceText(f.workspace, pathB);
+    const capture = syntheticCapture(WORK_TASK, [
+      { path: PATH_A, snapshot: snapshotA },
+      { path: pathB, snapshot: snapshotB },
+    ]);
+    const h = setup(f, { capture: () => capture });
+
+    await startWork(f, "first work");
+    await registeredSource(f, h, "source-stale");
+    await endWork(f);
+    await startWork(f, "second work");
+    await registeredSource(f, h, "source-idle");
+    await captureSource(f, h, "source-captured");
+    await callSource(f, "source-running");
+    const raw = { action: "inspect" };
+    await preflightInspectCall(f, "inspect-mixed", raw);
+    const runningInvoke = h.coordinator.invoke(
+      "source-running",
+      { task: WORK_TASK },
+      new AbortController().signal,
+    );
+    const catalog = h.coordinator.inspectOutputsForCall(
+      "inspect-mixed",
+      raw,
+      new AbortController().signal,
+    );
+    expect(catalog.ok).toBe(true);
+    if (!catalog.ok) throw new Error(catalog.reason);
+    expect(catalog.retainedSources).toBe(4);
+    expect(catalog.returnedSources).toBe(2);
+    expect(catalog.excludedNotReady).toBe(1);
+    expect(catalog.excludedUnavailable).toBe(1);
+    expect(catalog.returnedSources + catalog.excludedNotReady + catalog.excludedUnavailable)
+      .toBe(catalog.retainedSources);
+
+    const idle = catalog.rows.find((row) => row.sourceToolCallId === "source-idle");
+    expect(idle).toEqual({
+      sourceToolCallId: "source-idle",
+      outputState: "idle",
+      capture: null,
+    });
+    const captured = catalog.rows.find((row) => row.sourceToolCallId === "source-captured");
+    expect(captured).toBeDefined();
+    if (captured === undefined) throw new Error("missing captured row");
+    expect(captured.outputState).toBe("captured");
+    if (captured.capture === null) throw new Error("captured row has no capture");
+    expect(captured.capture.captureId).toBe(capture.captureId);
+    expect(captured.capture.captureDigest).toBe(capture.digest);
+    expect(captured.capture.files).toHaveLength(2);
+    for (const change of capture.changes) {
+      expect(captured.capture.files).toContainEqual({
+        path: change.path,
+        kind: change.kind,
+        bytes: change.snapshot.file.bytes,
+        sha256: change.snapshot.file.sha256,
+        observedAt: change.snapshot.file.observedAt,
+      });
+    }
+    expect(Object.isFrozen(captured)).toBe(true);
+    expect(Object.isFrozen(captured.capture)).toBe(true);
+    expect(Object.isFrozen(captured.capture.files)).toBe(true);
+    expect(Object.isFrozen(captured.capture.files[0])).toBe(true);
+
+    const text = JSON.stringify(catalog);
+    expect(text).not.toContain("idle text");
+    expect(text).not.toContain("captured text");
+    expect(text).not.toContain(WORK_TASK);
+    expect(text).not.toContain(f.workspace);
+    expect(text).not.toContain("source-running");
+    expect(text).not.toContain("source-stale");
+    expect(h.captureCalls()).toBe(1);
+    await settle(runningInvoke);
+  });
+
+  test("a late row callback excludes only its stale source; inventory growth refuses the catalog", async () => {
+    // A later row's matcher poisons an earlier source: exclude that row only.
+    {
+      const f = await fixture();
+      await writeFile(path.join(f.workspace, PATH_A), "final text\n", { mode: 0o600 });
+      const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+      const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+      let poison = false;
+      let captureCalls = 0;
+      const port: NativeHarnessOutputPort = {
+        async capture() {
+          captureCalls += 1;
+          return { ok: true as const, capture };
+        },
+        matches() {
+          if (poison) {
+            poison = false;
+            void f.host.emit("tool_result", {
+              toolCallId: "source-1",
+              toolName: "agent_harness",
+              input: { task: WORK_TASK },
+              content: [{ type: "text", text: "changed after registration" }],
+              details: null,
+              isError: false,
+            }, f.ctx);
+          }
+          return true;
+        },
+        revalidateOwner() {
+          return null;
+        },
+      };
+      const h = setup(f, { output: port });
+      await startWork(f);
+      await callSource(f, "source-1");
+      const signal = new AbortController().signal;
+      const result = await settle(h.coordinator.invoke("source-1", { task: WORK_TASK }, signal));
+      const wire = projectionFor(result);
+      expect(h.coordinator.registerToolResultProjection("source-1", result, wire, signal).ok).toBe(true);
+      await emitSourceResult(f, "source-1", wire);
+      await captureSource(f, h, "source-2");
+      poison = true;
+      const raw = { action: "inspect" };
+      await preflightInspectCall(f, "inspect-final", raw);
+      const catalog = h.coordinator.inspectOutputsForCall(
+        "inspect-final",
+        raw,
+        new AbortController().signal,
+      );
+      expect(catalog.ok).toBe(true);
+      if (!catalog.ok) throw new Error(catalog.reason);
+      expect(catalog.retainedSources).toBe(2);
+      expect(catalog.returnedSources).toBe(1);
+      expect(catalog.excludedNotReady).toBe(0);
+      expect(catalog.excludedUnavailable).toBe(1);
+      expect(catalog.rows).toHaveLength(1);
+      expect(catalog.rows[0]!.sourceToolCallId).toBe("source-2");
+      expect(captureCalls).toBe(1);
+    }
+
+    // A growing Slot inventory refuses the whole catalog.
+    {
+      const f = await fixture();
+      await writeFile(path.join(f.workspace, PATH_A), "growth text\n", { mode: 0o600 });
+      const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+      const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+      let injected: Promise<unknown> | null = null;
+      let injectedOnce = false;
+      let armedGrowth = false;
+      const port: NativeHarnessOutputPort = {
+        async capture() {
+          return { ok: true as const, capture };
+        },
+        matches() {
+          if (armedGrowth && !injectedOnce) {
+            injectedOnce = true;
+            injected = coordinatorRef!.invoke(
+              "source-new",
+              { task: WORK_TASK },
+              new AbortController().signal,
+            );
+          }
+          return true;
+        },
+        revalidateOwner() {
+          return null;
+        },
+      };
+      let coordinatorRef: NativeHarnessDelegationCoordinator | null = null;
+      const h = setup(f, { output: port });
+      coordinatorRef = h.coordinator;
+      await startWork(f);
+      await captureSource(f, h, "source-1");
+      await callSource(f, "source-new");
+      const raw = { action: "inspect" };
+      await preflightInspectCall(f, "inspect-growth", raw);
+      armedGrowth = true;
+      const catalog = h.coordinator.inspectOutputsForCall(
+        "inspect-growth",
+        raw,
+        new AbortController().signal,
+      );
+      expect(catalog.ok).toBe(false);
+      if (!catalog.ok) {
+        expect(catalog.code).toBe("source-conflict");
+        expect(catalog.reason).toContain("inventory changed");
+      }
+      expect(h.coordinator.inspect().retainedOperations).toBe(2);
+      if (injected !== null) await settle(injected as Promise<unknown>);
+    }
+  });
+
+  test("sixteen retained mutation actions do not block a pure read or catalog", async () => {
+    const { f, h, source } = await capturedReadFixture();
+    const signal = new AbortController().signal;
+    const actionRaw = captureActionInput("source-1");
+    for (let index = 0; index < NATIVE_HARNESS_MAX_CHECK_ACTIONS; index++) {
+      await preflightCaptureAction(f, `cap-${index}`, actionRaw);
+      const selected = await settle(h.coordinator.captureOutputForCall(
+        `cap-${index}`,
+        actionRaw,
+        signal,
+      ));
+      expect(selected.ok).toBe(true);
+    }
+    expect(h.coordinator.inspect().operations[0]!.output.checks.actions)
+      .toBe(NATIVE_HARNESS_MAX_CHECK_ACTIONS);
+
+    const readRaw = readInput("source-1", source.capture);
+    await preflightReadCall(f, "read-after-actions", readRaw);
+    const read = h.coordinator.readOutputForCall("read-after-actions", readRaw, signal);
+    expect(read.ok).toBe(true);
+    if (!read.ok) throw new Error(read.reason);
+    expect(read.snapshot).toBe(source.capture.changes[0]!.snapshot);
+
+    const inspectRaw = { action: "inspect" };
+    await preflightInspectCall(f, "inspect-after-actions", inspectRaw);
+    const catalog = h.coordinator.inspectOutputsForCall(
+      "inspect-after-actions",
+      inspectRaw,
+      signal,
+    );
+    expect(catalog.ok).toBe(true);
+    if (!catalog.ok) throw new Error(catalog.reason);
+    expect(catalog.retainedSources).toBe(1);
+    expect(catalog.returnedSources).toBe(1);
+    expect(catalog.rows[0]!.outputState).toBe("captured");
+    expect(h.coordinator.inspect().operations[0]!.output.checks.actions)
+      .toBe(NATIVE_HARNESS_MAX_CHECK_ACTIONS);
+    expect(h.captureCalls()).toBe(1);
   });
 });
