@@ -6,11 +6,13 @@ import type {
   NativeEntryControls,
   NativeWorkCallReference,
   NativeWorkCallInspection,
+  ReportOutcome,
 } from "./native-entry.ts";
-import type {
-  NativeHarnessOutputCapture,
-  NativeHarnessOutputCaptureResult,
-  NativeHarnessOutputRecord,
+import {
+  compareNativeHarnessOutputVersion,
+  type NativeHarnessOutputCapture,
+  type NativeHarnessOutputCaptureResult,
+  type NativeHarnessOutputRecord,
 } from "./native-harness-output.ts";
 import {
   NATIVE_WORK_TOOL,
@@ -19,9 +21,12 @@ import {
   type NativeWorkspaceTextSnapshot,
 } from "./native-work.ts";
 import {
+  NATIVE_HARNESS_REPORT_MAX_REREAD_ATTEMPTS,
   NATIVE_HARNESS_REPORT_MAX_SELECTED_CHECKS,
   createNativeHarnessReportFailure,
   createNativeHarnessReportFacts,
+  createNativeHarnessReportRereadFailure,
+  createNativeHarnessReportRereadSuccess,
   normalizeNativeHarnessReportRequest,
   type NativeHarnessReportBindingFailure,
   type NativeHarnessReportBindingFacts,
@@ -30,6 +35,10 @@ import {
   type NativeHarnessReportFailureCode,
   type NativeHarnessReportFileFacts,
   type NativeHarnessReportNormalizedRequest,
+  type NativeHarnessReportRereadFailure,
+  type NativeHarnessReportRereadFailureCode,
+  type NativeHarnessReportRereadResult,
+  type NativeHarnessReportSelection,
 } from "./native-harness-report.ts";
 import {
   NATIVE_HARNESS_MAX_CHECK_ACTIONS,
@@ -637,6 +646,14 @@ interface SlotOutput {
   lastClock: number | null;
   checks: NativeHarnessCheckState | null;
   actionBinding: CaptureActionBinding | null;
+  /** Bounded admitted report-reread records over this original capture. */
+  reportRecords: ReportRereadRecord[];
+  /** Count of admitted report I/O attempts; never resets to zero. */
+  reportAttempts: number;
+  /** The one exact active report-read owner under this output Slot. */
+  reportActive: ReportReadRuntime | null;
+  /** Sticky current-use refusal after authoritative drift evidence. */
+  reportCurrentUseRefusal: string | null;
 }
 
 interface Slot {
@@ -725,6 +742,8 @@ interface CoordinatorState {
   outputJoinValidating: boolean;
   outputObservationInProgress: boolean;
   reportBindingInProgress: boolean;
+  /** One bounded synchronous admission/join guard for report rereads. */
+  reportRereadInProgress: boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -2068,41 +2087,46 @@ function captureFinalGate(
   return null;
 }
 
-function readCapturedOutput(
-  value: unknown,
+interface DecodedCaptureEnvelope {
+  readonly ok: boolean;
+  readonly capture: unknown;
+  readonly code: unknown;
+  readonly reason: unknown;
+  /**
+   * Trusted positive-mismatch marker. It is read before any legacy failure
+   * mapping and is only valid on an `ok: false` envelope.
+   */
+  readonly mismatch: true | undefined;
+}
+
+/** One strict own-data decode of the trusted output capture envelope. */
+function decodeCaptureEnvelope(value: unknown): DecodedCaptureEnvelope | null {
+  const fields = readStrictFields(value, ["ok", "capture", "code", "reason", "observedMismatch"], ["ok"]);
+  if (fields === null) return null;
+  const ok = fields.get("ok");
+  const hasMismatch = fields.has("observedMismatch");
+  const mismatchValue = fields.get("observedMismatch");
+  if (hasMismatch && (mismatchValue !== true || ok !== false)) return null;
+  return {
+    ok: ok === true,
+    capture: fields.get("capture"),
+    code: fields.get("code"),
+    reason: fields.get("reason"),
+    mismatch: hasMismatch ? true : undefined,
+  };
+}
+
+/**
+ * Validates one already-decoded capture value against the original Slot,
+ * backend and result registration. No envelope field is re-read here.
+ */
+function readCaptureValue(
+  captureValue: unknown,
   slot: Slot,
   output: OutputPort,
   registration: OutputRegistration,
 ): { readonly ok: true; readonly capture: NativeHarnessOutputCapture; readonly bytes: number }
   | NativeHarnessOutputSelectionFailure {
-  const fields = readStrictFields(value, ["ok", "capture", "code", "reason", "observedMismatch"], ["ok"]);
-  if (fields === null) {
-    return outputFailure("capture-failed", "the trusted output capture returned an unreadable result");
-  }
-  if (fields.has("observedMismatch")
-    && (fields.get("observedMismatch") !== true || fields.get("ok") !== false)) {
-    return outputFailure("capture-failed", "the trusted output capture returned an unreadable result");
-  }
-  if (fields.get("ok") !== true) {
-    const code = fields.get("code");
-    const reason = fields.get("reason");
-    const mapped: NativeHarnessOutputSelectionCode = code === "aborted"
-      ? "cancelled"
-      : code === "deadline"
-        ? "deadline"
-        : code === "authority-lost"
-          ? "authority-lost"
-          : code === "invalid-control"
-            ? "invalid-caller"
-            : code === "source-unavailable" || code === "changed" || code === "missing"
-              ? "source-conflict"
-              : "capture-failed";
-    return outputFailure(
-      mapped,
-      typeof reason === "string" ? reason : "the trusted output capture refused",
-    );
-  }
-  const captureValue = fields.get("capture");
   if (!isRecord(captureValue)) {
     return outputFailure("capture-failed", "the trusted output capture returned no capture object");
   }
@@ -2148,6 +2172,44 @@ function readCapturedOutput(
     return outputFailure("source-conflict", "the issued output capture is not bound to the original backend");
   }
   return { ok: true, capture: captureValue as unknown as NativeHarnessOutputCapture, bytes: totalBytes };
+}
+
+/**
+ * Capture-caller view of the decoded envelope. The compatibility marker is
+ * accepted only as an optional `true` on a refused envelope and is ignored
+ * after the established failure mapping; it never mints a success or drift.
+ */
+function readCapturedOutput(
+  value: unknown,
+  slot: Slot,
+  output: OutputPort,
+  registration: OutputRegistration,
+): { readonly ok: true; readonly capture: NativeHarnessOutputCapture; readonly bytes: number }
+  | NativeHarnessOutputSelectionFailure {
+  const decoded = decodeCaptureEnvelope(value);
+  if (decoded === null) {
+    return outputFailure("capture-failed", "the trusted output capture returned an unreadable result");
+  }
+  if (!decoded.ok) {
+    const code = decoded.code;
+    const reason = decoded.reason;
+    const mapped: NativeHarnessOutputSelectionCode = code === "aborted"
+      ? "cancelled"
+      : code === "deadline"
+        ? "deadline"
+        : code === "authority-lost"
+          ? "authority-lost"
+          : code === "invalid-control"
+            ? "invalid-caller"
+            : code === "source-unavailable" || code === "changed" || code === "missing"
+              ? "source-conflict"
+              : "capture-failed";
+    return outputFailure(
+      mapped,
+      typeof reason === "string" ? reason : "the trusted output capture refused",
+    );
+  }
+  return readCaptureValue(decoded.capture, slot, output, registration);
 }
 
 function releaseOutputReservation(state: CoordinatorState, slot: Slot): void {
@@ -3417,6 +3479,60 @@ interface ReportBindingState {
   revision: ReportBindingRevision;
 }
 
+/** Bounded selection identity retained after an attempt settles. */
+interface ReportRereadSelection {
+  readonly sourceToolCallId: string;
+  readonly captureId: string;
+  readonly captureDigest: string;
+  readonly checkToolCallIds: readonly string[];
+}
+
+/**
+ * One admitted report reread. Settled records keep only compact original refs,
+ * the exact original Promise and its fixed result; the active runtime and
+ * preparation binding are cleared when the attempt drains.
+ */
+interface ReportRereadRecord {
+  readonly attempt: number;
+  readonly sourceId: string;
+  readonly reportId: string;
+  readonly reportRef: object;
+  readonly reportInputSha256: string;
+  readonly outcome: ReportOutcome;
+  readonly reportSignal: unknown;
+  readonly capture: NativeHarnessOutputCapture;
+  readonly outputSelection: NativeHarnessOutputSelectionSuccess;
+  readonly registration: OutputRegistration;
+  readonly checks: NativeHarnessCheckState | null;
+  readonly selection: ReportRereadSelection;
+  readonly startedAt: number;
+  readonly promise: Promise<NativeHarnessReportRereadResult>;
+  result: NativeHarnessReportRereadResult | null;
+  /** Active-only; null once the attempt settles. */
+  runtime: ReportReadRuntime | null;
+}
+
+/**
+ * Active-only report-read runtime. Guards resolve this record through the
+ * original Slot and read the fields below; they never close over a prepared
+ * facts object. Every field is cleared when the attempt drains.
+ */
+interface ReportReadRuntime {
+  readonly record: ReportRereadRecord;
+  readonly slot: Slot;
+  binding: ReportBindingState | null;
+  controller: AbortController | null;
+  cleanup: (() => void) | null;
+  reservation: number;
+  deadlineAt: number;
+  lastClock: number;
+  guardFailure: NativeHarnessReportRereadFailure | null;
+  settled: {
+    readonly promise: Promise<NativeHarnessReportRereadResult>;
+    resolve(value: NativeHarnessReportRereadResult): void;
+  } | null;
+}
+
 function isReportFailure(value: unknown): value is NativeHarnessReportBindingFailure {
   return typeof value === "object"
     && value !== null
@@ -3750,6 +3866,9 @@ function resolveReportBindingCandidate(
     );
   }
   const out = slot.output;
+  if (out.reportCurrentUseRefusal !== null) {
+    return createNativeHarnessReportFailure("source-conflict", out.reportCurrentUseRefusal);
+  }
   if (out.state !== "captured" || out.capture === null || out.selection === null) {
     return createNativeHarnessReportFailure("not-ready", "the source output has not been captured");
   }
@@ -4123,6 +4242,12 @@ function finalReportGate(
   revision: ReportBindingRevision,
   signalValue: unknown,
 ): NativeHarnessReportBindingFailure | null {
+  if (binding.slot.output.reportCurrentUseRefusal !== null) {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      binding.slot.output.reportCurrentUseRefusal,
+    );
+  }
   const owner = ownerPredicateReason(revision.source.output);
   if (owner !== null) {
     return createNativeHarnessReportFailure("authority-lost", owner);
@@ -4181,6 +4306,9 @@ function refreshReportPreparationUnchecked(
   }
   state.reportBindingInProgress = true;
   try {
+    if (binding.slot.output.reportCurrentUseRefusal !== null) {
+      return binding.slot.output.reportCurrentUseRefusal;
+    }
     const local = localReportIdentityProblem(state, binding);
     if (local !== null) return local;
     const reportSignal = readActualAbortSignal(binding.reportSignal);
@@ -4270,6 +4398,1020 @@ function revalidateReportPreparationUnchecked(
     || revision.reportInspection.callInputSha256 !== binding.reportInputSha256) {
     return "the captured report reference identity changed";
   }
+  return null;
+}
+
+/**
+ * Fixed sticky current-use refusal. It is set only by positive evidence from
+ * an admitted authoritative reread and is never cleared by restoration,
+ * another report id or a caller-held preparation.
+ */
+const REPORT_REREAD_DRIFT_REASON = "an authenticated report reread observed a changed current source";
+
+function reportRereadFailure(
+  code: NativeHarnessReportRereadFailureCode,
+  reason: string,
+  attempt?: number,
+): NativeHarnessReportRereadFailure {
+  return createNativeHarnessReportRereadFailure(code, reason, attempt);
+}
+
+function reportRereadSelectionOf(binding: ReportBindingState): ReportRereadSelection {
+  return Object.freeze({
+    sourceToolCallId: binding.request.selection.sourceToolCallId,
+    captureId: binding.request.selection.captureId,
+    captureDigest: binding.request.selection.captureDigest,
+    checkToolCallIds: Object.freeze([...binding.request.selection.checkToolCallIds]),
+  });
+}
+
+function sameReportRereadSelection(
+  left: ReportRereadSelection,
+  right: NativeHarnessReportSelection,
+): boolean {
+  if (left.sourceToolCallId !== right.sourceToolCallId
+    || left.captureId !== right.captureId
+    || left.captureDigest !== right.captureDigest
+    || left.checkToolCallIds.length !== right.checkToolCallIds.length) {
+    return false;
+  }
+  for (let index = 0; index < left.checkToolCallIds.length; index += 1) {
+    if (left.checkToolCallIds[index] !== right.checkToolCallIds[index]) return false;
+  }
+  return true;
+}
+
+/**
+ * Exact immutable admission inputs of one retained reread. Changed
+ * authenticated input or a different actual signal can only be refused.
+ */
+function sameReportRereadRecord(
+  record: ReportRereadRecord,
+  binding: ReportBindingState,
+): boolean {
+  return record.sourceId === binding.sourceId
+    && record.reportId === binding.reportId
+    && record.reportRef === binding.reportRef
+    && record.reportInputSha256 === binding.reportInputSha256
+    && record.outcome === binding.request.outcome
+    && record.reportSignal === binding.reportSignal
+    && record.capture === binding.capture
+    && record.outputSelection === binding.outputSelection
+    && record.registration === binding.registration
+    && record.checks === binding.checks
+    && sameReportRereadSelection(record.selection, binding.request.selection);
+}
+
+function findReportRereadRecord(slot: Slot, reportId: string): ReportRereadRecord | null {
+  const records = slot.output.reportRecords;
+  for (let index = records.length - 1; index >= 0; index -= 1) {
+    const record = records[index];
+    if (record !== undefined && record.reportId === reportId) return record;
+  }
+  return null;
+}
+
+/** Bounded cross-Slot scan for a report id already retained elsewhere. */
+function findForeignReportRereadRecord(
+  state: CoordinatorState,
+  sourceSlot: Slot,
+  reportId: string,
+): ReportRereadRecord | null {
+  for (const slot of state.slots.values()) {
+    if (slot === sourceSlot) continue;
+    const record = findReportRereadRecord(slot, reportId);
+    if (record !== null) return record;
+  }
+  return null;
+}
+
+function markReportCurrentUseRefusal(slot: Slot): void {
+  if (slot.output.reportCurrentUseRefusal === null) {
+    slot.output.reportCurrentUseRefusal = REPORT_REREAD_DRIFT_REASON;
+  }
+}
+
+function readReportRereadClock(
+  state: CoordinatorState,
+  runtime: ReportReadRuntime,
+): { readonly ok: true; readonly now: number }
+  | { readonly ok: false; readonly failure: NativeHarnessReportRereadFailure } {
+  const record = runtime.record;
+  const now = readClock(state.now);
+  if (now === null) {
+    return {
+      ok: false,
+      failure: reportRereadFailure("deadline", "the report reread clock is unavailable", record.attempt),
+    };
+  }
+  if (now < record.startedAt || now < runtime.lastClock) {
+    return {
+      ok: false,
+      failure: reportRereadFailure(
+        "deadline",
+        "the report reread clock moved backwards",
+        record.attempt,
+      ),
+    };
+  }
+  if (now > runtime.deadlineAt) {
+    return {
+      ok: false,
+      failure: reportRereadFailure("deadline", "the report reread budget expired", record.attempt),
+    };
+  }
+  runtime.lastClock = now;
+  return { ok: true, now };
+}
+
+function sameReportRereadRuntimeIdentity(
+  record: ReportRereadRecord,
+  binding: ReportBindingState,
+  runtime: ReportReadRuntime,
+): boolean {
+  const slot = runtime.slot;
+  return runtime.binding === binding
+    && record.runtime === runtime
+    && binding.slot === slot
+    && binding.reportRef === record.reportRef
+    && binding.reportInputSha256 === record.reportInputSha256
+    && binding.reportSignal === record.reportSignal
+    && binding.capture === record.capture
+    && binding.outputSelection === record.outputSelection
+    && binding.registration === record.registration
+    && binding.checks === record.checks
+    && sameReportRereadSelection(record.selection, binding.request.selection)
+    && slot.output.capture === record.capture
+    && slot.output.selection === record.outputSelection
+    && slot.output.registration === record.registration
+    && slot.output.checks === record.checks;
+}
+
+/**
+ * Cooperative leaf guard: fresh current binding and clock, then the final
+ * pure owner/signal/native checks and exact report ownership. It reads the
+ * runtime through the retained record and never retains facts itself.
+ */
+function reportRereadGuard(
+  state: CoordinatorState,
+  runtime: ReportReadRuntime,
+): NativeHarnessReportRereadFailure | null {
+  const record = runtime.record;
+  const slot = runtime.slot;
+  const binding = runtime.binding;
+  const attempt = record.attempt;
+  if (runtime.guardFailure !== null) return runtime.guardFailure;
+  if (state.disposed) {
+    return reportRereadFailure("authority-lost", "the delegation coordinator was disposed", attempt);
+  }
+  if (!state.enabled) {
+    return reportRereadFailure("authority-lost", "the delegation coordinator is disabled", attempt);
+  }
+  if (state.slots.get(record.sourceId) !== slot) {
+    return reportRereadFailure("authority-lost", "the original source Slot was replaced", attempt);
+  }
+  if (slot.output.reportActive !== runtime) {
+    return reportRereadFailure("authority-lost", "the report reread owner changed", attempt);
+  }
+  if (state.outputActive !== slot || state.outputReservedBytes !== runtime.reservation) {
+    return reportRereadFailure("authority-lost", "the report reread reservation was replaced", attempt);
+  }
+  const signal = readActualAbortSignal(record.reportSignal);
+  if (!signal.ok) return reportRereadFailure("invalid-caller", signal.reason, attempt);
+  if (signal.aborted) {
+    return reportRereadFailure("cancelled", "the actual report signal was aborted during the reread", attempt);
+  }
+  if (binding === null) {
+    return reportRereadFailure("authority-lost", "the report reread binding was cleared", attempt);
+  }
+  // Complete the fresh host refresh before the bounded clock read so a late
+  // prepare/getContext callback cannot leave a stale admitted interval.
+  const refresh = refreshReportPreparation(state, binding);
+  if (refresh !== null) return reportRereadFailure("authority-lost", refresh, attempt);
+  const clock = readReportRereadClock(state, runtime);
+  if (!clock.ok) return clock.failure;
+  const revalidated = revalidateReportPreparation(state, binding);
+  if (revalidated !== null) return reportRereadFailure("authority-lost", revalidated, attempt);
+  if (!sameReportRereadRuntimeIdentity(record, binding, runtime)) {
+    return reportRereadFailure("authority-lost", "the retained report reread identity changed", attempt);
+  }
+  return null;
+}
+
+/**
+ * Final settlement gate. It reuses the accepted binding-only validator for
+ * the original owner/signal/native/local authority, then adds only the exact
+ * active runtime, record and held-reservation ownership facts.
+ */
+function reportRereadFinalGate(
+  state: CoordinatorState,
+  runtime: ReportReadRuntime,
+): NativeHarnessReportRereadFailure | null {
+  const record = runtime.record;
+  const binding = runtime.binding;
+  const slot = runtime.slot;
+  const attempt = record.attempt;
+  // A cancellation/control refusal that landed in any last host callback wins.
+  if (runtime.guardFailure !== null) return runtime.guardFailure;
+  if (binding === null) {
+    return reportRereadFailure("authority-lost", "the report reread binding was cleared", attempt);
+  }
+  const revalidated = revalidateReportPreparation(state, binding);
+  if (revalidated !== null) {
+    return reportRereadFailure("authority-lost", revalidated, attempt);
+  }
+  if (state.slots.get(record.sourceId) !== slot) {
+    return reportRereadFailure("authority-lost", "the original source Slot was replaced", attempt);
+  }
+  if (state.outputActive !== slot
+    || slot.output.reportActive !== runtime
+    || state.outputReservedBytes !== runtime.reservation) {
+    return reportRereadFailure("authority-lost", "the report reread reservation was released", attempt);
+  }
+  if (!sameReportRereadRuntimeIdentity(record, binding, runtime)) {
+    return reportRereadFailure("authority-lost", "the report reread identity changed before settlement", attempt);
+  }
+  return null;
+}
+
+/**
+ * Admission final sequence: owner predicate, actual report signal, every
+ * prepared native pure check, then local refs/capacity/attempt facts.
+ */
+function reportRereadAdmissionGate(
+  state: CoordinatorState,
+  binding: ReportBindingState,
+  slot: Slot,
+  out: SlotOutput,
+): NativeHarnessReportRereadFailure | null {
+  const revision = binding.revision;
+  const owner = ownerPredicateReason(revision.source.output);
+  if (owner !== null) return reportRereadFailure("authority-lost", owner);
+  const signal = readActualAbortSignal(binding.reportSignal);
+  if (!signal.ok) return reportRereadFailure("invalid-caller", signal.reason);
+  if (signal.aborted) {
+    return reportRereadFailure("cancelled", "the actual report signal was aborted before the reread");
+  }
+  const sourcePure = pureCheckReason(revision.source.prepared.check);
+  if (sourcePure !== null) return reportRereadFailure("authority-lost", sourcePure);
+  for (const selected of revision.selected) {
+    const pure = pureCheckReason(selected.action.check);
+    if (pure !== null) return reportRereadFailure("authority-lost", pure);
+  }
+  const reportPure = pureCheckReason(revision.report);
+  if (reportPure !== null) return reportRereadFailure("authority-lost", reportPure);
+  if (state.disposed) {
+    return reportRereadFailure("authority-lost", "the delegation coordinator was disposed");
+  }
+  if (!state.enabled) {
+    return reportRereadFailure("authority-lost", "the delegation coordinator is disabled");
+  }
+  if (state.slots.get(binding.sourceId) !== slot) {
+    return reportRereadFailure("authority-lost", "the original source Slot was replaced");
+  }
+  if (state.outputActive !== null) {
+    return reportRereadFailure("capacity", "another output capture or report reread is in flight");
+  }
+  if (state.outputBytes + state.outputReservedBytes + NATIVE_HARNESS_OUTPUT_RESERVATION_BYTES
+    > NATIVE_HARNESS_MAX_OUTPUT_BYTES) {
+    return reportRereadFailure("capacity", "the retained output byte budget is exhausted or reserved");
+  }
+  if (out.reportAttempts >= NATIVE_HARNESS_REPORT_MAX_REREAD_ATTEMPTS) {
+    return reportRereadFailure("capacity", "the bounded report reread attempt budget is exhausted");
+  }
+  if (out.reportRecords.length >= NATIVE_HARNESS_REPORT_MAX_REREAD_ATTEMPTS) {
+    return reportRereadFailure("capacity", "the bounded report reread record budget is exhausted");
+  }
+  if (out.reportCurrentUseRefusal !== null) {
+    return reportRereadFailure("version-mismatch", out.reportCurrentUseRefusal);
+  }
+  if (out.capture !== binding.capture
+    || out.selection !== binding.outputSelection
+    || out.registration !== binding.registration
+    || out.checks !== binding.checks) {
+    return reportRereadFailure("authority-lost", "the original capture or selected refs changed");
+  }
+  return null;
+}
+
+function reportRereadFailureFromEnvelope(
+  decoded: DecodedCaptureEnvelope,
+  attempt: number,
+): NativeHarnessReportRereadFailure {
+  const reason = typeof decoded.reason === "string"
+    ? decoded.reason
+    : "the trusted output reread refused";
+  const code: NativeHarnessReportRereadFailureCode = decoded.code === "aborted"
+    ? "cancelled"
+    : decoded.code === "deadline"
+      ? "deadline"
+      : decoded.code === "authority-lost"
+        ? "authority-lost"
+        : decoded.code === "invalid-control"
+          ? "invalid-caller"
+          : "reread-unavailable";
+  return reportRereadFailure(code, reason, attempt);
+}
+
+function reportRereadFailureFromOutput(
+  failure: NativeHarnessOutputSelectionFailure,
+  attempt: number,
+): NativeHarnessReportRereadFailure {
+  const code: NativeHarnessReportRereadFailureCode = failure.code === "cancelled"
+    ? "cancelled"
+    : failure.code === "deadline"
+      ? "deadline"
+      : failure.code === "authority-lost"
+        ? "authority-lost"
+        : failure.code === "invalid-caller"
+          ? "invalid-caller"
+          : failure.code === "capacity"
+            ? "capacity"
+            : "reread-unavailable";
+  return reportRereadFailure(code, failure.reason, attempt);
+}
+
+type ReportRereadEvaluation =
+  | { readonly kind: "failure"; readonly failure: NativeHarnessReportRereadFailure }
+  | { readonly kind: "match" }
+  | { readonly kind: "drift"; readonly failure: NativeHarnessReportRereadFailure };
+
+function reportRereadFailureEvaluation(
+  failure: NativeHarnessReportRereadFailure,
+): ReportRereadEvaluation {
+  return { kind: "failure", failure };
+}
+
+/** Control codes can never become positive drift evidence. */
+function isReportRereadControlEnvelopeCode(code: unknown): boolean {
+  return code === "aborted"
+    || code === "deadline"
+    || code === "authority-lost"
+    || code === "invalid-control";
+}
+
+/**
+ * Decodes the trusted envelope once and compares a genuine issued capture with
+ * the original through the A1 helper. It deliberately performs no clock,
+ * refresh, final gate or sticky write: those belong to the settlement seal.
+ * Comparison invalid-binding is unavailability, not drift.
+ */
+function evaluateReportRereadLeaf(
+  runtime: ReportReadRuntime,
+  leaf: unknown,
+): ReportRereadEvaluation {
+  const record = runtime.record;
+  const binding = runtime.binding;
+  const attempt = record.attempt;
+  if (runtime.guardFailure !== null) {
+    return reportRereadFailureEvaluation(runtime.guardFailure);
+  }
+  if (binding === null) {
+    return reportRereadFailureEvaluation(
+      reportRereadFailure("authority-lost", "the report reread binding was cleared", attempt),
+    );
+  }
+  const decoded = decodeCaptureEnvelope(leaf);
+  if (decoded === null) {
+    return reportRereadFailureEvaluation(reportRereadFailure(
+      "reread-unavailable",
+      "the trusted output reread returned an unreadable result",
+      attempt,
+    ));
+  }
+  if (!decoded.ok) {
+    if (decoded.mismatch === true && isReportRereadControlEnvelopeCode(decoded.code)) {
+      // An inconsistent marker on a control refusal never proves drift.
+      return reportRereadFailureEvaluation(reportRereadFailureFromEnvelope(decoded, attempt));
+    }
+    if (decoded.mismatch === true) {
+      return {
+        kind: "drift",
+        failure: reportRereadFailure(
+          "version-mismatch",
+          "the reread returned a trusted observed-mismatch marker",
+          attempt,
+        ),
+      };
+    }
+    return reportRereadFailureEvaluation(reportRereadFailureFromEnvelope(decoded, attempt));
+  }
+  const read = readCaptureValue(
+    decoded.capture,
+    runtime.slot,
+    binding.revision.source.output,
+    record.registration,
+  );
+  if (!read.ok) {
+    return reportRereadFailureEvaluation(reportRereadFailureFromOutput(read, attempt));
+  }
+  const backend = runtime.slot.backend === null ? undefined : runtime.slot.backend.receiver;
+  if (backend === undefined) {
+    return reportRereadFailureEvaluation(reportRereadFailure(
+      "authority-lost",
+      "the original output backend is unavailable",
+      attempt,
+    ));
+  }
+  const comparison = compareNativeHarnessOutputVersion(
+    backend,
+    record.capture,
+    read.capture,
+  );
+  if (comparison.ok) return { kind: "match" };
+  if (comparison.code === "version-mismatch") {
+    return {
+      kind: "drift",
+      failure: reportRereadFailure(
+        "version-mismatch",
+        `the reread capture differs at the ${comparison.section} section`,
+        attempt,
+      ),
+    };
+  }
+  return reportRereadFailureEvaluation(reportRereadFailure(
+    "reread-unavailable",
+    "the reread capture binding could not be compared",
+    attempt,
+  ));
+}
+
+async function captureReportRereadLeaf(
+  state: CoordinatorState,
+  runtime: ReportReadRuntime,
+  output: OutputPort,
+): Promise<ReportRereadEvaluation> {
+  const record = runtime.record;
+  const controller = runtime.controller;
+  if (controller === null) {
+    return reportRereadFailureEvaluation(
+      reportRereadFailure("authority-lost", "the report reread controller was cleared", record.attempt),
+    );
+  }
+  const guard = (): void => {
+    const gate = reportRereadGuard(state, runtime);
+    if (gate !== null) {
+      if (runtime.guardFailure === null) runtime.guardFailure = gate;
+      throw new NativeHarnessDelegationError(gate.reason);
+    }
+  };
+  let raw: unknown;
+  let threw = false;
+  try {
+    raw = Reflect.apply(output.capture, output.receiver, [
+      runtime.slot.backend === null ? null : runtime.slot.backend.receiver,
+      guard,
+      controller.signal,
+    ]);
+  } catch {
+    threw = true;
+  }
+  if (threw) {
+    return reportRereadFailureEvaluation(runtime.guardFailure ?? reportRereadFailure(
+      "reread-unavailable",
+      "the trusted output reread threw",
+      record.attempt,
+    ));
+  }
+  if (!consumeNativePromise(raw)) {
+    return reportRereadFailureEvaluation(runtime.guardFailure ?? reportRereadFailure(
+      "reread-unavailable",
+      "the trusted output reread did not return a native Promise",
+      record.attempt,
+    ));
+  }
+  let leaf: unknown;
+  let rejected = false;
+  try {
+    leaf = await (raw as Promise<unknown>);
+  } catch {
+    rejected = true;
+  }
+  if (rejected) {
+    return reportRereadFailureEvaluation(runtime.guardFailure ?? reportRereadFailure(
+      "reread-unavailable",
+      "the trusted output reread rejected",
+      record.attempt,
+    ));
+  }
+  return evaluateReportRereadLeaf(runtime, leaf);
+}
+
+/**
+ * Exact-owner release. BOTH the Slot's exact report owner and the root shared
+ * gate must still name this runtime before either owner is cleared or the
+ * runtime reservation is subtracted. A stale runtime never releases another
+ * same-Slot report owner's gate.
+ */
+function releaseReportReadReservation(
+  state: CoordinatorState,
+  runtime: ReportReadRuntime,
+): void {
+  if (runtime.reservation === 0) return;
+  const slot = runtime.slot;
+  if (slot.output.reportActive !== runtime || state.outputActive !== slot) return;
+  slot.output.reportActive = null;
+  state.outputReservedBytes = Math.max(0, state.outputReservedBytes - runtime.reservation);
+  state.outputActive = null;
+  runtime.reservation = 0;
+}
+
+/** Removes the report-signal listener and drops its controller reference. */
+function removeReportRereadListener(runtime: ReportReadRuntime): void {
+  const cleanup = runtime.cleanup;
+  runtime.cleanup = null;
+  runtime.controller = null;
+  if (cleanup === null) return;
+  try {
+    cleanup();
+  } catch {
+    // Best-effort listener removal.
+  }
+}
+
+/**
+ * Settlement seal. It runs at the actual record.result/deferred boundary after
+ * the leaf's async continuation, completes the fresh host refresh, performs
+ * the final bounded clock read and listener cleanup, then runs the last pure
+ * owner/signal/native/local gates. No host callback follows that gate; only
+ * owned metadata, the sticky current-use fact and the deferred resolution.
+ */
+function sealReportReread(
+  state: CoordinatorState,
+  runtime: ReportReadRuntime,
+  evaluation: ReportRereadEvaluation,
+): NativeHarnessReportRereadResult {
+  const record = runtime.record;
+  const attempt = record.attempt;
+  if (runtime.guardFailure !== null) {
+    removeReportRereadListener(runtime);
+    return runtime.guardFailure;
+  }
+  const binding = runtime.binding;
+  if (binding === null) {
+    removeReportRereadListener(runtime);
+    return reportRereadFailure("authority-lost", "the report reread binding was cleared", attempt);
+  }
+  // External preparation reads finish first so the final clock cannot be stale.
+  const refresh = refreshReportPreparation(state, binding);
+  if (runtime.guardFailure !== null) {
+    removeReportRereadListener(runtime);
+    return runtime.guardFailure;
+  }
+  if (state.disposed) {
+    removeReportRereadListener(runtime);
+    return reportRereadFailure("authority-lost", "the delegation coordinator was disposed", attempt);
+  }
+  if (refresh !== null) {
+    removeReportRereadListener(runtime);
+    const signal = readActualAbortSignal(record.reportSignal);
+    return signal.ok && signal.aborted
+      ? reportRereadFailure("cancelled", "the actual report signal was aborted before sealing", attempt)
+      : reportRereadFailure("authority-lost", refresh, attempt);
+  }
+  // The final bounded clock read includes the outer async continuation.
+  const clock = readReportRereadClock(state, runtime);
+  if (runtime.guardFailure !== null) {
+    removeReportRereadListener(runtime);
+    return runtime.guardFailure;
+  }
+  if (state.disposed) {
+    removeReportRereadListener(runtime);
+    return reportRereadFailure("authority-lost", "the delegation coordinator was disposed", attempt);
+  }
+  if (!clock.ok) {
+    removeReportRereadListener(runtime);
+    return clock.failure;
+  }
+  // Listener cleanup is the last external callback before the pure gate.
+  removeReportRereadListener(runtime);
+  const final = reportRereadFinalGate(state, runtime);
+  if (final !== null) return final;
+  let result: NativeHarnessReportRereadResult;
+  if (evaluation.kind === "match") {
+    const success = createNativeHarnessReportRereadSuccess({
+      sourceToolCallId: record.sourceId,
+      reportToolCallId: record.reportId,
+      reportInputSha256: record.reportInputSha256,
+      captureId: record.capture.captureId,
+      captureDigest: record.capture.digest,
+      attempt,
+      startedAt: record.startedAt,
+      finishedAt: clock.now,
+    });
+    result = success ?? reportRereadFailure(
+      "reread-unavailable",
+      "the reread success metadata was malformed",
+      attempt,
+    );
+  } else {
+    result = evaluation.failure;
+  }
+  // Sticky drift becomes visible only after every final gate passed and no
+  // control failure won. Historical data and the interval result are unchanged.
+  if (evaluation.kind === "drift") markReportCurrentUseRefusal(runtime.slot);
+  return result;
+}
+
+/**
+ * Drains exactly once: clear every active runtime ref, release the held
+ * reservation only for the exact two-owner match, then resolve the original
+ * deferred Promise. The settled record keeps compact refs only.
+ */
+function settleReportReread(
+  state: CoordinatorState,
+  runtime: ReportReadRuntime,
+  result: NativeHarnessReportRereadResult,
+): void {
+  const record = runtime.record;
+  if (record.runtime !== runtime) return;
+  // Normal sealing removed this before the last pure gate; this only covers
+  // an unexpected task rejection that never reached the seal.
+  if (runtime.cleanup !== null) removeReportRereadListener(runtime);
+  const settled = runtime.settled;
+  runtime.controller = null;
+  runtime.binding = null;
+  runtime.guardFailure = null;
+  runtime.settled = null;
+  record.result = result;
+  record.runtime = null;
+  releaseReportReadReservation(state, runtime);
+  settled?.resolve(result);
+}
+
+async function runReportReread(
+  state: CoordinatorState,
+  runtime: ReportReadRuntime,
+): Promise<void> {
+  const record = runtime.record;
+  let evaluation: ReportRereadEvaluation;
+  try {
+    const binding = runtime.binding;
+    const output = binding === null ? null : binding.revision.source.output;
+    if (output === null) {
+      evaluation = reportRereadFailureEvaluation(reportRereadFailure(
+        "authority-lost",
+        "the trusted output port is unavailable",
+        record.attempt,
+      ));
+    } else {
+      evaluation = await captureReportRereadLeaf(state, runtime, output);
+    }
+  } catch (error) {
+    evaluation = reportRereadFailureEvaluation(runtime.guardFailure ?? reportRereadFailure(
+      "reread-unavailable",
+      `the report reread failed unexpectedly: ${outputThrownReason(error, "report reread failed")}`,
+      record.attempt,
+    ));
+  }
+  // Recheck at the actual record.result / deferred boundary, then seal with no
+  // await or external callback between the final gate and the resolution.
+  const result = sealReportReread(state, runtime, evaluation);
+  settleReportReread(state, runtime, result);
+}
+
+function reportRereadCancelled(
+  runtime: ReportReadRuntime,
+  reason: string,
+): boolean {
+  if (runtime.guardFailure !== null) return false;
+  runtime.guardFailure = reportRereadFailure("cancelled", reason, runtime.record.attempt);
+  const controller = runtime.controller;
+  if (controller !== null) {
+    try {
+      controller.abort(new Error(reason));
+    } catch {
+      // The local reread signal is already aborted.
+    }
+  }
+  return true;
+}
+
+/** Exact active report-id cancellation; it never scans or steals a source id. */
+function cancelReportReread(state: CoordinatorState, reportId: string): boolean {
+  for (const slot of state.slots.values()) {
+    const out = slot.output;
+    for (const record of out.reportRecords) {
+      if (record.reportId !== reportId) continue;
+      const runtime = record.runtime;
+      if (runtime === null || out.reportActive !== runtime) continue;
+      return reportRereadCancelled(runtime, "the report reread was cancelled by the host");
+    }
+  }
+  return false;
+}
+
+/** Independent disposal path; it is not nested under capture-action cleanup. */
+function cancelSlotReportReread(state: CoordinatorState, slot: Slot): void {
+  for (const record of slot.output.reportRecords) {
+    const runtime = record.runtime;
+    if (runtime === null) continue;
+    reportRereadCancelled(runtime, "the report reread was cancelled by coordinator disposal");
+  }
+}
+
+type ReportRereadStart =
+  | { readonly kind: "failure"; readonly failure: NativeHarnessReportRereadFailure }
+  | {
+    readonly kind: "join";
+    readonly record: ReportRereadRecord;
+    readonly promise: Promise<NativeHarnessReportRereadResult>;
+  }
+  | {
+    readonly kind: "admit";
+    readonly runtime: ReportReadRuntime;
+    readonly dispatch: () => void;
+  };
+
+/**
+ * Synchronous admission or exact join. All host reads finish before the final
+ * pure gate; the listener exists before it and is cleaned on refusal.
+ */
+function startReportReread(
+  state: CoordinatorState,
+  binding: ReportBindingState,
+): ReportRereadStart {
+  if (state.disposed) {
+    return { kind: "failure", failure: reportRereadFailure("authority-lost", "the delegation coordinator was disposed") };
+  }
+  if (!state.enabled) {
+    return { kind: "failure", failure: reportRereadFailure("authority-lost", "the delegation coordinator is disabled") };
+  }
+  const slot = state.slots.get(binding.sourceId);
+  if (slot === undefined || slot !== binding.slot) {
+    return { kind: "failure", failure: reportRereadFailure("authority-lost", "the original source Slot was replaced") };
+  }
+  if (slot.toolCallId !== binding.sourceId) {
+    return { kind: "failure", failure: reportRereadFailure("authority-lost", "the original source Slot id changed") };
+  }
+  const out = slot.output;
+  if (findForeignReportRereadRecord(state, slot, binding.reportId) !== null) {
+    return {
+      kind: "failure",
+      failure: reportRereadFailure("invalid-caller", "the report id is retained by another source"),
+    };
+  }
+  if (out.reportCurrentUseRefusal !== null) {
+    return { kind: "failure", failure: reportRereadFailure("version-mismatch", out.reportCurrentUseRefusal) };
+  }
+
+  const existing = findReportRereadRecord(slot, binding.reportId);
+  if (existing !== null) {
+    if (!sameReportRereadRecord(existing, binding)) {
+      return {
+        kind: "failure",
+        failure: reportRereadFailure(
+          "invalid-caller",
+          "different report inputs cannot join or restart the retained reread",
+        ),
+      };
+    }
+    if (existing.runtime === null && existing.result === null) {
+      return {
+        kind: "failure",
+        failure: reportRereadFailure("authority-lost", "the retained report reread lost its active runtime"),
+      };
+    }
+    const refresh = refreshReportPreparation(state, binding);
+    if (refresh !== null) {
+      return { kind: "failure", failure: reportRereadFailure("authority-lost", refresh) };
+    }
+    const revalidated = revalidateReportPreparation(state, binding);
+    if (revalidated !== null) {
+      return { kind: "failure", failure: reportRereadFailure("authority-lost", revalidated) };
+    }
+    if (state.slots.get(binding.sourceId) !== slot
+      || slot.output.reportRecords.indexOf(existing) < 0
+      || !sameReportRereadRecord(existing, binding)) {
+      return {
+        kind: "failure",
+        failure: reportRereadFailure("authority-lost", "the retained report reread record changed"),
+      };
+    }
+    return { kind: "join", record: existing, promise: existing.promise };
+  }
+
+  if (out.reportAttempts >= NATIVE_HARNESS_REPORT_MAX_REREAD_ATTEMPTS
+    || out.reportRecords.length >= NATIVE_HARNESS_REPORT_MAX_REREAD_ATTEMPTS) {
+    return {
+      kind: "failure",
+      failure: reportRereadFailure("capacity", "the bounded report reread attempt budget is exhausted"),
+    };
+  }
+  const signal = readActualAbortSignal(binding.reportSignal);
+  if (!signal.ok) {
+    return { kind: "failure", failure: reportRereadFailure("invalid-caller", signal.reason) };
+  }
+  if (signal.aborted) {
+    return {
+      kind: "failure",
+      failure: reportRereadFailure("cancelled", "the actual report signal was aborted before the reread"),
+    };
+  }
+  const startedAt = readClock(state.now);
+  if (startedAt === null) {
+    return { kind: "failure", failure: reportRereadFailure("deadline", "the report reread clock is unavailable") };
+  }
+  const initialCapacity = reportRereadAdmissionCapacity(state);
+  if (initialCapacity !== null) return { kind: "failure", failure: initialCapacity };
+
+  const refresh = refreshReportPreparation(state, binding);
+  if (refresh !== null) {
+    return { kind: "failure", failure: reportRereadFailure("authority-lost", refresh) };
+  }
+  const revalidated = revalidateReportPreparation(state, binding);
+  if (revalidated !== null) {
+    return { kind: "failure", failure: reportRereadFailure("authority-lost", revalidated) };
+  }
+
+  // Callbacks may reenter. Recheck local capacity before creating the listener.
+  if (state.disposed || !state.enabled || state.slots.get(binding.sourceId) !== slot) {
+    return {
+      kind: "failure",
+      failure: reportRereadFailure("authority-lost", "the original source Slot changed during admission"),
+    };
+  }
+  if (out.reportAttempts >= NATIVE_HARNESS_REPORT_MAX_REREAD_ATTEMPTS
+    || out.reportRecords.length >= NATIVE_HARNESS_REPORT_MAX_REREAD_ATTEMPTS) {
+    return {
+      kind: "failure",
+      failure: reportRereadFailure("capacity", "the bounded report reread attempt budget is exhausted"),
+    };
+  }
+  const lateCapacity = reportRereadAdmissionCapacity(state);
+  if (lateCapacity !== null) return { kind: "failure", failure: lateCapacity };
+
+  const combined = createCaptureController(binding.reportSignal as AbortSignal);
+  if (!combined.ok) {
+    return { kind: "failure", failure: reportRereadFailure("invalid-caller", combined.reason) };
+  }
+  let final: NativeHarnessReportRereadFailure | null;
+  try {
+    final = reportRereadAdmissionGate(state, binding, slot, out);
+  } catch (error) {
+    try {
+      combined.cleanup();
+    } catch {
+      // Best-effort listener removal.
+    }
+    return {
+      kind: "failure",
+      failure: reportRereadFailure(
+        "reread-unavailable",
+        `the report reread admission gate failed: ${outputThrownReason(error, "report reread failed")}`,
+      ),
+    };
+  }
+  if (final !== null) {
+    try {
+      combined.cleanup();
+    } catch {
+      // Best-effort listener removal.
+    }
+    return { kind: "failure", failure: final };
+  }
+
+  // Reserve and install the exact owner/deferred Promise before the leaf can
+  // run any callback. No capture-specific field on the output is changed.
+  const attempt = out.reportAttempts + 1;
+  const pending = deferred<NativeHarnessReportRereadResult>();
+  const record: ReportRereadRecord = {
+    attempt,
+    sourceId: binding.sourceId,
+    reportId: binding.reportId,
+    reportRef: binding.reportRef,
+    reportInputSha256: binding.reportInputSha256,
+    outcome: binding.request.outcome,
+    reportSignal: binding.reportSignal,
+    capture: binding.capture,
+    outputSelection: binding.outputSelection,
+    registration: binding.registration,
+    checks: binding.checks,
+    selection: reportRereadSelectionOf(binding),
+    startedAt,
+    promise: pending.promise,
+    result: null,
+    runtime: null,
+  };
+  const runtime: ReportReadRuntime = {
+    record,
+    slot,
+    binding,
+    controller: combined.controller,
+    cleanup: combined.cleanup,
+    reservation: NATIVE_HARNESS_OUTPUT_RESERVATION_BYTES,
+    deadlineAt: startedAt + NATIVE_HARNESS_OUTPUT_CAPTURE_BUDGET_MS,
+    lastClock: startedAt,
+    guardFailure: null,
+    settled: pending,
+  };
+  record.runtime = runtime;
+  out.reportRecords.push(record);
+  out.reportAttempts = attempt;
+  out.reportActive = runtime;
+  state.outputReservedBytes += runtime.reservation;
+  state.outputActive = slot;
+  return {
+    kind: "admit",
+    runtime,
+    dispatch: () => {
+      void runReportReread(state, runtime).then(undefined, () => {
+        settleReportReread(
+          state,
+          runtime,
+          reportRereadFailure(
+            "reread-unavailable",
+            "the report reread task failed unexpectedly",
+            record.attempt,
+          ),
+        );
+      });
+    },
+  };
+}
+
+function reportRereadAdmissionCapacity(
+  state: CoordinatorState,
+): NativeHarnessReportRereadFailure | null {
+  if (state.outputActive !== null) {
+    return reportRereadFailure("capacity", "another output capture or report reread is in flight");
+  }
+  if (state.outputBytes + state.outputReservedBytes + NATIVE_HARNESS_OUTPUT_RESERVATION_BYTES
+    > NATIVE_HARNESS_MAX_OUTPUT_BYTES) {
+    return reportRereadFailure("capacity", "the retained output byte budget is exhausted or reserved");
+  }
+  return null;
+}
+
+/**
+ * One bounded synchronous admission/join guard before any external callback.
+ * A reentrant refusal consumes zero and cannot clear the outer owner's guard.
+ */
+function beginReportReread(
+  state: CoordinatorState,
+  binding: ReportBindingState,
+  onAdmitted: (record: ReportRereadRecord) => void,
+): Promise<NativeHarnessReportRereadResult> {
+  if (state.reportRereadInProgress) {
+    return Promise.resolve(reportRereadFailure(
+      "not-ready",
+      "reentrant report reread admission or join was refused",
+    ));
+  }
+  state.reportRereadInProgress = true;
+  let start: ReportRereadStart;
+  try {
+    start = startReportReread(state, binding);
+  } catch (error) {
+    start = {
+      kind: "failure",
+      failure: reportRereadFailure(
+        "reread-unavailable",
+        `the report reread admission failed: ${outputThrownReason(error, "report reread failed")}`,
+      ),
+    };
+  } finally {
+    state.reportRereadInProgress = false;
+  }
+  if (start.kind === "failure") return Promise.resolve(start.failure);
+  if (start.kind === "join") {
+    onAdmitted(start.record);
+    return start.promise;
+  }
+  onAdmitted(start.runtime.record);
+  start.dispatch();
+  return start.runtime.record.promise;
+}
+
+/**
+ * Publication readiness layered on the binding-only validator. Before any
+ * admitted/joined reread it adds nothing; afterwards pending or failed
+ * attempts cannot authorize publication, and the exact success must match
+ * the retained record.
+ */
+function reportPublicationReadiness(
+  state: CoordinatorState,
+  binding: ReportBindingState,
+  record: ReportRereadRecord | null,
+): string | null {
+  if (record === null) return null;
+  const slot = binding.slot;
+  if (state.slots.get(record.sourceId) !== slot) return "the original source Slot was replaced";
+  if (slot.output.reportRecords.indexOf(record) < 0) return "the report reread record was not retained";
+  if (!sameReportRereadRecord(record, binding)) return "the report reread record is not this preparation";
+  const result = record.result;
+  if (result === null) return "the report reread is still pending";
+  if (!result.ok) return "the report reread did not establish the current version";
+  if (result.sourceToolCallId !== record.sourceId
+    || result.reportToolCallId !== record.reportId
+    || result.reportInputSha256 !== record.reportInputSha256
+    || result.captureId !== record.capture.captureId
+    || result.captureDigest !== record.capture.digest
+    || result.attempt !== record.attempt
+    || result.startedAt !== record.startedAt) {
+    return "the report reread result is not the retained observation";
+  }
+  if (state.outputActive !== null) return "another output observation is still in flight";
   return null;
 }
 
@@ -4381,13 +5523,24 @@ function prepareReportInternal(
     const final = finalReportGate(state, provisional, revision, signalValue);
     if (final !== null) return final;
     provisional.revision = revision;
+    let admittedRecord: ReportRereadRecord | null = null;
     const prepared: NativeHarnessReportBindingPreparation = Object.freeze({
       facts,
       refresh(): string | null {
         return refreshReportPreparation(state, provisional);
       },
       revalidate(): string | null {
-        return revalidateReportPreparation(state, provisional);
+        if (provisional.slot.output.reportCurrentUseRefusal !== null) {
+          return provisional.slot.output.reportCurrentUseRefusal;
+        }
+        const bindingReason = revalidateReportPreparation(state, provisional);
+        if (bindingReason !== null) return bindingReason;
+        return reportPublicationReadiness(state, provisional, admittedRecord);
+      },
+      reread(): Promise<NativeHarnessReportRereadResult> {
+        return beginReportReread(state, provisional, (record) => {
+          admittedRecord = record;
+        });
       },
     });
     return Object.freeze({ ok: true as const, prepared });
@@ -7402,6 +8555,10 @@ function createSlot(
       lastClock: null,
       checks: null,
       actionBinding: null,
+      reportRecords: [],
+      reportAttempts: 0,
+      reportActive: null,
+      reportCurrentUseRefusal: null,
     },
   };
   // The listener is assigned after the slot exists so it can identify itself.
@@ -7658,6 +8815,7 @@ export function createNativeHarnessDelegation(
     outputJoinValidating: false,
     outputObservationInProgress: false,
     reportBindingInProgress: false,
+    reportRereadInProgress: false,
   };
 
   const coordinator: NativeHarnessDelegationCoordinator = Object.freeze({
@@ -7861,6 +9019,9 @@ export function createNativeHarnessDelegation(
       }
       // The actual action id selects only the record it authenticates.
       if (cancelBoundCaptureAction(state, toolCallId)) cancelled = true;
+      // An actual report id selects only its exact active admitted reread. A
+      // source-id cancellation above never steals that owner.
+      if (cancelReportReread(state, toolCallId)) cancelled = true;
       return cancelled;
     },
     dispose(): void {
@@ -7874,6 +9035,8 @@ export function createNativeHarnessDelegation(
         } else {
           cancelOutputCapture(slot, "the output capture was disposed");
         }
+        // Independent report cleanup: never nested under capture-action state.
+        cancelSlotReportReread(state, slot);
       }
     },
     inspect(): NativeHarnessDelegationSnapshot {

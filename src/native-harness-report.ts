@@ -12,13 +12,16 @@ import { deepFreeze } from "./native-work.ts";
  * Host-only, read-only binding between one already captured Harness2 output
  * and the model's proposed `agent_work` report.
  *
- * This module owns no reread, no report publication and no fresh-filesystem
- * claim. Facts reference the authentic issued receipt once and are bounded
- * before the coordinator returns them. Callers must not treat these facts as
- * task acceptance or semantic verification.
+ * This module owns the bounded reread result union, but no reread execution,
+ * no report publication and no fresh-filesystem claim. Facts reference the
+ * authentic issued receipt once and are bounded before the coordinator returns
+ * them. Callers must not treat these facts as task acceptance or semantic
+ * verification.
  */
 
 export const NATIVE_HARNESS_REPORT_BINDING_SCHEMA = "omp-agent.native-harness-report-binding.v1";
+export const NATIVE_HARNESS_REPORT_REREAD_SCHEMA = "omp-agent.native-harness-report-reread.v1";
+export const NATIVE_HARNESS_REPORT_MAX_REREAD_ATTEMPTS = 4;
 export const NATIVE_HARNESS_REPORT_MAX_FACTS_BYTES = 64 * 1024;
 export const NATIVE_HARNESS_REPORT_MAX_SELECTED_CHECKS = 8;
 export const NATIVE_HARNESS_REPORT_MAX_ID_CHARS = 256;
@@ -132,6 +135,49 @@ export interface NativeHarnessReportBindingFacts {
   readonly semanticAcceptance: "not-evaluated";
 }
 
+export type NativeHarnessReportRereadFailureCode =
+  | "cancelled"
+  | "deadline"
+  | "capacity"
+  | "not-ready"
+  | "authority-lost"
+  | "invalid-caller"
+  | "reread-unavailable"
+  | "version-mismatch";
+
+/**
+ * One authenticated, admitted output reread over the original capture's
+ * backend and completion. It records only bounded interval facts: no native
+ * reference, private path, file text, receipt, plan or temporary capture.
+ */
+export interface NativeHarnessReportRereadSuccess {
+  readonly ok: true;
+  readonly schema: typeof NATIVE_HARNESS_REPORT_REREAD_SCHEMA;
+  readonly sourceToolCallId: string;
+  readonly reportToolCallId: string;
+  readonly reportInputSha256: string;
+  readonly captureId: string;
+  readonly captureDigest: string;
+  readonly attempt: number;
+  readonly startedAt: number;
+  readonly finishedAt: number;
+  readonly sameVersion: true;
+  readonly taskAccepted: false;
+  readonly semanticAcceptance: "not-evaluated";
+}
+
+export interface NativeHarnessReportRereadFailure {
+  readonly ok: false;
+  readonly code: NativeHarnessReportRereadFailureCode;
+  readonly reason: string;
+  /** Present only when this failure settled an admitted I/O attempt. */
+  readonly attempt?: number;
+}
+
+export type NativeHarnessReportRereadResult =
+  | NativeHarnessReportRereadSuccess
+  | NativeHarnessReportRereadFailure;
+
 export interface NativeHarnessReportBindingPreparation {
   readonly facts: NativeHarnessReportBindingFacts;
   /**
@@ -144,6 +190,13 @@ export interface NativeHarnessReportBindingPreparation {
    * string. It performs no host callback, I/O, clock or encoding.
    */
   revalidate(): string | null;
+  /**
+   * One cooperative reread of the original capture's backend/completion. It is
+   * bounded by admitted attempts, capacity and a shared deadline, and returns
+   * the exact admitted Promise for an equal duplicate. A stable negative result
+   * never becomes publication authority.
+   */
+  reread(): Promise<NativeHarnessReportRereadResult>;
 }
 
 export type NativeHarnessReportBindingResult =
@@ -210,6 +263,72 @@ export function createNativeHarnessReportFailure(
     ok: false as const,
     code,
     reason: boundedReason(reason, "native harness report binding refused"),
+  });
+}
+
+export function createNativeHarnessReportRereadFailure(
+  code: NativeHarnessReportRereadFailureCode,
+  reason: string,
+  attempt?: number,
+): NativeHarnessReportRereadFailure {
+  const boundedAttempt = typeof attempt === "number"
+    && Number.isSafeInteger(attempt)
+    && attempt >= 1
+    && attempt <= NATIVE_HARNESS_REPORT_MAX_REREAD_ATTEMPTS
+    ? attempt
+    : undefined;
+  return Object.freeze({
+    ok: false as const,
+    code,
+    reason: boundedReason(reason, "native harness report reread refused"),
+    ...(boundedAttempt === undefined ? {} : { attempt: boundedAttempt }),
+  });
+}
+
+/**
+ * Builds the frozen success record from already-authenticated original values.
+ * Malformed metadata refuses instead of publishing a partial success.
+ */
+export function createNativeHarnessReportRereadSuccess(value: {
+  readonly sourceToolCallId: string;
+  readonly reportToolCallId: string;
+  readonly reportInputSha256: string;
+  readonly captureId: string;
+  readonly captureDigest: string;
+  readonly attempt: number;
+  readonly startedAt: number;
+  readonly finishedAt: number;
+}): NativeHarnessReportRereadSuccess | null {
+  const sourceToolCallId = boundedString(value.sourceToolCallId, NATIVE_HARNESS_REPORT_MAX_ID_CHARS);
+  const reportToolCallId = boundedString(value.reportToolCallId, NATIVE_HARNESS_REPORT_MAX_ID_CHARS);
+  const captureId = boundedString(value.captureId, NATIVE_HARNESS_REPORT_MAX_ID_CHARS);
+  if (sourceToolCallId === null || reportToolCallId === null || captureId === null) return null;
+  if (!isHex64(value.reportInputSha256) || !isHex64(value.captureDigest)) return null;
+  if (!Number.isSafeInteger(value.attempt)
+    || value.attempt < 1
+    || value.attempt > NATIVE_HARNESS_REPORT_MAX_REREAD_ATTEMPTS) {
+    return null;
+  }
+  if (!Number.isSafeInteger(value.startedAt)
+    || value.startedAt < 0
+    || !Number.isSafeInteger(value.finishedAt)
+    || value.finishedAt < value.startedAt) {
+    return null;
+  }
+  return Object.freeze({
+    ok: true as const,
+    schema: NATIVE_HARNESS_REPORT_REREAD_SCHEMA,
+    sourceToolCallId,
+    reportToolCallId,
+    reportInputSha256: value.reportInputSha256,
+    captureId,
+    captureDigest: value.captureDigest,
+    attempt: value.attempt,
+    startedAt: value.startedAt,
+    finishedAt: value.finishedAt,
+    sameVersion: true as const,
+    taskAccepted: false as const,
+    semanticAcceptance: "not-evaluated" as const,
   });
 }
 

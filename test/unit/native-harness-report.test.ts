@@ -570,8 +570,8 @@ describe("host-only typed report binding", () => {
     const result = p.h.coordinator.prepareReport(p.request, p.signal);
     if (!result.ok) throw new Error(`${result.code}: ${result.reason}`);
     const { facts, refresh, revalidate } = result.prepared;
-    expect(Object.keys(result.prepared).sort()).toEqual(["facts", "refresh", "revalidate"]);
-    expect((result.prepared as { reread?: unknown }).reread).toBeUndefined();
+    expect(Object.keys(result.prepared).sort()).toEqual(["facts", "refresh", "reread", "revalidate"]);
+    expect(typeof result.prepared.reread).toBe("function");
     expect(Object.isFrozen(result.prepared)).toBe(true);
     expect(Object.isFrozen(facts)).toBe(true);
     expect(facts.schema).toBe("omp-agent.native-harness-report-binding.v1");
