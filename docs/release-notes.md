@@ -1,5 +1,11 @@
 # Release notes
 
+## Bounded dispatch inventory storage foundation (R2-B1a)
+
+R2-B1a adds a direct, unconnected dispatch inventory: one v1 `dispatch-inventory.json` under the actual `controller.store.root/runId` runs directory (not the outer descriptor store), capped at 32 rows/256 KiB canonical UTF-8+LF. It keeps immutable per-attempt identities, exact original deadlines/request timeout and a finite intended→launch-pending→process-bound→prompt-pending→terminal lifecycle. Creation is create-only and refuses an existing primary or `.bak`; open reads only the existing primary with no backup/legacy fallback. Binding refuses missing, corrupt, oversized, symlink or identity-drifted run/sidecar state. Post-write uncertainty poisons the handle. Synthetic completion may omit PID; real runner completion is only an observation, never stopped proof.
+
+Validation: focused 20/271; root fullcheck 1,496 unit tests/69 files/43,356 assertions, 15 simulated/155, typecheck 0, 62,150 ms. No runtime wiring, cleanup receipt, stopped proof, resume, provenance or general quality; B1b/B1c and full R2/R3 remain open. Defaults and prior evidence, including FAIL 70/71, are unchanged.
+
 ## Instanced durable accounting association (R2-A2b3)
 
 R2-A2b3 adds host-only instanced wiring from the selected original main source/ALS/Slot/coordinator to the existing A2a2 session association, A2a1 accounting owner and A2b2 backend source/origin. It is not restart recovery, interruption handling, resume or stopped-worker proof. `InstancedHarnessConfig.durableAccounting` is enabled only by explicit `true`; `false`/absent preserve the legacy path. There is no new model/tool/CLI parameter, second coordinator, ledger, model loop, automatic resume or default switch, and the flag enables no source/result/history/child tool. History registration remains independently controlled by `history`.
