@@ -20,6 +20,7 @@ import {
 import {
   createNativeEntry,
   NATIVE_WORK_CALL_INSPECTION_SCHEMA,
+  type NativeCallCheckPreparation,
   type NativeContext,
   type NativeOmpApi,
   type NativeToolResult,
@@ -696,6 +697,13 @@ function unavailableNativeWorkCallCapture(): NativeWorkCallCapture {
   } satisfies NativeWorkCallCapture);
 }
 
+function unavailableNativeCallCheckPreparation(): NativeCallCheckPreparation {
+  return Object.freeze({
+    ok: false,
+    inspection: unavailableNativeWorkCallInspection(),
+  } satisfies NativeCallCheckPreparation);
+}
+
 export function createDefinedNativeEntry(
   pi: DefinedOmpApi,
   options: DefinedNativeEntryOptions = {},
@@ -907,6 +915,9 @@ export function createDefinedNativeEntry(
       },
       inspectCall() {
         return unavailableNativeWorkCallInspection();
+      },
+      prepareCallCheck() {
+        return unavailableNativeCallCheckPreparation();
       },
     };
   }

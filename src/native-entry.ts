@@ -15,7 +15,11 @@ import {
   type NativeFileIo,
   type NativeObservedFile,
 } from "./native-work.ts";
-import { canonicalWorkspaceRoot, currentTaskOwner } from "./task-entry-port.ts";
+import {
+  canonicalWorkspaceRoot,
+  currentTaskOwner,
+  publishedTaskOwnerPresence,
+} from "./task-entry-port.ts";
 import {
   boundNativeInstanceReportCatalog,
   readNativeInstanceReportSelection,
@@ -197,6 +201,19 @@ export type NativeWorkCallCapture =
       readonly inspection: NativeWorkCallInspection;
     };
 
+export type NativeCallCheckReason = NativeWorkCallReason | "call-result-changed";
+
+export type NativeCallCheckPreparation =
+  | {
+      readonly ok: true;
+      readonly inspection: NativeWorkCallInspection;
+      readonly revalidate: () => NativeCallCheckReason | null;
+    }
+  | {
+      readonly ok: false;
+      readonly inspection: NativeWorkCallInspection;
+    };
+
 export interface NativeEntryControls {
   readonly enabled: boolean;
   readonly disabledReason: string | null;
@@ -204,6 +221,7 @@ export interface NativeEntryControls {
   dispose(): void;
   captureCall(selector: NativeWorkCallSelector, context: NativeContext): NativeWorkCallCapture;
   inspectCall(ref: unknown, context: NativeContext): NativeWorkCallInspection;
+  prepareCallCheck(ref: unknown, context: NativeContext): NativeCallCheckPreparation;
 }
 
 type WorkStatus = "active" | "ended" | "unknown";
@@ -2634,7 +2652,7 @@ function readCallSelector(selector: unknown): ReadCallSelector {
   };
 }
 
-function readCallPortHost(context: NativeContext): CallPortHost {
+function readCallPortHost(context: NativeContext, descriptorOnlyOwner = false): CallPortHost {
   // Every context/selector getter is read before the final global ownership
   // read. A reentrant session/cwd getter may publish a managed owner, so the
   // owner must be observed last and then judged against a fresh state/Maps
@@ -2650,7 +2668,13 @@ function readCallPortHost(context: NativeContext): CallPortHost {
   let ownerKnown = true;
   let ownerPresent = false;
   try {
-    ownerPresent = currentTaskOwner() !== undefined;
+    if (descriptorOnlyOwner) {
+      const presence = publishedTaskOwnerPresence();
+      ownerKnown = presence !== "unavailable";
+      ownerPresent = presence === "present";
+    } else {
+      ownerPresent = currentTaskOwner() !== undefined;
+    }
   } catch {
     ownerKnown = false;
   }
@@ -2946,6 +2970,234 @@ function inspectCall(
   );
 }
 
+interface PreparedCallState {
+  readonly state: EntryState;
+  readonly refFacts: NativeWorkCallReference;
+  readonly work: Work;
+  readonly call: ObservedCall;
+  readonly binding: { work: Work; call: ObservedCall };
+  readonly worksList: Work[];
+  readonly callIndex: Map<string, ObservedCall>;
+  readonly callBindings: Map<string, { work: Work; call: ObservedCall }>;
+  readonly callIdMemory: Map<string, number>;
+  readonly resultState: ResultState;
+  readonly result: ObservedResult | null;
+}
+
+/** Pure, synchronous re-read of the prepared identities and bounded state. */
+function checkPreparedCall(prepared: PreparedCallState): NativeCallCheckReason | null {
+  const { state, refFacts, work, call, binding } = prepared;
+  if (state.disposed) return "entry-disposed";
+  if (!state.enabled) return "entry-disabled";
+  const owner = publishedTaskOwnerPresence();
+  if (owner === "present") return "managed-owner-present";
+  if (owner === "unavailable") return "live-identity-unavailable";
+
+  if (state.works !== prepared.worksList) return "binding-inconsistent";
+  if (!state.works.includes(work)) return "work-not-retained";
+  if (work.invalidated) return "work-invalidated";
+  if (work.observationId !== refFacts.observationId
+    || work.generation !== refFacts.generation
+    || work.sessionId !== refFacts.sessionId
+    || work.workspaceRoot !== refFacts.workspaceRoot
+    || work.callIndex !== prepared.callIndex
+    || state.callBindings !== prepared.callBindings
+    || state.callIdMemory !== prepared.callIdMemory) {
+    return "binding-inconsistent";
+  }
+  if (state.current !== work) return "work-replaced";
+
+  const indexed = work.callIndex.get(refFacts.toolCallId);
+  if (indexed === undefined) return "call-not-retained";
+  if (indexed !== call) return "call-rebound";
+  const currentBinding = state.callBindings.get(refFacts.toolCallId);
+  if (currentBinding === undefined) return "call-not-retained";
+  if (currentBinding !== binding || binding.work !== work || binding.call !== call) {
+    return "call-rebound";
+  }
+  if (call.toolCallId !== refFacts.toolCallId || call.toolName !== refFacts.toolName) {
+    return "call-rebound";
+  }
+  if (call.associationConflict) return "call-conflicted";
+  if (state.callIdMemory.get(refFacts.toolCallId) !== refFacts.generation) return "call-rebound";
+
+  const classification = classifyCallAssociation(state, work, call);
+  if (classification.state !== "current") return classification.reason;
+  if (call.resultState !== prepared.resultState || call.result !== prepared.result) {
+    return "call-result-changed";
+  }
+  if (prepared.resultState === "observed" && prepared.result === null) return "call-result-changed";
+  return null;
+}
+
+function prepareCallCheck(
+  state: EntryState,
+  issuedReferences: WeakSet<object>,
+  ref: unknown,
+  context: NativeContext,
+): NativeCallCheckPreparation {
+  // Membership is checked before reading any ref getter or host field.
+  if (ref === null
+    || (typeof ref !== "object" && typeof ref !== "function")
+    || !issuedReferences.has(ref as object)) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "unavailable", "foreign-reference", null, null, null),
+    });
+  }
+  const observed = readIssuedReference(ref);
+  if (observed === null) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "unavailable", "foreign-reference", null, null, null),
+    });
+  }
+
+  // Finish every host getter before judging state or Maps. The descriptor-only
+  // owner probe keeps an owner accessor from running during preparation.
+  const host = readCallPortHost(context, true);
+  const entryFailure = callEntryFailure(state, host);
+  if (entryFailure !== null) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "unavailable", entryFailure, observed, null, null),
+    });
+  }
+
+  const work = state.works.find((candidate) =>
+    candidate.observationId === observed.observationId
+    && candidate.generation === observed.generation
+  ) ?? null;
+  if (work === null) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "stale", "work-not-retained", observed, null, null),
+    });
+  }
+  if (work.sessionId !== observed.sessionId || work.workspaceRoot !== observed.workspaceRoot) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "stale", "work-replaced", observed, work, null),
+    });
+  }
+  if (work.invalidated) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "stale", "work-invalidated", observed, work, null),
+    });
+  }
+  const call = work.callIndex.get(observed.toolCallId);
+  if (call === undefined) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "stale", "call-not-retained", observed, work, null),
+    });
+  }
+  if (call.toolCallId !== observed.toolCallId || call.toolName !== observed.toolName) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "stale", "call-rebound", observed, work, call),
+    });
+  }
+  const binding = state.callBindings.get(observed.toolCallId);
+  if (binding === undefined) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "stale", "call-not-retained", observed, work, call),
+    });
+  }
+  if (binding.work !== work || binding.call !== call) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "stale", "call-rebound", observed, work, call),
+    });
+  }
+  if (call.associationConflict) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "stale", "call-conflicted", observed, work, call),
+    });
+  }
+  if (state.callIdMemory.get(observed.toolCallId) !== work.generation) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "stale", "call-rebound", observed, work, call),
+    });
+  }
+  if (state.current !== work) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "stale", "work-replaced", observed, work, call),
+    });
+  }
+  if (work.sessionId === null || work.workspaceRoot === null) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "unavailable", "work-evidence-unavailable", observed, work, call),
+    });
+  }
+  if (host.sessionId !== work.sessionId) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "stale", "live-session-changed", observed, work, call),
+    });
+  }
+  if (host.workspaceRoot !== work.workspaceRoot) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "stale", "live-workspace-changed", observed, work, call),
+    });
+  }
+  if (call.resultState === "observed" && call.result === null) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "unavailable", "call-evidence-unknown", observed, work, call),
+    });
+  }
+  if (call.resultState === "preflight" && call.result !== null) {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(state, "unavailable", "binding-inconsistent", observed, work, call),
+    });
+  }
+
+  const classification = classifyCallAssociation(state, work, call);
+  if (classification.state !== "current") {
+    return deepFreeze({
+      ok: false as const,
+      inspection: callInspection(
+        state,
+        classification.state,
+        classification.reason,
+        observed,
+        work,
+        call,
+      ),
+    });
+  }
+
+  const prepared: PreparedCallState = {
+    state,
+    refFacts: referenceCopy(observed),
+    work,
+    call,
+    binding,
+    worksList: state.works,
+    callIndex: work.callIndex,
+    callBindings: state.callBindings,
+    callIdMemory: state.callIdMemory,
+    resultState: call.resultState,
+    result: call.result,
+  };
+  const inspection = callInspection(state, "current", "current-work", observed, work, call);
+  const revalidate = (): NativeCallCheckReason | null => checkPreparedCall(prepared);
+  return deepFreeze({
+    ok: true as const,
+    inspection,
+    revalidate,
+  });
+}
+
 function createControls(state: EntryState): NativeEntryControls {
   const issuedReferences = new WeakSet<object>();
   return {
@@ -2966,6 +3218,9 @@ function createControls(state: EntryState): NativeEntryControls {
     },
     inspectCall(ref, context) {
       return inspectCall(state, issuedReferences, ref, context);
+    },
+    prepareCallCheck(ref, context) {
+      return prepareCallCheck(state, issuedReferences, ref, context);
     },
   };
 }

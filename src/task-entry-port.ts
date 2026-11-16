@@ -87,6 +87,43 @@ const PORT_KEY = Symbol.for("omp-agent.b1.task-owner.v1");
 
 type PortHost = typeof globalThis & { [PORT_KEY]?: TaskOwner };
 
+/** Fixed intrinsics so a later builtin monkeypatch cannot change this read. */
+const getOwnPropertyDescriptor = Object.getOwnPropertyDescriptor;
+const getPrototypeOf = Object.getPrototypeOf;
+const ordinaryPrototype = Object.prototype;
+
+export type PublishedTaskOwnerPresence = "absent" | "present" | "unavailable";
+
+/**
+ * Descriptor-only view of the locally published owner. It never reads the
+ * owner value beyond the data descriptor's `value` field, never invokes an
+ * accessor and never walks an arbitrary prototype chain.
+ */
+export function publishedTaskOwnerPresence(): PublishedTaskOwnerPresence {
+  try {
+    const host = globalThis as PortHost;
+    const own = getOwnPropertyDescriptor(host, PORT_KEY);
+    if (own !== undefined) {
+      // An own undefined data slot shadows any inherited slot, matching the
+      // ordinary property read used by currentTaskOwner.
+      if (!("value" in own)) return "unavailable";
+      return own.value === undefined ? "absent" : "present";
+    }
+
+    const prototype = getPrototypeOf(host);
+    // A directly null prototype has no inherited slot to hide an owner.
+    if (prototype === null) return "absent";
+    if (prototype !== ordinaryPrototype) return "unavailable";
+    if (getPrototypeOf(ordinaryPrototype) !== null) return "unavailable";
+    // Do not cache this absence: a later inherited slot must be observed.
+    return getOwnPropertyDescriptor(ordinaryPrototype, PORT_KEY) === undefined
+      ? "absent"
+      : "unavailable";
+  } catch {
+    return "unavailable";
+  }
+}
+
 export function publishTaskOwner(owner: TaskOwner): void {
   (globalThis as PortHost)[PORT_KEY] = owner;
 }

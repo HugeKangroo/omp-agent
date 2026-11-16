@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   createNativeEntry,
+  type NativeCallCheckPreparation,
   type NativeContext,
   type NativeEntryControls,
   type NativeOmpApi,
@@ -12,6 +13,7 @@ import {
 import {
   clearPublishedTaskOwner,
   publishTaskOwner,
+  publishedTaskOwnerPresence,
 } from "../../src/task-entry-port.ts";
 import type { TaskOwner } from "../../src/task-owner.ts";
 
@@ -197,6 +199,33 @@ function expectCaptureFailure(capture: NativeWorkCallCapture): Extract<NativeWor
   if (capture.ok) throw new Error("capture unexpectedly succeeded");
   expect(capture.ref).toBeNull();
   return capture;
+}
+
+function expectCheckOk(
+  check: NativeCallCheckPreparation,
+): Extract<NativeCallCheckPreparation, { ok: true }> {
+  expect(check.ok).toBe(true);
+  if (!check.ok) throw new Error(`check failed: ${check.inspection.state}/${check.inspection.reason}`);
+  return check;
+}
+
+function expectCheckFailure(
+  check: NativeCallCheckPreparation,
+): Extract<NativeCallCheckPreparation, { ok: false }> {
+  expect(check.ok).toBe(false);
+  if (check.ok) throw new Error("check unexpectedly succeeded");
+  expect("revalidate" in check).toBe(false);
+  return check;
+}
+
+const PORT_KEY = Symbol.for("omp-agent.b1.task-owner.v1");
+
+function restoreDescriptor(target: object, key: PropertyKey, descriptor: PropertyDescriptor | undefined): void {
+  if (descriptor === undefined) {
+    Reflect.deleteProperty(target, key);
+  } else {
+    Object.defineProperty(target, key, descriptor);
+  }
 }
 
 describe("native work call association port", () => {
@@ -672,5 +701,413 @@ describe("native work call association port", () => {
     expect(expectCaptureFailure(f.entry.captureCall({ toolCallId: "c3", toolName: "read" }, f.ctx)).inspection)
       .toMatchObject({ state: "stale", reason: "call-conflicted" });
     expect(f.entry.inspectCall(existing.ref, f.ctx).state).toBe("current");
+  });
+
+  test("prepared checks fix preflight and observed identities, then replay the original ref", async () => {
+    const f = await fixture();
+    await input(f.host, f.ctx, "prepared preflight");
+    await prepare(f.host, f.ctx, "prepared preflight");
+    await f.host.emit("tool_call", { toolCallId: "c1", toolName: "read", input: {} }, f.ctx);
+    const preflight = expectCaptureOk(f.entry.captureCall({ toolCallId: "c1", toolName: "read" }, f.ctx));
+
+    const prepared = expectCheckOk(f.entry.prepareCallCheck(preflight.ref, f.ctx));
+    expect(prepared.inspection).toMatchObject({
+      state: "current",
+      reason: "current-work",
+      callResultState: "preflight",
+      pendingInputCount: 0,
+      pendingInputsDropped: 0,
+    });
+    expect(Object.isFrozen(prepared)).toBe(true);
+    expect(Object.isFrozen(prepared.inspection)).toBe(true);
+    expect((prepared.inspection as unknown as Record<string, unknown>).revalidate).toBeUndefined();
+    expect(prepared.revalidate()).toBeNull();
+
+    // A different pending tool is not pending input.
+    await f.host.emit("tool_call", { toolCallId: "other", toolName: "write", input: {} }, f.ctx);
+    expect(prepared.revalidate()).toBeNull();
+
+    await f.host.emit("tool_result", {
+      toolCallId: "c1",
+      toolName: "read",
+      content: [{ type: "text", text: "prepared result" }],
+      isError: false,
+      details: undefined,
+    }, f.ctx);
+    expect(prepared.revalidate()).toBe("call-result-changed");
+
+    // Fresh replay still uses the original issued ref, now at observed state.
+    const observed = expectCheckOk(f.entry.prepareCallCheck(preflight.ref, f.ctx));
+    expect(observed.inspection).toMatchObject({
+      state: "current",
+      reason: "current-work",
+      callResultState: "observed",
+    });
+    expect(observed.revalidate()).toBeNull();
+    expect(observed.revalidate()).toBeNull();
+
+    const inspectionBefore = f.entry.inspectCall(preflight.ref, f.ctx);
+    const originalAgent = Object.getOwnPropertyDescriptor(f.ctx, "agent");
+    const originalSessionManager = f.ctx.sessionManager!;
+    const originalNow = Date.now;
+    Object.defineProperty(f.ctx, "agent", {
+      configurable: true,
+      get(): never {
+        throw new Error("final context read");
+      },
+    });
+    f.ctx.sessionManager = {
+      getSessionId(): never {
+        throw new Error("final session read");
+      },
+      getCwd(): never {
+        throw new Error("final cwd read");
+      },
+    };
+    Date.now = () => {
+      throw new Error("final clock read");
+    };
+    try {
+      expect(observed.revalidate()).toBeNull();
+      expect(observed.revalidate()).toBeNull();
+    } finally {
+      restoreDescriptor(f.ctx, "agent", originalAgent);
+      f.ctx.sessionManager = originalSessionManager;
+      Date.now = originalNow;
+    }
+    expect(f.entry.inspectCall(preflight.ref, f.ctx)).toEqual(inspectionBefore);
+  });
+
+  test("prepared checks reject late context-getter ingress without consuming it", async () => {
+    const ingress = await fixture();
+    await observedWork(ingress, "late ingress", "i1");
+    const ingressRef = expectCaptureOk(ingress.entry.captureCall({ toolCallId: "i1", toolName: "read" }, ingress.ctx));
+    const ingressCheck = expectCheckOk(ingress.entry.prepareCallCheck(ingressRef.ref, ingress.ctx));
+    const originalManager = ingress.ctx.sessionManager!;
+    let injected = false;
+    try {
+      ingress.ctx.sessionManager = {
+        getSessionId() {
+          if (!injected) {
+            injected = true;
+            ingress.host.emitSync("input", { text: "late input", source: "rpc" }, ingress.ctx);
+          }
+          return originalManager.getSessionId();
+        },
+        getCwd() {
+          return originalManager.getCwd();
+        },
+      };
+      ingress.ctx.sessionManager.getSessionId();
+    } finally {
+      ingress.ctx.sessionManager = originalManager;
+    }
+    expect(ingressCheck.revalidate()).toBe("pending-input");
+    expect(ingress.entry.inspectCall(ingressRef.ref, ingress.ctx)).toMatchObject({
+      state: "suspended",
+      reason: "pending-input",
+      pendingInputCount: 1,
+      callResultState: "observed",
+    });
+    expect(ingressCheck.revalidate()).toBe("pending-input");
+
+    const replaced = await fixture();
+    await observedWork(replaced, "late work", "w1");
+    const replacedRef = expectCaptureOk(replaced.entry.captureCall({ toolCallId: "w1", toolName: "read" }, replaced.ctx));
+    const replacedCheck = expectCheckOk(replaced.entry.prepareCallCheck(replacedRef.ref, replaced.ctx));
+    const replacedManager = replaced.ctx.sessionManager!;
+    let activated = false;
+    try {
+      replaced.ctx.sessionManager = {
+        getSessionId() {
+          if (!activated) {
+            activated = true;
+            replaced.host.emitSync("before_agent_start", {
+              reason: "prompt",
+              prompt: "late replacement work",
+              systemPrompt: [],
+            }, replaced.ctx);
+          }
+          return replacedManager.getSessionId();
+        },
+        getCwd() {
+          return replacedManager.getCwd();
+        },
+      };
+      replaced.ctx.sessionManager.getSessionId();
+    } finally {
+      replaced.ctx.sessionManager = replacedManager;
+    }
+    expect(replacedCheck.revalidate()).toBe("work-invalidated");
+    expect(replaced.entry.inspectCall(replacedRef.ref, replaced.ctx)).toMatchObject({
+      state: "stale",
+      reason: "work-invalidated",
+    });
+  });
+
+  test("prepared checks refuse conflict, pruning, disable, dispose and a late owner", async () => {
+    const conflict = await fixture();
+    await observedWork(conflict, "prepared conflict", "x1");
+    const conflictRef = expectCaptureOk(conflict.entry.captureCall({ toolCallId: "x1", toolName: "read" }, conflict.ctx));
+    const conflictCheck = expectCheckOk(conflict.entry.prepareCallCheck(conflictRef.ref, conflict.ctx));
+    await conflict.host.emit("tool_call", { toolCallId: "x1", toolName: "write", input: {} }, conflict.ctx);
+    expect(conflictCheck.revalidate()).toBe("call-conflicted");
+
+    const pruned = await fixture({ maxCallsPerWork: 1 });
+    await observedWork(pruned, "prepared prune", "p1");
+    const prunedRef = expectCaptureOk(pruned.entry.captureCall({ toolCallId: "p1", toolName: "read" }, pruned.ctx));
+    const prunedCheck = expectCheckOk(pruned.entry.prepareCallCheck(prunedRef.ref, pruned.ctx));
+    await pruned.host.emit("tool_call", { toolCallId: "p2", toolName: "read", input: {} }, pruned.ctx);
+    expect(prunedCheck.revalidate()).toBe("call-not-retained");
+
+    const prunedWork = await fixture({ maxRetainedWorks: 1 });
+    await observedWork(prunedWork, "prepared work prune", "pw1");
+    const prunedWorkRef = expectCaptureOk(prunedWork.entry.captureCall({ toolCallId: "pw1", toolName: "read" }, prunedWork.ctx));
+    const prunedWorkCheck = expectCheckOk(prunedWork.entry.prepareCallCheck(prunedWorkRef.ref, prunedWork.ctx));
+    await input(prunedWork.host, prunedWork.ctx, "replacement work");
+    await prepare(prunedWork.host, prunedWork.ctx, "replacement work");
+    await prunedWork.host.observe(prunedWork.ctx, "pw2", "read");
+    expect(prunedWorkCheck.revalidate()).toBe("work-not-retained");
+
+    const disabled = await fixture();
+    await observedWork(disabled, "prepared disable", "d1");
+    const disabledRef = expectCaptureOk(disabled.entry.captureCall({ toolCallId: "d1", toolName: "read" }, disabled.ctx));
+    const disabledCheck = expectCheckOk(disabled.entry.prepareCallCheck(disabledRef.ref, disabled.ctx));
+    publishTaskOwner({ ownerId: "late-disable-owner" } as unknown as TaskOwner);
+    await disabled.host.emit("input", { text: "disable now", source: "rpc" }, disabled.ctx);
+    expect(disabled.entry.enabled).toBe(false);
+    expect(disabledCheck.revalidate()).toBe("entry-disabled");
+    clearPublishedTaskOwner();
+
+    const disposed = await fixture();
+    await observedWork(disposed, "prepared dispose", "z1");
+    const disposedRef = expectCaptureOk(disposed.entry.captureCall({ toolCallId: "z1", toolName: "read" }, disposed.ctx));
+    const disposedCheck = expectCheckOk(disposed.entry.prepareCallCheck(disposedRef.ref, disposed.ctx));
+    disposed.entry.dispose();
+    expect(disposedCheck.revalidate()).toBe("entry-disposed");
+
+    const owned = await fixture();
+    await observedWork(owned, "prepared late owner", "o1");
+    const ownedRef = expectCaptureOk(owned.entry.captureCall({ toolCallId: "o1", toolName: "read" }, owned.ctx));
+    const ownedCheck = expectCheckOk(owned.entry.prepareCallCheck(ownedRef.ref, owned.ctx));
+    publishTaskOwner({ ownerId: "late-prepared-owner" } as unknown as TaskOwner);
+    expect(ownedCheck.revalidate()).toBe("managed-owner-present");
+    expect(owned.entry.isEnabled()).toBe(true);
+  });
+
+  test("prepared checks reject foreign refs before any ref or host getter", async () => {
+    const f = await fixture();
+    await observedWork(f, "foreign prepared ref", "f1");
+    const captured = expectCaptureOk(f.entry.captureCall({ toolCallId: "f1", toolName: "read" }, f.ctx));
+
+    let getterReads = 0;
+    const getterRef = {
+      get observationId(): never {
+        getterReads += 1;
+        throw new Error("ref getter");
+      },
+      get generation(): never {
+        getterReads += 1;
+        throw new Error("ref getter");
+      },
+      get sessionId(): never {
+        getterReads += 1;
+        throw new Error("ref getter");
+      },
+      get workspaceRoot(): never {
+        getterReads += 1;
+        throw new Error("ref getter");
+      },
+      get toolCallId(): never {
+        getterReads += 1;
+        throw new Error("ref getter");
+      },
+      get toolName(): never {
+        getterReads += 1;
+        throw new Error("ref getter");
+      },
+    };
+    const untouchedContext = {
+      get cwd(): never {
+        throw new Error("host getter");
+      },
+      get agent(): never {
+        throw new Error("host getter");
+      },
+      get sessionManager(): never {
+        throw new Error("host getter");
+      },
+    } as unknown as NativeContext;
+    const foreign = expectCheckFailure(f.entry.prepareCallCheck(getterRef, untouchedContext));
+    expect(foreign.inspection).toMatchObject({
+      state: "unavailable",
+      reason: "foreign-reference",
+      association: null,
+    });
+    expect(getterReads).toBe(0);
+    expect(Object.isFrozen(foreign)).toBe(true);
+    expect(Object.isFrozen(foreign.inspection)).toBe(true);
+
+    expect(expectCheckFailure(f.entry.prepareCallCheck(structuredClone(captured.ref), f.ctx)).inspection)
+      .toMatchObject({ state: "unavailable", reason: "foreign-reference" });
+    expect(expectCheckFailure(f.entry.prepareCallCheck({ ...captured.ref }, f.ctx)).inspection)
+      .toMatchObject({ state: "unavailable", reason: "foreign-reference" });
+    expect(expectCheckFailure(f.entry.prepareCallCheck(null, f.ctx)).inspection.reason)
+      .toBe("foreign-reference");
+    expect(expectCheckFailure(f.entry.prepareCallCheck(7, f.ctx)).inspection.reason)
+      .toBe("foreign-reference");
+
+    const other = await fixture();
+    expect(expectCheckFailure(other.entry.prepareCallCheck(captured.ref, other.ctx)).inspection)
+      .toMatchObject({ state: "unavailable", reason: "foreign-reference" });
+  });
+
+  test("published owner presence is descriptor-only, layout-bounded and never cached", async () => {
+    const originalGlobalOwn = Object.getOwnPropertyDescriptor(globalThis, PORT_KEY);
+    const originalPrototypeOwn = Object.getOwnPropertyDescriptor(Object.prototype, PORT_KEY);
+    const originalGlobalProto = Object.getPrototypeOf(globalThis);
+    try {
+      expect(Object.getPrototypeOf(globalThis)).toBe(Object.prototype);
+      expect(Object.getPrototypeOf(Object.prototype)).toBeNull();
+      clearPublishedTaskOwner();
+      expect(publishedTaskOwnerPresence()).toBe("absent");
+      publishTaskOwner({ ownerId: "presence-owner" } as unknown as TaskOwner);
+      expect(publishedTaskOwnerPresence()).toBe("present");
+      clearPublishedTaskOwner();
+      expect(publishedTaskOwnerPresence()).toBe("absent");
+
+      Object.defineProperty(Object.prototype, PORT_KEY, {
+        configurable: true,
+        value: { ownerId: "inherited-data" },
+      });
+      expect(publishedTaskOwnerPresence()).toBe("unavailable");
+
+      // Own undefined shadows the inherited data slot.
+      Object.defineProperty(globalThis, PORT_KEY, {
+        configurable: true,
+        writable: true,
+        value: undefined,
+      });
+      expect(publishedTaskOwnerPresence()).toBe("absent");
+      restoreDescriptor(globalThis, PORT_KEY, originalGlobalOwn);
+
+      let ownGetterCalls = 0;
+      Object.defineProperty(globalThis, PORT_KEY, {
+        configurable: true,
+        get() {
+          ownGetterCalls += 1;
+          return { ownerId: "own-accessor" };
+        },
+      });
+      expect(publishedTaskOwnerPresence()).toBe("unavailable");
+      expect(ownGetterCalls).toBe(0);
+      restoreDescriptor(globalThis, PORT_KEY, originalGlobalOwn);
+
+      let inheritedGetterCalls = 0;
+      Object.defineProperty(Object.prototype, PORT_KEY, {
+        configurable: true,
+        get() {
+          inheritedGetterCalls += 1;
+          return { ownerId: "inherited-accessor" };
+        },
+      });
+      expect(publishedTaskOwnerPresence()).toBe("unavailable");
+      expect(inheritedGetterCalls).toBe(0);
+      restoreDescriptor(Object.prototype, PORT_KEY, originalPrototypeOwn);
+
+      // Absence is re-read, not cached: a later inherited slot is observed.
+      expect(publishedTaskOwnerPresence()).toBe("absent");
+      Object.defineProperty(Object.prototype, PORT_KEY, {
+        configurable: true,
+        value: undefined,
+      });
+      expect(publishedTaskOwnerPresence()).toBe("unavailable");
+      restoreDescriptor(Object.prototype, PORT_KEY, originalPrototypeOwn);
+
+      Object.setPrototypeOf(globalThis, Object.create(Object.getPrototypeOf(globalThis)));
+      let unknownPrototype: ReturnType<typeof publishedTaskOwnerPresence>;
+      try {
+        unknownPrototype = publishedTaskOwnerPresence();
+      } finally {
+        Object.setPrototypeOf(globalThis, originalGlobalProto);
+      }
+      expect(unknownPrototype).toBe("unavailable");
+
+      Object.setPrototypeOf(globalThis, null);
+      let nullPrototype: ReturnType<typeof publishedTaskOwnerPresence>;
+      try {
+        nullPrototype = publishedTaskOwnerPresence();
+      } finally {
+        Object.setPrototypeOf(globalThis, originalGlobalProto);
+      }
+      expect(nullPrototype).toBe("absent");
+    } finally {
+      restoreDescriptor(globalThis, PORT_KEY, originalGlobalOwn);
+      restoreDescriptor(Object.prototype, PORT_KEY, originalPrototypeOwn);
+      if (Object.getPrototypeOf(globalThis) !== originalGlobalProto) {
+        Object.setPrototypeOf(globalThis, originalGlobalProto);
+      }
+      clearPublishedTaskOwner();
+    }
+  });
+
+  test("prepared checks use the descriptor-only owner probe", async () => {
+    const f = await fixture();
+    await observedWork(f, "prepared owner probe", "q1");
+    const captured = expectCaptureOk(f.entry.captureCall({ toolCallId: "q1", toolName: "read" }, f.ctx));
+    const originalGlobalOwn = Object.getOwnPropertyDescriptor(globalThis, PORT_KEY);
+    const originalPrototypeOwn = Object.getOwnPropertyDescriptor(Object.prototype, PORT_KEY);
+    const originalGlobalProto = Object.getPrototypeOf(globalThis);
+    try {
+      let inheritedGetterCalls = 0;
+      Object.defineProperty(Object.prototype, PORT_KEY, {
+        configurable: true,
+        get() {
+          inheritedGetterCalls += 1;
+          return { ownerId: "prepared-inherited" };
+        },
+      });
+      const inheritedCheck = f.entry.prepareCallCheck(captured.ref, f.ctx);
+      restoreDescriptor(Object.prototype, PORT_KEY, originalPrototypeOwn);
+      expect(expectCheckFailure(inheritedCheck).inspection).toMatchObject({
+        state: "unavailable",
+        reason: "live-identity-unavailable",
+      });
+      expect(inheritedGetterCalls).toBe(0);
+
+      Object.defineProperty(Object.prototype, PORT_KEY, {
+        configurable: true,
+        value: { ownerId: "prepared-inherited-data" },
+      });
+      Object.defineProperty(globalThis, PORT_KEY, {
+        configurable: true,
+        writable: true,
+        value: undefined,
+      });
+      const shadowed = expectCheckOk(f.entry.prepareCallCheck(captured.ref, f.ctx));
+      restoreDescriptor(globalThis, PORT_KEY, originalGlobalOwn);
+      restoreDescriptor(Object.prototype, PORT_KEY, originalPrototypeOwn);
+      expect(shadowed.revalidate()).toBeNull();
+
+      Object.setPrototypeOf(globalThis, Object.create(Object.getPrototypeOf(globalThis)));
+      let unknownCheck: NativeCallCheckPreparation;
+      try {
+        unknownCheck = f.entry.prepareCallCheck(captured.ref, f.ctx);
+      } finally {
+        Object.setPrototypeOf(globalThis, originalGlobalProto);
+      }
+      expect(expectCheckFailure(unknownCheck).inspection.reason).toBe("live-identity-unavailable");
+
+      const late = expectCheckOk(f.entry.prepareCallCheck(captured.ref, f.ctx));
+      publishTaskOwner({ ownerId: "prepared-late-owner" } as unknown as TaskOwner);
+      expect(late.revalidate()).toBe("managed-owner-present");
+    } finally {
+      restoreDescriptor(globalThis, PORT_KEY, originalGlobalOwn);
+      restoreDescriptor(Object.prototype, PORT_KEY, originalPrototypeOwn);
+      if (Object.getPrototypeOf(globalThis) !== originalGlobalProto) {
+        Object.setPrototypeOf(globalThis, originalGlobalProto);
+      }
+      clearPublishedTaskOwner();
+    }
   });
 });
