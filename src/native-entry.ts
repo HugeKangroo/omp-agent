@@ -41,6 +41,22 @@ import {
   fingerprintExpectedCallResult,
   fingerprintObservedCallResult,
 } from "./native-result-expectation.ts";
+import {
+  boundNativeHarnessReportWire,
+  readNativeHarnessReportSelectedInput,
+  type NativeHarnessReportInputFingerprint,
+  type NativeHarnessReportOwnedInput,
+  type NativeHarnessReportPort,
+} from "./native-harness-report-protocol.ts";
+import {
+  NATIVE_HARNESS_REPORT_BINDING_SCHEMA,
+  NATIVE_HARNESS_REPORT_MAX_REREAD_ATTEMPTS,
+  NATIVE_HARNESS_REPORT_REREAD_SCHEMA,
+  type NativeHarnessReportBindingFacts,
+  type NativeHarnessReportRequest,
+  type NativeHarnessReportRereadSuccess,
+  type NativeHarnessReportSelection,
+} from "./native-harness-report.ts";
 
 /**
  * Explicitly loaded alternative entry for ordinary OMP-native work.
@@ -135,6 +151,8 @@ export interface NativeEntryOptions {
   maxRememberedCallIds?: number;
   /** INTERNAL trusted composition only; supplied once by the instanced entry. */
   instanceReports?: NativeInstanceReportPort;
+  /** INTERNAL trusted composition only; the accepted A3 producer in production. */
+  harnessReports?: NativeHarnessReportPort;
 }
 
 export const NATIVE_WORK_CALL_INSPECTION_SCHEMA = "omp-agent.native-work-call-inspection.v1";
@@ -393,6 +411,8 @@ interface ReportBinding {
   sessionId: string | null;
   workspaceRoot: string | null;
   unavailableReason: string | null;
+  /** One original Harness report preflight ref, cached after its first use. */
+  harnessReportRef: NativeWorkCallReference | null;
 }
 
 /**
@@ -433,6 +453,7 @@ interface EntryState {
   maxReportBindings: number;
   maxRememberedCallIds: number;
   instanceReports: NativeInstanceReportPort | null;
+  harnessReports: NativeHarnessReportPort | null;
 }
 
 export interface NativeWorkCheckReport {
@@ -491,6 +512,11 @@ export interface NativeWorkReport {
   caveats: string[];
   /** Present only when this report explicitly selected one C1-observed result. */
   instanceResult?: NativeInstanceReportFacts;
+  /** Present only when this report explicitly selected one trusted Harness source. */
+  harnessResult?: {
+    readonly facts: NativeHarnessReportBindingFacts;
+    readonly reread: NativeHarnessReportRereadSuccess;
+  };
 }
 
 interface ReportCheckArgument {
@@ -669,6 +695,8 @@ type PlainResponseRead =
 const PREPARE_RESPONSE_KEYS = ["ok", "prepared", "reason"] as const;
 const PREPARED_RESPONSE_KEYS = ["facts", "refresh", "revalidate"] as const;
 const REFRESH_RESPONSE_KEYS = ["ok", "reason"] as const;
+const HARNESS_PREPARE_KEYS = ["ok", "prepared", "code", "reason"] as const;
+const HARNESS_PREPARED_KEYS = ["facts", "refresh", "revalidate", "reread"] as const;
 
 /**
  * Read one strict plain-data response shape. No accessor or `then` getter is
@@ -1096,6 +1124,28 @@ function parseArguments(value: unknown): ParsedArguments {
   };
 }
 
+/**
+ * Semantic parse/default/trim for the selected profile uses only the B2b1
+ * owned snapshot. The raw selector and its raw order are never normalized
+ * here; they were fingerprinted before this parser runs.
+ */
+function parseSelectedReportArguments(input: NativeHarnessReportOwnedInput): ReportArguments {
+  const ordinary: Record<string, unknown> = { action: "report", outcome: input.outcome };
+  if (input.checks !== undefined) ordinary.checks = input.checks;
+  if (input.outputFiles !== undefined) ordinary.outputFiles = input.outputFiles;
+  if (input.summary !== undefined) ordinary.summary = input.summary;
+  if (input.limitations !== undefined) ordinary.limitations = input.limitations;
+  const parsed = parseArguments(ordinary);
+  if (parsed.action !== "report") throw new Error("agent_work report action changed while parsing.");
+  if (parsed.outputFiles.length !== 0) {
+    throw new Error("agent_work harnessResult report outputFiles must be empty.");
+  }
+  if (parsed.instanceResult !== undefined || parsed.handoffAdoptionId !== undefined) {
+    throw new Error("agent_work harnessResult cannot be combined with instanceResult or handoffAdoptionId.");
+  }
+  return parsed;
+}
+
 function createState(options: NativeEntryOptions): EntryState {
   return {
     enabled: true,
@@ -1121,6 +1171,7 @@ function createState(options: NativeEntryOptions): EntryState {
     maxReportBindings: clampInteger(options.maxReportBindings, DEFAULT_MAX_REPORT_BINDINGS, 4, 64),
     maxRememberedCallIds: clampInteger(options.maxRememberedCallIds, DEFAULT_MAX_REMEMBERED_CALL_IDS, 2, 8192),
     instanceReports: options.instanceReports ?? null,
+    harnessReports: options.harnessReports ?? null,
   };
 }
 
@@ -1248,6 +1299,7 @@ function createReportBinding(work: Work, call: ObservedCall): ReportBinding {
     sessionId: work.sessionId,
     workspaceRoot: work.workspaceRoot,
     unavailableReason,
+    harnessReportRef: null,
   };
 }
 
@@ -2003,7 +2055,11 @@ function onNavigation(state: EntryState, context: NativeContext, reason: string)
   invalidateCurrent(state, reason);
 }
 
-function reportSignature(work: Work, parsed: ReportArguments): string {
+function reportSignature(
+  work: Work,
+  parsed: ReportArguments,
+  harnessSelection?: NativeHarnessReportSelection,
+): string {
   const checks = [...parsed.checks]
     .sort((left, right) => (left.toolCallId < right.toolCallId ? -1 : left.toolCallId > right.toolCallId ? 1 : 0))
     .map((check) => [check.toolCallId, check.purpose]);
@@ -2016,6 +2072,16 @@ function reportSignature(work: Work, parsed: ReportArguments): string {
     limitations: parsed.limitations,
     ...(parsed.instanceResult === undefined ? {} : { instanceResult: parsed.instanceResult }),
     ...(parsed.handoffAdoptionId === undefined ? {} : { handoffAdoptionId: parsed.handoffAdoptionId }),
+    ...(harnessSelection === undefined ? {} : {
+      harnessResult: {
+        sourceToolCallId: harnessSelection.sourceToolCallId,
+        captureId: harnessSelection.captureId,
+        captureDigest: harnessSelection.captureDigest,
+        checkToolCallIds: [...harnessSelection.checkToolCallIds].sort(
+          (left, right) => (left < right ? -1 : left > right ? 1 : 0),
+        ),
+      },
+    }),
   }));
 }
 
@@ -2038,6 +2104,10 @@ function buildReport(
   files: NativeObservedFile[],
   recordedAt: number,
   instanceResult: NativeInstanceReportFacts | undefined,
+  harnessResult?: {
+    readonly facts: NativeHarnessReportBindingFacts;
+    readonly reread: NativeHarnessReportRereadSuccess;
+  },
 ): NativeWorkReport {
   const checks: NativeWorkCheckReport[] = selected.map(({ call, result, purpose }) => ({
     toolCallId: call.toolCallId,
@@ -2087,6 +2157,14 @@ function buildReport(
     );
     unverified.push(
       "The selected result envelope is a tool-result-middleware observation; semanticAcceptance remains not-evaluated.",
+    );
+  }
+  if (harnessResult !== undefined) {
+    unverified.push(
+      "The selected Harness facts are bounded, frozen, non-authoritative observations from the trusted host composition; they are not managed task acceptance, semantic verification, an apply operation, or a future filesystem guarantee.",
+    );
+    unverified.push(
+      `The Harness reread observed the exact original captured version from ${harnessResult.reread.startedAt} to ${harnessResult.reread.finishedAt}; filesystemFreshness remains not-rechecked and is not continuous freshness.`,
     );
   }
 
@@ -2142,8 +2220,13 @@ function buildReport(
       ...(instanceResult?.handoff === undefined ? [] : [
         "The frozen handoff condition was PASS for the exact bytes observed during this report; this does not establish exclusive authorship, a commit-time file snapshot, or an atomic commit.",
       ]),
+      ...(harnessResult === undefined ? [] : [
+        "The selected Harness report is a non-authoritative observation; its adjacent same-version reread is not task acceptance, semantic verification, an apply operation, or continuous future freshness.",
+        "No main-workspace output file was read for this selected Harness report; captured Harness files remain nested, bounded facts only.",
+      ]),
     ],
     ...(instanceResult === undefined ? {} : { instanceResult }),
+    ...(harnessResult === undefined ? {} : { harnessResult }),
   };
   return deepFreeze(report);
 }
@@ -2935,6 +3018,730 @@ async function executeSelectedReport(
   );
 }
 
+interface HarnessPreparedPort {
+  readonly ok: true;
+  readonly facts: NativeHarnessReportBindingFacts;
+  readonly refresh: () => unknown;
+  readonly revalidate: () => unknown;
+  readonly reread: () => unknown;
+}
+
+type HarnessPrimitiveCheck = { readonly ok: true } | PortInvocationFailure;
+
+function refMatchesWork(
+  ref: NativeWorkCallReference,
+  work: Work,
+  call: ObservedCall,
+  sessionId: string | null,
+  workspaceRoot: string | null,
+): boolean {
+  return ref.observationId === work.observationId
+    && ref.generation === work.generation
+    && ref.sessionId === sessionId
+    && ref.workspaceRoot === workspaceRoot
+    && ref.toolCallId === call.toolCallId
+    && ref.toolName === call.toolName;
+}
+
+/**
+ * Call the trusted port once and copy its facts plus all three callbacks before
+ * any reread. The returned closures keep the original preparation receiver.
+ */
+function prepareHarnessReportPort(
+  port: NativeHarnessReportPort,
+  request: NativeHarnessReportRequest,
+  signal: unknown,
+  context: NativeContext,
+): HarnessPreparedPort | PortInvocationFailure {
+  let raw: unknown;
+  try {
+    raw = port.prepare(request, signal, context);
+  } catch (error) {
+    return { ok: false, reason: `Harness report preparation threw: ${boundPortReason(error, "unreadable failure")}` };
+  }
+  if (consumeNativePromise(raw)) {
+    return { ok: false, reason: "Harness report preparation returned a promise; synchronous preparation is required" };
+  }
+  const response = readPlainResponse(raw, HARNESS_PREPARE_KEYS);
+  if (!response.ok) {
+    return {
+      ok: false,
+      reason: plainResponseReason(
+        response.failure,
+        "Harness report preparation",
+        "Harness report preparation returned an unreadable result",
+      ),
+    };
+  }
+  const ok = response.fields.get("ok");
+  if (ok === false) {
+    const reason = response.fields.get("reason");
+    return {
+      ok: false,
+      reason: typeof reason === "string" && reason.length > 0
+        ? boundPortReason(reason, "Harness report is unavailable")
+        : "Harness report is unavailable without a readable reason",
+    };
+  }
+  if (ok !== true) return { ok: false, reason: "Harness report preparation returned an unknown result" };
+
+  const preparedValue = response.fields.get("prepared");
+  if (consumeNativePromise(preparedValue)) {
+    return { ok: false, reason: "Harness report preparation object is a promise; synchronous preparation is required" };
+  }
+  const prepared = readPlainResponse(preparedValue, HARNESS_PREPARED_KEYS);
+  if (!prepared.ok) {
+    return {
+      ok: false,
+      reason: plainResponseReason(
+        prepared.failure,
+        "Harness report preparation object",
+        "Harness report preparation returned no readable preparation object",
+      ),
+    };
+  }
+  const factsValue = prepared.fields.get("facts");
+  const refreshValue = prepared.fields.get("refresh");
+  const revalidateValue = prepared.fields.get("revalidate");
+  const rereadValue = prepared.fields.get("reread");
+  if (!isRecord(factsValue)) {
+    return { ok: false, reason: "Harness report preparation did not provide readable facts" };
+  }
+  if (typeof refreshValue !== "function"
+    || typeof revalidateValue !== "function"
+    || typeof rereadValue !== "function") {
+    return { ok: false, reason: "Harness report preparation did not provide synchronous refresh/revalidate and a reread method" };
+  }
+  const refresh = refreshValue as (this: unknown) => unknown;
+  const revalidate = revalidateValue as (this: unknown) => unknown;
+  const reread = rereadValue as (this: unknown) => unknown;
+  return {
+    ok: true,
+    facts: factsValue as unknown as NativeHarnessReportBindingFacts,
+    refresh: () => Reflect.apply(refresh, preparedValue, []),
+    revalidate: () => Reflect.apply(revalidate, preparedValue, []),
+    reread: () => Reflect.apply(reread, preparedValue, []),
+  };
+}
+
+function invokeHarnessRefresh(refresh: () => unknown): HarnessPrimitiveCheck {
+  let raw: unknown;
+  try {
+    raw = refresh();
+  } catch (error) {
+    return { ok: false, reason: `Harness report refresh threw: ${boundPortReason(error, "unreadable failure")}` };
+  }
+  if (raw === null) return { ok: true };
+  if (typeof raw === "string") {
+    return { ok: false, reason: boundPortReason(raw, "Harness report refresh refused") };
+  }
+  if (consumeNativePromise(raw)) {
+    return { ok: false, reason: "Harness report refresh returned a promise; a synchronous string or null is required" };
+  }
+  return { ok: false, reason: "Harness report refresh returned a non-primitive result" };
+}
+
+function invokeHarnessRevalidate(revalidate: () => unknown): HarnessPrimitiveCheck {
+  let raw: unknown;
+  try {
+    raw = revalidate();
+  } catch (error) {
+    return { ok: false, reason: `Harness report revalidate threw: ${boundPortReason(error, "unreadable failure")}` };
+  }
+  if (raw === null) return { ok: true };
+  if (typeof raw === "string") {
+    return { ok: false, reason: boundPortReason(raw, "Harness report revalidate refused") };
+  }
+  if (consumeNativePromise(raw)) {
+    return { ok: false, reason: "Harness report revalidate returned a promise; a synchronous string or null is required" };
+  }
+  return { ok: false, reason: "Harness report revalidate returned a non-primitive final check" };
+}
+
+async function awaitHarnessReread(
+  reread: () => unknown,
+  request: NativeHarnessReportRequest,
+): Promise<{ readonly ok: true; readonly reread: NativeHarnessReportRereadSuccess } | PortInvocationFailure> {
+  let raw: unknown;
+  try {
+    raw = reread();
+  } catch (error) {
+    return { ok: false, reason: `Harness report reread threw: ${boundPortReason(error, "unreadable failure")}` };
+  }
+  if (!(raw instanceof Promise)) {
+    return { ok: false, reason: "Harness report reread did not return the original operation promise" };
+  }
+  let settled: unknown;
+  try {
+    settled = await raw;
+  } catch (error) {
+    return { ok: false, reason: `Harness report reread rejected: ${boundPortReason(error, "unreadable failure")}` };
+  }
+  if (!isRecord(settled)) {
+    return { ok: false, reason: "Harness report reread returned no readable result" };
+  }
+  if (settled.ok !== true) {
+    const reason = settled.reason;
+    return {
+      ok: false,
+      reason: typeof reason === "string" && reason.length > 0
+        ? boundPortReason(reason, "Harness report reread did not succeed")
+        : "Harness report reread did not succeed",
+    };
+  }
+  if (settled.schema !== NATIVE_HARNESS_REPORT_REREAD_SCHEMA
+    || settled.sourceToolCallId !== request.selection.sourceToolCallId
+    || settled.reportToolCallId !== request.reportRef.toolCallId
+    || settled.reportInputSha256 !== request.reportInputSha256
+    || settled.captureId !== request.selection.captureId
+    || settled.captureDigest !== request.selection.captureDigest
+    || typeof settled.attempt !== "number"
+    || !Number.isSafeInteger(settled.attempt)
+    || settled.attempt < 1
+    || settled.attempt > NATIVE_HARNESS_REPORT_MAX_REREAD_ATTEMPTS
+    || typeof settled.startedAt !== "number"
+    || !Number.isSafeInteger(settled.startedAt)
+    || settled.startedAt < 0
+    || typeof settled.finishedAt !== "number"
+    || !Number.isSafeInteger(settled.finishedAt)
+    || settled.finishedAt < settled.startedAt
+    || settled.sameVersion !== true
+    || settled.taskAccepted !== false
+    || settled.semanticAcceptance !== "not-evaluated") {
+    return { ok: false, reason: "Harness report reread success does not bind this exact source, report input, capture, attempt and interval" };
+  }
+  return { ok: true, reread: settled as unknown as NativeHarnessReportRereadSuccess };
+}
+
+/** Request-facing facts identity only; A3 remains the provenance owner. */
+function harnessFactsIdentityFailure(
+  facts: NativeHarnessReportBindingFacts,
+  selection: NativeHarnessReportSelection,
+  work: NativeReportWorkIdentity,
+  outcome: ReportOutcome,
+): string | null {
+  try {
+    if (facts.schema !== NATIVE_HARNESS_REPORT_BINDING_SCHEMA
+      || facts.authority !== "non-authoritative"
+      || facts.modelDeclaredOutcome !== outcome
+      || facts.filesystemFreshness !== "not-rechecked"
+      || facts.taskAccepted !== false
+      || facts.semanticAcceptance !== "not-evaluated") {
+      return "the trusted Harness facts do not carry the required non-authoritative labels";
+    }
+    if (!isRecord(facts.source) || !isRecord(facts.capture)) {
+      return "the trusted Harness facts have no readable source/capture identity";
+    }
+    if (facts.source.toolCallId !== selection.sourceToolCallId
+      || facts.source.observationId !== work.observationId
+      || facts.source.generation !== work.generation
+      || facts.capture.captureId !== selection.captureId
+      || facts.capture.captureDigest !== selection.captureDigest) {
+      return "the trusted Harness facts do not match the requested source, capture or work identity";
+    }
+    if (!Array.isArray(facts.files)) {
+      return "the trusted Harness facts have no readable file rows";
+    }
+    const factCheckIds = new Set<string>();
+    for (const file of facts.files) {
+      if (!isRecord(file)) return "the trusted Harness facts contain an unreadable file row";
+      const check = (file as Record<string, unknown>).check;
+      if (check === null) continue;
+      if (!isRecord(check) || typeof check.checkToolCallId !== "string") {
+        return "the trusted Harness facts contain an unreadable check row";
+      }
+      factCheckIds.add(check.checkToolCallId);
+    }
+    const selectedIds = new Set(selection.checkToolCallIds);
+    if (factCheckIds.size !== selectedIds.size) {
+      return "the trusted Harness check ids do not match the explicit selection";
+    }
+    for (const id of selectedIds) {
+      if (!factCheckIds.has(id)) return "a selected Harness check id is absent from the trusted facts";
+    }
+    for (const id of factCheckIds) {
+      if (!selectedIds.has(id)) return "the trusted Harness facts contain an unselected check id";
+    }
+    return null;
+  } catch {
+    return "the trusted Harness facts could not be inspected";
+  }
+}
+
+/**
+ * Full historical comparison uses stable trusted JSON plus the original
+ * receipt identities. It is not a schema walker and never copies facts.
+ */
+function sameHarnessFacts(
+  current: NativeHarnessReportBindingFacts,
+  original: NativeHarnessReportBindingFacts,
+): boolean {
+  try {
+    const currentJson = JSON.stringify(current);
+    const originalJson = JSON.stringify(original);
+    if (typeof currentJson !== "string" || currentJson !== originalJson) return false;
+    if (!Array.isArray(current.files)
+      || !Array.isArray(original.files)
+      || current.files.length !== original.files.length) {
+      return false;
+    }
+    for (let index = 0; index < current.files.length; index++) {
+      const currentFile = current.files[index];
+      const originalFile = original.files[index];
+      if (!isRecord(currentFile) || !isRecord(originalFile)) return false;
+      const currentCheck = (currentFile as Record<string, unknown>).check;
+      const originalCheck = (originalFile as Record<string, unknown>).check;
+      if ((currentCheck === null) !== (originalCheck === null)) return false;
+      if (currentCheck !== null && originalCheck !== null) {
+        if (!isRecord(currentCheck) || !isRecord(originalCheck)) return false;
+        if ((currentCheck as Record<string, unknown>).receipt
+          !== (originalCheck as Record<string, unknown>).receipt) {
+          return false;
+        }
+      }
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function buildHarnessReportWire(
+  report: NativeWorkReport,
+  message: string,
+): { readonly ok: true; readonly wire: NativeToolResult } | { readonly ok: false; readonly result: NativeToolResult } {
+  let wire: NativeToolResult;
+  try {
+    wire = successResult(report, message);
+  } catch {
+    return {
+      ok: false,
+      result: errorResult("agent_work report refused: the complete report wire could not be encoded. No report was recorded."),
+    };
+  }
+  const bounded = boundNativeHarnessReportWire(wire);
+  if (!bounded.ok) {
+    return {
+      ok: false,
+      result: errorResult(`agent_work report refused: ${bounded.reason}. No report was recorded.`),
+    };
+  }
+  return { ok: true, wire: bounded.wire };
+}
+
+function harnessNativeCheckFailure(
+  check: NativeCallCheckPreparation,
+  ref: NativeWorkCallReference,
+  fingerprint: NativeHarnessReportInputFingerprint,
+): NativeToolResult | null {
+  if (!check.ok) {
+    return errorResult(
+      `agent_work report refused: the original report preflight is no longer current (${check.inspection.reason}). No report was recorded.`,
+    );
+  }
+  const inspection = check.inspection;
+  if (inspection.state !== "current" || inspection.evidenceState !== "available") {
+    return errorResult(
+      `agent_work report refused: the original report preflight is ${inspection.state} (${inspection.reason}). No report was recorded.`,
+    );
+  }
+  const association = inspection.association;
+  if (association === null
+    || association.observationId !== ref.observationId
+    || association.generation !== ref.generation
+    || association.sessionId !== ref.sessionId
+    || association.workspaceRoot !== ref.workspaceRoot
+    || association.toolCallId !== ref.toolCallId
+    || association.toolName !== ref.toolName) {
+    return errorResult("agent_work report refused: the original report preflight association changed. No report was recorded.");
+  }
+  if (inspection.callInputSha256 !== fingerprint.sha256) {
+    return errorResult("agent_work report refused: the computed report input does not match the original preflight input. No report was recorded.");
+  }
+  if (inspection.callResultState !== "preflight" || inspection.resultProjection?.state !== "unregistered") {
+    return errorResult("agent_work report refused: the report call is not an unobserved preflight with an unregistered projection. No report was recorded.");
+  }
+  return null;
+}
+
+/**
+ * Cache the one original preflight ref on the existing routing binding. The
+ * capture may reenter; every state/host read finishes before one pure install.
+ */
+function acquireHarnessReportRef(
+  state: EntryState,
+  controls: NativeEntryControls,
+  binding: ReportBinding,
+  work: Work,
+  call: ObservedCall,
+  signal: unknown,
+  context: NativeContext,
+): { readonly ok: true; readonly ref: NativeWorkCallReference } | { readonly ok: false; readonly result: NativeToolResult } {
+  if (binding.harnessReportRef !== null) {
+    if (!refMatchesWork(binding.harnessReportRef, work, call, work.sessionId, work.workspaceRoot)) {
+      return {
+        ok: false,
+        result: errorResult("agent_work report refused: the cached report reference does not match this exact call. No report was recorded."),
+      };
+    }
+    return { ok: true, ref: binding.harnessReportRef };
+  }
+  const captured = controls.captureCall(
+    { toolCallId: call.toolCallId, toolName: NATIVE_WORK_TOOL },
+    context,
+  );
+  if (!captured.ok) {
+    return {
+      ok: false,
+      result: errorResult(
+        `agent_work report refused: the original report preflight could not be issued (${captured.inspection.reason}). No report was recorded.`,
+      ),
+    };
+  }
+  const live = readSelectedLiveContext(state, context, signal, "while binding the Harness report call");
+  if (!live.ok) return { ok: false, result: live.result };
+  const current = currentnessFailure(state, live.live, binding, work, "report");
+  if (current !== null) return { ok: false, result: current };
+  const routing = reportRoutingFailure(state, call.toolCallId, binding);
+  if (routing !== null) return { ok: false, result: routing };
+  if (binding.work !== work || binding.call !== call) {
+    return {
+      ok: false,
+      result: errorResult("agent_work report refused: its routing binding changed while issuing the report reference. No report was recorded."),
+    };
+  }
+  if (binding.harnessReportRef !== null) {
+    if (!refMatchesWork(binding.harnessReportRef, work, call, work.sessionId, work.workspaceRoot)) {
+      return {
+        ok: false,
+        result: errorResult("agent_work report refused: a nested report reference does not match this exact call. No report was recorded."),
+      };
+    }
+    return { ok: true, ref: binding.harnessReportRef };
+  }
+  if (!refMatchesWork(captured.ref, work, call, work.sessionId, work.workspaceRoot)) {
+    return {
+      ok: false,
+      result: errorResult("agent_work report refused: the issued report reference does not match this exact call. No report was recorded."),
+    };
+  }
+  binding.harnessReportRef = captured.ref;
+  return { ok: true, ref: captured.ref };
+}
+
+/**
+ * Last pure publication gate. All host reads, awaits and wire encoding have
+ * finished; only captured callbacks, owned data, state and the live snapshot
+ * are judged. No report pointer is changed here.
+ */
+function finalHarnessGate(
+  state: EntryState,
+  live: LiveContextSnapshot,
+  binding: ReportBinding,
+  toolCallId: string,
+  work: Work,
+  selected: readonly SelectedCheck[],
+  ref: NativeWorkCallReference,
+  expectedReport: NativeWorkReport | null,
+  expectedSignature: string | null,
+  preparedRevalidate: () => unknown,
+  nativeRevalidate: () => NativeCallCheckReason | null,
+): NativeToolResult | null {
+  const a3 = invokeHarnessRevalidate(preparedRevalidate);
+  if (!a3.ok) {
+    return errorResult(`agent_work report refused: ${a3.reason}. No report was recorded.`);
+  }
+  let nativeReason: NativeCallCheckReason | null;
+  try {
+    nativeReason = nativeRevalidate();
+  } catch {
+    return errorResult("agent_work report refused: the original report preflight check threw. No report was recorded.");
+  }
+  if (nativeReason !== null) {
+    return errorResult(
+      `agent_work report refused: the original report preflight changed before publication (${nativeReason}). No report was recorded.`,
+    );
+  }
+  if (state.disposed || !state.enabled) {
+    return errorResult("agent_work report refused: the entry is disabled or disposed at publication. No report was recorded.");
+  }
+  const current = currentnessFailure(state, live, binding, work, "final");
+  if (current !== null) return current;
+  const routing = reportRoutingFailure(state, toolCallId, binding);
+  if (routing !== null) return routing;
+  if (binding.work !== work
+    || binding.call !== work.callIndex.get(toolCallId)
+    || binding.harnessReportRef !== ref) {
+    return errorResult("agent_work report refused: its original routing, call or report reference changed. No report was recorded.");
+  }
+  const selectedFailure = revalidateSelected(state, work, selected);
+  if (selectedFailure !== null) return selectedFailure;
+  if (expectedReport === null) {
+    if (work.report !== null || work.reportSignature !== null) {
+      return errorResult(
+        "agent_work report refused: another report was published during this call and was preserved. No report was recorded by this call.",
+      );
+    }
+  } else if (work.report !== expectedReport || work.reportSignature !== expectedSignature) {
+    return errorResult(
+      "agent_work report refused: the existing report publication changed before replay completed and was preserved. No report was recorded.",
+    );
+  }
+  return null;
+}
+
+async function executeHarnessReport(
+  state: EntryState,
+  controls: NativeEntryControls,
+  toolCallId: string,
+  binding: ReportBinding,
+  fingerprint: NativeHarnessReportInputFingerprint,
+  selection: NativeHarnessReportSelection,
+  parsed: ReportArguments,
+  signal: unknown,
+  context: NativeContext,
+): Promise<NativeToolResult> {
+  const port = state.harnessReports;
+  if (port === null) {
+    return errorResult(
+      "agent_work report refused: the explicit harnessResult selection is unavailable because no Harness report composition is configured. No report was recorded.",
+    );
+  }
+  const initialSignal = selectedSignalFailure(signal, "before Harness report preparation");
+  if (initialSignal !== null) return initialSignal;
+  const initialRouting = reportRoutingFailure(state, toolCallId, binding);
+  if (initialRouting !== null) return initialRouting;
+  if (binding.unavailableReason !== null) {
+    return errorResult(`agent_work report is unavailable for this work: ${binding.unavailableReason}. No report was recorded.`);
+  }
+  const work = binding.work;
+  const call = binding.call;
+  if (work.invalidated) {
+    return errorResult("agent_work report refused because its work association was invalidated. No report was recorded.");
+  }
+  if (work.evidenceState === "unavailable") {
+    return errorResult(
+      `agent_work report refused: ${work.evidenceUnavailableReason ?? "work evidence is unavailable"}. No report was recorded.`,
+    );
+  }
+  if (work.sessionId === null || work.workspaceRoot === null) {
+    return errorResult("agent_work report refused: session or workspace identity is unavailable. No report was recorded.");
+  }
+  if (call.toolName !== NATIVE_WORK_TOOL || call.associationConflict) {
+    return errorResult("agent_work report refused: its tool_call preflight identity is conflicted or ambiguous. No report was recorded.");
+  }
+  if (call.resultState !== "preflight" || call.result !== null || call.resultExpectation !== null) {
+    return errorResult("agent_work report refused: the report call is not an unobserved preflight with an unregistered projection. No report was recorded.");
+  }
+  if (call.inputFingerprint.state !== "available"
+    || call.inputFingerprint.bytes !== fingerprint.bytes
+    || call.inputFingerprint.sha256 !== fingerprint.sha256) {
+    return errorResult("agent_work report refused: the computed report input bytes/sha256 do not match the original preflight input. No report was recorded.");
+  }
+  const workIdentity = workedIdentity(work);
+  if (workIdentity === null) {
+    return errorResult("agent_work report refused: session or workspace identity is unavailable. No report was recorded.");
+  }
+  const parsedIds = new Set(parsed.checks.map((check) => check.toolCallId));
+  if (!parsedIds.has(selection.sourceToolCallId)) {
+    return errorResult(
+      `agent_work report refused: harnessResult.sourceToolCallId ${JSON.stringify(selection.sourceToolCallId)} must also appear in checks. No report was recorded.`,
+    );
+  }
+  for (const checkId of selection.checkToolCallIds) {
+    if (!parsedIds.has(checkId)) {
+      return errorResult(
+        `agent_work report refused: harnessResult.checkToolCallIds entry ${JSON.stringify(checkId)} must also appear in checks. No report was recorded.`,
+      );
+    }
+  }
+  const selectionChecks = selectChecks(state, work, parsed.checks);
+  if ("error" in selectionChecks) return selectionChecks.error;
+  const selected = selectionChecks.selected;
+  const signature = reportSignature(work, parsed, selection);
+  if (work.report !== null && work.reportSignature !== signature) {
+    return errorResult("agent_work report refused: a different report is already recorded for this work and cannot be rewritten.");
+  }
+  const initialLive = readSelectedLiveContext(state, context, signal, "before Harness report preparation");
+  if (!initialLive.ok) return initialLive.result;
+  const initialCurrent = currentnessFailure(state, initialLive.live, binding, work, "report");
+  if (initialCurrent !== null) return initialCurrent;
+  const initialRoutingAfterReads = reportRoutingFailure(state, toolCallId, binding);
+  if (initialRoutingAfterReads !== null) return initialRoutingAfterReads;
+
+  const acquired = acquireHarnessReportRef(state, controls, binding, work, call, signal, context);
+  if (!acquired.ok) return acquired.result;
+  const ref = acquired.ref;
+  const request: NativeHarnessReportRequest = Object.freeze({
+    reportRef: ref,
+    reportInputSha256: fingerprint.sha256,
+    work: workIdentity,
+    selection,
+    outcome: parsed.outcome,
+  });
+  const prepared = prepareHarnessReportPort(port, request, signal, context);
+  if (!prepared.ok) {
+    return errorResult(`agent_work report refused: ${prepared.reason}. No report was recorded.`);
+  }
+  const factsProblem = harnessFactsIdentityFailure(prepared.facts, selection, workIdentity, parsed.outcome);
+  if (factsProblem !== null) {
+    return errorResult(`agent_work report refused: ${factsProblem}. No report was recorded.`);
+  }
+
+  const preRefresh = invokeHarnessRefresh(prepared.refresh);
+  if (!preRefresh.ok) {
+    return errorResult(`agent_work report refused: ${preRefresh.reason}. No report was recorded.`);
+  }
+  const preNative = controls.prepareCallCheck(ref, context);
+  const preNativeProblem = harnessNativeCheckFailure(preNative, ref, fingerprint);
+  if (preNativeProblem !== null) return preNativeProblem;
+  if (!preNative.ok) {
+    return errorResult("agent_work report refused: the original report preflight is unavailable. No report was recorded.");
+  }
+  const preLive = readSelectedLiveContext(state, context, signal, "while preparing the Harness report");
+  if (!preLive.ok) return preLive.result;
+  const preRevalidate = invokeHarnessRevalidate(prepared.revalidate);
+  if (!preRevalidate.ok) {
+    return errorResult(`agent_work report refused: ${preRevalidate.reason}. No report was recorded.`);
+  }
+  const preProblem = currentnessFailure(state, preLive.live, binding, work, "report");
+  if (preProblem !== null) return preProblem;
+  const preRouting = reportRoutingFailure(state, toolCallId, binding);
+  if (preRouting !== null) return preRouting;
+  const preSelected = revalidateSelected(state, work, selected);
+  if (preSelected !== null) return preSelected;
+  let preNativeReason: NativeCallCheckReason | null;
+  try {
+    preNativeReason = preNative.revalidate();
+  } catch {
+    return errorResult("agent_work report refused: the original report preflight check threw. No report was recorded.");
+  }
+  if (preNativeReason !== null) {
+    return errorResult(
+      `agent_work report refused: the original report preflight changed during preparation (${preNativeReason}). No report was recorded.`,
+    );
+  }
+
+  const existing = work.report;
+  if (existing !== null) {
+    if (work.reportSignature !== signature) {
+      return errorResult("agent_work report refused: a different report is already recorded for this work and cannot be rewritten.");
+    }
+    if (existing.harnessResult === undefined) {
+      return errorResult("agent_work report refused: the existing identical report is not a Harness report and was preserved. No report was recorded.");
+    }
+    if (!sameHarnessFacts(prepared.facts, existing.harnessResult.facts)) {
+      return errorResult("agent_work report refused: the existing identical report has different Harness facts and was preserved. No report was recorded.");
+    }
+    const wire = buildHarnessReportWire(
+      existing,
+      "Existing identical Harness report observed; the original recordedAt and reread interval are preserved and files were not reread.",
+    );
+    if (!wire.ok) return wire.result;
+    const final = finalHarnessGate(
+      state,
+      preLive.live,
+      binding,
+      toolCallId,
+      work,
+      selected,
+      ref,
+      existing,
+      signature,
+      prepared.revalidate,
+      preNative.revalidate,
+    );
+    if (final !== null) return final;
+    return wire.wire;
+  }
+
+  const reread = await awaitHarnessReread(prepared.reread, request);
+  if (!reread.ok) {
+    return errorResult(`agent_work report refused: ${reread.reason}. No report was recorded.`);
+  }
+
+  const postRefresh = invokeHarnessRefresh(prepared.refresh);
+  if (!postRefresh.ok) {
+    return errorResult(`agent_work report refused: ${postRefresh.reason}. No report was recorded.`);
+  }
+  const postNative = controls.prepareCallCheck(ref, context);
+  const postNativeProblem = harnessNativeCheckFailure(postNative, ref, fingerprint);
+  if (postNativeProblem !== null) return postNativeProblem;
+  if (!postNative.ok) {
+    return errorResult("agent_work report refused: the original report preflight is unavailable. No report was recorded.");
+  }
+  const recordedAt = state.now();
+  const postLive = readSelectedLiveContext(state, context, signal, "while observing the Harness reread");
+  if (!postLive.ok) return postLive.result;
+
+  const winner = work.report;
+  if (winner !== null) {
+    if (work.reportSignature !== signature) {
+      return errorResult("agent_work report refused: a different report is already recorded for this work and cannot be rewritten.");
+    }
+    if (winner.harnessResult === undefined) {
+      return errorResult("agent_work report refused: the existing identical report is not a Harness report and was preserved. No report was recorded.");
+    }
+    if (!sameHarnessFacts(prepared.facts, winner.harnessResult.facts)) {
+      return errorResult("agent_work report refused: the existing identical report has different Harness facts and was preserved. No report was recorded.");
+    }
+    const wire = buildHarnessReportWire(
+      winner,
+      "An identical Harness report was published concurrently; the original report, recordedAt and reread interval are returned unchanged.",
+    );
+    if (!wire.ok) return wire.result;
+    const final = finalHarnessGate(
+      state,
+      postLive.live,
+      binding,
+      toolCallId,
+      work,
+      selected,
+      ref,
+      winner,
+      signature,
+      prepared.revalidate,
+      postNative.revalidate,
+    );
+    if (final !== null) return final;
+    return wire.wire;
+  }
+
+  const report = buildReport(
+    work,
+    parsed,
+    work.sessionId,
+    work.workspaceRoot,
+    selected,
+    [],
+    recordedAt,
+    undefined,
+    { facts: prepared.facts, reread: reread.reread },
+  );
+  const wire = buildHarnessReportWire(
+    report,
+    "Recorded non-authoritative Harness observations for this selected source; this is not task acceptance, semantic verification, apply, or future filesystem freshness.",
+  );
+  if (!wire.ok) return wire.result;
+  const final = finalHarnessGate(
+    state,
+    postLive.live,
+    binding,
+    toolCallId,
+    work,
+    selected,
+    ref,
+    null,
+    null,
+    prepared.revalidate,
+    postNative.revalidate,
+  );
+  if (final !== null) return final;
+  work.report = report;
+  work.reportSignature = signature;
+  return wire.wire;
+}
+
 async function executeReport(
   state: EntryState,
   toolCallId: string,
@@ -3060,11 +3867,15 @@ async function executeReport(
 
 async function executeTool(
   state: EntryState,
+  controls: NativeEntryControls,
   toolCallId: string,
   params: unknown,
   signal: AbortSignal | undefined,
   context: NativeContext,
 ): Promise<NativeToolResult> {
+  // This exact routing entry is the only report association the Harness branch
+  // may use. It is captured before any caller descriptor or host getter runs.
+  const originalReportBinding = state.reportBindings.get(toolCallId) ?? null;
   if (state.disposed || !state.enabled) {
     return errorResult(`agent_work is disabled: ${state.disabledReason ?? "the entry is disposed"}. No effect occurred.`);
   }
@@ -3076,11 +3887,59 @@ async function executeTool(
     return errorResult("agent_work only records the main session's work; subagent calls are refused and no effect occurred.");
   }
 
+  const selectedRead = readNativeHarnessReportSelectedInput(params);
+  if (selectedRead.state === "invalid") {
+    return errorResult(`agent_work report refused: ${selectedRead.reason}. No report was recorded.`);
+  }
+  if (selectedRead.state === "selected") {
+    if (state.harnessReports === null) {
+      return errorResult(
+        "agent_work report refused: the explicit harnessResult selection is unavailable because no Harness report composition is configured. No report was recorded.",
+      );
+    }
+    if (originalReportBinding === null) {
+      return errorResult("agent_work report context is unavailable: no matching tool_call preflight was observed for this call id.");
+    }
+    let parsed: ReportArguments;
+    try {
+      parsed = parseSelectedReportArguments(selectedRead.input);
+    } catch (error) {
+      return errorResult(errorMessage(error));
+    }
+    return executeHarnessReport(
+      state,
+      controls,
+      toolCallId,
+      originalReportBinding,
+      selectedRead.fingerprint,
+      selectedRead.selection,
+      parsed,
+      signal,
+      context,
+    );
+  }
+
   let parsed: ParsedArguments;
   try {
     parsed = parseArguments(params);
   } catch (error) {
     return errorResult(errorMessage(error));
+  }
+  // The ordinary parser can trigger an action getter that adds an own
+  // harnessResult after the first discriminator observation. Never downgrade
+  // that explicit selector into an ordinary report or inspect.
+  let lateHarnessSelector: boolean;
+  try {
+    lateHarnessSelector = Object.hasOwn(params as object, "harnessResult");
+  } catch {
+    return errorResult(
+      "agent_work report refused: the report arguments could not be inspected for an explicit harnessResult. No report was recorded.",
+    );
+  }
+  if (lateHarnessSelector) {
+    return errorResult(
+      "agent_work report refused: an explicit harnessResult appeared after ordinary parsing and cannot fall back to an ordinary report. No report was recorded.",
+    );
   }
   if (parsed.action === "inspect") return inspectResult(state, context);
   return executeReport(state, toolCallId, parsed, signal, context);
@@ -4027,6 +4886,42 @@ const AGENT_WORK_PARAMETERS = {
       maxLength: MAX_NATIVE_INSTANCE_REPORT_ID_CHARS,
       description: "Optional exact PASS adoption id from the trusted handoff composition. Requires instanceResult and exactly one outputFiles entry equal to the adopted file.",
     },
+    harnessResult: {
+      type: "object",
+      properties: {
+        sourceToolCallId: {
+          type: "string",
+          minLength: 1,
+          maxLength: MAX_TOOL_CALL_ID_CHARS,
+          description: "Exact source tool call id from the host-provided Harness selector; it must also appear in checks.",
+        },
+        captureId: {
+          type: "string",
+          minLength: 1,
+          maxLength: MAX_TOOL_CALL_ID_CHARS,
+          description: "Exact capture id from the host-provided Harness selector.",
+        },
+        captureDigest: {
+          type: "string",
+          pattern: "^[0-9a-f]{64}$",
+          description: "Lowercase sha256 of the original Harness capture.",
+        },
+        checkToolCallIds: {
+          type: "array",
+          maxItems: 8,
+          uniqueItems: true,
+          items: {
+            type: "string",
+            minLength: 1,
+            maxLength: MAX_TOOL_CALL_ID_CHARS,
+          },
+          description: "Exact host-provided check call ids; every id must also appear in checks.",
+        },
+      },
+      required: ["sourceToolCallId", "captureId", "captureDigest", "checkToolCallIds"],
+      additionalProperties: false,
+      description: "Optional exact Harness report selector. Cannot be combined with instanceResult or handoffAdoptionId, requires empty outputFiles, and does not establish task acceptance or semantic verification.",
+    },
   },
   required: ["action"],
   additionalProperties: false,
@@ -4034,10 +4929,13 @@ const AGENT_WORK_PARAMETERS = {
 
 export function createNativeEntry(pi: NativeOmpApi, options: NativeEntryOptions = {}): NativeEntryControls {
   const state = createState(options);
+  // One controls instance owns the one issued-reference set for both the
+  // disabled return and the registered tool closure.
+  const controls = createControls(state);
   if (currentTaskOwner() !== undefined) {
     state.enabled = false;
     state.disabledReason = "a managed TaskOwner is already published; this native work entry is disabled.";
-    return createControls(state);
+    return controls;
   }
 
   try {
@@ -4045,12 +4943,12 @@ export function createNativeEntry(pi: NativeOmpApi, options: NativeEntryOptions 
       name: NATIVE_WORK_TOOL,
       label: "Native work observation",
       description:
-        "Inspect or record bounded non-authoritative observations of the current main-session work. inspect shows retained work, observed call facts, and bounded candidate selectors for observed native instance results. report selects only real completed tool call ids from this same work, with model-declared purposes, outcome and limitations, plus optional workspace-relative text output files. An optional instanceResult selector associates all reported output files with exactly one observed result; its parent task call must be in checks and its ids/digest must come from inspect. Selected file hashes are bytes read during the report, not original child delivery, exclusive authorship, commit-time filesystem state, semantic acceptance or verification. It creates no managed task, authority, acceptance or verification, blocks no native tool, and reports this plugin's tool_result observations after any earlier middleware. agent_work calls cannot be selected as checks.",
+        "Inspect or record bounded non-authoritative observations of the current main-session work. inspect shows retained work, observed call facts, and bounded candidate selectors for observed native instance results. report selects only real completed tool call ids from this same work, with model-declared purposes, outcome and limitations, plus optional workspace-relative text output files. An optional instanceResult selector associates all reported output files with exactly one observed result; its parent task call must be in checks and its ids/digest must come from inspect. An optional harnessResult selector is host-composed: copy its exact source and check ids, include every check id in checks, keep outputFiles empty, and never combine it with instanceResult or handoffAdoptionId. Its bounded same-version reread is not task acceptance, semantic verification, an apply operation, or future filesystem freshness. Selected file hashes are bytes read during the report, not original child delivery, exclusive authorship, commit-time filesystem state, semantic acceptance or verification. It creates no managed task, authority, acceptance or verification, blocks no native tool, and reports this plugin's tool_result observations after any earlier middleware. agent_work calls cannot be selected as checks.",
       parameters: AGENT_WORK_PARAMETERS,
       approval: "read",
       loadMode: "essential",
       execute: (toolCallId, params, signal, _onUpdate, context) =>
-        executeTool(state, toolCallId, params, signal, context),
+        executeTool(state, controls, toolCallId, params, signal, context),
     });
     pi.on("input", (event, context) => onInput(state, event as InputEventLike, context));
     pi.on("before_agent_start", (event, context) => onBeforeAgentStart(state, event as BeforeAgentStartLike, context));
@@ -4074,7 +4972,7 @@ export function createNativeEntry(pi: NativeOmpApi, options: NativeEntryOptions 
     disposeState(state, "registration failed");
     throw error;
   }
-  return createControls(state);
+  return controls;
 }
 
 function stderr(message: string, details?: unknown): void {
