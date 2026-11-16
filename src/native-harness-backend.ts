@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -11,6 +12,38 @@ import {
   type WorkerResult,
 } from "../vendor/harness2/index.ts";
 import type { NativeContext } from "./native-entry.ts";
+import {
+  NATIVE_HARNESS_COMPLETION_LIMITATIONS,
+  NATIVE_HARNESS_COMPLETION_LIMITS,
+  NATIVE_HARNESS_COMPLETION_ORIGIN,
+  NATIVE_HARNESS_COMPLETION_SCHEMA,
+  NATIVE_HARNESS_COMPLETION_SOLVER_IDS,
+  NATIVE_HARNESS_COMPLETION_SOURCE_ID,
+  NATIVE_HARNESS_COMPLETION_SOURCE_INTEGRITY,
+  boundedCompletionPath,
+  boundedCompletionReason,
+  boundedCompletionToken,
+  boundedCompletionHash,
+  completionMetadataBytes,
+  copyPreparedInputs,
+  copyWitnessBase,
+  copyWitnessFacts,
+  copyWitnessResult,
+  digestBoundedResultText,
+  isPositiveSafeInteger,
+  readOwnData,
+  sameBoundedProjection,
+  sameWitnessBase,
+  sameWitnessResult,
+  snapshotMatchesWitnessBase,
+  type NativeHarnessBackendCompletion,
+  type NativeHarnessCheckedBaseInput,
+  type NativeHarnessCompletionBase,
+  type NativeHarnessCompletionParent,
+  type NativeHarnessCompletionPreparedInput,
+  type NativeHarnessCompletionSelection,
+  type NativeHarnessCompletionWitness,
+} from "./native-harness-completion.ts";
 import {
   NATIVE_HARNESS_MAX_DURATION_MS,
   NATIVE_HARNESS_MAX_PER_RUN_USD,
@@ -137,10 +170,36 @@ interface RetainedRecord {
 
 interface BackendState {
   controller: HarnessController | null;
+  descriptor: NativeHarnessWorkspaceDescriptor | null;
   runId: string | null;
   taskSha256: string | null;
   status: string | null;
   readonly record: RetainedRecord;
+  readonly completion: BackendCompletionState;
+}
+
+interface WitnessSlot {
+  bytes: number;
+  witness: NativeHarnessCompletionWitness;
+}
+
+interface BackendCompletionState {
+  sequence: number;
+  readonly witnesses: WitnessSlot[];
+  witnessBytes: number;
+  overflow: boolean;
+  overflowReason: string | null;
+  witnessFailure: string | null;
+  provenanceFailure: string | null;
+  issued: NativeHarnessBackendCompletion | null;
+  conflicted: boolean;
+  conflictReason: string | null;
+}
+
+interface MatchedCompletionStage {
+  readonly selection: NativeHarnessCompletionSelection;
+  readonly base: NativeHarnessCompletionBase;
+  readonly parent: NativeHarnessCompletionParent | null;
 }
 
 interface PrepareBudget {
@@ -166,6 +225,30 @@ interface PrepareFacts {
 }
 
 type StrictFields = ReadonlyMap<string, unknown>;
+
+/**
+ * Identity index from one actual frozen backend object to its private state.
+ * This is not a run registry: it holds no extra completion capability and is
+ * set exactly once by makeBackend.
+ */
+const BACKEND_COMPLETION_STATES = new WeakMap<object, BackendState>();
+
+class CompletionUnavailable extends Error {}
+
+function createCompletionState(): BackendCompletionState {
+  return {
+    sequence: 0,
+    witnesses: [],
+    witnessBytes: 0,
+    overflow: false,
+    overflowReason: null,
+    witnessFailure: null,
+    provenanceFailure: null,
+    issued: null,
+    conflicted: false,
+    conflictReason: null,
+  };
+}
 
 const ACTUAL_ABORTED_GETTER = (() => {
   try {
@@ -809,6 +892,7 @@ async function verifySnapshotFiles(
   record: RunRecord,
   expected: GateExpectation,
   hostManifest: readonly NativeHarnessWorkspaceManifestEntry[],
+  checked?: NativeHarnessCheckedBaseInput[],
 ): Promise<void> {
   const snapshot = record.snapshot;
   if (snapshot === undefined) throw new Error("actual Harness2 base snapshot is missing");
@@ -844,6 +928,238 @@ async function verifySnapshotFiles(
     if (declared.hash !== snapshotBytesHash(mode, bytes)) {
       throw new Error("base snapshot input hash does not match its declared manifest entry");
     }
+    checked?.push(Object.freeze({
+      path: hostEntry.relativePath,
+      size: captured.file.bytes,
+      mode,
+      contentSha256: captured.file.sha256,
+      controllerHash: declared.hash,
+    }));
+  }
+}
+
+function blockWitnessOverflow(completion: BackendCompletionState, reason: string): null {
+  if (!completion.overflow) {
+    completion.overflow = true;
+    completion.overflowReason = boundedCompletionReason(reason);
+  }
+  completion.witnessFailure ??= completion.overflowReason;
+  return null;
+}
+
+function storeCompletionWitness(
+  completion: BackendCompletionState,
+  witness: NativeHarnessCompletionWitness,
+): number | null {
+  if (completion.overflow) return null;
+  if (completion.witnesses.length >= NATIVE_HARNESS_COMPLETION_LIMITS.maxWitnesses) {
+    return blockWitnessOverflow(completion, "witness capacity exceeded");
+  }
+  const bytes = completionMetadataBytes(witness);
+  if (bytes === null || bytes > NATIVE_HARNESS_COMPLETION_LIMITS.maxWitnessMetadataBytes) {
+    completion.witnessFailure ??= "witness metadata exceeded its bound";
+    return null;
+  }
+  if (completion.witnessBytes + bytes > NATIVE_HARNESS_COMPLETION_LIMITS.maxWitnessTotalBytes) {
+    return blockWitnessOverflow(completion, "witness metadata budget exceeded");
+  }
+  completion.witnessBytes += bytes;
+  completion.witnesses.push({ bytes, witness });
+  return completion.witnesses.length - 1;
+}
+
+/**
+ * Reserves one actual dispatch observation. Any copy/shape failure is retained
+ * as bounded unavailability; it never refuses the worker call.
+ */
+function reserveCompletionWitness(
+  expected: GateExpectation,
+  request: WorkerRequest,
+  checkedRecord: RunRecord,
+  finalRecord: RunRecord,
+  checkedInputs: readonly NativeHarnessCheckedBaseInput[],
+): number | null {
+  const completion = expected.state.completion;
+  completion.sequence += 1;
+  const sequence = completion.sequence;
+  try {
+    if (completion.overflow) return null;
+    const runId = readOwnData(request, "runId").value;
+    const stage = readOwnData(request, "stage").value;
+    const role = readOwnData(request, "role").value;
+    const cwd = readOwnData(request, "cwd").value;
+    const artifactDir = readOwnData(request, "artifactDir").value;
+    const model = readOwnData(request, "model").value;
+
+    const checkedSnapshot = readOwnData(checkedRecord, "snapshot").value;
+    const base = copyWitnessBase({
+      snapshotId: readOwnData(checkedSnapshot, "id").value,
+      root: readOwnData(checkedSnapshot, "root").value,
+      sourceRoot: readOwnData(checkedSnapshot, "sourceRoot").value,
+      createdAt: readOwnData(checkedSnapshot, "createdAt").value,
+      checked: checkedInputs,
+      inputs: expected.descriptor.inputManifest,
+      manifestSha256: expected.descriptor.manifestSha256,
+    });
+
+    const stages = readOwnData(finalRecord, "stages").value;
+    const finalStage = typeof stage === "string" ? readOwnData(stages, stage).value : undefined;
+    const finalStageStatus = readOwnData(finalStage, "status").value;
+    const finalStageId = readOwnData(finalStage, "id").value;
+    const finalStageCwd = readOwnData(finalStage, "cwd").value;
+    const attempt = readOwnData(finalStage, "attempt").value;
+    const parentValue = readOwnData(finalStage, "parentStage");
+    const parentHashValue = readOwnData(finalStage, "parentArtifactHash");
+    let parent: NativeHarnessCompletionParent | null = null;
+    let parentProblem: string | null = null;
+    if (!parentValue.present && !parentHashValue.present) {
+      parent = null;
+    } else if (
+      parentValue.present
+      && parentHashValue.present
+      && parentValue.readable
+      && parentHashValue.readable
+    ) {
+      const parentCandidate = boundedCompletionToken(parentValue.value, 64);
+      const parentHash = boundedCompletionHash(parentHashValue.value);
+      if (
+        parentCandidate === null
+        || parentHash === null
+        || !(NATIVE_HARNESS_COMPLETION_SOLVER_IDS as readonly string[]).includes(parentCandidate)
+      ) {
+        parentProblem = "final dispatch stage parent reference is invalid";
+      } else {
+        parent = Object.freeze({ candidate: parentCandidate, artifactHash: parentHash });
+      }
+    } else {
+      parentProblem = "final dispatch stage parent reference is incomplete or unreadable";
+    }
+
+    let problem: string | null = null;
+    if (base === null) {
+      problem = "checked base snapshot facts could not be copied";
+    } else if (
+      finalStageStatus !== "running"
+      || finalStageId !== stage
+      || finalStageCwd !== cwd
+      || !isPositiveSafeInteger(attempt)
+    ) {
+      problem = "final dispatch stage facts do not match the actual Runner request";
+    } else if (parentProblem !== null) {
+      problem = parentProblem;
+    } else {
+      const finalSnapshot = readOwnData(finalRecord, "snapshot").value;
+      if (!snapshotMatchesWitnessBase(finalSnapshot, base)) {
+        problem = "final run record snapshot does not exactly match the checked base snapshot";
+      }
+    }
+    if (problem !== null) {
+      completion.provenanceFailure ??= problem;
+      completion.witnessFailure ??= problem;
+    }
+
+    const facts = copyWitnessFacts({
+      sequence,
+      runId,
+      stage,
+      role,
+      cwd,
+      artifactDir,
+      model,
+      attempt,
+      parent,
+      base,
+    });
+    if (facts === null) {
+      completion.witnessFailure ??= "dispatch witness facts could not be copied";
+    }
+    const witness = deepFreeze({
+      sequence,
+      facts,
+      result: null,
+      failure: facts === null ? "dispatch witness facts could not be copied" : problem,
+      eligible: facts !== null && base !== null && problem === null,
+    });
+    return storeCompletionWitness(completion, witness);
+  } catch {
+    completion.witnessFailure ??= "dispatch witness copy failed";
+    return null;
+  }
+}
+
+/** Records the actual Runner return (or thrown invocation) without altering it. */
+function settleCompletionWitness(
+  expected: GateExpectation,
+  index: number | null,
+  returned: WorkerResult | null,
+  didThrow: boolean,
+): void {
+  if (index === null) return;
+  const completion = expected.state.completion;
+  const slot = completion.witnesses[index];
+  if (slot === undefined) return;
+  try {
+    const pending = slot.witness;
+    let settled: NativeHarnessCompletionWitness;
+    if (didThrow) {
+      settled = deepFreeze({
+        sequence: pending.sequence,
+        facts: pending.facts,
+        result: null,
+        failure: "Runner invocation threw",
+        eligible: false,
+      });
+    } else {
+      const copied = copyWitnessResult(returned);
+      if (copied.result === null) {
+        completion.witnessFailure ??= copied.failure ?? "witness result facts are unavailable";
+      }
+      settled = deepFreeze({
+        sequence: pending.sequence,
+        facts: pending.facts,
+        result: copied.result,
+        failure: copied.failure,
+        eligible: pending.eligible && copied.result !== null,
+      });
+    }
+    let bytes = completionMetadataBytes(settled);
+    if (bytes === null || bytes > NATIVE_HARNESS_COMPLETION_LIMITS.maxWitnessMetadataBytes) {
+      completion.witnessFailure ??= "result witness metadata exceeded its bound";
+      settled = deepFreeze({
+        sequence: pending.sequence,
+        facts: pending.facts,
+        result: null,
+        failure: "result witness metadata exceeded its bound",
+        eligible: false,
+      });
+      bytes = completionMetadataBytes(settled);
+    }
+    if (bytes === null || bytes > NATIVE_HARNESS_COMPLETION_LIMITS.maxWitnessMetadataBytes) {
+      completion.witnessFailure ??= "witness metadata exceeded its bound";
+      settled = deepFreeze({
+        sequence: pending.sequence,
+        facts: null,
+        result: null,
+        failure: "witness metadata exceeded its bound",
+        eligible: false,
+      });
+      bytes = completionMetadataBytes(settled);
+    }
+    if (bytes === null) {
+      completion.witnessFailure ??= "witness metadata could not be encoded";
+      return;
+    }
+    if (completion.witnessBytes - slot.bytes + bytes > NATIVE_HARNESS_COMPLETION_LIMITS.maxWitnessTotalBytes) {
+      completion.overflow = true;
+      completion.overflowReason ??= "witness metadata budget exceeded";
+      completion.witnessFailure ??= completion.overflowReason;
+      return;
+    }
+    completion.witnessBytes = completion.witnessBytes - slot.bytes + bytes;
+    slot.bytes = bytes;
+    slot.witness = settled;
+  } catch {
+    completion.witnessFailure ??= "witness settlement failed";
   }
 }
 
@@ -869,15 +1185,411 @@ function createBaseInputGateRunner(
         record = await verifyRunRecord(controller, request.runId, expected);
       }
       const hostManifest = assertManifestPaths(record, expected);
-      await verifySnapshotFiles(record, expected, hostManifest);
+      const checkedInputs: NativeHarnessCheckedBaseInput[] = [];
+      await verifySnapshotFiles(record, expected, hostManifest, checkedInputs);
+      const checkedRecord = record;
       // Re-read current Controller state after every asynchronous base-input
       // observation. A refusal here stops only worker dispatch; the Controller
       // may still settle its own private run record. No provider dispatch or
       // original-source write follows a refused gate.
-      await verifyRunRecord(controller, request.runId, expected);
-      return await underlying.run(request);
+      const finalRecord = await verifyRunRecord(controller, request.runId, expected);
+      // The later reread is not byte-checked. Its snapshot must match the facts
+      // actually checked above before the dispatch witness can support output.
+      // A mismatch makes completion origin unavailable; it never refuses the
+      // existing worker call or changes Controller accounting.
+      const witnessIndex = reserveCompletionWitness(
+        expected,
+        request,
+        checkedRecord,
+        finalRecord,
+        checkedInputs,
+      );
+      let result: WorkerResult;
+      try {
+        result = await underlying.run(request);
+      } catch (error) {
+        settleCompletionWitness(expected, witnessIndex, null, true);
+        throw error;
+      }
+      settleCompletionWitness(expected, witnessIndex, result, false);
+      return result;
     },
   });
+}
+
+interface PreparedCompletionFacts {
+  readonly sourceRoot: string;
+  readonly preparedRoot: string;
+  readonly workspaceRoot: string;
+  readonly storeRoot: string;
+  readonly manifestSha256: string;
+  readonly inputs: readonly NativeHarnessCompletionPreparedInput[];
+}
+
+function copyPreparedCompletionFacts(
+  descriptor: NativeHarnessWorkspaceDescriptor,
+): PreparedCompletionFacts {
+  const sourceRoot = boundedCompletionPath(readOwnData(descriptor, "sourceRoot").value);
+  const preparedRoot = boundedCompletionPath(readOwnData(descriptor, "preparedRoot").value);
+  const workspaceRoot = boundedCompletionPath(readOwnData(descriptor, "workspaceRoot").value);
+  const storeRoot = boundedCompletionPath(readOwnData(descriptor, "storeRoot").value);
+  const manifestSha256 = boundedCompletionHash(readOwnData(descriptor, "manifestSha256").value);
+  const inputs = copyPreparedInputs(readOwnData(descriptor, "inputManifest").value);
+  if (
+    sourceRoot === null
+    || preparedRoot === null
+    || workspaceRoot === null
+    || storeRoot === null
+    || manifestSha256 === null
+    || inputs === null
+  ) {
+    throw new CompletionUnavailable("prepared descriptor facts could not be copied");
+  }
+  return deepFreeze({ sourceRoot, preparedRoot, workspaceRoot, storeRoot, manifestSha256, inputs });
+}
+
+function witnessBaseMatchesPrepared(
+  base: NativeHarnessCompletionBase,
+  prepared: PreparedCompletionFacts,
+): boolean {
+  if (base.sourceRoot !== prepared.workspaceRoot || base.manifestSha256 !== prepared.manifestSha256) {
+    return false;
+  }
+  if (base.inputs.length !== prepared.inputs.length) return false;
+  for (let index = 0; index < base.inputs.length; index += 1) {
+    const checked = base.inputs[index]!;
+    const declared = prepared.inputs[index]!;
+    if (
+      checked.path !== declared.relativePath
+      || checked.size !== declared.bytes
+      || checked.contentSha256 !== declared.sha256
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function readStageParent(stageValue: unknown): NativeHarnessCompletionParent | null {
+  const candidate = readOwnData(stageValue, "parentStage");
+  const artifactHash = readOwnData(stageValue, "parentArtifactHash");
+  if (!candidate.present && !artifactHash.present) return null;
+  if (!candidate.present || !artifactHash.present || !candidate.readable || !artifactHash.readable) {
+    throw new CompletionUnavailable("dispatch stage parent reference is incomplete or unreadable");
+  }
+  const candidateText = boundedCompletionToken(candidate.value, 64);
+  const hashText = boundedCompletionHash(artifactHash.value);
+  if (
+    candidateText === null
+    || hashText === null
+    || !(NATIVE_HARNESS_COMPLETION_SOLVER_IDS as readonly string[]).includes(candidateText)
+  ) {
+    throw new CompletionUnavailable("dispatch stage parent reference is invalid");
+  }
+  return Object.freeze({ candidate: candidateText, artifactHash: hashText });
+}
+
+function sameCompletionParent(
+  left: NativeHarnessCompletionParent | null,
+  right: NativeHarnessCompletionParent | null,
+): boolean {
+  if (left === null || right === null) return left === right;
+  return left.candidate === right.candidate && left.artifactHash === right.artifactHash;
+}
+
+function matchCompletionStage(
+  completion: BackendCompletionState,
+  runId: string,
+  candidate: string,
+  stageValue: unknown,
+  prepared: PreparedCompletionFacts,
+  expectedBase: NativeHarnessCompletionBase | null,
+): MatchedCompletionStage {
+  if (readOwnData(stageValue, "status").value !== "completed") {
+    throw new CompletionUnavailable(`${candidate} stage is not completed`);
+  }
+  if (readOwnData(stageValue, "id").value !== candidate) {
+    throw new CompletionUnavailable(`${candidate} stage identity does not match`);
+  }
+  const attempt = readOwnData(stageValue, "attempt").value;
+  if (!isPositiveSafeInteger(attempt)) {
+    throw new CompletionUnavailable(`${candidate} stage attempt is unavailable`);
+  }
+  const cwd = boundedCompletionPath(readOwnData(stageValue, "cwd").value);
+  if (cwd === null) throw new CompletionUnavailable(`${candidate} stage cwd is unavailable`);
+  const artifactHash = boundedCompletionHash(readOwnData(stageValue, "artifactHash").value);
+  if (artifactHash === null) throw new CompletionUnavailable(`${candidate} artifact hash is unavailable`);
+  const traceHash = boundedCompletionHash(readOwnData(stageValue, "traceHash").value);
+  if (traceHash === null) throw new CompletionUnavailable(`${candidate} trace hash is unavailable`);
+  const stageParent = readStageParent(stageValue);
+
+  const copied = copyWitnessResult(readOwnData(stageValue, "result").value);
+  if (copied.result === null) {
+    throw new CompletionUnavailable(`${candidate} result facts are unavailable`);
+  }
+  const result = copied.result;
+  if (result.status !== "completed") {
+    throw new CompletionUnavailable(`${candidate} result is not completed`);
+  }
+
+  const matches: Array<{ readonly witness: NativeHarnessCompletionWitness }> = [];
+  for (const slot of completion.witnesses) {
+    const witness = slot.witness;
+    if (!witness.eligible || witness.facts === null || witness.result === null) continue;
+    const facts = witness.facts;
+    if (
+      facts.runId !== runId
+      || facts.stage !== candidate
+      || facts.role !== "solver"
+      || facts.attempt !== attempt
+      || facts.cwd !== cwd
+    ) {
+      continue;
+    }
+    if (!sameCompletionParent(facts.parent, stageParent)) continue;
+    if (facts.base === null || !witnessBaseMatchesPrepared(facts.base, prepared)) continue;
+    if (expectedBase !== null && !sameWitnessBase(facts.base, expectedBase)) continue;
+    if (result.eventsPath !== path.join(facts.artifactDir, "worker-events.jsonl")) continue;
+    if (witness.result.eventsPath !== result.eventsPath) continue;
+    if (!sameWitnessResult(witness.result, result)) continue;
+    matches.push({ witness });
+  }
+  if (matches.length !== 1) {
+    throw new CompletionUnavailable(
+      matches.length === 0
+        ? `${candidate} has no matching completed dispatch witness`
+        : `${candidate} has ambiguous matching dispatch witnesses`,
+    );
+  }
+  const matched = matches[0]!.witness;
+  const facts = matched.facts!;
+  const returned = matched.result!;
+  const base = facts.base!;
+  return {
+    selection: Object.freeze({
+      candidate,
+      attempt,
+      cwd,
+      artifactHash,
+      traceHash,
+      witnessSequence: matched.sequence,
+      artifactDir: facts.artifactDir,
+      eventsPath: returned.eventsPath,
+      resultStatus: "completed" as const,
+      startedAt: returned.startedAt,
+      endedAt: returned.endedAt,
+      textBytes: returned.textBytes,
+      textSha256: returned.textSha256,
+    }),
+    base,
+    parent: stageParent,
+  };
+}
+
+function failCompletion(completion: BackendCompletionState, reason: unknown): void {
+  completion.conflicted = true;
+  completion.conflictReason ??= boundedCompletionReason(reason);
+}
+
+/** Builds one immutable projection from the actual completed execution. */
+function buildNativeHarnessCompletion(
+  state: BackendState,
+  record: RunRecord,
+  host: NativeHarnessBackendHostConfig,
+  completionId: string,
+): NativeHarnessBackendCompletion {
+  const completion = state.completion;
+  if (completion.provenanceFailure !== null) {
+    throw new CompletionUnavailable(completion.provenanceFailure);
+  }
+  if (completion.overflow) {
+    throw new CompletionUnavailable(completion.overflowReason ?? "witness metadata budget exceeded");
+  }
+  if (completion.witnessFailure !== null) {
+    throw new CompletionUnavailable(completion.witnessFailure);
+  }
+  if (state.runId === null || state.taskSha256 === null || state.descriptor === null) {
+    throw new CompletionUnavailable("backend completion state is not the actual created run");
+  }
+  const runId = state.runId;
+  const prepared = copyPreparedCompletionFacts(state.descriptor);
+  if (readOwnData(record, "status").value !== "completed") {
+    throw new CompletionUnavailable("run record status is not completed");
+  }
+  if (readOwnData(record, "id").value !== runId) {
+    throw new CompletionUnavailable("run record id is not the backend-created run");
+  }
+  if (readOwnData(record, "workspace").value !== prepared.workspaceRoot) {
+    throw new CompletionUnavailable("run record workspace is not the prepared private workspace");
+  }
+  const task = readOwnData(record, "task").value;
+  if (typeof task !== "string" || sha256Hex(task) !== state.taskSha256) {
+    throw new CompletionUnavailable("run record task is not the actual created task");
+  }
+  const config = readOwnData(record, "config").value;
+  if (
+    readOwnData(config, "strategy").value !== "auto"
+    || readOwnData(config, "mode").value !== "product"
+    || readOwnData(config, "domain").value !== NATIVE_HARNESS_BACKEND_DOMAIN
+  ) {
+    throw new CompletionUnavailable("run configuration is not the fixed auto/product/generic profile");
+  }
+  if (
+    readOwnData(config, "model").value !== host.model
+    || readOwnData(config, "improverModel").value !== host.model
+  ) {
+    throw new CompletionUnavailable("run model is not the fixed host model");
+  }
+  if (readOwnData(config, "ompCommand").value !== host.ompCommand) {
+    throw new CompletionUnavailable("run ompCommand is not the fixed host executable");
+  }
+  if (!sameAuth(host.auth, readOwnData(config, "auth").value)) {
+    throw new CompletionUnavailable("run authentication source is not the fixed host authentication source");
+  }
+  if (readOwnData(config, "execution").present) {
+    throw new CompletionUnavailable("run configuration contains a native execution override");
+  }
+  const adaptation = readOwnData(config, "adaptation").value;
+  if (
+    readOwnData(adaptation, "capabilities").value !== EXPECTED_ADAPTATION.capabilities
+    || readOwnData(adaptation, "reuse").value !== EXPECTED_ADAPTATION.reuse
+    || readOwnData(adaptation, "learnMethods").value !== EXPECTED_ADAPTATION.learnMethods
+  ) {
+    throw new CompletionUnavailable("run adaptation policy is not the fixed host policy");
+  }
+
+  const snapshot = readOwnData(record, "snapshot").value;
+  if (snapshot === null || typeof snapshot !== "object") {
+    throw new CompletionUnavailable("actual Harness2 base snapshot is missing");
+  }
+  const stages = readOwnData(record, "stages").value;
+  if (stages === null || typeof stages !== "object") {
+    throw new CompletionUnavailable("actual Harness2 stages are unavailable");
+  }
+  const winner = readOwnData(record, "winner").value;
+  if (
+    typeof winner !== "string"
+    || !(NATIVE_HARNESS_COMPLETION_SOLVER_IDS as readonly string[]).includes(winner)
+  ) {
+    throw new CompletionUnavailable("selected candidate is not a fixed solver stage");
+  }
+  const winnerStage = readOwnData(stages, winner).value;
+  const winnerMatch = matchCompletionStage(completion, runId, winner, winnerStage, prepared, null);
+  if (!snapshotMatchesWitnessBase(snapshot, winnerMatch.base)) {
+    throw new CompletionUnavailable("run record snapshot does not exactly match the checked base snapshot");
+  }
+  const runRoot = path.join(prepared.storeRoot, "runs", runId);
+  if (
+    winnerMatch.base.root !== path.resolve(winnerMatch.base.root)
+    || !isContained(runRoot, winnerMatch.base.root)
+  ) {
+    throw new CompletionUnavailable("base snapshot root is not confined to the private run store");
+  }
+
+  if (winner === "refine") {
+    if (winnerMatch.parent === null) {
+      throw new CompletionUnavailable("refine has no matching dispatch parent");
+    }
+  } else if (winnerMatch.parent !== null) {
+    throw new CompletionUnavailable("non-refine candidate has an unexpected dispatch parent");
+  }
+
+  const ancestry: NativeHarnessCompletionSelection[] = [];
+  const visited = new Set<string>([winner]);
+  let currentParent = winnerMatch.parent;
+  while (currentParent !== null) {
+    const parentId = currentParent.candidate;
+    if (visited.has(parentId)) throw new CompletionUnavailable("refinement ancestry contains a cycle");
+    if (ancestry.length >= NATIVE_HARNESS_COMPLETION_LIMITS.maxAncestryStages) {
+      throw new CompletionUnavailable("refinement ancestry exceeds its bound");
+    }
+    visited.add(parentId);
+    const parentStage = readOwnData(stages, parentId).value;
+    const parentMatch = matchCompletionStage(
+      completion,
+      runId,
+      parentId,
+      parentStage,
+      prepared,
+      winnerMatch.base,
+    );
+    if (parentMatch.selection.artifactHash !== currentParent.artifactHash) {
+      throw new CompletionUnavailable("refinement parent artifact hash does not match the child reference");
+    }
+    ancestry.push(parentMatch.selection);
+    currentParent = parentMatch.parent;
+  }
+
+  const issued: NativeHarnessBackendCompletion = deepFreeze({
+    schema: NATIVE_HARNESS_COMPLETION_SCHEMA,
+    origin: NATIVE_HARNESS_COMPLETION_ORIGIN,
+    completionId,
+    sourceId: NATIVE_HARNESS_COMPLETION_SOURCE_ID,
+    sourceIntegrity: NATIVE_HARNESS_COMPLETION_SOURCE_INTEGRITY,
+    taskAccepted: false as const,
+    semanticAcceptance: "not-evaluated" as const,
+    runId,
+    taskSha256: state.taskSha256,
+    model: host.model,
+    profile: { strategy: "auto" as const, mode: "product" as const, domain: "generic" as const },
+    prepared,
+    base: {
+      snapshotId: winnerMatch.base.snapshotId,
+      root: winnerMatch.base.root,
+      sourceRoot: winnerMatch.base.sourceRoot,
+      createdAt: winnerMatch.base.createdAt,
+      manifestSha256: winnerMatch.base.manifestSha256,
+      entries: winnerMatch.base.entries,
+    },
+    winner: winnerMatch.selection,
+    ancestry,
+    limitations: NATIVE_HARNESS_COMPLETION_LIMITATIONS,
+  });
+  const bytes = completionMetadataBytes(issued);
+  if (bytes === null || bytes > NATIVE_HARNESS_COMPLETION_LIMITS.maxCompletionMetadataBytes) {
+    throw new CompletionUnavailable("completion metadata exceeded its bound");
+  }
+  return issued;
+}
+
+/**
+ * Observes one fulfilled execute. The first completed observation may issue;
+ * every later fulfilled observation is compared with the sealed facts and a
+ * difference makes completion availability sticky-unavailable.
+ */
+function observeNativeHarnessCompletion(
+  state: BackendState,
+  record: RunRecord,
+  host: NativeHarnessBackendHostConfig,
+): void {
+  const completion = state.completion;
+  if (completion.conflicted) return;
+  if (completion.issued !== null) {
+    try {
+      if (readOwnData(record, "status").value !== "completed") {
+        throw new CompletionUnavailable("repeated execute status is not the sealed completed status");
+      }
+      const observed = buildNativeHarnessCompletion(state, record, host, completion.issued.completionId);
+      if (!sameBoundedProjection(observed, completion.issued)) {
+        throw new CompletionUnavailable("repeated completion observation does not match the issued facts");
+      }
+    } catch (error) {
+      failCompletion(
+        completion,
+        error instanceof CompletionUnavailable ? error.message : "completion projection failed",
+      );
+    }
+    return;
+  }
+  if (readOwnData(record, "status").value !== "completed") return;
+  try {
+    completion.issued = buildNativeHarnessCompletion(state, record, host, randomUUID());
+  } catch (error) {
+    failCompletion(
+      completion,
+      error instanceof CompletionUnavailable ? error.message : "completion projection failed",
+    );
+  }
 }
 
 function makeBackend(
@@ -938,6 +1650,10 @@ function makeBackend(
       state.status = record.status;
       state.record.backendStatus = record.status;
       state.record.retainedForInspection = true;
+      // Observe this fulfilled execute before returning the existing status.
+      // A projection failure never changes the result or hides the
+      // Controller's settled accounting.
+      observeNativeHarnessCompletion(state, record, host);
       return { status: record.status };
     },
     async cancel(runId: string): Promise<unknown> {
@@ -962,7 +1678,9 @@ function makeBackend(
       return diagnosticOf(state.record);
     },
   };
-  return Object.freeze(backend);
+  const frozen = Object.freeze(backend);
+  BACKEND_COMPLETION_STATES.set(frozen, state);
+  return frozen;
 }
 
 export function createNativeHarnessBackend(
@@ -1060,10 +1778,12 @@ export function createNativeHarnessBackend(
     retain(records, record);
     const state: BackendState = {
       controller: null,
+      descriptor,
       runId: null,
       taskSha256: null,
       status: null,
       record,
+      completion: createCompletionState(),
     };
     const expected: GateExpectation = {
       state,
@@ -1107,4 +1827,49 @@ export function createNativeHarnessBackend(
       return deepFreeze(records.map(diagnosticOf));
     },
   });
+}
+
+/**
+ * Returns only the completion already issued by this exact actual backend.
+ * Synchronous; no filesystem, host callback, model call or reflection on the
+ * supplied value. A foreign object, clone or proxy is not an association key.
+ */
+export function readNativeHarnessBackendCompletion(
+  backend: unknown,
+): { readonly ok: true; readonly completion: NativeHarnessBackendCompletion }
+  | { readonly ok: false; readonly reason: string } {
+  const state = typeof backend === "object" && backend !== null
+    ? BACKEND_COMPLETION_STATES.get(backend)
+    : undefined;
+  if (state === undefined) {
+    return { ok: false, reason: "unknown native harness backend object" };
+  }
+  const completion = state.completion;
+  if (completion.conflicted) {
+    return {
+      ok: false,
+      reason: completion.conflictReason ?? "native completion is unavailable",
+    };
+  }
+  if (completion.issued !== null) {
+    return { ok: true, completion: completion.issued };
+  }
+  return { ok: false, reason: "no native completion has been issued" };
+}
+
+/**
+ * True only for the same exact backend object and the same exact completion
+ * object, while the completion state has not observed a mismatch.
+ */
+export function matchesNativeHarnessBackendCompletion(
+  backend: unknown,
+  completion: unknown,
+): boolean {
+  const state = typeof backend === "object" && backend !== null
+    ? BACKEND_COMPLETION_STATES.get(backend)
+    : undefined;
+  if (state === undefined) return false;
+  if (state.completion.conflicted) return false;
+  const issued = state.completion.issued;
+  return issued !== null && issued === completion;
 }

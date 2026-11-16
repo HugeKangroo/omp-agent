@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { afterEach, describe, expect, test } from "bun:test";
 import {
   lstat,
@@ -14,10 +15,13 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   createNativeHarnessBackend,
+  matchesNativeHarnessBackendCompletion,
   NATIVE_HARNESS_BACKEND_MAX_RETAINED,
+  readNativeHarnessBackendCompletion,
   type NativeHarnessBackendHostConfig,
   type NativeHarnessBackendTestOptions,
 } from "../../src/native-harness-backend.ts";
+import type { NativeHarnessBackendCompletion } from "../../src/native-harness-completion.ts";
 import {
   NATIVE_HARNESS_MAX_DURATION_MS,
   NATIVE_HARNESS_MAX_TASK_BYTES,
@@ -46,6 +50,28 @@ const SELECT_RESPONSE = JSON.stringify({
   winner: "A",
   reason: "Bounded test selection.",
   limitations: ["Bounded test execution is not semantic acceptance."],
+});
+
+const EXPLORE_PLAN_RESPONSE = JSON.stringify({
+  decision: "explore",
+  reason: "Bounded test exploration.",
+  criteria: [{ id: "task", description: "Fulfill the requested bounded task.", kind: "requirement" }],
+  routes: [
+    {
+      id: "route_1",
+      name: "Route one",
+      approach: "Bounded first approach.",
+      assumptions: [],
+      tradeoffs: [],
+    },
+    {
+      id: "route_2",
+      name: "Route two",
+      approach: "Bounded second approach.",
+      assumptions: [],
+      tradeoffs: [],
+    },
+  ],
 });
 
 const roots: string[] = [];
@@ -146,12 +172,22 @@ function settle<T>(promise: Promise<T>, ms = 5000): Promise<T> {
 interface DeterministicRunner {
   readonly runner: Runner;
   readonly requests: WorkerRequest[];
+  readonly results: WorkerResult[];
   readonly baselineStarted: Promise<WorkerRequest>;
 }
 
-function deterministicRunner(options: { blockBaseline?: boolean } = {}): DeterministicRunner {
+function deterministicRunner(options: {
+  blockBaseline?: boolean;
+  eventsFile?: string;
+  failBaselineOnce?: boolean;
+  hugeBaselineText?: boolean;
+  hugeSelectText?: boolean;
+} = {}): DeterministicRunner {
   const requests: WorkerRequest[] = [];
+  const results: WorkerResult[] = [];
   const started = deferred<WorkerRequest>();
+  const eventsFile = options.eventsFile ?? "worker-events.jsonl";
+  let pendingBaselineFailures = options.failBaselineOnce === true ? 1 : 0;
   const runner: Runner = {
     async run(request: WorkerRequest): Promise<WorkerResult> {
       requests.push(request);
@@ -165,9 +201,9 @@ function deterministicRunner(options: { blockBaseline?: boolean } = {}): Determi
           request.signal?.addEventListener("abort", () => resolve(), { once: true });
         });
         await mkdir(request.artifactDir, { recursive: true, mode: 0o700 });
-        const eventsPath = path.join(request.artifactDir, "worker-events.jsonl");
+        const eventsPath = path.join(request.artifactDir, eventsFile);
         await writeFile(eventsPath, `${JSON.stringify({ type: "fixture", stage: request.stage })}\n`, { mode: 0o600 });
-        return {
+        const result: WorkerResult = {
           text: "",
           usage: { inputTokens: 0, outputTokens: 0, costUsd: 0 },
           startedAt: new Date().toISOString(),
@@ -175,30 +211,113 @@ function deterministicRunner(options: { blockBaseline?: boolean } = {}): Determi
           eventsPath,
           status: "cancelled",
         };
+        results.push(result);
+        return result;
       }
       await mkdir(request.artifactDir, { recursive: true, mode: 0o700 });
-      const eventsPath = path.join(request.artifactDir, "worker-events.jsonl");
+      const eventsPath = path.join(request.artifactDir, eventsFile);
       await writeFile(eventsPath, `${JSON.stringify({ type: "fixture", stage: request.stage })}\n`, { mode: 0o600 });
       let text = "stage completed";
       if (request.stage === "plan") {
         text = PLAN_RESPONSE;
       } else if (request.stage === "select") {
-        text = SELECT_RESPONSE;
+        text = options.hugeSelectText === true ? "x".repeat(1024 * 1024 + 1) : SELECT_RESPONSE;
       } else if (request.stage === "baseline") {
         await writeFile(path.join(request.cwd, "candidate.txt"), "candidate\n", { mode: 0o600 });
         text = "baseline completed";
       }
-      return {
+      let status: WorkerResult["status"] = "completed";
+      let error: string | undefined;
+      if (request.stage === "baseline" && pendingBaselineFailures > 0) {
+        pendingBaselineFailures -= 1;
+        status = "failed";
+        error = "fixture baseline failure";
+        text = "baseline failed";
+      }
+      if (request.stage === "baseline" && options.hugeBaselineText === true) {
+        text = "x".repeat(1024 * 1024 + 1);
+      }
+      const result: WorkerResult = {
         text,
         usage: { inputTokens: 1, outputTokens: 1, costUsd: 0.01 },
         startedAt: new Date().toISOString(),
         endedAt: new Date().toISOString(),
         eventsPath,
-        status: "completed",
+        status,
+        ...(error === undefined ? {} : { error }),
       };
+      results.push(result);
+      return result;
     },
   };
-  return { runner, requests, baselineStarted: started.promise };
+  return { runner, requests, results, baselineStarted: started.promise };
+}
+
+function explorationEvaluation(stage: "review" | "select", runId: string): string {
+  const candidates = stage === "review"
+    ? ["baseline", "route_1", "route_2"]
+    : ["baseline", "route_1", "route_2", "refine"];
+  const ordered = [...candidates].sort((left, right) => {
+    const leftHash = createHash("sha256").update(`${runId}:${left}`).digest("hex");
+    const rightHash = createHash("sha256").update(`${runId}:${right}`).digest("hex");
+    return leftHash.localeCompare(rightHash);
+  });
+  const label = (candidate: string): string => {
+    const index = ordered.indexOf(candidate);
+    if (index < 0) throw new Error("fixture candidate is not evaluated");
+    return String.fromCharCode(65 + index);
+  };
+  const winner = stage === "review" ? "route_2" : "refine";
+  return JSON.stringify({
+    assessments: ordered.map((candidate) => ({
+      candidate: label(candidate),
+      criteria: [{ criterionId: "task", verdict: "unknown", evidence: "Bounded fixture evidence." }],
+      strengths: [],
+      weaknesses: [],
+    })),
+    winner: label(winner),
+    reason: "Bounded fixture selection.",
+    limitations: ["Bounded fixture execution is not semantic acceptance."],
+    ...(stage === "review"
+      ? { refinement: { candidate: label("route_2"), instructions: "Refine the bounded route." } }
+      : {}),
+  });
+}
+
+function exploreRunner(): DeterministicRunner {
+  const requests: WorkerRequest[] = [];
+  const results: WorkerResult[] = [];
+  const started = deferred<WorkerRequest>();
+  const runner: Runner = {
+    async run(request: WorkerRequest): Promise<WorkerResult> {
+      requests.push(request);
+      await mkdir(request.artifactDir, { recursive: true, mode: 0o700 });
+      const eventsPath = path.join(request.artifactDir, "worker-events.jsonl");
+      await writeFile(eventsPath, `${JSON.stringify({ type: "fixture", stage: request.stage })}\n`, { mode: 0o600 });
+      let text = "stage completed";
+      if (request.stage === "plan") {
+        text = EXPLORE_PLAN_RESPONSE;
+      } else if (request.stage === "review" || request.stage === "select") {
+        text = explorationEvaluation(request.stage, request.runId);
+      } else if (request.stage === "reflect") {
+        text = "bounded non-lesson response";
+      } else {
+        await writeFile(path.join(request.cwd, `${request.stage}.txt`), `${request.stage}\n`, { mode: 0o600 });
+        text = `${request.stage} completed`;
+      }
+      const result: WorkerResult = {
+        text,
+        usage: { inputTokens: 1, outputTokens: 1, costUsd: 0.001 },
+        startedAt: new Date().toISOString(),
+        endedAt: new Date().toISOString(),
+        eventsPath,
+        status: "completed",
+      };
+      results.push(result);
+      return result;
+    },
+  };
+  return { runner, requests, results, baselineStarted: started.promise };
 }
 
 async function prepareBackend(
@@ -640,5 +759,423 @@ describe("G5-2B actual Harness2 backend adapter", () => {
     expect(diagnostics.every((entry) => entry.reason?.includes("expired during preparation") === true)).toBe(true);
     expect(new Set(diagnostics.map((entry) => entry.preparedRoot)).size).toBe(NATIVE_HARNESS_BACKEND_MAX_RETAINED);
     expect(det.requests).toHaveLength(0);
+  });
+});
+
+function requireCompletion(backend: NativeHarnessBackend): NativeHarnessBackendCompletion {
+  const observed = readNativeHarnessBackendCompletion(backend);
+  if (!observed.ok) throw new Error(`completion unavailable: ${observed.reason}`);
+  return observed.completion;
+}
+
+describe("G5-3A1 host-only actual backend completion", () => {
+  test("actual completed solver dispatch issues one bounded host-only completion", async () => {
+    const f = await fixture();
+    const agentDir = path.join(f.root, "agent-profile");
+    const host: NativeHarnessBackendHostConfig = {
+      ...f.host,
+      auth: { kind: "omp-profile", agentDir },
+    };
+    const det = deterministicRunner();
+    const factory = createNativeHarnessBackend(host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, prepareRequest(f, factory.runner));
+    const runId = await requiredRunId(backend, "completion task");
+    expect(readNativeHarnessBackendCompletion(backend).ok).toBe(false);
+
+    const executed = await backend.execute(runId) as { readonly status?: unknown };
+    expect(executed.status).toBe("completed");
+    const completion = requireCompletion(backend);
+    const diagnostic = factory.inspect().at(-1)!;
+    const record = await readRecord(diagnostic.storeRoot!, runId);
+    const baseline = record.stages.baseline;
+    const baselineRequest = det.requests.find((request) => request.stage === "baseline")!;
+
+    expect(completion.schema).toBe("omp-agent.native-harness-backend-completion.v1");
+    expect(completion.origin).toBe("harness2-native");
+    expect(completion.taskAccepted).toBe(false);
+    expect(completion.semanticAcceptance).toBe("not-evaluated");
+    expect(completion.runId).toBe(runId);
+    expect(completion.taskSha256).toBe(createHash("sha256").update("completion task").digest("hex"));
+    expect(completion.model).toBe(host.model);
+    expect(completion.profile).toEqual({ strategy: "auto", mode: "product", domain: "generic" });
+    expect(completion.sourceId).toMatch(/^[a-f0-9]{64}$/);
+
+    expect(completion.prepared.sourceRoot).toBe(f.sourceRoot);
+    expect(completion.prepared.preparedRoot).toBe(diagnostic.preparedRoot!);
+    expect(completion.prepared.workspaceRoot).toBe(diagnostic.workspaceRoot!);
+    expect(completion.prepared.storeRoot).toBe(diagnostic.storeRoot!);
+    expect(completion.prepared.manifestSha256).toBe(diagnostic.inputManifestSha256!);
+    expect(completion.prepared.inputs).toEqual([
+      {
+        relativePath: "a.txt",
+        bytes: 6,
+        sha256: createHash("sha256").update("alpha\n").digest("hex"),
+      },
+      {
+        relativePath: "b.txt",
+        bytes: 5,
+        sha256: createHash("sha256").update("beta\n").digest("hex"),
+      },
+    ]);
+
+    expect(completion.base.snapshotId).toBe(record.snapshot.id);
+    expect(completion.base.root).toBe(record.snapshot.root);
+    expect(completion.base.sourceRoot).toBe(record.snapshot.sourceRoot);
+    expect(completion.base.createdAt).toBe(record.snapshot.createdAt);
+    expect(completion.base.manifestSha256).toBe(diagnostic.inputManifestSha256!);
+    const expectedEntries = [...record.snapshot.files]
+      .map((entry: Record<string, any>) => ({
+        path: entry.path,
+        size: entry.size,
+        mode: entry.mode,
+        hash: entry.hash,
+      }))
+      .sort((left, right) => left.path.localeCompare(right.path));
+    expect(completion.base.entries).toEqual(expectedEntries);
+
+    expect(completion.winner.candidate).toBe("baseline");
+    expect(completion.winner.attempt).toBe(baseline.attempt);
+    expect(completion.winner.cwd).toBe(baseline.cwd);
+    expect(completion.winner.cwd).toBe(baselineRequest.cwd);
+    expect(completion.winner.artifactDir).toBe(baselineRequest.artifactDir);
+    expect(completion.winner.eventsPath).toBe(path.join(baselineRequest.artifactDir, "worker-events.jsonl"));
+    expect(completion.winner.artifactHash).toBe(baseline.artifactHash);
+    expect(completion.winner.traceHash).toBe(baseline.traceHash);
+    expect(completion.winner.resultStatus).toBe("completed");
+    expect(completion.winner.startedAt).toBe(baseline.result.startedAt);
+    expect(completion.winner.endedAt).toBe(baseline.result.endedAt);
+    expect(completion.winner.textBytes).toBe(Buffer.byteLength("baseline completed", "utf8"));
+    expect(completion.winner.textSha256)
+      .toBe(createHash("sha256").update("baseline completed").digest("hex"));
+    expect(completion.ancestry).toEqual([]);
+    expect(completion.limitations.length).toBeGreaterThan(0);
+
+    expect(matchesNativeHarnessBackendCompletion(backend, completion)).toBe(true);
+    const again = readNativeHarnessBackendCompletion(backend);
+    expect(again.ok).toBe(true);
+    if (again.ok) expect(again.completion).toBe(completion);
+    expect(matchesNativeHarnessBackendCompletion(backend, { ...completion })).toBe(false);
+    expect(matchesNativeHarnessBackendCompletion(backend, JSON.parse(JSON.stringify(completion)))).toBe(false);
+    expect(matchesNativeHarnessBackendCompletion({ ...backend }, completion)).toBe(false);
+
+    expect(Object.isFrozen(completion)).toBe(true);
+    expect(Object.isFrozen(completion.winner)).toBe(true);
+    expect(Object.isFrozen(completion.prepared.inputs)).toBe(true);
+    const serialized = JSON.stringify(completion);
+    expect(serialized).not.toContain("completion task");
+    expect(serialized).not.toContain("baseline completed");
+    expect(serialized).not.toContain("agentDir");
+    expect(serialized).not.toContain("agent-profile");
+    expect(serialized).not.toContain("\"prompt\"");
+    expect(serialized).not.toContain("\"auth\"");
+  });
+
+  test("a completed disk short circuit without a real witness cannot issue authority", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, prepareRequest(f, factory.runner));
+    const runId = await requiredRunId(backend);
+    const diagnostic = factory.inspect().at(-1)!;
+    const recordPath = path.join(diagnostic.storeRoot!, "runs", runId, "run.json");
+    const record = JSON.parse(await readFile(recordPath, "utf8")) as Record<string, any>;
+    record.status = "completed";
+    await writeFile(recordPath, JSON.stringify(record), { mode: 0o600 });
+
+    const executed = await backend.execute(runId) as { readonly status?: unknown };
+    expect(executed.status).toBe("completed");
+    expect(det.requests).toHaveLength(0);
+    const observed = readNativeHarnessBackendCompletion(backend);
+    expect(observed.ok).toBe(false);
+    expect(matchesNativeHarnessBackendCompletion(backend, {
+      runId,
+      winner: { candidate: "baseline" },
+    })).toBe(false);
+  });
+
+  test("wrong actual dispatch stage, role or cwd makes output origin unavailable", async () => {
+    const mutations: ReadonlyArray<{
+      readonly name: string;
+      readonly mutate: (request: WorkerRequest) => void;
+    }> = [
+      {
+        name: "stage",
+        mutate(request) {
+          request.stage = "final";
+        },
+      },
+      {
+        name: "role",
+        mutate(request) {
+          request.role = "selector";
+        },
+      },
+      {
+        name: "cwd",
+        mutate(request) {
+          request.cwd = path.dirname(request.artifactDir);
+        },
+      },
+    ];
+
+    for (const item of mutations) {
+      const f = await fixture();
+      const det = deterministicRunner();
+      let mutate: ((request: WorkerRequest) => void) | null = null;
+      const factory = createNativeHarnessBackend(f.host, {
+        deterministicRunner: det.runner,
+        mutateWorkerRequest(request) {
+          mutate?.(request);
+        },
+      });
+      const { backend } = await prepareBackend(factory, f, prepareRequest(f, factory.runner));
+      const runId = await requiredRunId(backend);
+      mutate = item.mutate;
+      const executed = await backend.execute(runId) as { readonly status?: unknown };
+      expect(executed.status, item.name).toBe("completed");
+      expect(readNativeHarnessBackendCompletion(backend).ok, item.name).toBe(false);
+    }
+  });
+
+  test("post-dispatch request, result and disk mutation never changes sealed facts", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, prepareRequest(f, factory.runner));
+    const runId = await requiredRunId(backend);
+    await backend.execute(runId);
+    const completion = requireCompletion(backend);
+    const before = JSON.stringify(completion);
+    const index = det.requests.findIndex((request) => request.stage === "baseline");
+    const baselineRequest = det.requests[index]!;
+    const baselineResult = det.results[index]!;
+    baselineRequest.cwd = f.sourceRoot;
+    baselineRequest.artifactDir = path.join(f.sourceRoot, "outside-artifacts");
+    baselineResult.text = "mutated result";
+    baselineResult.eventsPath = path.join(f.sourceRoot, "outside-events.jsonl");
+    const diagnostic = factory.inspect().at(-1)!;
+    const recordPath = path.join(diagnostic.storeRoot!, "runs", runId, "run.json");
+    const record = JSON.parse(await readFile(recordPath, "utf8")) as Record<string, any>;
+    record.stages.baseline.result.text = "disk mutation";
+    record.snapshot.id = "forged-snapshot";
+    record.task = "mutated task";
+    await writeFile(recordPath, JSON.stringify(record), { mode: 0o600 });
+
+    expect(JSON.stringify(requireCompletion(backend))).toBe(before);
+    expect(matchesNativeHarnessBackendCompletion(backend, completion)).toBe(true);
+    const status = await backend.get!(runId) as { readonly status?: unknown };
+    expect(status.status).toBe("completed");
+    expect(JSON.stringify(requireCompletion(backend))).toBe(before);
+  });
+
+  test("identical repeated execute keeps the object; an observed mismatch is sticky", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, prepareRequest(f, factory.runner));
+    const runId = await requiredRunId(backend);
+    await backend.execute(runId);
+    const completion = requireCompletion(backend);
+    const diagnostic = factory.inspect().at(-1)!;
+    const recordPath = path.join(diagnostic.storeRoot!, "runs", runId, "run.json");
+    const original = await readFile(recordPath, "utf8");
+
+    const repeated = await backend.execute(runId) as { readonly status?: unknown };
+    expect(repeated.status).toBe("completed");
+    const repeatedRead = readNativeHarnessBackendCompletion(backend);
+    expect(repeatedRead.ok).toBe(true);
+    if (repeatedRead.ok) expect(repeatedRead.completion).toBe(completion);
+    expect(matchesNativeHarnessBackendCompletion(backend, completion)).toBe(true);
+
+    const changed = JSON.parse(original) as Record<string, any>;
+    changed.stages.baseline.result.text = "tampered record";
+    await writeFile(recordPath, JSON.stringify(changed), { mode: 0o600 });
+    const observedMismatch = await backend.execute(runId) as { readonly status?: unknown };
+    expect(observedMismatch.status).toBe("completed");
+    expect(readNativeHarnessBackendCompletion(backend).ok).toBe(false);
+    expect(matchesNativeHarnessBackendCompletion(backend, completion)).toBe(false);
+
+    await writeFile(recordPath, original, { mode: 0o600 });
+    const restored = await backend.execute(runId) as { readonly status?: unknown };
+    expect(restored.status).toBe("completed");
+    expect(readNativeHarnessBackendCompletion(backend).ok).toBe(false);
+    expect(matchesNativeHarnessBackendCompletion(backend, completion)).toBe(false);
+  });
+
+  test("a changed applied status after issue is an observed mismatch", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, prepareRequest(f, factory.runner));
+    const runId = await requiredRunId(backend);
+    await backend.execute(runId);
+    const completion = requireCompletion(backend);
+    const diagnostic = factory.inspect().at(-1)!;
+    const recordPath = path.join(diagnostic.storeRoot!, "runs", runId, "run.json");
+    const record = JSON.parse(await readFile(recordPath, "utf8")) as Record<string, any>;
+    record.status = "applied";
+    await writeFile(recordPath, JSON.stringify(record), { mode: 0o600 });
+    const executed = await backend.execute(runId) as { readonly status?: unknown };
+    expect(executed.status).toBe("applied");
+    expect(readNativeHarnessBackendCompletion(backend).ok).toBe(false);
+    expect(matchesNativeHarnessBackendCompletion(backend, completion)).toBe(false);
+  });
+
+  test("multiple attempts match the selected final completed attempt", async () => {
+    const f = await fixture();
+    const det = deterministicRunner({ failBaselineOnce: true });
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, prepareRequest(f, factory.runner));
+    const runId = await requiredRunId(backend);
+
+    const failed = await backend.execute(runId) as { readonly status?: unknown };
+    expect(failed.status).toBe("failed");
+    expect(readNativeHarnessBackendCompletion(backend).ok).toBe(false);
+    expect(det.requests.filter((request) => request.stage === "baseline")).toHaveLength(1);
+
+    const completed = await backend.execute(runId) as { readonly status?: unknown };
+    expect(completed.status).toBe("completed");
+    expect(det.requests.filter((request) => request.stage === "baseline")).toHaveLength(2);
+    const completion = requireCompletion(backend);
+    expect(completion.winner.candidate).toBe("baseline");
+    expect(completion.winner.attempt).toBe(2);
+    expect(completion.winner.textSha256)
+      .toBe(createHash("sha256").update("baseline completed").digest("hex"));
+
+    await backend.cancel(runId);
+    expect(matchesNativeHarnessBackendCompletion(backend, completion)).toBe(true);
+    expect(requireCompletion(backend)).toBe(completion);
+  });
+
+  test("cancel after a failed execution cannot turn it into a completion source", async () => {
+    const f = await fixture();
+    const det = deterministicRunner({ failBaselineOnce: true });
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, prepareRequest(f, factory.runner));
+    const runId = await requiredRunId(backend);
+    const failed = await backend.execute(runId) as { readonly status?: unknown };
+    expect(failed.status).toBe("failed");
+    expect(readNativeHarnessBackendCompletion(backend).ok).toBe(false);
+    await backend.cancel(runId);
+    const cancelled = await backend.execute(runId) as { readonly status?: unknown };
+    expect(cancelled.status).toBe("cancelled");
+    expect(readNativeHarnessBackendCompletion(backend).ok).toBe(false);
+    expect(det.requests.filter((request) => request.stage === "baseline")).toHaveLength(1);
+  });
+
+  test("result text over the retained bound fails output origin without changing execution", async () => {
+    const f = await fixture();
+    const det = deterministicRunner({ hugeBaselineText: true });
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, prepareRequest(f, factory.runner));
+    const runId = await requiredRunId(backend);
+    const executed = await backend.execute(runId) as { readonly status?: unknown };
+    expect(executed.status).toBe("completed");
+    expect(det.requests.map((request) => request.stage)).toEqual(["plan", "baseline", "select"]);
+    const diagnostic = factory.inspect().at(-1)!;
+    const record = await readRecord(diagnostic.storeRoot!, runId);
+    expect(record.status).toBe("completed");
+    expect(record.stages.baseline.status).toBe("completed");
+    expect(record.stages.baseline.result.text.length).toBe(1024 * 1024 + 1);
+    expect(record.stages.baseline.accountedCostUsd).toBe(0.01);
+    expect(readNativeHarnessBackendCompletion(backend).ok).toBe(false);
+  });
+
+  test("a non-winning witness text overflow makes the output source unavailable", async () => {
+    const f = await fixture();
+    const det = deterministicRunner({ hugeSelectText: true });
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, prepareRequest(f, factory.runner));
+    const runId = await requiredRunId(backend);
+    const executed = await backend.execute(runId) as { readonly status?: unknown };
+    expect(executed.status).toBe("completed");
+    expect(det.requests.map((request) => request.stage)).toEqual(["plan", "baseline", "select"]);
+    const diagnostic = factory.inspect().at(-1)!;
+    const record = await readRecord(diagnostic.storeRoot!, runId);
+    expect(record.status).toBe("completed");
+    expect(record.winner).toBe("baseline");
+    expect(record.stages.select.status).toBe("completed");
+    expect(record.stages.select.result.text.length).toBe(1024 * 1024 + 1);
+    expect(readNativeHarnessBackendCompletion(backend).ok).toBe(false);
+  });
+
+  test("a legitimate refinement parent is retained with matching artifact lineage", async () => {
+    const f = await fixture();
+    const det = exploreRunner();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, prepareRequest(f, factory.runner));
+    const runId = await requiredRunId(backend);
+    const executed = await backend.execute(runId) as { readonly status?: unknown };
+    expect(executed.status).toBe("completed");
+    const completion = requireCompletion(backend);
+    const diagnostic = factory.inspect().at(-1)!;
+    const record = await readRecord(diagnostic.storeRoot!, runId);
+    const refineRequest = det.requests.find((request) => request.stage === "refine")!;
+    const routeRequest = det.requests.find((request) => request.stage === "route_2")!;
+
+    expect(record.winner).toBe("refine");
+    expect(completion.winner.candidate).toBe("refine");
+    expect(completion.winner.cwd).toBe(refineRequest.cwd);
+    expect(completion.winner.artifactHash).toBe(record.stages.refine.artifactHash);
+    expect(completion.winner.traceHash).toBe(record.stages.refine.traceHash);
+    expect(completion.winner.eventsPath).toBe(path.join(refineRequest.artifactDir, "worker-events.jsonl"));
+
+    expect(completion.ancestry).toHaveLength(1);
+    const parent = completion.ancestry[0]!;
+    expect(parent.candidate).toBe("route_2");
+    expect(parent.cwd).toBe(routeRequest.cwd);
+    expect(parent.artifactHash).toBe(record.stages.route_2.artifactHash);
+    expect(parent.artifactHash).toBe(record.stages.refine.parentArtifactHash);
+    expect(parent.traceHash).toBe(record.stages.route_2.traceHash);
+    expect(parent.eventsPath).toBe(path.join(routeRequest.artifactDir, "worker-events.jsonl"));
+    expect(parent.witnessSequence).toBeLessThan(completion.winner.witnessSequence);
+  });
+
+  test("foreign, proxied and copied values cannot resolve or match authority", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, prepareRequest(f, factory.runner));
+    const runId = await requiredRunId(backend);
+    await backend.execute(runId);
+    const completion = requireCompletion(backend);
+
+    let accesses = 0;
+    const hostile = new Proxy({}, {
+      get() {
+        accesses += 1;
+        throw new Error("property access must not occur");
+      },
+      getPrototypeOf() {
+        accesses += 1;
+        throw new Error("prototype access must not occur");
+      },
+      ownKeys() {
+        accesses += 1;
+        throw new Error("key access must not occur");
+      },
+    });
+    const proxiedBackend = new Proxy(backend, {
+      get() {
+        accesses += 1;
+        throw new Error("property access must not occur");
+      },
+      getPrototypeOf() {
+        accesses += 1;
+        throw new Error("prototype access must not occur");
+      },
+      ownKeys() {
+        accesses += 1;
+        throw new Error("key access must not occur");
+      },
+    });
+
+    expect(readNativeHarnessBackendCompletion(proxiedBackend).ok).toBe(false);
+    expect(readNativeHarnessBackendCompletion(hostile).ok).toBe(false);
+    expect(readNativeHarnessBackendCompletion({ ...backend }).ok).toBe(false);
+    expect(matchesNativeHarnessBackendCompletion(proxiedBackend, completion)).toBe(false);
+    expect(matchesNativeHarnessBackendCompletion(backend, hostile)).toBe(false);
+    expect(matchesNativeHarnessBackendCompletion(backend, { ...completion })).toBe(false);
+    expect(accesses).toBe(0);
   });
 });
