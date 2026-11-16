@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Buffer } from "node:buffer";
 import { realpath } from "node:fs/promises";
 import path from "node:path";
@@ -78,6 +79,23 @@ import {
   type NativeHandoffRequestDescriptor,
   type NativeHandoffWorkFacts,
 } from "./native-handoff-entry.ts";
+import {
+  createNativeHarnessBackend,
+  type NativeHarnessBackendHost,
+  type NativeHarnessBackendHostConfig,
+} from "./native-harness-backend.ts";
+import {
+  createNativeHarnessDelegation,
+  NATIVE_HARNESS_TOOL,
+  type NativeHarnessDelegationCoordinator,
+  type NativeHarnessDelegationPolicy,
+} from "./native-harness-delegation.ts";
+import {
+  createNativeHarnessEntry,
+  type NativeHarnessEntry,
+  type NativeHarnessEntryInspection,
+  type NativeHarnessRootResolution,
+} from "./native-harness-entry.ts";
 import {
   createNativeSnapshotEntry,
   MAX_SNAPSHOT_OPERATIONS,
@@ -260,6 +278,17 @@ export interface InstancedDiagnostic {
   readonly version: string | null;
 }
 
+export interface InstancedHarnessConfig {
+  /** Exact trusted host backend configuration; copied and frozen at entry creation. */
+  readonly backend: NativeHarnessBackendHostConfig;
+  /** Lowering-only delegation policy. It cannot widen the 2A limits. */
+  readonly policy?: NativeHarnessDelegationPolicy;
+}
+
+export type InstancedHarnessBackendFactory = (
+  config: NativeHarnessBackendHostConfig,
+) => NativeHarnessBackendHost;
+
 export interface InstancedNativeEntryOptions {
   /** Test/integration seam; production reads the registered string flag once. */
   readonly mainDefinitionPath?: string;
@@ -273,6 +302,10 @@ export interface InstancedNativeEntryOptions {
   readonly admissionTimeoutMs?: number;
   readonly limits?: Partial<InstancedLimits>;
   readonly diagnostic?: (event: InstancedDiagnostic) => void;
+  /** Optional trusted host capability. Absent means no harness registration or effects. */
+  readonly harness?: InstancedHarnessConfig;
+  /** INTERNAL test-only backend seam; production uses createNativeHarnessBackend. */
+  readonly harnessBackendFactory?: InstancedHarnessBackendFactory;
 }
 
 export type InstancedStatusPhaseCounts = Readonly<Record<"admitted" | "bound" | "refused" | "closed", number>>;
@@ -460,6 +493,8 @@ type InstancedStatusDetail = Omit<InstancedEntryStatus, "view">;
 export interface InstancedNativeEntryControls {
   readonly controller: ReturnType<typeof createDefinedNativeEntry>["controller"];
   readonly nativeEntry: ReturnType<typeof createDefinedNativeEntry>["nativeEntry"];
+  /** Host-only non-authoritative diagnostics; absent when Harness is not configured. */
+  readonly harnessInspect?: (context: NativeContext) => NativeHarnessEntryInspection | null;
   getStatus(): InstancedEntryStatus;
   dispose(): void;
 }
@@ -596,6 +631,26 @@ interface InstanceRecord {
   closedReason: string | null;
 }
 
+/**
+ * One Harness coordinator/backend lifetime per owning main root. The context
+ * store scopes each actual async tool execute; a rejected or foreign call never
+ * replaces the active invocation's context.
+ */
+interface HarnessTrackedCall {
+  readonly promise: Promise<unknown>;
+  refs: number;
+}
+
+interface HarnessRootState {
+  readonly coordinator: NativeHarnessDelegationCoordinator;
+  readonly backend: NativeHarnessBackendHost;
+  readonly scope: AsyncLocalStorage<NativeContext>;
+  /** Currently active or pending-unknown invocations; settled/refused are removed. */
+  readonly calls: Map<string, HarnessTrackedCall>;
+  readonly mainTools: readonly string[];
+  readonly mainModel: DefinitionModelRef;
+}
+
 interface RootState {
   readonly token: symbol;
   readonly id: number;
@@ -623,6 +678,7 @@ interface RootState {
   seenLifecycle: WeakSet<object>;
   handoffCoordinator: NativeHandoffCoordinator | null;
   handoffStore: NativeHandoffStore | null;
+  harness: HarnessRootState | null;
   handoffPreflights: Map<string, HandoffPreflight>;
   offerReservations: Map<string, HandoffOfferReservation>;
   retainedBytes: number;
@@ -652,6 +708,8 @@ interface FactoryContext {
   readonly portsPromise: Promise<InstancedNativePorts>;
   readonly loadChildDefinition: ((input: InstancedChildSnapshotInput) => Promise<DefinitionSnapshot>) | undefined;
   readonly diagnostic: ((event: InstancedDiagnostic) => void) | undefined;
+  readonly harnessConfig: InstancedHarnessConfig | null;
+  readonly harnessBackendFactory: InstancedHarnessBackendFactory;
   statusCommandRegistered: boolean;
   eventBusSubscribed: boolean;
   rootToken: symbol | null;
@@ -864,6 +922,158 @@ function normalizeLimits(limits: Partial<InstancedLimits> | undefined): Instance
     maxRecords: readLimit(limits?.maxRecords, DEFAULT_LIMITS.maxRecords),
     maxRetainedTextBytes: readLimit(limits?.maxRetainedTextBytes, DEFAULT_LIMITS.maxRetainedTextBytes),
   };
+}
+
+function readOwnDataFields(
+  value: unknown,
+  allowed: readonly string[],
+  required: readonly string[],
+): Map<string, unknown> | null {
+  if (!isRecord(value)) return null;
+  let prototype: object | null;
+  let keys: (string | symbol)[];
+  try {
+    prototype = Object.getPrototypeOf(value);
+    keys = Reflect.ownKeys(value);
+  } catch {
+    return null;
+  }
+  if (prototype !== Object.prototype && prototype !== null) return null;
+  if (keys.length > allowed.length || keys.some((key) => typeof key !== "string")) return null;
+  const fields = new Map<string, unknown>();
+  for (const key of keys) {
+    if (typeof key !== "string" || !allowed.includes(key)) return null;
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      return null;
+    }
+    if (
+      descriptor === undefined
+      || !("value" in descriptor)
+      || descriptor.get !== undefined
+      || descriptor.set !== undefined
+      || descriptor.enumerable !== true
+    ) {
+      return null;
+    }
+    fields.set(key, descriptor.value);
+  }
+  for (const key of required) {
+    if (!fields.has(key)) return null;
+  }
+  return fields;
+}
+
+const HARNESS_BACKEND_FIELDS = ["model", "ompCommand", "auth", "storageRoot", "inputFiles"] as const;
+const HARNESS_POLICY_FIELDS = [
+  "maxRetainedOperations",
+  "maxConcurrent",
+  "perRunUsd",
+  "lifetimeUsd",
+  "maxDurationMs",
+  "cleanupGraceMs",
+] as const;
+
+function copyHarnessBackendConfig(value: unknown): NativeHarnessBackendHostConfig {
+  const fields = readOwnDataFields(
+    value,
+    HARNESS_BACKEND_FIELDS,
+    ["model", "ompCommand", "storageRoot", "inputFiles"],
+  );
+  if (fields === null) {
+    throw new Error("harness.backend must be an exact own-data object with model, ompCommand, storageRoot and inputFiles.");
+  }
+  const model = fields.get("model");
+  const ompCommand = fields.get("ompCommand");
+  const storageRoot = fields.get("storageRoot");
+  if (typeof model !== "string" || model.length === 0
+    || typeof ompCommand !== "string" || ompCommand.length === 0
+    || typeof storageRoot !== "string" || storageRoot.length === 0) {
+    throw new Error("harness.backend model, ompCommand and storageRoot must be nonempty strings.");
+  }
+  const rawFiles = fields.get("inputFiles");
+  if (!Array.isArray(rawFiles) || Object.getPrototypeOf(rawFiles) !== Array.prototype) {
+    throw new Error("harness.backend inputFiles must be a plain array.");
+  }
+  const inputFiles: string[] = [];
+  for (let index = 0; index < rawFiles.length; index += 1) {
+    const descriptor = Object.getOwnPropertyDescriptor(rawFiles, String(index));
+    if (
+      descriptor === undefined
+      || !("value" in descriptor)
+      || descriptor.get !== undefined
+      || descriptor.set !== undefined
+      || typeof descriptor.value !== "string"
+      || descriptor.value.length === 0
+    ) {
+      throw new Error("harness.backend inputFiles entries must be enumerable own data strings.");
+    }
+    inputFiles.push(descriptor.value);
+  }
+  if (Object.keys(rawFiles).length !== inputFiles.length) {
+    throw new Error("harness.backend inputFiles must not contain holes or extra properties.");
+  }
+  const rawAuth = fields.get("auth");
+  let auth: NativeHarnessBackendHostConfig["auth"];
+  if (rawAuth !== undefined) {
+    const authFields = readOwnDataFields(rawAuth, ["kind", "agentDir"], ["kind", "agentDir"]);
+    if (authFields === null || authFields.get("kind") !== "omp-profile") {
+      throw new Error("harness.backend auth must be an exact omp-profile object.");
+    }
+    const agentDir = authFields.get("agentDir");
+    if (typeof agentDir !== "string" || agentDir.length === 0) {
+      throw new Error("harness.backend auth.agentDir must be a nonempty string.");
+    }
+    auth = Object.freeze({ kind: "omp-profile" as const, agentDir });
+  }
+  return deepFreeze({
+    model,
+    ompCommand,
+    storageRoot,
+    inputFiles: Object.freeze(inputFiles),
+    ...(auth === undefined ? {} : { auth }),
+  });
+}
+
+function readHarnessConfig(value: unknown): InstancedHarnessConfig | null {
+  if (value === undefined) return null;
+  const fields = readOwnDataFields(value, ["backend", "policy"], ["backend"]);
+  if (fields === null) {
+    throw new Error("harness options must be an exact own-data object with backend and an optional policy.");
+  }
+  const backend = copyHarnessBackendConfig(fields.get("backend"));
+  const rawPolicy = fields.get("policy");
+  let policy: NativeHarnessDelegationPolicy | undefined;
+  if (rawPolicy !== undefined) {
+    const policyFields = readOwnDataFields(rawPolicy, HARNESS_POLICY_FIELDS, []);
+    if (policyFields === null) {
+      throw new Error("harness.policy must be an exact own-data lowering policy object.");
+    }
+    const copied: Record<string, number> = {};
+    for (const key of HARNESS_POLICY_FIELDS) {
+      const entry = policyFields.get(key);
+      if (entry === undefined) continue;
+      if (typeof entry !== "number" || !Number.isFinite(entry)) {
+        throw new Error(`harness.policy ${key} must be a finite number.`);
+      }
+      copied[key] = entry;
+    }
+    policy = Object.freeze(copied) as NativeHarnessDelegationPolicy;
+  }
+  return deepFreeze({
+    backend,
+    ...(policy === undefined ? {} : { policy }),
+  });
+}
+
+function readHarnessBackendFactory(value: unknown): InstancedHarnessBackendFactory {
+  if (value === undefined) return createNativeHarnessBackend;
+  if (typeof value !== "function") {
+    throw new Error("harnessBackendFactory must be a function when present.");
+  }
+  return value as InstancedHarnessBackendFactory;
 }
 
 function remainingMs(deadline: number): number {
@@ -1210,6 +1420,20 @@ function closeHandoffRoot(root: RootState, reason: string): void {
   }
 }
 
+/**
+ * Root close/failure disposes only the root's own Harness coordinator. The
+ * underlying native controls and the 2A lifetime ledger are never replaced.
+ */
+function closeHarnessRoot(root: RootState): void {
+  const harness = root.harness;
+  if (harness === null) return;
+  try {
+    harness.coordinator.dispose();
+  } catch {
+    // The coordinator disposal path is local and must not break root cleanup.
+  }
+}
+
 function failRoot(factory: FactoryContext, root: RootState, code: string, message: string): void {
   if (root.phase === "closed" || root.phase === "failed") return;
   root.open = false;
@@ -1222,6 +1446,7 @@ function failRoot(factory: FactoryContext, root: RootState, code: string, messag
   invalidateWorkObservations(root, "the instance root failed");
   for (const record of root.records) closeRecord(record, "the instance root failed");
   closeHandoffRoot(root, "the instance root failed");
+  closeHarnessRoot(root);
   diagnose(factory, "root-failed", `${code}: ${message}`);
 }
 
@@ -1236,6 +1461,7 @@ function closeRoot(factory: FactoryContext, root: RootState, reason: string): vo
   invalidateWorkObservations(root, reason);
   for (const record of root.records) closeRecord(record, reason);
   closeHandoffRoot(root, reason);
+  closeHarnessRoot(root);
   diagnose(factory, "root-closed", reason);
 }
 
@@ -1707,6 +1933,7 @@ function claimRoot(factory: FactoryContext, context: NativeContext): RootState |
     seenLifecycle: new WeakSet(),
     handoffCoordinator: null,
     handoffStore: null,
+    harness: null,
     handoffPreflights: new Map(),
     offerReservations: new Map(),
     retainedBytes: 0,
@@ -1779,6 +2006,7 @@ async function startRoot(
   readChildDefinitions: () => string | readonly string[] | undefined,
 ): Promise<void> {
   const deadline = Date.now() + factory.rootStartupTimeoutMs;
+  const startupEpoch = root.epoch;
   try {
     const facts = readHostFacts(context);
     if (facts.agentKind !== "main" || facts.agentId === null || facts.sessionId === null || facts.workspaceRoot === null) {
@@ -1835,7 +2063,9 @@ async function startRoot(
     if (!prepared.ok) throw new Error("Child definition selection loading timed out.");
     const selections = prepared.value;
 
-    if (!root.open || root.epoch !== 0) throw new Error("The root was invalidated while child selections were loading.");
+    if (!root.open || root.phase !== "starting" || root.epoch !== startupEpoch) {
+      throw new Error("The root was invalidated while child selections were loading.");
+    }
     const finalFacts = readHostFacts(context);
     if (finalFacts.agentKind !== "main"
       || finalFacts.agentId !== root.agentId
@@ -1864,8 +2094,34 @@ async function startRoot(
       throw new Error("The D1 main binding became invalid while child selections were loading.");
     }
 
+    // The host must have registered, activated and selected the same tool; no
+    // companion or active-tool widening happens here. Unselected roots keep
+    // the tool registered but create no Harness backend or coordinator.
+    const harnessSelected = factory.harnessConfig !== null
+      && main.roleTools.includes(NATIVE_HARNESS_TOOL)
+      && main.effectiveTools.includes(NATIVE_HARNESS_TOOL)
+      && activeTools.includes(NATIVE_HARNESS_TOOL);
+    admitHarnessRoot(
+      factory,
+      root,
+      pi,
+      context,
+      activeTools,
+      currentModel,
+      harnessSelected,
+      startupEpoch,
+    );
+    if (!harnessStartupCurrent(factory, root, startupEpoch)) {
+      throw new Error("The root was invalidated while the Harness capability was being admitted.");
+    }
+
     const selectionMap = new Map<string, SelectedDefinition>();
     for (const selection of selections) selectionMap.set(selection.name, selection);
+    // Last pure local gate before publishing ready: no callback may have
+    // closed, failed, disposed or replaced the startup root generation.
+    if (!harnessStartupCurrent(factory, root, startupEpoch)) {
+      throw new Error("The root was invalidated before it could be published ready.");
+    }
     root.selections = selections;
     root.selectionByName = selectionMap;
     root.settings = settings.settings;
@@ -2716,6 +2972,266 @@ function mainHandoffRoot(
   }
   if (!matchesOwnerIdentity(root, facts)) return null;
   return { root, store: root.handoffStore, coordinator: root.handoffCoordinator };
+}
+
+/**
+ * Revalidates the actual execute context that an admitted harness operation is
+ * still running under. It never uses display status as authority: the D1 gate,
+ * live active tools, live model and existing root/settings checks must all pass.
+ */
+function harnessContextFailure(
+  factory: FactoryContext,
+  root: RootState,
+  pi: DefinedOmpApi,
+  harness: HarnessRootState,
+  context: NativeContext,
+): string | null {
+  if (factory.disposed) return "the instanced native entry was disposed";
+  if (moduleRoot !== root || !ownsRoot(factory, root)) return "the instance root was replaced";
+  if (!root.open || root.phase !== "ready") return "the instance root is no longer open and ready";
+  if (root.harness !== harness) return "the root Harness coordinator changed";
+  let facts: HostFacts;
+  try {
+    facts = readHostFacts(context);
+  } catch {
+    return "the actual main execute context is unreadable";
+  }
+  if (!matchesOwnerIdentity(root, facts)) {
+    return "the actual execute context is not the owning main root";
+  }
+  if (!refreshRoot(factory, root, pi, context)) {
+    return root.failure ?? "the fresh main D1/root gate refused the Harness operation";
+  }
+  if (root.harness !== harness || !root.open || root.phase !== "ready") {
+    return "the root Harness authority was invalidated during revalidation";
+  }
+  const tools = readActiveTools(pi);
+  if (tools === null) return "the actual main active tools are unavailable";
+  if (!sameSet(tools, harness.mainTools)) return "the actual main tool set changed since the Harness root was admitted";
+  if (!tools.includes(NATIVE_HARNESS_TOOL)) return "agent_harness is no longer in the actual main active tool set";
+  const model = readCurrentModel(context);
+  if (!sameModel(model, harness.mainModel)) return "the actual main model changed since the Harness root was admitted";
+  return null;
+}
+
+/**
+ * Admits the root's one Harness coordinator and one backend factory result.
+ * Called only after the actual D1 binding selected agent_harness and the live
+ * host active tool set contains it. Reentry cannot create a second lifetime.
+ */
+function harnessStartupCurrent(
+  factory: FactoryContext,
+  root: RootState,
+  startupEpoch: number,
+): boolean {
+  return !factory.disposed
+    && moduleRoot === root
+    && root.factoryId === factory.id
+    && factory.rootToken !== null
+    && root.token === factory.rootToken
+    && root.open
+    && root.phase === "starting"
+    && root.epoch === startupEpoch;
+}
+
+function admitHarnessRoot(
+  factory: FactoryContext,
+  root: RootState,
+  pi: DefinedOmpApi,
+  context: NativeContext,
+  activeTools: readonly string[],
+  currentModel: InstancedModel,
+  selected: boolean,
+  startupEpoch: number,
+): void {
+  const config = factory.harnessConfig;
+  if (config === null || !selected || root.harness !== null) return;
+  const backend = factory.harnessBackendFactory(config.backend);
+  if (!harnessStartupCurrent(factory, root, startupEpoch)) {
+    throw new Error("the main root was invalidated during Harness backend admission");
+  }
+  const scope = new AsyncLocalStorage<NativeContext>();
+  const mainTools = Object.freeze([...activeTools]);
+  const mainModel = Object.freeze({ provider: currentModel.provider, id: currentModel.id });
+  const coordinator = createNativeHarnessDelegation({
+    native: factory.definitionEntry.nativeEntry,
+    ...(config.policy === undefined ? {} : { policy: config.policy }),
+    getContext: (): NativeContext => {
+      const harness = root.harness;
+      if (harness === null || harness.coordinator !== coordinator) {
+        throw new Error("the root Harness coordinator is not admitted");
+      }
+      const scoped = harness.scope.getStore();
+      if (scoped === undefined) {
+        throw new Error("no actual main execute context is scoped for this Harness invocation");
+      }
+      const reason = harnessContextFailure(factory, root, pi, harness, scoped);
+      if (reason !== null) throw new Error(reason);
+      return scoped;
+    },
+    prepare(request, preparedContext) {
+      return backend.prepare(request, preparedContext);
+    },
+    runner: backend.runner,
+    enabled: true,
+  });
+  if (!harnessStartupCurrent(factory, root, startupEpoch)) {
+    coordinator.dispose();
+    throw new Error("the main root was invalidated during Harness coordinator admission");
+  }
+  root.harness = {
+    coordinator,
+    backend,
+    scope,
+    calls: new Map(),
+    mainTools,
+    mainModel,
+  };
+  if (!harnessStartupCurrent(factory, root, startupEpoch)) {
+    root.harness = null;
+    coordinator.dispose();
+    throw new Error("the main root was invalidated while publishing the Harness coordinator");
+  }
+}
+
+/**
+ * Tracks only the promise currently admitted for a call id. Rejected parallel
+ * calls and same-id changed-task/signal refusals return a different promise and
+ * therefore cannot untrack the original active operation. Concurrent replays
+ * that receive the same promise are reference-counted. A settled operation is
+ * removed unless 2A reports pending-unknown, which remains cancelable for the
+ * root lifetime.
+ */
+function trackHarnessCall<T>(
+  harness: HarnessRootState,
+  actualToolCallId: string,
+  promise: Promise<T>,
+): Promise<T> {
+  const existing = harness.calls.get(actualToolCallId);
+  let tracked: HarnessTrackedCall;
+  if (existing !== undefined) {
+    if (existing.promise !== promise) return promise;
+    existing.refs += 1;
+    tracked = existing;
+  } else {
+    tracked = { promise, refs: 1 };
+    harness.calls.set(actualToolCallId, tracked);
+  }
+  void promise.then(
+    (value) => releaseHarnessCall(harness, actualToolCallId, tracked, value),
+    () => releaseHarnessCall(harness, actualToolCallId, tracked, null),
+  );
+  return promise;
+}
+
+function releaseHarnessCall(
+  harness: HarnessRootState,
+  actualToolCallId: string,
+  tracked: HarnessTrackedCall,
+  value: unknown,
+): void {
+  if (harness.calls.get(actualToolCallId) !== tracked || tracked.refs <= 0) return;
+  tracked.refs -= 1;
+  if (tracked.refs > 0) return;
+  // Keep pending-unknown ids cancelable for the root lifetime; the coordinator
+  // still owns the operation slot, retention and lifetime budget.
+  if (isRecord(value) && value.executionState === "pending-unknown") return;
+  harness.calls.delete(actualToolCallId);
+}
+
+/** Cancels active Harness operations by tracked original call ids. */
+function cancelHarnessCalls(root: RootState): void {
+  const harness = root.harness;
+  if (harness === null) return;
+  for (const toolCallId of harness.calls.keys()) {
+    try {
+      harness.coordinator.cancel(toolCallId);
+    } catch {
+      // Cancellation is best effort; native work currentness remains the gate.
+    }
+  }
+}
+
+/**
+ * Fresh resolver for one actual main execute. A child or foreign main context
+ * is refused here before any coordinator invocation, backend creation,
+ * preparation or dispatch can occur.
+ */
+function resolveMainHarnessRoot(
+  factory: FactoryContext,
+  context: NativeContext,
+  pi: DefinedOmpApi,
+): NativeHarnessRootResolution {
+  if (factory.disposed) return { ok: false, reason: "the instanced native entry was disposed" };
+  const root = moduleRoot;
+  if (root === null
+    || root.factoryId !== factory.id
+    || !ownsRoot(factory, root)
+    || !root.open
+    || root.phase !== "ready") {
+    return { ok: false, reason: "the owning main Harness root is not open and ready" };
+  }
+  const harness = root.harness;
+  if (harness === null) {
+    return {
+      ok: false,
+      reason: "the Harness capability is not enabled and explicitly selected for this main root",
+    };
+  }
+  let facts: HostFacts;
+  try {
+    facts = readHostFacts(context);
+  } catch {
+    return { ok: false, reason: "the actual main execute context is unreadable" };
+  }
+  if (!matchesOwnerIdentity(root, facts)) {
+    return { ok: false, reason: "the actual execute context is not the owning main root" };
+  }
+  if (!refreshRoot(factory, root, pi, context)) {
+    return { ok: false, reason: root.failure ?? "the fresh main D1/root gate refused the Harness operation" };
+  }
+  if (root.harness !== harness || !root.open || root.phase !== "ready") {
+    return { ok: false, reason: "the root Harness authority was invalidated during resolution" };
+  }
+  const tools = readActiveTools(pi);
+  if (tools === null) return { ok: false, reason: "the actual main active tools are unavailable" };
+  if (!sameSet(tools, harness.mainTools)) {
+    return { ok: false, reason: "the actual main tool set changed since the Harness root was admitted" };
+  }
+  if (!tools.includes(NATIVE_HARNESS_TOOL)) {
+    return { ok: false, reason: "agent_harness is no longer in the actual main active tool set" };
+  }
+  const model = readCurrentModel(context);
+  if (!sameModel(model, harness.mainModel)) {
+    return { ok: false, reason: "the actual main model changed since the Harness root was admitted" };
+  }
+  return {
+    ok: true,
+    root: {
+      coordinator: harness.coordinator,
+      runWithContext<T>(
+        scopedContext: NativeContext,
+        actualToolCallId: string,
+        operation: () => Promise<T>,
+      ): Promise<T> {
+        if (root.harness !== harness || !ownsRoot(factory, root) || !root.open || root.phase !== "ready") {
+          return Promise.reject(new Error("the owning main Harness root is no longer current"));
+        }
+        return harness.scope.run(scopedContext, () => {
+          const operationPromise = operation();
+          return trackHarnessCall(harness, actualToolCallId, operationPromise);
+        });
+      },
+      diagnostics(): readonly unknown[] {
+        try {
+          const value = harness.backend.inspect();
+          return Array.isArray(value) ? value : [];
+        } catch {
+          return [];
+        }
+      },
+    },
+  };
 }
 
 function handoffMainRefreshFailure(
@@ -5151,6 +5667,9 @@ function childToolCall(
   if (!childGuard(factory, pi, root, record, context) || record === null) {
     return block("Native child instance binding or runtime facts are refused; no tool ran.");
   }
+  if (isRecord(event) && event.toolName === NATIVE_HARNESS_TOOL) {
+    return block("agent_harness is available only to the owning actual main root; no child backend ran.");
+  }
   if (!isRecord(event) || event.toolName !== NATIVE_SNAPSHOT_TOOL) return undefined;
   if (record.handoffOffer === null || record.handoffToken === null) {
     return block("agent_snapshot is available only to a child bound to an actual handoff offer.");
@@ -5560,6 +6079,8 @@ export function createInstancedNativeEntry(
   options: InstancedNativeEntryOptions = {},
 ): InstancedNativeEntryControls {
   const limits = normalizeLimits(options.limits);
+  const harnessConfig = readHarnessConfig(options.harness);
+  const harnessBackendFactory = readHarnessBackendFactory(options.harnessBackendFactory);
   const startupTimeoutMs = clampTimeout(options.startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, MAX_STARTUP_TIMEOUT_MS);
   const d1TimeoutMs = Math.max(1, Math.floor(startupTimeoutMs / 2));
   const admissionTimeoutMs = clampTimeout(options.admissionTimeoutMs, DEFAULT_ADMISSION_TIMEOUT_MS, MAX_ADMISSION_TIMEOUT_MS);
@@ -5626,15 +6147,26 @@ export function createInstancedNativeEntry(
       return inspectInstanceReportCatalog(portFactory, context, work);
     },
   });
-  // Both tools are registered before D1 chooses the actual definition/tool
-  // catalog. They stay defaultInactive and their resolvers refuse until this
-  // factory and root are fully initialized.
+  // The companion and optional Harness tools are registered before D1 chooses
+  // the actual definition/tool catalog. They stay defaultInactive and their
+  // resolvers refuse until this factory and root are fully initialized.
   let toolFactory: FactoryContext | null = null;
   let mainPorts: NativeHandoffPorts | null = null;
   let childPorts: NativeChildPorts | null = null;
   let handoffEntry: NativeHandoffEntry | null = null;
   let snapshotEntry: NativeSnapshotEntry | null = null;
+  let harnessEntry: NativeHarnessEntry | null = null;
   let toolRegistrationFailure: string | null = null;
+  if (harnessConfig !== null) {
+    harnessEntry = createNativeHarnessEntry({
+      resolveRoot(context: NativeContext) {
+        if (toolFactory === null) {
+          return { ok: false, reason: "the native Harness entry is not initialized" };
+        }
+        return resolveMainHarnessRoot(toolFactory, context, pi);
+      },
+    });
+  }
   handoffEntry = createNativeHandoffEntry({
     resolveRoot(context: NativeContext) {
       if (toolFactory === null || mainPorts === null) {
@@ -5675,6 +6207,7 @@ export function createInstancedNativeEntry(
     } as unknown as NativeTool;
     pi.registerTool(handoffTool);
     pi.registerTool(snapshotTool);
+    if (harnessEntry !== null) pi.registerTool(harnessEntry.tool as unknown as NativeTool);
   } catch (error) {
     toolRegistrationFailure = boundedMessage(`Native handoff tool registration failed: ${errorMessage(error)}`);
   }
@@ -5724,6 +6257,8 @@ export function createInstancedNativeEntry(
     portsPromise,
     loadChildDefinition: options.loadChildDefinition,
     diagnostic: options.diagnostic,
+    harnessConfig,
+    harnessBackendFactory,
     statusCommandRegistered: false,
     eventBusSubscribed: false,
     rootToken: null,
@@ -5987,6 +6522,9 @@ export function createInstancedNativeEntry(
         root,
         "the parent work ended before the child session bound; a late child event cannot revive the admission",
       );
+      // Cancel active Harness operations by their tracked original call ids.
+      // The coordinator and its lifetime ledger stay for later work.
+      cancelHarnessCalls(root);
       root.workEpoch += 1;
     } catch {
       // Work-ending observation must not break host cleanup.
@@ -6091,9 +6629,15 @@ export function createInstancedNativeEntry(
     }
   });
 
+  const harnessEntryForInspect = harnessEntry;
   const controls: InstancedNativeEntryControls = {
     controller: definitionEntry.controller,
     nativeEntry: definitionEntry.nativeEntry,
+    ...(harnessEntryForInspect === null ? {} : {
+      harnessInspect(context: NativeContext): NativeHarnessEntryInspection | null {
+        return harnessEntryForInspect.inspect(context);
+      },
+    }),
     getStatus() {
       try {
         return buildStatus(factory);
@@ -6121,6 +6665,7 @@ export function createInstancedNativeEntry(
       factory.rootToken = null;
       handoffEntry?.dispose();
       snapshotEntry?.dispose();
+      harnessEntry?.dispose();
       definitionEntry.dispose();
     },
   };

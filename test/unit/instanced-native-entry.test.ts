@@ -24,6 +24,8 @@ import {
   INSTANCED_NATIVE_ENTRY_SCHEMA,
   type InstancedChildSnapshotInput,
   type InstancedEntryStatus,
+  type InstancedHarnessBackendFactory,
+  type InstancedHarnessConfig,
   type InstancedModel,
   type InstancedNativeContext,
   type InstancedNativeEntryControls,
@@ -32,6 +34,18 @@ import {
   type InstancedOmpApi,
   type InstancedSupportedSettings,
 } from "../../src/instanced-native-entry.ts";
+import {
+  NATIVE_HARNESS_TOOL,
+  type NativeHarnessBackend,
+  type NativeHarnessDelegationPolicy,
+  type NativeHarnessDelegationResult,
+  type NativeHarnessPrepareRequest,
+  type NativeHarnessPrepareResult,
+} from "../../src/native-harness-delegation.ts";
+import type {
+  NativeHarnessBackendHost,
+  NativeHarnessBackendHostConfig,
+} from "../../src/native-harness-backend.ts";
 import type { NativeContext, NativeToolResult } from "../../src/native-entry.ts";
 import { deepFreeze, NATIVE_WORK_TOOL } from "../../src/native-work.ts";
 
@@ -49,6 +63,8 @@ const SUPPORTED_SETTINGS: InstancedSupportedSettings = {
 
 type RegisteredTool = {
   name: string;
+  approval?: string;
+  loadMode?: string;
   defaultInactive?: boolean;
   execute(...args: unknown[]): Promise<NativeToolResult>;
 };
@@ -231,6 +247,7 @@ function createTestBus(): TestBus {
 class Host {
   readonly handlers = new Map<string, Handler[]>();
   readonly tools = new Map<string, RegisteredTool>();
+  readonly toolRegistrations: RegisteredTool[] = [];
   readonly commands = new Map<string, CommandHandler>();
   readonly bus: TestBus;
   readonly flags = new Map<string, string | boolean | undefined>();
@@ -330,7 +347,9 @@ class Host {
         host.handlers.set(event, list);
       },
       registerTool(tool) {
-        host.tools.set(tool.name, tool as RegisteredTool);
+        const registered = tool as RegisteredTool;
+        host.tools.set(tool.name, registered);
+        host.toolRegistrations.push(registered);
       },
       registerFlag(name, flagOptions) {
         host.flagRegistrations.push({ name, options: flagOptions });
@@ -525,6 +544,186 @@ function blockedReason(value: unknown): string {
   return isRecord(value) && value.block === true && typeof value.reason === "string" ? value.reason : "";
 }
 
+interface Deferred<T> {
+  readonly promise: Promise<T>;
+  resolve(value: T): void;
+  reject(error: unknown): void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+interface FakeHarnessOptions {
+  readonly createGate?: Deferred<void>;
+  readonly executeGate?: Deferred<void>;
+  /** Per-run gates indexed by the fake run number. */
+  readonly executeGates?: readonly Deferred<void>[];
+  /** Holds only runs after the first, letting a prior run settle normally. */
+  readonly deferExecuteAfterFirst?: Deferred<void>;
+  readonly executeStatus?: "completed" | "failed" | "cancelled";
+}
+
+interface FakeHarness {
+  readonly host: NativeHarnessBackendHost;
+  readonly events: string[];
+  readonly prepareRequests: NativeHarnessPrepareRequest[];
+  readonly contexts: NativeContext[];
+}
+
+function createFakeHarness(options: FakeHarnessOptions = {}): FakeHarness {
+  const events: string[] = [];
+  const prepareRequests: NativeHarnessPrepareRequest[] = [];
+  const contexts: NativeContext[] = [];
+  let nextRun = 1;
+  const backend: NativeHarnessBackend = {
+    async create(_task: string): Promise<unknown> {
+      events.push("create");
+      if (options.createGate !== undefined) await options.createGate.promise;
+      return { runId: `run-${nextRun++}` };
+    },
+    async execute(runId: string): Promise<unknown> {
+      events.push("execute");
+      if (options.executeGate !== undefined) await options.executeGate.promise;
+      const runNumber = Number(runId.split("-")[1]);
+      const runGate = Number.isInteger(runNumber) ? options.executeGates?.[runNumber - 1] : undefined;
+      if (runGate !== undefined) await runGate.promise;
+      if (options.deferExecuteAfterFirst !== undefined && runId !== "run-1") {
+        await options.deferExecuteAfterFirst.promise;
+      }
+      return { status: options.executeStatus ?? "completed" };
+    },
+    async cancel(runId: string): Promise<unknown> {
+      events.push(`cancel:${runId}`);
+      return { requested: true };
+    },
+    async get(_runId: string): Promise<unknown> {
+      return { status: "running" };
+    },
+  };
+  return {
+    events,
+    prepareRequests,
+    contexts,
+    host: {
+      runner: {
+        async run(): Promise<never> {
+          throw new Error("the fake Harness backend must not dispatch its runner");
+        },
+      } as unknown as NativeHarnessBackendHost["runner"],
+      async prepare(request: NativeHarnessPrepareRequest, context: NativeContext): Promise<NativeHarnessPrepareResult> {
+        events.push("prepare");
+        prepareRequests.push(request);
+        contexts.push(context);
+        request.guard();
+        return { ok: true, backend };
+      },
+      inspect: () => [],
+    },
+  };
+}
+
+function harnessBackendConfig(
+  overrides: Partial<NativeHarnessBackendHostConfig> = {},
+): NativeHarnessBackendHostConfig {
+  return {
+    model: "fixture/main",
+    ompCommand: "/fixture/bin/omp",
+    storageRoot: "/fixture/harness-store",
+    inputFiles: ["selected-input.txt"],
+    ...overrides,
+  };
+}
+
+const HARNESS_MAIN_TOOLS = ["read", "task", NATIVE_HARNESS_TOOL] as const;
+
+function harnessMainOptions(
+  tools: readonly string[] = HARNESS_MAIN_TOOLS,
+): {
+  readonly main: DefinitionSnapshot;
+  readonly mainTools: readonly string[];
+  readonly hostActiveTools: readonly string[];
+} {
+  return {
+    main: mainSnapshot(WORKSPACE, tools),
+    mainTools: tools,
+    hostActiveTools: tools,
+  };
+}
+
+function harnessFixture(
+  fake: FakeHarness,
+  policy?: NativeHarnessDelegationPolicy,
+): { readonly harness: InstancedHarnessConfig; readonly factory: InstancedHarnessBackendFactory; readonly calls: NativeHarnessBackendHostConfig[] } {
+  const calls: NativeHarnessBackendHostConfig[] = [];
+  return {
+    harness: {
+      backend: harnessBackendConfig(),
+      ...(policy === undefined ? {} : { policy }),
+    },
+    factory(config) {
+      calls.push(config);
+      return fake.host;
+    },
+    calls,
+  };
+}
+
+async function executeHarness(
+  root: RootFixture,
+  toolCallId: string,
+  task: string,
+  signal: AbortSignal,
+  context: InstancedNativeContext = root.host.context,
+): Promise<NativeToolResult> {
+  await root.host.emit("tool_call", {
+    toolCallId,
+    toolName: NATIVE_HARNESS_TOOL,
+    input: { task },
+  }, context);
+  const tool = root.host.tools.get(NATIVE_HARNESS_TOOL);
+  if (tool === undefined) throw new Error("agent_harness was not registered");
+  const result = await tool.execute(toolCallId, { task }, signal, undefined, context);
+  await root.host.emit("tool_result", {
+    toolCallId,
+    toolName: NATIVE_HARNESS_TOOL,
+    input: { task },
+    content: result.content,
+    isError: result.isError === true,
+    details: result.details,
+  }, context);
+  return result;
+}
+
+function startHarness(
+  root: RootFixture,
+  toolCallId: string,
+  task: string,
+  signal: AbortSignal,
+  context: InstancedNativeContext = root.host.context,
+): Promise<NativeToolResult> {
+  return executeHarness(root, toolCallId, task, signal, context);
+}
+
+function harnessDetails(result: NativeToolResult): NativeHarnessDelegationResult {
+  return result.details as NativeHarnessDelegationResult;
+}
+
+function expectHarnessRefused(result: NativeToolResult, pattern: RegExp): void {
+  expect(result.isError).toBe(true);
+  const details = harnessDetails(result);
+  expect(details.resultKind).toBe("refused");
+  expect(details.taskAccepted).toBe(false);
+  expect(details.semanticAcceptance).toBe("not-evaluated");
+  expect(String(details.reason)).toMatch(pattern);
+}
+
 interface RootFixture {
   readonly host: Host;
   readonly entry: InstancedNativeEntryControls;
@@ -549,6 +748,8 @@ interface RootOptions {
   readonly hostActiveTools?: readonly string[];
   readonly commandRegistration?: "ok" | "missing" | "throws";
   readonly workspace?: string;
+  readonly harness?: InstancedHarnessConfig;
+  readonly harnessBackendFactory?: InstancedHarnessBackendFactory;
 }
 
 async function startRoot(options: RootOptions = {}): Promise<RootFixture> {
@@ -585,6 +786,10 @@ async function startRoot(options: RootOptions = {}): Promise<RootFixture> {
     startupTimeoutMs: 5_000,
     admissionTimeoutMs: 5_000,
     ...(options.limits === undefined ? {} : { limits: options.limits }),
+    ...(options.harness === undefined ? {} : { harness: options.harness }),
+    ...(options.harnessBackendFactory === undefined
+      ? {}
+      : { harnessBackendFactory: options.harnessBackendFactory }),
     diagnostic: (event) => host.diagnostics.push(event),
   });
   controls.push(entry);
@@ -4657,4 +4862,580 @@ describe("actual instanced handoff composition", () => {
       await base.cleanup();
     }
   }, 20_000);
+});
+
+describe("actual instanced Harness composition", () => {
+  test("absent config registers no tool and creates no backend or coordinator", async () => {
+    const fake = createFakeHarness();
+    let factoryCalls = 0;
+    const root = await startRoot({
+      harnessBackendFactory(config) {
+        factoryCalls += 1;
+        expect(config.model).toBe("fixture/main");
+        return fake.host;
+      },
+    });
+    expect(root.host.tools.has(NATIVE_HARNESS_TOOL)).toBe(false);
+    expect(root.entry.harnessInspect).toBeUndefined();
+    expect(factoryCalls).toBe(0);
+    expect(fake.events).toEqual([]);
+    expect(root.entry.getStatus().phase).toBe("ready");
+    expect(root.host.toolRegistrations.filter((tool) => tool.name === NATIVE_WORK_TOOL)).toHaveLength(1);
+  });
+
+  test("selected main tool executes through the existing 2A native call and one observer", async () => {
+    const fake = createFakeHarness();
+    const harness = harnessFixture(fake);
+    const root = await startRoot({
+      ...harnessMainOptions(),
+      harness: harness.harness,
+      harnessBackendFactory: harness.factory,
+    });
+    const tool = root.host.tools.get(NATIVE_HARNESS_TOOL);
+    expect(tool !== undefined).toBe(true);
+    expect(tool!.approval).toBe("exec");
+    expect(tool!.defaultInactive).toBe(true);
+    expect(harness.calls).toHaveLength(1);
+    expect(fake.events).toEqual([]);
+    expect(root.host.toolRegistrations.filter((entry) => entry.name === NATIVE_WORK_TOOL)).toHaveLength(1);
+
+    await beginWork(root, "selected harness work");
+    const controller = new AbortController();
+    const result = await executeHarness(root, "harness-call-1", "bounded task", controller.signal);
+    expect(result.isError).not.toBe(true);
+    const details = harnessDetails(result);
+    expect(details.outcome).toBe("backend-completed");
+    expect(details.taskAccepted).toBe(false);
+    expect(details.semanticAcceptance).toBe("not-evaluated");
+    expect(fake.events).toEqual(["prepare", "create", "execute"]);
+    expect(fake.prepareRequests).toHaveLength(1);
+    expect(fake.prepareRequests[0]!.association.toolCallId).toBe("harness-call-1");
+    expect(fake.contexts[0]).toBe(root.host.context);
+    const inspection = root.entry.harnessInspect?.(root.host.context);
+    expect(inspection?.authority).toBe("non-authoritative");
+    expect(inspection?.available).toBe(true);
+    expect(inspection?.coordinator?.retainedOperations).toBe(1);
+    expect(inspection?.backend).toEqual([]);
+  });
+
+  test("unselected or inactive harness tool is refused with no backend effect", async () => {
+    const fake = createFakeHarness();
+    const harness = harnessFixture(fake);
+    const root = await startRoot({
+      harness: harness.harness,
+      harnessBackendFactory: harness.factory,
+    });
+    expect(root.host.tools.has(NATIVE_HARNESS_TOOL)).toBe(true);
+    expect(harness.calls).toHaveLength(0);
+    expect(fake.events).toEqual([]);
+
+    const result = await root.host.tools.get(NATIVE_HARNESS_TOOL)!.execute(
+      "unselected-harness-call",
+      { task: "must not run" },
+      new AbortController().signal,
+      undefined,
+      root.host.context,
+    );
+    expectHarnessRefused(result, /not enabled and explicitly selected/);
+    expect(harness.calls).toHaveLength(0);
+    expect(fake.events).toEqual([]);
+  });
+
+  test("child attempts and child/foreign direct contexts refuse before preparation", async () => {
+    const fake = createFakeHarness();
+    const harness = harnessFixture(fake);
+    const childDefinition = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1", {
+      tools: ["read", NATIVE_HARNESS_TOOL],
+    });
+    const root = await startRoot({
+      children: [childDefinition],
+      ...harnessMainOptions(),
+      harness: harness.harness,
+      harnessBackendFactory: harness.factory,
+    });
+    await beginWork(root, "child harness refusal work");
+    await admit(root, "task-child-harness");
+    await spawn(root);
+    const child = await startChild(root, "task-child-harness", "ChildHarness", {
+      activeTools: ["read", NATIVE_HARNESS_TOOL],
+    });
+    const blocked = await child.host.emit("tool_call", {
+      toolCallId: "child-harness-call",
+      toolName: NATIVE_HARNESS_TOOL,
+      input: { task: "child must not run" },
+    });
+    expect(isRecord(blocked) && blocked.block).toBe(true);
+    expect(blockedReason(blocked)).toMatch(/owning actual main root/);
+
+    const childContext = child.host.context;
+    let direct = await root.host.tools.get(NATIVE_HARNESS_TOOL)!.execute(
+      "child-context-harness-call",
+      { task: "must not run" },
+      new AbortController().signal,
+      undefined,
+      childContext,
+    );
+    expectHarnessRefused(direct, /owning actual main root/);
+
+    const foreignHost = new Host({
+      agentKind: "main",
+      agentId: "Other",
+      sessionId: "session-other",
+      cwd: root.workspace,
+      activeTools: ["read", "task", NATIVE_HARNESS_TOOL],
+    });
+    direct = await root.host.tools.get(NATIVE_HARNESS_TOOL)!.execute(
+      "foreign-context-harness-call",
+      { task: "must not run" },
+      new AbortController().signal,
+      undefined,
+      foreignHost.context,
+    );
+    expectHarnessRefused(direct, /owning main root/);
+    expect(harness.calls).toHaveLength(1);
+    expect(fake.events).toEqual([]);
+  });
+
+  test("original execute signal cancels the admitted run and backend run id", async () => {
+    const createGate = deferred<void>();
+    const fake = createFakeHarness({ createGate });
+    const harness = harnessFixture(fake);
+    const root = await startRoot({
+      ...harnessMainOptions(),
+      harness: harness.harness,
+      harnessBackendFactory: harness.factory,
+    });
+    await beginWork(root, "abort harness work");
+    const controller = new AbortController();
+    const running = startHarness(root, "harness-abort-call", "abort this run", controller.signal);
+    await waitFor(() => fake.events.includes("create"));
+    controller.abort();
+    createGate.resolve();
+    const result = await running;
+    expect(harnessDetails(result).outcome).toBe("cancelled");
+    expect(harnessDetails(result).cancellation).toBe("requested");
+    expect(fake.events).toContain("cancel:run-1");
+    expect(fake.events.filter((event) => event === "execute")).toHaveLength(0);
+  });
+
+  test("same-call replay returns history without a second run", async () => {
+    const fake = createFakeHarness();
+    const harness = harnessFixture(fake);
+    const root = await startRoot({
+      ...harnessMainOptions(),
+      harness: harness.harness,
+      harnessBackendFactory: harness.factory,
+    });
+    await beginWork(root, "replay harness work");
+    const signal = new AbortController().signal;
+    const first = await executeHarness(root, "harness-replay-call", "replay task", signal);
+    expect(harnessDetails(first).historical).toBe(false);
+    const creates = fake.events.filter((event) => event === "create").length;
+    await root.host.emit("tool_call", {
+      toolCallId: "harness-replay-call",
+      toolName: NATIVE_HARNESS_TOOL,
+      input: { task: "replay task" },
+    });
+    const replay = await root.host.tools.get(NATIVE_HARNESS_TOOL)!.execute(
+      "harness-replay-call",
+      { task: "replay task" },
+      signal,
+      undefined,
+      root.host.context,
+    );
+    expect(harnessDetails(replay).historical).toBe(true);
+    expect(harnessDetails(replay).resultKind).toBe("historical");
+    expect(fake.events.filter((event) => event === "create")).toHaveLength(creates);
+  });
+
+  test("rejected parallel ids cannot hide a later admitted run from work-end cancel", async () => {
+    const firstGate = deferred<void>();
+    const secondGate = deferred<void>();
+    const fake = createFakeHarness({ executeGates: [firstGate, secondGate] });
+    const harness = harnessFixture(fake, { perRunUsd: 0.1, lifetimeUsd: 1 });
+    const root = await startRoot({
+      ...harnessMainOptions(),
+      harness: harness.harness,
+      harnessBackendFactory: harness.factory,
+    });
+    await beginWork(root, "parallel tracking work");
+    const first = startHarness(
+      root,
+      "active-1",
+      "first admitted task",
+      new AbortController().signal,
+    );
+    await waitFor(() => fake.events.includes("execute"));
+    for (let index = 2; index <= 16; index += 1) {
+      const rejected = await executeHarness(
+        root,
+        `rejected-${index}`,
+        `parallel rejected ${index}`,
+        new AbortController().signal,
+      );
+      expect(harnessDetails(rejected).outcome).toBe("refused");
+    }
+    expect(fake.prepareRequests).toHaveLength(1);
+    firstGate.resolve();
+    await first;
+
+    const secondSignal = new AbortController();
+    const second = startHarness(root, "active-17", "second admitted task", secondSignal.signal);
+    await waitFor(() => fake.events.filter((event) => event === "execute").length >= 2);
+    await root.host.emit("agent_end", {});
+    await waitFor(() => fake.events.includes("cancel:run-2"));
+    expect(fake.prepareRequests).toHaveLength(2);
+    expect(fake.prepareRequests[1]!.signal.aborted).toBe(true);
+    secondGate.resolve();
+    const result = await second;
+    expect(harnessDetails(result).outcome).toBe("cancelled");
+  });
+
+  test("same-id changed task or signal refusal cannot untrack the original active run", async () => {
+    const gate = deferred<void>();
+    const fake = createFakeHarness({ executeGates: [gate] });
+    const harness = harnessFixture(fake);
+    const root = await startRoot({
+      ...harnessMainOptions(),
+      harness: harness.harness,
+      harnessBackendFactory: harness.factory,
+    });
+    await beginWork(root, "same id tracking work");
+    const originalSignal = new AbortController();
+    const original = startHarness(root, "same-id-active", "original task", originalSignal.signal);
+    await waitFor(() => fake.events.includes("execute"));
+
+    const changedTask = await executeHarness(
+      root,
+      "same-id-active",
+      "different task",
+      originalSignal.signal,
+    );
+    expectHarnessRefused(changedTask, /different task/);
+    const changedSignal = await executeHarness(
+      root,
+      "same-id-active",
+      "original task",
+      new AbortController().signal,
+    );
+    expectHarnessRefused(changedSignal, /invocation signal/);
+
+    await root.host.emit("agent_end", {});
+    await waitFor(() => fake.events.includes("cancel:run-1"));
+    gate.resolve();
+    const result = await original;
+    expect(harnessDetails(result).outcome).toBe("cancelled");
+  });
+
+  test("owner work-end cancels the active run without resetting the lifetime ledger", async () => {
+    const executeGate = deferred<void>();
+    const fake = createFakeHarness({ deferExecuteAfterFirst: executeGate });
+    const harness = harnessFixture(fake, { perRunUsd: 1, lifetimeUsd: 2 });
+    const root = await startRoot({
+      ...harnessMainOptions(),
+      harness: harness.harness,
+      harnessBackendFactory: harness.factory,
+    });
+    await beginWork(root, "first budget work");
+    const first = await executeHarness(
+      root,
+      "harness-budget-1",
+      "first bounded task",
+      new AbortController().signal,
+    );
+    expect(harnessDetails(first).outcome).toBe("backend-completed");
+    await root.host.emit("agent_end", {});
+    await beginWork(root, "second budget work");
+
+    const running = startHarness(
+      root,
+      "harness-budget-2",
+      "second bounded task",
+      new AbortController().signal,
+    );
+    await waitFor(() => fake.events.filter((event) => event === "execute").length >= 2);
+    await root.host.emit("agent_end", {});
+    await waitFor(() => fake.events.includes("cancel:run-2"));
+    executeGate.resolve();
+    const second = await running;
+    expect(harnessDetails(second).outcome).toBe("cancelled");
+    expect(harnessDetails(second).cancellation).toBe("requested");
+    await beginWork(root, "third budget work");
+
+    const third = await executeHarness(
+      root,
+      "harness-budget-3",
+      "third bounded task",
+      new AbortController().signal,
+    );
+    expectHarnessRefused(third, /lifetime delegation budget/);
+    expect(fake.events.filter((event) => event === "create")).toHaveLength(2);
+  });
+
+  test("main navigation, shutdown and disposal cancel the owner run", async () => {
+    for (const action of ["navigation", "shutdown", "dispose"] as const) {
+      const executeGate = deferred<void>();
+      const fake = createFakeHarness({ executeGate });
+      const harness = harnessFixture(fake);
+      const root = await startRoot({
+        ...harnessMainOptions(),
+        harness: harness.harness,
+        harnessBackendFactory: harness.factory,
+      });
+      await beginWork(root, `${action} harness work`);
+      const running = startHarness(
+        root,
+        `harness-${action}`,
+        `${action} bounded task`,
+        new AbortController().signal,
+      );
+      await waitFor(() => fake.events.includes("execute"));
+      if (action === "navigation") {
+        await root.host.emit("session_switch", {});
+      } else if (action === "shutdown") {
+        await root.host.emit("session_shutdown", {});
+      } else {
+        root.entry.dispose();
+      }
+      await waitFor(() => fake.events.includes("cancel:run-1"));
+      executeGate.resolve();
+      const result = await running;
+      expect(harnessDetails(result).authorityFresh).toBe(false);
+      expect(["cancelled", "incomplete"]).toContain(harnessDetails(result).outcome);
+      root.entry.dispose();
+    }
+  });
+
+  test("foreign main work-end issues no owner backend cancel", async () => {
+    const executeGate = deferred<void>();
+    const fake = createFakeHarness({ executeGate });
+    const harness = harnessFixture(fake);
+    const root = await startRoot({
+      ...harnessMainOptions(),
+      harness: harness.harness,
+      harnessBackendFactory: harness.factory,
+    });
+    await beginWork(root, "foreign work-end owner work");
+    const running = startHarness(
+      root,
+      "harness-foreign-work-end",
+      "owner work remains active",
+      new AbortController().signal,
+    );
+    await waitFor(() => fake.events.includes("execute"));
+    await root.host.emit("agent_end", {}, ownerContext({ agentId: "Other" }));
+    expect(fake.events).not.toContain("cancel:run-1");
+    executeGate.resolve();
+    const result = await running;
+    // The instance owner filter did not request cancellation. The wrapped
+    // native observer still ends the same session/cwd work, so the final 2A
+    // gate refuses freshness rather than fabricating completion.
+    expect(harnessDetails(result).cancellation).toBe("none");
+    expect(harnessDetails(result).authorityFresh).toBe(false);
+    expect(harnessDetails(result).outcome).toBe("incomplete");
+    expect(fake.events.filter((event) => event.startsWith("cancel:"))).toHaveLength(0);
+  });
+
+  test("a rejected competing call cannot swap the active execute context", async () => {
+    const createGate = deferred<void>();
+    const fake = createFakeHarness({ createGate });
+    const harness = harnessFixture(fake);
+    const root = await startRoot({
+      ...harnessMainOptions(),
+      harness: harness.harness,
+      harnessBackendFactory: harness.factory,
+    });
+    await beginWork(root, "original context work");
+    const running = startHarness(
+      root,
+      "harness-original-context",
+      "original bounded task",
+      new AbortController().signal,
+    );
+    await waitFor(() => fake.events.includes("create"));
+    const foreignHost = new Host({
+      agentKind: "main",
+      agentId: "Other",
+      sessionId: "session-other",
+      cwd: root.workspace,
+      activeTools: ["read", "task", NATIVE_HARNESS_TOOL],
+    });
+    const competing = await root.host.tools.get(NATIVE_HARNESS_TOOL)!.execute(
+      "harness-competing-context",
+      { task: "competing bounded task" },
+      new AbortController().signal,
+      undefined,
+      foreignHost.context,
+    );
+    expectHarnessRefused(competing, /owning main root/);
+    createGate.resolve();
+    const result = await running;
+    expect(harnessDetails(result).outcome).toBe("backend-completed");
+    expect(harnessDetails(result).authorityFresh).toBe(true);
+    expect(fake.events.filter((event) => event === "create")).toHaveLength(1);
+    expect(fake.events).not.toContain("cancel:run-1");
+  });
+
+  test("model, tools and settings drift refuse and cancel an active run", async () => {
+    const drifts = ["model", "tools", "settings"] as const;
+    for (const drift of drifts) {
+      const createGate = deferred<void>();
+      const fake = createFakeHarness({ createGate });
+      const harness = harnessFixture(fake);
+      const root = await startRoot({
+        ...harnessMainOptions(),
+        harness: harness.harness,
+        harnessBackendFactory: harness.factory,
+      });
+      await beginWork(root, `${drift} drift work`);
+      const running = startHarness(
+        root,
+        `harness-drift-${drift}`,
+        `${drift} drift task`,
+        new AbortController().signal,
+      );
+      await waitFor(() => fake.events.includes("create"));
+      if (drift === "model") {
+        root.host.currentModel = OTHER_MODEL;
+      } else if (drift === "tools") {
+        root.host.activeTools = ["read", "task", NATIVE_HARNESS_TOOL, "extra-tool"];
+      } else {
+        (root.ports as { readScopedSettings: () => unknown }).readScopedSettings = () => ({
+          ok: true,
+          settings: { ...SUPPORTED_SETTINGS, taskBatch: true },
+        });
+      }
+      createGate.resolve();
+      const result = await running;
+      expect(harnessDetails(result).authorityFresh).toBe(false);
+      expect(["cancelled", "incomplete"]).toContain(harnessDetails(result).outcome);
+      expect(fake.events).toContain("cancel:run-1");
+      expect(fake.events.filter((event) => event === "execute")).toHaveLength(0);
+      root.entry.dispose();
+    }
+  });
+
+  test("factory navigation during admission cannot resurrect a closed root", async () => {
+    const fake = createFakeHarness();
+    const main = mainSnapshot(WORKSPACE, HARNESS_MAIN_TOOLS);
+    const child = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+    const host = new Host({ cwd: WORKSPACE, sessionId: "session-root", activeTools: HARNESS_MAIN_TOOLS });
+    let entered = 0;
+    const entry = createInstancedNativeEntry(host.pi, {
+      mainDefinitionPath: main.definition.canonicalPath,
+      childDefinitions: [child.definition.requestedPath],
+      nativePorts: makePorts({
+        discoverAgents: async () => [{
+          name: child.definition.name,
+          filePath: child.definition.canonicalPath,
+          source: "project",
+        }],
+      }),
+      loadMainDefinition: async () => main,
+      loadChildDefinition: async () => child,
+      startupTimeoutMs: 5_000,
+      harness: { backend: harnessBackendConfig() },
+      harnessBackendFactory: () => {
+        entered += 1;
+        const handlers = host.handlers.get("session_clear") ?? [];
+        handlers.at(-1)!({ type: "session_clear" }, host.context);
+        return fake.host;
+      },
+    });
+    controls.push(entry);
+    await host.sessionStart();
+    const value = entry.getStatus();
+    expect(entered).toBe(1);
+    expect(value.phase).toBe("closed");
+    expect(value.restartRequired).toBe(true);
+    expect(fake.events).toEqual([]);
+  });
+
+  test("factory disposal during admission cannot resurrect the disposed entry", async () => {
+    const fake = createFakeHarness();
+    const main = mainSnapshot(WORKSPACE, HARNESS_MAIN_TOOLS);
+    const child = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+    const host = new Host({ cwd: WORKSPACE, sessionId: "session-root", activeTools: HARNESS_MAIN_TOOLS });
+    let entry!: InstancedNativeEntryControls;
+    let entered = 0;
+    entry = createInstancedNativeEntry(host.pi, {
+      mainDefinitionPath: main.definition.canonicalPath,
+      childDefinitions: [child.definition.requestedPath],
+      nativePorts: makePorts({
+        discoverAgents: async () => [{
+          name: child.definition.name,
+          filePath: child.definition.canonicalPath,
+          source: "project",
+        }],
+      }),
+      loadMainDefinition: async () => main,
+      loadChildDefinition: async () => child,
+      startupTimeoutMs: 5_000,
+      harness: { backend: harnessBackendConfig() },
+      harnessBackendFactory: () => {
+        entered += 1;
+        entry.dispose();
+        return fake.host;
+      },
+    });
+    controls.push(entry);
+    await host.sessionStart();
+    const value = entry.getStatus();
+    expect(entered).toBe(1);
+    expect(value.phase).toBe("closed");
+    expect(fake.events).toEqual([]);
+  });
+
+  test("late factory callback closes the ready root without reopening it", async () => {
+    const fake = createFakeHarness();
+    const main = mainSnapshot(WORKSPACE, HARNESS_MAIN_TOOLS);
+    const child = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1");
+    const host = new Host({ cwd: WORKSPACE, sessionId: "session-root", activeTools: HARNESS_MAIN_TOOLS });
+    const entry = createInstancedNativeEntry(host.pi, {
+      mainDefinitionPath: main.definition.canonicalPath,
+      childDefinitions: [child.definition.requestedPath],
+      nativePorts: makePorts({
+        discoverAgents: async () => [{
+          name: child.definition.name,
+          filePath: child.definition.canonicalPath,
+          source: "project",
+        }],
+      }),
+      loadMainDefinition: async () => main,
+      loadChildDefinition: async () => child,
+      startupTimeoutMs: 5_000,
+      harness: { backend: harnessBackendConfig() },
+      harnessBackendFactory: () => {
+        setTimeout(() => {
+          const handlers = host.handlers.get("session_switch") ?? [];
+          handlers.at(-1)!({ type: "session_switch" }, host.context);
+        }, 0);
+        return fake.host;
+      },
+    });
+    controls.push(entry);
+    await host.sessionStart();
+    expect(entry.getStatus().phase).toBe("ready");
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    expect(entry.getStatus().phase).toBe("closed");
+    expect(entry.getStatus().restartRequired).toBe(true);
+    expect(fake.events).toEqual([]);
+  });
+
+  test("normal child admission remains unchanged when Harness is selected on the main root", async () => {
+    const fake = createFakeHarness();
+    const harness = harnessFixture(fake);
+    const root = await startRoot({
+      ...harnessMainOptions(),
+      harness: harness.harness,
+      harnessBackendFactory: harness.factory,
+    });
+    await beginWork(root, "normal child work under harness root");
+    await admit(root, "task-normal-child");
+    await spawn(root);
+    await startChild(root, "task-normal-child", "ChildNormal");
+    expect(records(root)[0]?.phase).toBe("bound");
+    expect(fake.events).toEqual([]);
+    expect(harness.calls).toHaveLength(1);
+  });
 });
