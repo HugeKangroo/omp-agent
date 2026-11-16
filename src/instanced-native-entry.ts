@@ -38,6 +38,7 @@ import {
   MAX_NATIVE_INSTANCE_REPORT_CATALOG_BYTES,
   MAX_NATIVE_INSTANCE_REPORT_CATALOG_ITEMS,
   unavailableNativeInstanceReportCatalog,
+  type NativeHandoffReportFacts,
   type NativeInstanceReportCatalog,
   type NativeInstanceReportCatalogItem,
   type NativeInstanceReportCheck,
@@ -47,6 +48,51 @@ import {
   type NativeInstanceReportSelection,
   type NativeReportWorkIdentity,
 } from "./native-instance-report.ts";
+import {
+  MAX_HANDOFF_OFFERS,
+  type HandoffAdoption,
+  type HandoffBindingFacts,
+  type HandoffCallRef,
+  type HandoffConsumerRef,
+  type HandoffOffer,
+  type HandoffOfferView,
+  type HandoffToolCallRef,
+  type NativeHandoffStore,
+} from "./native-handoff.ts";
+import {
+  createNativeHandoffCoordinator,
+  createNativeHandoffEntry,
+  getNativeHandoffCoordinatorStore,
+  MAX_HANDOFF_OPERATIONS,
+  NATIVE_HANDOFF_TOOL,
+  prepareNativeHandoffReport,
+  readNativeHandoffRequestDescriptor,
+  type NativeHandoffCallIdentity,
+  type NativeHandoffCheck,
+  type NativeHandoffCoordinator,
+  type NativeHandoffEntry,
+  type NativeHandoffPorts,
+  type NativeHandoffPrepareRequest,
+  type NativeHandoffPrepareResult,
+  type NativeHandoffPreparedOperation,
+  type NativeHandoffRequestDescriptor,
+  type NativeHandoffWorkFacts,
+} from "./native-handoff-entry.ts";
+import {
+  createNativeSnapshotEntry,
+  MAX_SNAPSHOT_OPERATIONS,
+  NATIVE_SNAPSHOT_TOOL,
+  readNativeSnapshotRequestDescriptor,
+  type NativeChildCallIdentity,
+  type NativeChildObservationPreparation,
+  type NativeChildPorts,
+  type NativeChildPrepareRequest,
+  type NativeChildPrepareResult,
+  type NativeChildReadEventIdentity,
+  type NativeChildReadExpectation,
+  type NativeSnapshotEntry,
+  type NativeSnapshotRequestDescriptor,
+} from "./native-handoff-snapshot.ts";
 import {
   verifyNativeAutoloadSkills,
   verifyNativeChildRole,
@@ -83,6 +129,8 @@ const NATIVE_SKILLS_SPECIFIER = "@oh-my-pi/pi-coding-agent/extensibility/skills"
 const NATIVE_SETTINGS_SPECIFIER = "@oh-my-pi/pi-coding-agent/config/settings";
 const NATIVE_REGISTRY_SPECIFIER = "@oh-my-pi/pi-coding-agent/config/registry";
 const ROLE_FRAME = "\u2042 Role\n{{agent}}\n\u2042 Coop";
+const HANDOFF_REF_PREFIX = "OMP_HANDOFF_REF_V1";
+const HANDOFF_TASK_PREFIX = "Complete assignment thoroughly:\n\n";
 
 const DEFAULT_STARTUP_TIMEOUT_MS = 20_000;
 const MAX_STARTUP_TIMEOUT_MS = 25_000;
@@ -438,6 +486,44 @@ interface SelectedDefinition {
   readonly tools: readonly string[];
 }
 
+interface HandoffPreflight {
+  readonly descriptor: NativeHandoffRequestDescriptor;
+  /**
+   * Exact original native call reference captured on the first execute. Replay
+   * and preparation must reuse this object, never recapture it.
+   */
+  originalCallRef: object | null;
+  work: NativeHandoffWorkFacts | null;
+  identityRevalidate: (() => string | null) | null;
+  state: "open" | "failed";
+  failureReason: string | null;
+}
+
+interface SnapshotPreflight {
+  readonly descriptor: NativeSnapshotRequestDescriptor;
+  /**
+   * Distinct actual child tool token issued by this preflight. It is never the
+   * main call reference or a JSON clone.
+   */
+  readonly token: HandoffToolCallRef;
+}
+
+interface HandoffOfferReservation {
+  readonly offerId: string;
+  readonly offer: HandoffOffer;
+  readonly consumerToken: object;
+  readonly parentTaskCall: HandoffCallRef;
+  readonly parentRevalidate: () => string | null;
+  readonly producerRevalidate: (() => string | null) | null;
+  readonly sourceProducer: InstanceRecord | null;
+  readonly sourceProducerWorkRef: NativeWorkCallReference | null;
+  readonly sourceProducerObservation: NativeInstanceResultObservation | null;
+  readonly sourceProducerVersion: string | null;
+  state: "reserved" | "bound" | "failed";
+  record: InstanceRecord | null;
+  failureReason: string | null;
+}
+
 interface PendingAdmission {
   readonly parentToolCallId: string;
   readonly agentName: string;
@@ -449,6 +535,7 @@ interface PendingAdmission {
   readonly workCaptureReason: string | null;
   readonly workInspection: NativeWorkCallInspection | null;
   readonly workInspectionHook: InstancedWorkObservationHook | null;
+  readonly handoff: HandoffOfferReservation | null;
   state: "loading" | "invalidated" | "timedout";
 }
 
@@ -460,6 +547,17 @@ interface InstanceRecord {
   readonly parentToolCallId: string;
   readonly index: 0;
   readonly inputDigest: string;
+  /** Complete original task text, retained only for handoff-bound tasks. */
+  readonly task: string | null;
+  readonly taskBytes: number;
+  readonly handoffToken: object | null;
+  readonly handoffOfferId: string | null;
+  readonly handoffOffer: HandoffOffer | null;
+  readonly handoffParentTaskRef: HandoffCallRef | null;
+  readonly handoffParentRevalidate: (() => string | null) | null;
+  handoffPromptGate: "unobserved" | "verified" | "refused";
+  handoffContextGate: "unobserved" | "verified" | "refused";
+  readonly snapshotPreflights: Map<string, SnapshotPreflight>;
   readonly admittedEpoch: number;
   readonly admittedRootToken: symbol;
   readonly admittedWorkEpoch: number;
@@ -523,6 +621,10 @@ interface RootState {
   recordByChildId: Map<string, InstanceRecord>;
   seenToolCalls: Set<string>;
   seenLifecycle: WeakSet<object>;
+  handoffCoordinator: NativeHandoffCoordinator | null;
+  handoffStore: NativeHandoffStore | null;
+  handoffPreflights: Map<string, HandoffPreflight>;
+  offerReservations: Map<string, HandoffOfferReservation>;
   retainedBytes: number;
   refusalCount: number;
   lastRefusal: { code: string; message: string } | null;
@@ -985,7 +1087,43 @@ function diagnose(
   }
 }
 
+function offerReservationForRecord(
+  root: RootState,
+  record: InstanceRecord,
+): HandoffOfferReservation | null {
+  if (record.handoffOfferId === null) return null;
+  return root.offerReservations.get(record.handoffOfferId) ?? null;
+}
+
+/**
+ * A refusal/failure after a consumer offer was bound must make that offer
+ * monotonic-failed even when the record itself is already closed. The core
+ * offer handle remains historical; this is not a second ledger.
+ */
+function invalidateRecordHandoff(
+  root: RootState,
+  record: InstanceRecord,
+  reason: string,
+): void {
+  if (record.handoffOffer === null) return;
+  const store = root.handoffStore;
+  if (store !== null) {
+    try {
+      store.markBindingFailed(record.handoffOffer, reason);
+    } catch {
+      // Already failed/invalidated is not a new authority failure.
+    }
+  }
+  const reservation = offerReservationForRecord(root, record);
+  if (reservation !== null && reservation.state !== "failed") {
+    reservation.state = "failed";
+    reservation.failureReason = boundedMessage(reason);
+  }
+}
+
 function markRefused(root: RootState, record: InstanceRecord, code: string, message: string): void {
+  // Handoff failure is independent of the record's closed/refused phase.
+  invalidateRecordHandoff(root, record, `${code}: ${message}`);
   if (record.phase === "refused" || record.phase === "closed") return;
   record.phase = "refused";
   record.refusalCode = boundedString(code, 64);
@@ -1043,6 +1181,35 @@ function invalidateWorkObservations(root: RootState, reason: string): void {
   }
 }
 
+/**
+ * Root close/failure terminates the one coordinator/store generation. Unbound
+ * reservations are made monotonic-failed first; bound offers are closed with
+ * the coordinator rather than revived by a later factory.
+ */
+function closeHandoffRoot(root: RootState, reason: string): void {
+  const store = root.handoffStore;
+  if (store !== null) {
+    for (const reservation of root.offerReservations.values()) {
+      if (reservation.state === "failed") continue;
+      try {
+        store.markBindingFailed(reservation.offer, reason);
+      } catch {
+        // A store already invalidated has no live offer to mutate.
+      }
+      reservation.state = "failed";
+      reservation.failureReason = boundedMessage(reason);
+    }
+  }
+  const coordinator = root.handoffCoordinator;
+  if (coordinator !== null) {
+    try {
+      coordinator.close();
+    } catch {
+      // The coordinator close path is local and must not break root cleanup.
+    }
+  }
+}
+
 function failRoot(factory: FactoryContext, root: RootState, code: string, message: string): void {
   if (root.phase === "closed" || root.phase === "failed") return;
   root.open = false;
@@ -1054,6 +1221,7 @@ function failRoot(factory: FactoryContext, root: RootState, code: string, messag
   invalidatePending(root, "the instance root failed");
   invalidateWorkObservations(root, "the instance root failed");
   for (const record of root.records) closeRecord(record, "the instance root failed");
+  closeHandoffRoot(root, "the instance root failed");
   diagnose(factory, "root-failed", `${code}: ${message}`);
 }
 
@@ -1067,6 +1235,7 @@ function closeRoot(factory: FactoryContext, root: RootState, reason: string): vo
   invalidatePending(root, reason);
   invalidateWorkObservations(root, reason);
   for (const record of root.records) closeRecord(record, reason);
+  closeHandoffRoot(root, reason);
   diagnose(factory, "root-closed", reason);
 }
 
@@ -1474,8 +1643,11 @@ function onLifecycleEvent(factory: FactoryContext, bus: InstancedEventBus, data:
       if (status === "completed") record.lifecycleEvidence.completed = true;
       if (status === "failed") record.lifecycleEvidence.failed = true;
       if (status === "aborted") record.lifecycleEvidence.aborted = true;
+      if (status === "failed" || status === "aborted") {
+        invalidateRecordHandoff(root, record, `native lifecycle ${status}`);
+      }
       closeRecord(record, `native lifecycle ${status}`);
-      assessResultLifecycleConflict(record);
+      assessResultLifecycleConflict(root, record);
     }
   } catch {
     // EventBus callbacks are not awaited and must never throw into the host.
@@ -1533,10 +1705,24 @@ function claimRoot(factory: FactoryContext, context: NativeContext): RootState |
     recordByChildId: new Map(),
     seenToolCalls: new Set(),
     seenLifecycle: new WeakSet(),
+    handoffCoordinator: null,
+    handoffStore: null,
+    handoffPreflights: new Map(),
+    offerReservations: new Map(),
     retainedBytes: 0,
     refusalCount: 0,
     lastRefusal: null,
   };
+  try {
+    const coordinator = createNativeHandoffCoordinator(Object.freeze({}));
+    const store = getNativeHandoffCoordinatorStore(coordinator);
+    if (store === null) throw new Error("the native handoff store was unavailable at root creation.");
+    root.handoffCoordinator = coordinator;
+    root.handoffStore = store;
+  } catch (error) {
+    factory.refusedReason = boundedMessage(`Native handoff composition failed: ${errorMessage(error)}`);
+    return null;
+  }
   moduleRoot = root;
   factory.rootToken = root.token;
   return root;
@@ -1731,6 +1917,31 @@ function readTaskInput(raw: unknown):
   return { ok: true, agent, task, digest };
 }
 
+type HandoffTaskReference =
+  | { readonly kind: "none" }
+  | { readonly kind: "handoff"; readonly offerId: string }
+  | { readonly kind: "invalid"; readonly reason: string };
+
+/**
+ * The reference is accepted only as the exact first line. No scanning of later
+ * text, systemPrompt or model-controlled context is allowed.
+ */
+function readHandoffTaskReference(task: string): HandoffTaskReference {
+  const firstLine = task.split("\n", 1)[0] ?? "";
+  if (!firstLine.startsWith(HANDOFF_REF_PREFIX)) return { kind: "none" };
+  if (!firstLine.startsWith(`${HANDOFF_REF_PREFIX} `)) {
+    return { kind: "invalid", reason: `the first task line must be exactly ${HANDOFF_REF_PREFIX} <offerId>.` };
+  }
+  const offerId = firstLine.slice(HANDOFF_REF_PREFIX.length + 1);
+  if (offerId.length === 0
+    || offerId.length > MAX_ID_CHARS
+    || /\s/.test(offerId)
+    || /[\x00-\x1f\x7f]/.test(offerId)) {
+    return { kind: "invalid", reason: "the handoff offerId on the first task line is invalid." };
+  }
+  return { kind: "handoff", offerId };
+}
+
 async function loadAdmissionSnapshot(
   root: RootState,
   selected: SelectedDefinition,
@@ -1885,7 +2096,7 @@ function expectedResultAssociation(
  * terminal disagree. A normal close or a missing parent cancellation is never
  * treated as evidence by itself.
  */
-function assessResultLifecycleConflict(record: InstanceRecord): void {
+function assessResultLifecycleConflict(root: RootState, record: InstanceRecord): void {
   if (record.resultLifecycleConflict !== null) return;
   const observation = record.resultObservation;
   if (observation === null || observation.state !== "observed") return;
@@ -1906,6 +2117,7 @@ function assessResultLifecycleConflict(record: InstanceRecord): void {
   }
   if (code !== null && message !== null) {
     record.resultLifecycleConflict = { code, message: boundedMessage(message) };
+    invalidateRecordHandoff(root, record, `result lifecycle conflict ${code}`);
   }
 }
 
@@ -2250,6 +2462,7 @@ function prepareInstanceReport(
   selection: NativeInstanceReportSelection,
   work: NativeReportWorkIdentity,
   context: NativeContext,
+  handoffAdoptionId?: string,
 ): NativeInstanceReportPrepareResult {
   try {
     const root = moduleRoot;
@@ -2337,7 +2550,33 @@ function prepareInstanceReport(
     if (localFailure !== null) {
       return { ok: false, reason: localFailure };
     }
-    const facts: NativeInstanceReportFacts = deepFreeze({
+    let handoffState: HandoffReportState | null = null;
+    if (handoffAdoptionId !== undefined) {
+      if (typeof handoffAdoptionId !== "string"
+        || handoffAdoptionId.length === 0
+        || handoffAdoptionId.length > MAX_ID_CHARS
+        || /[\x00-\x1f\x7f]/.test(handoffAdoptionId)) {
+        return { ok: false, reason: "the requested handoff adoption id is invalid" };
+      }
+      const handoffResult = prepareHandoffReport(
+        factory,
+        root,
+        context,
+        selection,
+        expectedWork,
+        record,
+        handoffAdoptionId,
+      );
+      if (!handoffResult.ok) return { ok: false, reason: handoffResult.reason };
+      handoffState = handoffResult.state;
+      // The handoff preparation read the host. Re-check the producer binding
+      // and owner after those getters before freezing facts.
+      const afterHandoffOwner = ownerIdentityFailure(root, expectedWork, context);
+      if (afterHandoffOwner !== null) return { ok: false, reason: afterHandoffOwner };
+      const afterHandoffLocal = localReportBindingFailure(binding);
+      if (afterHandoffLocal !== null) return { ok: false, reason: afterHandoffLocal };
+    }
+    const baseFacts: NativeInstanceReportFacts = {
       result: { ...observation.association },
       work: {
         observationId: ref.observationId,
@@ -2354,14 +2593,26 @@ function prepareInstanceReport(
       },
       artifactBasis: "observed-during-report" as const,
       semanticAcceptance: "not-evaluated" as const,
-    });
+      ...(handoffState === null ? {} : { handoff: handoffState.handoffFacts }),
+    };
+    const facts: NativeInstanceReportFacts = deepFreeze(baseFacts);
     const prepared = Object.freeze({
       facts,
       refresh(nextContext: NativeContext): NativeInstanceReportCheck {
-        return refreshReportBinding(binding, nextContext);
+        const base = refreshReportBinding(binding, nextContext);
+        if (!base.ok) return base;
+        if (handoffState !== null) {
+          const handoff = handoffReportRefresh(handoffState, nextContext);
+          if (!handoff.ok) return handoff;
+          const local = localReportBindingFailure(binding);
+          if (local !== null) return checkFailure(local);
+        }
+        return { ok: true };
       },
       revalidate(): string | null {
-        return localReportBindingFailure(binding);
+        const local = localReportBindingFailure(binding);
+        if (local !== null) return local;
+        return handoffState === null ? null : handoffReportLocalFailure(handoffState);
       },
     });
     return { ok: true, prepared };
@@ -2371,6 +2622,1570 @@ function prepareInstanceReport(
       reason: boundedMessage(`instance result preparation failed: ${errorMessage(error)}`),
     };
   }
+}
+
+function handoffWorkFromReference(ref: NativeWorkCallReference): NativeHandoffWorkFacts {
+  return Object.freeze({
+    observationId: ref.observationId,
+    generation: ref.generation,
+    sessionId: ref.sessionId,
+    workspaceRoot: ref.workspaceRoot,
+  });
+}
+
+function sameHandoffWork(left: NativeHandoffWorkFacts, right: NativeHandoffWorkFacts): boolean {
+  return left.observationId === right.observationId
+    && left.generation === right.generation
+    && left.sessionId === right.sessionId
+    && left.workspaceRoot === right.workspaceRoot;
+}
+
+function sameWorkReference(ref: NativeWorkCallReference, work: NativeHandoffWorkFacts): boolean {
+  return ref.observationId === work.observationId
+    && ref.generation === work.generation
+    && ref.sessionId === work.sessionId
+    && ref.workspaceRoot === work.workspaceRoot;
+}
+
+type CallCheckAcceptance = "preflight" | "observed" | "either";
+
+function callCheckFailure(
+  preparation: ReturnType<DefinedControls["nativeEntry"]["prepareCallCheck"]>,
+  ref: NativeWorkCallReference,
+  expectedWork: NativeHandoffWorkFacts | null,
+  accept: CallCheckAcceptance,
+): string | null {
+  if (!preparation.ok) {
+    return `the original native call is unavailable (${preparation.inspection.reason})`;
+  }
+  const inspection = preparation.inspection;
+  if (inspection.state !== "current") {
+    return `the original native call is ${inspection.state} (${inspection.reason})`;
+  }
+  const association = inspection.association;
+  if (association === null
+    || association.observationId !== ref.observationId
+    || association.generation !== ref.generation
+    || association.sessionId !== ref.sessionId
+    || association.workspaceRoot !== ref.workspaceRoot
+    || association.toolCallId !== ref.toolCallId
+    || association.toolName !== ref.toolName) {
+    return "the original native call inspection did not retain the exact reference";
+  }
+  if (expectedWork !== null && !sameWorkReference(ref, expectedWork)) {
+    return "the original native call does not belong to the handoff work";
+  }
+  const resultState = inspection.callResultState;
+  if (accept === "observed") {
+    if (resultState !== "observed") {
+      return `the original native task call has no observed result (${resultState ?? "unknown"})`;
+    }
+  } else if (accept === "preflight") {
+    if (resultState !== "preflight") {
+      return `the original native call is not the current preflight (${resultState ?? "unknown"})`;
+    }
+  } else if (resultState !== "preflight" && resultState !== "observed") {
+    return `the original native call has no preflight or observed result (${resultState ?? "unknown"})`;
+  }
+  return null;
+}
+
+function mainHandoffRoot(
+  factory: FactoryContext,
+  context: NativeContext,
+): { readonly root: RootState; readonly store: NativeHandoffStore; readonly coordinator: NativeHandoffCoordinator } | null {
+  if (factory.disposed) return null;
+  const root = moduleRoot;
+  if (root === null
+    || root.factoryId !== factory.id
+    || !ownsRoot(factory, root)
+    || !root.open
+    || root.phase !== "ready"
+    || root.handoffStore === null
+    || root.handoffCoordinator === null
+    || root.handoffCoordinator.closed) {
+    return null;
+  }
+  let facts: HostFacts;
+  try {
+    facts = readHostFacts(context);
+  } catch {
+    return null;
+  }
+  if (!matchesOwnerIdentity(root, facts)) return null;
+  return { root, store: root.handoffStore, coordinator: root.handoffCoordinator };
+}
+
+function handoffMainRefreshFailure(
+  factory: FactoryContext,
+  root: RootState,
+  context: NativeContext,
+): string | null {
+  if (moduleRoot !== root) return "the instance root was replaced";
+  if (!ownsRoot(factory, root) || !root.open || root.phase !== "ready") {
+    return "the instance root is no longer open and ready";
+  }
+  if (root.handoffCoordinator === null || root.handoffCoordinator.closed) {
+    return "the root handoff coordinator is closed";
+  }
+  let facts: HostFacts;
+  try {
+    facts = readHostFacts(context);
+  } catch {
+    return "the actual host context could not be read";
+  }
+  if (!matchesOwnerIdentity(root, facts)) {
+    return "the actual main agent, session or live workspace does not match the bound owner";
+  }
+  let allowed = false;
+  try {
+    allowed = factory.definitionEntry.controller.allowsObservation({
+      agentKind: "main",
+      sessionId: facts.sessionId,
+      workspaceRoot: facts.workspaceRoot,
+      hasUI: (context as InstancedNativeContext).hasUI === true,
+      hasPendingMessages: null,
+    });
+  } catch {
+    return "the D1 main binding could not be observed";
+  }
+  if (!allowed) return "the D1 main binding is no longer valid";
+  return null;
+}
+
+function producerRecordFor(
+  root: RootState,
+  selector: { readonly instanceId: string; readonly parentToolCallId: string; readonly envelopeSha256: string },
+): { readonly record: InstanceRecord } | { readonly reason: string } {
+  const record = root.recordByToolCall.get(selector.parentToolCallId);
+  if (record === undefined
+    || record.id !== selector.instanceId
+    || record.parentToolCallId !== selector.parentToolCallId) {
+    return { reason: "the selected producer instance is not retained on this root" };
+  }
+  if (record.handoffToken === null) {
+    return { reason: "the producer instance has no opaque producer token" };
+  }
+  const failure = reportResultFailure(record, root);
+  if (failure !== null) return { reason: failure };
+  const envelope = observedReportEnvelope(record.resultObservation);
+  if (envelope === null || envelope.sha256 !== selector.envelopeSha256) {
+    return { reason: "the producer result envelope does not match the explicit selector" };
+  }
+  return { record };
+}
+
+function producerFactsFor(record: InstanceRecord, work: NativeHandoffWorkFacts): HandoffBindingFacts {
+  return Object.freeze({
+    callId: record.parentToolCallId,
+    workId: work.observationId,
+    definitionVersion: record.definition.version,
+  });
+}
+
+function recordByParentTaskCall(
+  root: RootState,
+  parentToolCallId: string,
+): InstanceRecord | null {
+  const record = root.recordByToolCall.get(parentToolCallId);
+  if (record === undefined || record.parentToolCallId !== parentToolCallId) return null;
+  return record;
+}
+
+function handoffReservationFailure(
+  root: RootState,
+  reservation: HandoffOfferReservation,
+  reason: string,
+): void {
+  if (reservation.state !== "failed") {
+    reservation.state = "failed";
+    reservation.failureReason = boundedMessage(reason);
+  }
+  const store = root.handoffStore;
+  if (store !== null) {
+    try {
+      store.markBindingFailed(reservation.offer, reason);
+    } catch {
+      // The offer may already be failed or its store invalidated.
+    }
+  }
+}
+
+/**
+ * Reserve one offer consumption before asynchronous definition loading. The
+ * bounded root map never evicts and never reuses a failed reservation.
+ */
+function reserveHandoffOffer(
+  factory: FactoryContext,
+  root: RootState,
+  offerId: string,
+  workRef: NativeWorkCallReference | null,
+  context: NativeContext,
+): { readonly ok: true; readonly reservation: HandoffOfferReservation }
+  | { readonly ok: false; readonly reason: string } {
+  const store = root.handoffStore;
+  if (store === null) return { ok: false, reason: "the native handoff store is unavailable" };
+  if (root.offerReservations.has(offerId)) {
+    return { ok: false, reason: "the handoff offer already has a permanent consumption reservation" };
+  }
+  if (root.offerReservations.size >= MAX_HANDOFF_OFFERS) {
+    return { ok: false, reason: `the handoff offer reservation capacity (${MAX_HANDOFF_OFFERS}) is exhausted` };
+  }
+  const offer = store.resolveOffer(offerId);
+  const view = store.lookupOffer(offerId);
+  if (offer === null || view === null) {
+    return { ok: false, reason: "the task handoff offer is not available on this root" };
+  }
+  if (view.state !== "open") {
+    return { ok: false, reason: `the task handoff offer is ${view.state}, not open` };
+  }
+  const token: object = Object.freeze({});
+  const makeFailed = (reason: string): { readonly ok: false; readonly reason: string } => {
+    const reservation: HandoffOfferReservation = {
+      offerId,
+      offer,
+      consumerToken: token,
+      parentTaskCall: workRef === null ? Object.freeze({}) : workRef,
+      parentRevalidate: () => reason,
+      producerRevalidate: null,
+      sourceProducer: null,
+      sourceProducerWorkRef: null,
+      sourceProducerObservation: null,
+      sourceProducerVersion: null,
+      state: "failed",
+      record: null,
+      failureReason: reason,
+    };
+    root.offerReservations.set(offerId, reservation);
+    handoffReservationFailure(root, reservation, reason);
+    return { ok: false, reason };
+  };
+  if (workRef === null) {
+    return makeFailed("no original native parent task call reference was captured.");
+  }
+  if (workRef.toolName !== "task") {
+    return makeFailed("the original native parent call is not the task call.");
+  }
+  const preparation = factory.definitionEntry.nativeEntry.prepareCallCheck(workRef, context);
+  const failure = callCheckFailure(preparation, workRef, null, "preflight");
+  if (failure !== null) return makeFailed(failure);
+  const revalidate = () => {
+    if (!preparation.ok) return "the original parent native call is unavailable";
+    const result = preparation.revalidate();
+    return result === null ? null : boundedMessage(result);
+  };
+  const captureView = store.lookupCapture(view.captureId);
+  if (captureView === null) {
+    return makeFailed("the offer's source capture is unavailable.");
+  }
+  const handoffWork = handoffWorkFromReference(workRef);
+  if (captureView.producer.workId !== handoffWork.observationId) {
+    return makeFailed("the offer's source capture belongs to a different native work generation.");
+  }
+  const sourceProducer = recordByParentTaskCall(root, captureView.producer.callId);
+  if (sourceProducer === null
+    || sourceProducer.handoffToken === null
+    || sourceProducer.definition.version !== captureView.producer.definitionVersion
+    || sourceProducer.workRef === null) {
+    return makeFailed("the offer's actual source producer record is unavailable.");
+  }
+  const producerResultFailure = reportResultFailure(sourceProducer, root);
+  if (producerResultFailure !== null) return makeFailed(producerResultFailure);
+  if (observedReportEnvelope(sourceProducer.resultObservation) === null) {
+    return makeFailed("the offer's source producer has no complete observed result.");
+  }
+  const producerPreparation = factory.definitionEntry.nativeEntry.prepareCallCheck(
+    sourceProducer.workRef,
+    context,
+  );
+  const producerFailure = callCheckFailure(
+    producerPreparation,
+    sourceProducer.workRef,
+    handoffWork,
+    "observed",
+  );
+  if (producerFailure !== null) return makeFailed(producerFailure);
+  const producerRevalidate = () => {
+    if (!producerPreparation.ok) return "the offer source producer native call is unavailable";
+    const result = producerPreparation.revalidate();
+    return result === null ? null : boundedMessage(result);
+  };
+  const reservation: HandoffOfferReservation = {
+    offerId,
+    offer,
+    consumerToken: token,
+    parentTaskCall: workRef,
+    parentRevalidate: revalidate,
+    producerRevalidate,
+    sourceProducer,
+    sourceProducerWorkRef: sourceProducer.workRef,
+    sourceProducerObservation: sourceProducer.resultObservation,
+    sourceProducerVersion: sourceProducer.definition.version,
+    state: "reserved",
+    record: null,
+    failureReason: null,
+  };
+  root.offerReservations.set(offerId, reservation);
+  return { ok: true, reservation };
+}
+
+/**
+ * Last local gate before the core bind. It uses captured record/result/ref
+ * identities and the two fresh native pure checks; it never reads the host.
+ */
+function handoffReservationLocalFailure(
+  root: RootState,
+  reservation: HandoffOfferReservation,
+): string | null {
+  if (root.offerReservations.get(reservation.offerId) !== reservation) {
+    return "the offer reservation was replaced or lost after preparation";
+  }
+  if (reservation.state !== "reserved") {
+    return "the offer reservation is no longer available for binding";
+  }
+  const producer = reservation.sourceProducer;
+  const workRef = reservation.sourceProducerWorkRef;
+  const observation = reservation.sourceProducerObservation;
+  if (producer === null
+    || workRef === null
+    || observation === null
+    || reservation.sourceProducerVersion === null) {
+    return "the offer source producer facts were not captured";
+  }
+  if (root.recordByToolCall.get(producer.parentToolCallId) !== producer) {
+    return "the offer source producer record is no longer retained";
+  }
+  if (producer.workRef !== workRef
+    || producer.resultObservation !== observation
+    || producer.definition.version !== reservation.sourceProducerVersion
+    || producer.handoffToken === null) {
+    return "the offer source producer record, result or definition changed";
+  }
+  const resultFailure = reportResultFailure(producer, root);
+  if (resultFailure !== null) return resultFailure;
+  const parentPure = reservation.parentRevalidate();
+  if (parentPure !== null) return parentPure;
+  const producerPure = reservation.producerRevalidate?.() ?? null;
+  if (producerPure !== null) return producerPure;
+  return null;
+}
+
+function bindHandoffOfferConsumer(
+  root: RootState,
+  reservation: HandoffOfferReservation,
+  record: InstanceRecord,
+): string | null {
+  if (root.offerReservations.get(reservation.offerId) !== reservation
+    || reservation.state !== "reserved") {
+    return "the handoff offer reservation is no longer available for binding.";
+  }
+  const store = root.handoffStore;
+  if (store === null) return "the native handoff store is unavailable.";
+  if (record.workRef !== reservation.parentTaskCall) {
+    return "the admitted record lost its original native parent task reference.";
+  }
+  const facts: HandoffBindingFacts = {
+    callId: record.parentToolCallId,
+    workId: record.workRef.observationId,
+    definitionVersion: record.definition.version,
+  };
+  try {
+    const view = store.bindOfferConsumer(
+      reservation.offer,
+      reservation.consumerToken,
+      reservation.parentTaskCall,
+      facts,
+    );
+    if (view.state !== "bound" || view.offerId !== reservation.offerId) {
+      throw new Error("the core did not report the expected bound consumer view.");
+    }
+  } catch (error) {
+    const reason = `the actual task call could not bind the handoff offer: ${errorMessage(error)}`;
+    handoffReservationFailure(root, reservation, reason);
+    return reason;
+  }
+  reservation.state = "bound";
+  reservation.record = record;
+  return null;
+}
+
+function taskMessageText(content: unknown): string | null {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content) || content.length === 0) return null;
+  const text: string[] = [];
+  for (const part of content) {
+    if (!isRecord(part) || part.type !== "text" || typeof part.text !== "string") return null;
+    text.push(part.text);
+  }
+  return text.join("\n");
+}
+
+/**
+ * Minimal fixed-host context check: exactly one user message carries the
+ * complete accepted task text. Provider date/workspace wrappers are not part
+ * of this context shape and are never stripped or guessed.
+ */
+function verifyHandoffTaskMessage(messages: readonly unknown[], task: string): boolean {
+  const expected = HANDOFF_TASK_PREFIX + task;
+  let matches = 0;
+  for (const message of messages) {
+    if (!isRecord(message) || message.role !== "user") continue;
+    const text = taskMessageText(message.content);
+    if (text === expected) matches += 1;
+  }
+  return matches === 1;
+}
+
+function handoffCallCheckFailure(
+  factory: FactoryContext,
+  ref: NativeWorkCallReference,
+  context: NativeContext,
+  expectedWork: NativeHandoffWorkFacts,
+  accept: CallCheckAcceptance,
+): { readonly ok: true; readonly revalidate: () => string | null }
+  | { readonly ok: false; readonly reason: string } {
+  let preparation;
+  try {
+    preparation = factory.definitionEntry.nativeEntry.prepareCallCheck(ref, context);
+  } catch (error) {
+    return { ok: false, reason: boundedMessage(`the native call check threw: ${errorMessage(error)}`) };
+  }
+  const failure = callCheckFailure(preparation, ref, expectedWork, accept);
+  if (failure !== null) return { ok: false, reason: failure };
+  return {
+    ok: true,
+    revalidate: () => {
+      if (!preparation.ok) return "the original child native call is unavailable";
+      const result = preparation.revalidate();
+      return result === null ? null : boundedMessage(result);
+    },
+  };
+}
+
+interface HandoffPrepareState {
+  readonly factory: FactoryContext;
+  readonly root: RootState;
+  readonly store: NativeHandoffStore;
+  readonly coordinator: NativeHandoffCoordinator;
+  readonly request: NativeHandoffPrepareRequest;
+  readonly preflight: HandoffPreflight;
+  readonly work: NativeHandoffWorkFacts;
+  readonly producer: InstanceRecord;
+  readonly consumer: InstanceRecord | null;
+  readonly producerObservation: NativeInstanceResultObservation;
+  readonly consumerObservation: NativeInstanceResultObservation | null;
+  mainPure: (() => string | null) | null;
+  producerPure: (() => string | null) | null;
+  consumerPure: (() => string | null) | null;
+  readonly rootToken: symbol;
+  readonly rootEpoch: number;
+}
+
+function handoffPrepareLocalFailure(state: HandoffPrepareState): string | null {
+  const { factory, root, store, coordinator, preflight, producer, consumer } = state;
+  if (moduleRoot !== root) return "the instance root was replaced after preparation";
+  if (!ownsRoot(factory, root) || !root.open || root.phase !== "ready") {
+    return "the instance root is no longer open and ready";
+  }
+  if (root.token !== state.rootToken || root.epoch !== state.rootEpoch) {
+    return "the instance root generation changed after preparation";
+  }
+  if (root.handoffStore !== store || root.handoffCoordinator !== coordinator || coordinator.closed) {
+    return "the root handoff coordinator or store changed after preparation";
+  }
+  if (getNativeHandoffCoordinatorStore(coordinator) !== store) {
+    return "the root handoff coordinator is no longer current";
+  }
+  if (root.handoffPreflights.get(state.request.actualToolCallId) !== preflight) {
+    return "the original handoff preflight is no longer retained";
+  }
+  if (preflight.state !== "open") {
+    return preflight.failureReason ?? "the original handoff preflight failed";
+  }
+  if (preflight.originalCallRef !== state.request.nativeCallRef
+    || preflight.work === null
+    || !sameHandoffWork(preflight.work, state.work)) {
+    return "the original handoff call reference or work identity changed";
+  }
+  if (root.recordByToolCall.get(producer.parentToolCallId) !== producer
+    || producer.handoffToken === null) {
+    return "the producer instance is no longer retained";
+  }
+  if (producer.resultObservation !== state.producerObservation) {
+    return "the producer result observation object changed";
+  }
+  const producerFailure = reportResultFailure(producer, root);
+  if (producerFailure !== null) return producerFailure;
+  if (consumer !== null) {
+    if (root.recordByToolCall.get(consumer.parentToolCallId) !== consumer
+      || consumer.handoffToken === null
+      || consumer.workRef === null
+      || consumer.handoffParentTaskRef !== consumer.workRef) {
+      return "the consumer instance or its original parent call reference changed";
+    }
+    if (consumer.resultObservation !== state.consumerObservation) {
+      return "the consumer result observation object changed";
+    }
+    const consumerFailure = reportResultFailure(consumer, root);
+    if (consumerFailure !== null) return consumerFailure;
+    if (!consumer.lifecycleEvidence.completed) {
+      return "the consumer lifecycle is not explicitly completed";
+    }
+    const reservation = offerReservationForRecord(root, consumer);
+    if (reservation === null || reservation.state !== "bound" || reservation.record !== consumer) {
+      return "the consumer offer binding is no longer retained";
+    }
+    if (consumer.handoffOffer === null) return "the consumer offer handle changed";
+    const offerView = store.lookupOffer(consumer.handoffOffer.offerId);
+    if (offerView === null || offerView.state !== "bound") {
+      return "the consumer offer is no longer bound";
+    }
+  }
+  return null;
+}
+
+function handoffPrepareRefresh(state: HandoffPrepareState, context: NativeContext): NativeHandoffCheck {
+  try {
+    const ownerFailure = handoffMainRefreshFailure(state.factory, state.root, context);
+    if (ownerFailure !== null) return { ok: false, reason: ownerFailure };
+    const mainCheck = handoffCallCheckFailure(
+      state.factory,
+      state.request.nativeCallRef as NativeWorkCallReference,
+      context,
+      state.work,
+      "preflight",
+    );
+    if (!mainCheck.ok) return { ok: false, reason: mainCheck.reason };
+    state.mainPure = mainCheck.revalidate;
+    const producerRef = state.producer.workRef;
+    if (producerRef === null) return { ok: false, reason: "the producer has no original native work reference" };
+    const producerCheck = handoffCallCheckFailure(
+      state.factory,
+      producerRef,
+      context,
+      state.work,
+      "observed",
+    );
+    if (!producerCheck.ok) return { ok: false, reason: producerCheck.reason };
+    state.producerPure = producerCheck.revalidate;
+    if (state.consumer !== null) {
+      const consumerRef = state.consumer.workRef;
+      if (consumerRef === null) return { ok: false, reason: "the consumer has no original native work reference" };
+      const consumerCheck = handoffCallCheckFailure(
+        state.factory,
+        consumerRef,
+        context,
+        state.work,
+        "observed",
+      );
+      if (!consumerCheck.ok) return { ok: false, reason: consumerCheck.reason };
+      state.consumerPure = consumerCheck.revalidate;
+    }
+    const afterOwner = handoffMainRefreshFailure(state.factory, state.root, context);
+    if (afterOwner !== null) return { ok: false, reason: afterOwner };
+    const local = handoffPrepareLocalFailure(state);
+    if (local !== null) return { ok: false, reason: local };
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: boundedMessage(`handoff preparation refresh threw: ${errorMessage(error)}`) };
+  }
+}
+
+function handoffPrepareRevalidate(state: HandoffPrepareState): string | null {
+  const local = handoffPrepareLocalFailure(state);
+  if (local !== null) return local;
+  if (state.mainPure !== null) {
+    const main = state.mainPure();
+    if (main !== null) return main;
+  }
+  if (state.producerPure !== null) {
+    const producer = state.producerPure();
+    if (producer !== null) return producer;
+  }
+  if (state.consumerPure !== null) {
+    const consumer = state.consumerPure();
+    if (consumer !== null) return consumer;
+  }
+  return null;
+}
+
+function prepareMainHandoff(
+  factory: FactoryContext,
+  request: NativeHandoffPrepareRequest,
+  context: NativeContext,
+): NativeHandoffPrepareResult {
+  try {
+    const resolved = mainHandoffRoot(factory, context);
+    if (resolved === null) return { ok: false, reason: "the actual main handoff root is unavailable" };
+    const { root, store, coordinator } = resolved;
+    const preflight = root.handoffPreflights.get(request.actualToolCallId);
+    if (preflight === undefined) {
+      return { ok: false, reason: "no actual tool_call preflight froze this handoff call" };
+    }
+    if (preflight.state !== "open") {
+      return { ok: false, reason: preflight.failureReason ?? "the original handoff preflight failed" };
+    }
+    const expectedAction = request.kind === "capture-initial" || request.kind === "capture-repair"
+      ? "capture"
+      : request.kind;
+    if (preflight.descriptor.action !== expectedAction
+      || preflight.descriptor.digest !== request.requestDigest) {
+      return { ok: false, reason: "the handoff request digest does not match its actual preflight" };
+    }
+    if (request.nativeCallRef !== preflight.originalCallRef) {
+      return { ok: false, reason: "the original native handoff call reference changed" };
+    }
+    let preparation;
+    try {
+      preparation = factory.definitionEntry.nativeEntry.prepareCallCheck(request.nativeCallRef, context);
+    } catch (error) {
+      return { ok: false, reason: boundedMessage(`the native handoff call check threw: ${errorMessage(error)}`) };
+    }
+    if (!preparation.ok) {
+      return { ok: false, reason: `the native handoff call is unavailable (${preparation.inspection.reason})` };
+    }
+    const inspection = preparation.inspection;
+    const association = inspection.association;
+    if (inspection.state !== "current"
+      || inspection.callResultState !== "preflight"
+      || association === null
+      || association.observationId !== preflight.work?.observationId
+      || association.generation !== preflight.work?.generation
+      || association.sessionId !== preflight.work?.sessionId
+      || association.workspaceRoot !== preflight.work?.workspaceRoot) {
+      return { ok: false, reason: "the native handoff call is not the current preflight of the frozen work" };
+    }
+    const work = handoffWorkFromReference(association);
+    const rootToken = root.token;
+    const rootEpoch = root.epoch;
+    const mainDefinition = factory.definitionEntry.controller.getStatus();
+    const mainVersion = mainDefinition.version;
+    let producer: InstanceRecord;
+    let consumer: InstanceRecord | null = null;
+    if (request.kind === "capture-initial" || request.kind === "capture-repair") {
+      const found = producerRecordFor(root, request.request.producer);
+      if ("reason" in found) return { ok: false, reason: found.reason };
+      producer = found.record;
+      if (request.kind === "capture-repair") {
+        if (request.fromOffer.offerId !== request.offerView.offerId
+          || request.offerView.state !== "bound"
+          || request.offerView.readUsable !== true) {
+          return { ok: false, reason: "the repair source offer has no usable delivered read" };
+        }
+        const reservation = root.offerReservations.get(request.fromOffer.offerId);
+        if (reservation === undefined
+          || reservation.state !== "bound"
+          || reservation.record !== producer
+          || reservation.consumerToken !== producer.handoffToken
+          || producer.handoffOffer !== request.fromOffer) {
+          return { ok: false, reason: "the repair producer is not the original offer's actual consumer" };
+        }
+        if (request.captureView.relativePath.length === 0
+          || request.captureView.captureId !== request.offerView.captureId
+          || request.captureView.version !== request.offerView.version) {
+          return { ok: false, reason: "the repair source offer and capture views do not match" };
+        }
+      }
+    } else if (request.kind === "offer") {
+      const found = recordByParentTaskCall(root, request.captureView.producer.callId);
+      if (found === null
+        || found.handoffToken === null
+        || found.definition.version !== request.captureView.producer.definitionVersion) {
+        return { ok: false, reason: "the offer source producer record is unavailable" };
+      }
+      producer = found;
+    } else {
+      const found = recordByParentTaskCall(root, request.captureView.producer.callId);
+      if (found === null
+        || found.handoffToken === null
+        || found.definition.version !== request.captureView.producer.definitionVersion) {
+        return { ok: false, reason: "the adoption producer record is unavailable" };
+      }
+      producer = found;
+      const selected = recordByParentTaskCall(root, request.request.consumerParentToolCallId);
+      if (selected === null
+        || selected.handoffToken === null
+        || selected.handoffOffer === null
+        || selected.handoffOffer.offerId !== request.receiptView.offerId
+        || request.receiptView.parentBinding.callId !== selected.parentToolCallId
+        || request.receiptView.parentBinding.definitionVersion !== selected.definition.version) {
+        return { ok: false, reason: "the selected adoption consumer is not the offer's actual bound task" };
+      }
+      if (!selected.lifecycleEvidence.completed) {
+        return { ok: false, reason: "the selected adoption consumer is not explicitly completed" };
+      }
+      const consumerFailure = reportResultFailure(selected, root);
+      if (consumerFailure !== null) return { ok: false, reason: consumerFailure };
+      if (observedReportEnvelope(selected.resultObservation) === null) {
+        return { ok: false, reason: "the selected adoption consumer has no complete observed result" };
+      }
+      const reservation = offerReservationForRecord(root, selected);
+      if (reservation === null || reservation.state !== "bound" || reservation.record !== selected) {
+        return { ok: false, reason: "the selected adoption consumer offer binding is not retained" };
+      }
+      consumer = selected;
+    }
+    const producerObservation = producer.resultObservation;
+    if (producerObservation === null || observedReportEnvelope(producerObservation) === null) {
+      return { ok: false, reason: "the selected producer has no complete observed result" };
+    }
+    const consumerObservation = consumer === null ? null : consumer.resultObservation;
+    const state: HandoffPrepareState = {
+      factory,
+      root,
+      store,
+      coordinator,
+      request,
+      preflight,
+      work,
+      producer,
+      consumer,
+      producerObservation,
+      consumerObservation,
+      mainPure: null,
+      producerPure: null,
+      consumerPure: null,
+      rootToken,
+      rootEpoch,
+    };
+    const producerFacts = producerFactsFor(producer, work);
+    if (request.kind === "capture-initial") {
+      if (typeof mainVersion !== "string" || mainVersion.length === 0 || mainVersion.length > MAX_ID_CHARS) {
+        return { ok: false, reason: "the actual main definition version is unavailable" };
+      }
+      const proposalFacts: HandoffBindingFacts = Object.freeze({
+        callId: request.actualToolCallId,
+        workId: work.observationId,
+        definitionVersion: mainVersion,
+      });
+      const refreshed = handoffPrepareRefresh(state, context);
+      if (!refreshed.ok) return { ok: false, reason: refreshed.reason };
+      return {
+        ok: true,
+        prepared: {
+          kind: "capture-initial",
+          work,
+          producer: producer.handoffToken!,
+          producerFacts,
+          proposalFacts,
+          refresh: (next) => handoffPrepareRefresh(state, next),
+          revalidate: () => handoffPrepareRevalidate(state),
+        } satisfies NativeHandoffPreparedOperation,
+      };
+    }
+    if (request.kind === "capture-repair") {
+      const refreshed = handoffPrepareRefresh(state, context);
+      if (!refreshed.ok) return { ok: false, reason: refreshed.reason };
+      return {
+        ok: true,
+        prepared: {
+          kind: "capture-repair",
+          work,
+          producer: producer.handoffToken!,
+          producerFacts,
+          refresh: (next) => handoffPrepareRefresh(state, next),
+          revalidate: () => handoffPrepareRevalidate(state),
+        } satisfies NativeHandoffPreparedOperation,
+      };
+    }
+    if (request.kind === "offer") {
+      const refreshed = handoffPrepareRefresh(state, context);
+      if (!refreshed.ok) return { ok: false, reason: refreshed.reason };
+      return {
+        ok: true,
+        prepared: {
+          kind: "offer",
+          work,
+          producer: producer.handoffToken!,
+          refresh: (next) => handoffPrepareRefresh(state, next),
+          revalidate: () => handoffPrepareRevalidate(state),
+        } satisfies NativeHandoffPreparedOperation,
+      };
+    }
+    if (consumer === null) return { ok: false, reason: "the adoption consumer is unavailable" };
+    const refreshed = handoffPrepareRefresh(state, context);
+    if (!refreshed.ok) return { ok: false, reason: refreshed.reason };
+    return {
+      ok: true,
+      prepared: {
+        kind: "adopt",
+        work,
+        producer: producer.handoffToken!,
+        consumer: consumer.handoffToken!,
+        consumerParentToolCallId: consumer.parentToolCallId,
+        refresh: (next) => handoffPrepareRefresh(state, next),
+        revalidate: () => handoffPrepareRevalidate(state),
+      } satisfies NativeHandoffPreparedOperation,
+    };
+  } catch (error) {
+    return { ok: false, reason: boundedMessage(`handoff preparation failed: ${errorMessage(error)}`) };
+  }
+}
+
+function identifyMainHandoffCall(
+  factory: FactoryContext,
+  actualToolCallId: string,
+  context: NativeContext,
+  prior: object | undefined,
+  descriptor: NativeHandoffRequestDescriptor,
+): NativeHandoffCallIdentity {
+  try {
+    const resolved = mainHandoffRoot(factory, context);
+    if (resolved === null) return { ok: false, reason: "the actual main handoff root is unavailable" };
+    const { root } = resolved;
+    const preflight = root.handoffPreflights.get(actualToolCallId);
+    if (preflight === undefined) {
+      return { ok: false, reason: "no actual tool_call preflight froze this handoff call" };
+    }
+    if (preflight.state !== "open") {
+      return { ok: false, reason: preflight.failureReason ?? "the original handoff preflight failed" };
+    }
+    if (preflight.descriptor.action !== descriptor.action
+      || preflight.descriptor.digest !== descriptor.digest) {
+      return { ok: false, reason: "the handoff call was replayed with different parameters" };
+    }
+    if (preflight.originalCallRef !== null && prior !== undefined && prior !== preflight.originalCallRef) {
+      return { ok: false, reason: "the original native handoff call reference changed" };
+    }
+    let ref = preflight.originalCallRef;
+    if (ref === null) {
+      if (prior !== undefined) {
+        return { ok: false, reason: "the handoff preflight lost its original native call reference" };
+      }
+      const captured = factory.definitionEntry.nativeEntry.captureCall(
+        { toolCallId: actualToolCallId, toolName: "agent_handoff" },
+        context,
+      );
+      if (!captured.ok) {
+        return { ok: false, reason: `the actual handoff call is unavailable (${captured.inspection.reason})` };
+      }
+      ref = captured.ref;
+      preflight.originalCallRef = ref;
+    }
+    if (prior !== undefined && prior !== ref) {
+      return { ok: false, reason: "the original native handoff call reference changed" };
+    }
+    const nativeRef = ref as NativeWorkCallReference;
+    const preparation = factory.definitionEntry.nativeEntry.prepareCallCheck(nativeRef, context);
+    const failure = callCheckFailure(preparation, nativeRef, preflight.work, "either");
+    if (failure !== null) return { ok: false, reason: failure };
+    if (preparation.inspection.association === null) {
+      return { ok: false, reason: "the native handoff call has no work association" };
+    }
+    const work = handoffWorkFromReference(preparation.inspection.association);
+    if (preflight.work !== null && !sameHandoffWork(preflight.work, work)) {
+      return { ok: false, reason: "the actual handoff work changed for the same call" };
+    }
+    preflight.work = work;
+    const pure = () => {
+      if (root.handoffPreflights.get(actualToolCallId) !== preflight
+        || preflight.state !== "open"
+        || preflight.originalCallRef !== ref
+        || preflight.work === null
+        || !sameHandoffWork(preflight.work, work)) {
+        return preflight.failureReason ?? "the original handoff preflight changed";
+      }
+      if (!preparation.ok) return "the original native handoff call is unavailable";
+      const result = preparation.revalidate();
+      return result === null ? null : boundedMessage(result);
+    };
+    preflight.identityRevalidate = pure;
+    return { ok: true, callRef: ref, work, revalidate: pure };
+  } catch (error) {
+    return { ok: false, reason: boundedMessage(`handoff call identification failed: ${errorMessage(error)}`) };
+  }
+}
+
+function mainHandoffPreflight(
+  factory: FactoryContext,
+  root: RootState,
+  event: unknown,
+  context: NativeContext,
+): { readonly block: true; readonly reason: string } | undefined {
+  if (root.handoffStore === null
+    || root.handoffCoordinator === null
+    || root.handoffCoordinator.closed) {
+    return block("The native handoff coordinator is unavailable; no handoff tool ran.");
+  }
+  if (!isRecord(event) || typeof event.toolCallId !== "string") {
+    return block("The handoff tool call lacks a usable call id.");
+  }
+  const toolCallId = boundedId(event.toolCallId);
+  if (toolCallId === null) return block("The handoff tool call id is unsupported.");
+  const existing = root.handoffPreflights.get(toolCallId);
+  if (existing !== undefined && existing.state === "failed") {
+    return block(existing.failureReason ?? "The original handoff tool call preflight already failed.");
+  }
+  const failExisting = (reason: string): { readonly block: true; readonly reason: string } => {
+    if (existing !== undefined) {
+      existing.state = "failed";
+      existing.failureReason = reason;
+      root.lastRefusal = { code: "handoff-preflight-conflict", message: reason };
+    }
+    return block(reason);
+  };
+  let rawInput: unknown;
+  try {
+    if (!("input" in event)) {
+      return failExisting("The same handoff tool call id was observed without usable input.");
+    }
+    rawInput = event.input;
+  } catch {
+    return failExisting("The same handoff tool call id was observed with unreadable input.");
+  }
+  const parsed = readNativeHandoffRequestDescriptor(rawInput);
+  if (!parsed.ok) {
+    return failExisting(existing === undefined
+      ? parsed.reason
+      : "The same handoff tool call id was observed with malformed parameters.");
+  }
+  if (existing !== undefined) {
+    if (existing.descriptor.action === parsed.descriptor.action
+      && existing.descriptor.digest === parsed.descriptor.digest) {
+      return undefined;
+    }
+    return failExisting("The same handoff tool call id was reused with different parameters.");
+  }
+  if (root.handoffPreflights.size >= MAX_HANDOFF_OPERATIONS) {
+    return block("The bounded handoff preflight capacity is exhausted.");
+  }
+  root.handoffPreflights.set(toolCallId, {
+    descriptor: parsed.descriptor,
+    originalCallRef: null,
+    work: null,
+    identityRevalidate: null,
+    state: "open",
+    failureReason: null,
+  });
+  if (!mainHandoffRoot(factory, context)) {
+    root.handoffPreflights.delete(toolCallId);
+    return block("The actual main handoff root is unavailable; no handoff tool ran.");
+  }
+  return undefined;
+}
+
+interface OwnedHandoffChild {
+  readonly factory: FactoryContext;
+  readonly root: RootState;
+  readonly store: NativeHandoffStore;
+  readonly coordinator: NativeHandoffCoordinator;
+  readonly record: InstanceRecord;
+}
+
+/**
+ * Read-only resolver for the exact bound child, root generation, offer and
+ * opaque consumer token. Prompt/context gates are part of the binding.
+ */
+function ownedHandoffChild(
+  factory: FactoryContext,
+  context: NativeContext,
+): OwnedHandoffChild | null {
+  if (factory.disposed) return null;
+  const root = moduleRoot;
+  if (root === null || !root.open || root.phase !== "ready") return null;
+  // locateOwnedChild authenticates the actual child factory through
+  // childRecordId, the record's childFactoryId/homeRootToken and the frozen
+  // child session facts. The main root factory id is not the child identity.
+  const owned = locateOwnedChild(factory, root, context);
+  if (owned === null || !sameChildIdentity(owned.record, owned.facts)) return null;
+  const record = owned.record;
+  if (record.phase !== "bound"
+    || record.handoffToken === null
+    || record.handoffOffer === null
+    || record.handoffParentTaskRef === null
+    || record.handoffParentRevalidate === null
+    || record.handoffPromptGate !== "verified"
+    || record.handoffContextGate !== "verified") {
+    return null;
+  }
+  if (root.handoffStore === null || root.handoffCoordinator === null || root.handoffCoordinator.closed) {
+    return null;
+  }
+  return { factory, root, store: root.handoffStore, coordinator: root.handoffCoordinator, record };
+}
+
+function childHandoffRefresh(
+  factory: FactoryContext,
+  pi: DefinedOmpApi,
+  owned: OwnedHandoffChild,
+  context: NativeContext,
+): NativeHandoffCheck {
+  try {
+    const root = owned.root;
+    if (!childGuard(factory, pi, root, owned.record, context)) {
+      return { ok: false, reason: "the actual child binding or runtime facts are refused" };
+    }
+    if (owned.record.handoffOffer === null
+      || owned.record.handoffToken === null
+      || owned.record.handoffParentTaskRef === null
+      || owned.root.handoffStore !== owned.store
+      || owned.root.handoffCoordinator !== owned.coordinator
+      || owned.coordinator.closed) {
+      return { ok: false, reason: "the original child handoff binding changed" };
+    }
+    const offer = owned.store.lookupOffer(owned.record.handoffOffer.offerId);
+    if (offer === null || offer.state !== "bound") {
+      return { ok: false, reason: "the child offer is no longer bound" };
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, reason: boundedMessage(`child handoff refresh threw: ${errorMessage(error)}`) };
+  }
+}
+
+function childHandoffBindingFailure(
+  owned: OwnedHandoffChild,
+  preflight: SnapshotPreflight | undefined,
+  expected: {
+    readonly consumer?: HandoffConsumerRef;
+    readonly parentTaskCall?: HandoffCallRef;
+    readonly readToolCall?: HandoffToolCallRef;
+    readonly readCallId?: string;
+    readonly offerId?: string;
+  },
+): string | null {
+  const { factory, root, store, coordinator, record } = owned;
+  if (factory.disposed) return "the child factory was disposed";
+  if (factory.refusedReason !== null) {
+    return `the child factory recorded a terminal refusal: ${factory.refusedReason}`;
+  }
+  if (factory.homeRootToken !== null && factory.homeRootToken !== root.token) {
+    return "the child factory belongs to a different root generation";
+  }
+  if (factory.childRecordId !== record.id
+    || record.childFactoryId !== factory.id
+    || record.childRootToken !== root.token
+    || record.admittedRootToken !== root.token) {
+    return "the child factory is no longer frozen to this exact record and root";
+  }
+  if (expected.readCallId !== undefined
+    && record.snapshotPreflights.get(expected.readCallId) === undefined) {
+    return "the exact child snapshot preflight is no longer retained";
+  }
+  if (moduleRoot !== root || !root.open || root.phase !== "ready") {
+    return "the child instance root is no longer open and ready";
+  }
+  if (root.handoffStore !== store || root.handoffCoordinator !== coordinator || coordinator.closed) {
+    return "the original child root coordinator is no longer current";
+  }
+  if (getNativeHandoffCoordinatorStore(coordinator) !== store) {
+    return "the original child root coordinator is no longer current";
+  }
+  if (record.phase !== "bound"
+    || record.handoffToken === null
+    || record.handoffOffer === null
+    || record.handoffParentTaskRef === null) {
+    return "the original child handoff binding changed";
+  }
+  if (expected.consumer !== undefined && expected.consumer !== record.handoffToken) {
+    return "the child tool call does not belong to this consumer";
+  }
+  if (expected.parentTaskCall !== undefined && expected.parentTaskCall !== record.handoffParentTaskRef) {
+    return "the child tool call does not belong to the original parent task";
+  }
+  if (expected.offerId !== undefined && record.handoffOffer.offerId !== expected.offerId) {
+    return "the child tool call does not belong to the selected offer";
+  }
+  const offer = store.lookupOffer(record.handoffOffer.offerId);
+  if (offer === null || offer.state !== "bound") return "the child offer is no longer bound";
+  const parent = record.handoffParentRevalidate;
+  if (parent === null) return "the child parent task pure check is unavailable";
+  const parentFailure = parent();
+  if (parentFailure !== null) return parentFailure;
+  return null;
+}
+
+function identifyChildHandoffCall(
+  factory: FactoryContext,
+  actualToolCallId: string,
+  context: NativeContext,
+  prior: HandoffToolCallRef | undefined,
+  descriptor: NativeSnapshotRequestDescriptor,
+): NativeChildCallIdentity {
+  try {
+    const owned = ownedHandoffChild(factory, context);
+    if (owned === null) return { ok: false, reason: "no bound handoff child owns this actual tool call" };
+    const { root, record } = owned;
+    const preflight = record.snapshotPreflights.get(actualToolCallId);
+    if (preflight === undefined) {
+      markRefused(root, record, "handoff-child-preflight", "The child snapshot call had no actual tool_call preflight.");
+      return { ok: false, reason: "no actual tool_call preflight froze this child snapshot call" };
+    }
+    if (preflight.descriptor.action !== descriptor.action
+      || preflight.descriptor.digest !== descriptor.digest) {
+      markRefused(root, record, "handoff-child-preflight", "The child snapshot call was reused with different parameters.");
+      return { ok: false, reason: "the child snapshot call was replayed with different parameters" };
+    }
+    if (prior !== undefined && prior !== preflight.token) {
+      markRefused(root, record, "handoff-child-preflight", "The child snapshot call reference changed.");
+      return { ok: false, reason: "the original child snapshot call reference changed" };
+    }
+    if (record.handoffParentTaskRef === null || record.handoffToken === null) {
+      return { ok: false, reason: "the bound child lacks its original parent call or consumer token" };
+    }
+    const pure = () => {
+      const failure = childHandoffBindingFailure(owned, preflight, {
+        consumer: record.handoffToken!,
+        parentTaskCall: record.handoffParentTaskRef!,
+        readCallId: actualToolCallId,
+      });
+      if (record.snapshotPreflights.get(actualToolCallId) !== preflight) {
+        return "the original child snapshot preflight changed";
+      }
+      return failure;
+    };
+    const initial = pure();
+    if (initial !== null) {
+      markRefused(root, record, "handoff-child-binding", initial);
+      return { ok: false, reason: initial };
+    }
+    return {
+      ok: true,
+      childToolCallRef: preflight.token,
+      consumerRef: record.handoffToken,
+      parentTaskRef: record.handoffParentTaskRef,
+      facts: Object.freeze({
+        childToolCallId: actualToolCallId,
+        childToolName: "agent_snapshot",
+        parentTaskCallId: record.parentToolCallId,
+      }),
+      revalidate: pure,
+    };
+  } catch (error) {
+    return { ok: false, reason: boundedMessage(`child snapshot identification failed: ${errorMessage(error)}`) };
+  }
+}
+
+function prepareChildHandoff(
+  factory: FactoryContext,
+  pi: DefinedOmpApi,
+  request: NativeChildPrepareRequest,
+  context: NativeContext,
+): NativeChildPrepareResult {
+  try {
+    const owned = ownedHandoffChild(factory, context);
+    if (owned === null) return { ok: false, reason: "no bound handoff child owns this snapshot preparation" };
+    const { root, record } = owned;
+    if (record.handoffToken === null || record.handoffOffer === null) {
+      return { ok: false, reason: "the bound child lacks its handoff token or offer" };
+    }
+    if (request.consumer !== record.handoffToken
+      || request.offer !== record.handoffOffer
+      || request.parentTaskCall !== record.handoffParentTaskRef) {
+      markRefused(root, record, "handoff-child-binding", "The snapshot preparation does not match the actual child binding.");
+      return { ok: false, reason: "the snapshot preparation does not match the actual child binding" };
+    }
+    const preflight = record.snapshotPreflights.get(request.actualToolCallId);
+    if (preflight === undefined
+      || preflight.token !== request.childToolCallRef
+      || preflight.descriptor.digest !== request.requestDigest
+      || preflight.descriptor.action !== request.request.action) {
+      markRefused(root, record, "handoff-child-preflight", "The prepared child snapshot call does not match its actual preflight.");
+      return { ok: false, reason: "the prepared child snapshot call does not match its actual preflight" };
+    }
+    if (request.callFacts.parentTaskCallId !== record.parentToolCallId
+      || request.callFacts.childToolCallId !== request.actualToolCallId
+      || request.callFacts.childToolName !== "agent_snapshot") {
+      markRefused(root, record, "handoff-child-binding", "The child tool call facts do not match the actual child.");
+      return { ok: false, reason: "the child tool call facts do not match the actual child" };
+    }
+    if (request.offerView.state !== "bound") {
+      return { ok: false, reason: "the selected child offer is not bound" };
+    }
+    const pure = () => {
+      const failure = childHandoffBindingFailure(owned, preflight, {
+        consumer: request.consumer,
+        parentTaskCall: request.parentTaskCall,
+        readToolCall: request.childToolCallRef,
+        readCallId: request.actualToolCallId,
+        offerId: request.offer.offerId,
+      });
+      if (failure !== null) return failure;
+      if (record.snapshotPreflights.get(request.actualToolCallId) !== preflight) {
+        return "the original child snapshot preflight changed";
+      }
+      return null;
+    };
+    const initial = pure();
+    if (initial !== null) {
+      markRefused(root, record, "handoff-child-binding", initial);
+      return { ok: false, reason: initial };
+    }
+    return {
+      ok: true,
+      prepared: {
+        refresh: (next) => childHandoffRefresh(factory, pi, owned, next),
+        revalidate: pure,
+      },
+    };
+  } catch (error) {
+    return { ok: false, reason: boundedMessage(`child snapshot preparation failed: ${errorMessage(error)}`) };
+  }
+}
+
+function prepareChildReadObservation(
+  factory: FactoryContext,
+  pi: DefinedOmpApi,
+  event: NativeChildReadEventIdentity,
+  context: NativeContext,
+  expected: NativeChildReadExpectation,
+): NativeChildObservationPreparation {
+  try {
+    const owned = ownedHandoffChild(factory, context);
+    if (owned === null) return { ok: false, reason: "no bound handoff child owns this read observation" };
+    const { root, record } = owned;
+    if (record.handoffToken === null
+      || record.handoffOffer === null
+      || record.handoffParentTaskRef === null
+      || expected.consumer !== record.handoffToken
+      || expected.parentTaskCall !== record.handoffParentTaskRef
+      || expected.offerId !== record.handoffOffer.offerId) {
+      markRefused(root, record, "handoff-child-read", "The read result does not match the actual child/offer binding.");
+      return { ok: false, reason: "the read result does not match the actual child/offer binding" };
+    }
+    if (event.type !== "tool_result"
+      || event.toolName !== "agent_snapshot"
+      || event.toolCallId !== expected.readCallId) {
+      return { ok: false, reason: "the read event is not the exact actual child snapshot call" };
+    }
+    const preflight = record.snapshotPreflights.get(expected.readCallId);
+    if (preflight === undefined || preflight.token !== expected.readToolCall) {
+      markRefused(root, record, "handoff-child-read", "The read result has no exact preflight call token.");
+      return { ok: false, reason: "the read result has no exact preflight call token" };
+    }
+    // Effective input is evidence only. A malformed/changed same-call input
+    // remains authenticated and lets the leaf record failure.
+    const pure = () => {
+      const failure = childHandoffBindingFailure(owned, preflight, {
+        consumer: expected.consumer,
+        parentTaskCall: expected.parentTaskCall,
+        readToolCall: expected.readToolCall,
+        readCallId: expected.readCallId,
+        offerId: expected.offerId,
+      });
+      if (failure !== null) return failure;
+      if (record.snapshotPreflights.get(expected.readCallId) !== preflight) {
+        return "the original child read preflight changed";
+      }
+      return null;
+    };
+    const initial = pure();
+    if (initial !== null) {
+      markRefused(root, record, "handoff-child-read", initial);
+      return { ok: false, reason: initial };
+    }
+    return {
+      ok: true,
+      prepared: {
+        refresh: (next) => childHandoffRefresh(factory, pi, owned, next),
+        revalidate: pure,
+      },
+    };
+  } catch (error) {
+    return { ok: false, reason: boundedMessage(`child read observation preparation failed: ${errorMessage(error)}`) };
+  }
+}
+
+interface HandoffReportState {
+  readonly factory: FactoryContext;
+  readonly root: RootState;
+  readonly store: NativeHandoffStore;
+  readonly coordinator: NativeHandoffCoordinator;
+  readonly adoptionId: string;
+  readonly adoption: HandoffAdoption;
+  readonly producer: InstanceRecord;
+  readonly consumer: InstanceRecord;
+  readonly expectedWork: NativeReportWorkIdentity;
+  readonly producerObservation: NativeInstanceResultObservation;
+  readonly consumerObservation: NativeInstanceResultObservation;
+  readonly consumerWork: NativeWorkCallReference;
+  readonly adoptCallId: string;
+  readonly adoptPreflight: HandoffPreflight;
+  readonly coreRevalidate: () => string | null;
+  readonly handoffFacts: NativeHandoffReportFacts;
+  adoptPure: (() => string | null) | null;
+  readonly rootToken: symbol;
+  readonly rootEpoch: number;
+  producerPure: (() => string | null) | null;
+  consumerPure: (() => string | null) | null;
+}
+
+function handoffReportLocalFailure(state: HandoffReportState): string | null {
+  const { factory, root, store, coordinator, producer, consumer, adoption } = state;
+  if (moduleRoot !== root) return "the instance root was replaced after handoff report preparation";
+  if (!ownsRoot(factory, root) || !root.open || root.phase !== "ready") {
+    return "the instance root is no longer open and ready";
+  }
+  if (root.token !== state.rootToken || root.epoch !== state.rootEpoch) {
+    return "the instance root generation changed after handoff report preparation";
+  }
+  if (root.handoffStore !== store || root.handoffCoordinator !== coordinator || coordinator.closed) {
+    return "the root handoff coordinator or store changed after report preparation";
+  }
+  if (getNativeHandoffCoordinatorStore(coordinator) !== store) {
+    return "the root handoff coordinator is no longer current";
+  }
+  if (state.adoptPreflight.state !== "open") {
+    return state.adoptPreflight.failureReason ?? "the original adoption call preflight failed";
+  }
+  if (root.handoffPreflights.get(state.adoptCallId) !== state.adoptPreflight) {
+    return "the original adoption call preflight is no longer retained";
+  }
+  if (store.resolveAdoption(state.adoptionId) !== adoption) {
+    return "the original handoff adoption handle is no longer retained";
+  }
+  if (root.recordByToolCall.get(producer.parentToolCallId) !== producer
+    || root.recordByToolCall.get(consumer.parentToolCallId) !== consumer) {
+    return "a handoff report instance record is no longer retained";
+  }
+  if (producer.resultObservation !== state.producerObservation
+    || consumer.resultObservation !== state.consumerObservation) {
+    return "a handoff report result observation object changed";
+  }
+  const producerFailure = reportResultFailure(producer, root);
+  if (producerFailure !== null) return producerFailure;
+  const consumerFailure = reportResultFailure(consumer, root);
+  if (consumerFailure !== null) return consumerFailure;
+  if (!consumer.lifecycleEvidence.completed) return "the handoff report consumer is no longer explicitly completed";
+  if (consumer.workRef !== state.consumerWork) return "the consumer native parent call reference changed";
+  if (producer.handoffToken === null || consumer.handoffToken === null) {
+    return "a handoff report opaque instance token is missing";
+  }
+  const reservation = offerReservationForRecord(root, consumer);
+  if (reservation === null || reservation.state !== "bound" || reservation.record !== consumer) {
+    return "the handoff report consumer offer is no longer bound";
+  }
+  if (state.producerPure !== null) {
+    const pure = state.producerPure();
+    if (pure !== null) return pure;
+  }
+  if (state.consumerPure !== null) {
+    const pure = state.consumerPure();
+    if (pure !== null) return pure;
+  }
+  if (state.adoptPure !== null) {
+    const pure = state.adoptPure();
+    if (pure !== null) return pure;
+  }
+  return state.coreRevalidate();
+}
+
+function handoffReportRefresh(state: HandoffReportState, context: NativeContext): NativeInstanceReportCheck {
+  try {
+    const ownerFailure = handoffMainRefreshFailure(state.factory, state.root, context);
+    if (ownerFailure !== null) return checkFailure(ownerFailure);
+    if (state.producer.workRef === null) {
+      return checkFailure("the handoff report producer has no original native work reference");
+    }
+    const producerCheck = handoffCallCheckFailure(
+      state.factory,
+      state.producer.workRef,
+      context,
+      {
+        observationId: state.expectedWork.observationId,
+        generation: state.expectedWork.generation,
+        sessionId: state.expectedWork.sessionId,
+        workspaceRoot: state.expectedWork.workspaceRoot,
+      },
+      "observed",
+    );
+    if (!producerCheck.ok) return checkFailure(producerCheck.reason);
+    state.producerPure = producerCheck.revalidate;
+    const consumerCheck = handoffCallCheckFailure(
+      state.factory,
+      state.consumerWork,
+      context,
+      {
+        observationId: state.expectedWork.observationId,
+        generation: state.expectedWork.generation,
+        sessionId: state.expectedWork.sessionId,
+        workspaceRoot: state.expectedWork.workspaceRoot,
+      },
+      "observed",
+    );
+    if (!consumerCheck.ok) return checkFailure(consumerCheck.reason);
+    state.consumerPure = consumerCheck.revalidate;
+    if (state.adoptPreflight.originalCallRef === null) {
+      return checkFailure("the original adoption native call reference is unavailable");
+    }
+    const adoptNativeRef = state.adoptPreflight.originalCallRef as NativeWorkCallReference;
+    let adoptPreparation;
+    try {
+      adoptPreparation = state.factory.definitionEntry.nativeEntry.prepareCallCheck(adoptNativeRef, context);
+    } catch (error) {
+      return checkFailure(`the original adoption native call check threw: ${errorMessage(error)}`);
+    }
+    const adoptFailure = callCheckFailure(adoptPreparation, adoptNativeRef, null, "either");
+    if (adoptFailure !== null) return checkFailure(adoptFailure);
+    state.adoptPure = () => {
+      if (state.adoptPreflight.state !== "open") {
+        return state.adoptPreflight.failureReason ?? "the original adoption call preflight failed";
+      }
+      if (!adoptPreparation.ok) return "the original adoption native call is unavailable";
+      const result = adoptPreparation.revalidate();
+      return result === null ? null : boundedMessage(result);
+    };
+    const afterOwner = handoffMainRefreshFailure(state.factory, state.root, context);
+    if (afterOwner !== null) return checkFailure(afterOwner);
+    const local = handoffReportLocalFailure(state);
+    if (local !== null) return checkFailure(local);
+    return { ok: true };
+  } catch (error) {
+    return checkFailure(`handoff report refresh threw: ${errorMessage(error)}`);
+  }
+}
+
+function prepareHandoffReport(
+  factory: FactoryContext,
+  root: RootState,
+  context: NativeContext,
+  selection: NativeInstanceReportSelection,
+  work: NativeReportWorkIdentity,
+  producer: InstanceRecord,
+  handoffAdoptionId: string,
+): { readonly ok: true; readonly handoff: NativeHandoffReportFacts; readonly state: HandoffReportState }
+  | { readonly ok: false; readonly reason: string } {
+  const store = root.handoffStore;
+  const coordinator = root.handoffCoordinator;
+  if (store === null || coordinator === null || coordinator.closed) {
+    return { ok: false, reason: "the native handoff coordinator is unavailable" };
+  }
+  const adoption = store.resolveAdoption(handoffAdoptionId);
+  const adoptionView = store.lookupAdoption(handoffAdoptionId);
+  if (adoption === null || adoptionView === null) {
+    return { ok: false, reason: "the explicit handoff adoption is unavailable" };
+  }
+  if (adoptionView.outcome !== "pass") {
+    return { ok: false, reason: "the explicit handoff adoption is not a PASS adoption" };
+  }
+  if (adoptionView.producer.callId !== selection.parentToolCallId
+    || adoptionView.producer.definitionVersion !== producer.definition.version
+    || adoptionView.producer.workId !== work.observationId
+    || adoptionView.parentBinding.workId !== work.observationId) {
+    return { ok: false, reason: "the handoff adoption producer facts do not match the selected C2 producer and work" };
+  }
+  const consumer = recordByParentTaskCall(root, adoptionView.parentBinding.callId);
+  if (consumer === null
+    || consumer.handoffToken === null
+    || consumer.handoffOffer === null
+    || consumer.handoffOffer.offerId !== adoptionView.offerId
+    || adoptionView.parentBinding.definitionVersion !== consumer.definition.version) {
+    return { ok: false, reason: "the handoff adoption consumer is not the actual bound consumer task" };
+  }
+  if (!consumer.lifecycleEvidence.completed) {
+    return { ok: false, reason: "the handoff adoption consumer is not explicitly completed" };
+  }
+  const consumerFailure = reportResultFailure(consumer, root);
+  if (consumerFailure !== null) return { ok: false, reason: consumerFailure };
+  const consumerObservation = consumer.resultObservation;
+  const consumerEnvelope = observedReportEnvelope(consumerObservation);
+  if (consumerObservation === null
+    || consumerObservation.association === null
+    || consumerEnvelope === null
+    || consumer.workRef === null
+    || consumer.handoffParentTaskRef !== consumer.workRef) {
+    return { ok: false, reason: "the handoff adoption consumer result or work reference is incomplete" };
+  }
+  const association = consumerObservation.association;
+  if (association.parentSessionId !== work.sessionId
+    || association.workspaceRoot !== work.workspaceRoot) {
+    return { ok: false, reason: "the handoff consumer result does not share the report session and workspace" };
+  }
+  const adoptCallId = adoptionView.adoptionCall.callId;
+  const adoptPreflight = root.handoffPreflights.get(adoptCallId);
+  if (adoptPreflight === undefined
+    || adoptPreflight.state !== "open"
+    || adoptPreflight.originalCallRef === null
+    || adoptPreflight.descriptor.action !== "adopt") {
+    return {
+      ok: false,
+      reason: adoptPreflight?.failureReason ?? "the original adoption tool_call preflight is unavailable or failed",
+    };
+  }
+  let adoptPreparation;
+  try {
+    adoptPreparation = factory.definitionEntry.nativeEntry.prepareCallCheck(
+      adoptPreflight.originalCallRef as NativeWorkCallReference,
+      context,
+    );
+  } catch (error) {
+    return { ok: false, reason: boundedMessage(`the original adoption call check threw: ${errorMessage(error)}`) };
+  }
+  const adoptFailure = callCheckFailure(
+    adoptPreparation,
+    adoptPreflight.originalCallRef as NativeWorkCallReference,
+    null,
+    "either",
+  );
+  if (adoptFailure !== null) return { ok: false, reason: adoptFailure };
+  if (producer.handoffToken === null || producer.resultObservation === null) {
+    return { ok: false, reason: "the handoff producer has no retained token or result" };
+  }
+  const preparedReport = prepareNativeHandoffReport(coordinator, {
+    adoptionId: handoffAdoptionId,
+    work: {
+      observationId: work.observationId,
+      generation: work.generation,
+      sessionId: work.sessionId,
+      workspaceRoot: work.workspaceRoot,
+    },
+    producer: producer.handoffToken,
+    consumer: consumer.handoffToken,
+    consumerParentTaskCall: consumer.workRef,
+  });
+  if (!preparedReport.ok) return { ok: false, reason: preparedReport.reason };
+  const consumerWork: NativeWorkCallReference = Object.freeze({
+    observationId: consumer.workRef.observationId,
+    generation: consumer.workRef.generation,
+    sessionId: consumer.workRef.sessionId,
+    workspaceRoot: consumer.workRef.workspaceRoot,
+    toolCallId: consumer.workRef.toolCallId,
+    toolName: "task" as const,
+  });
+  const handoff: NativeHandoffReportFacts = deepFreeze({
+    ...preparedReport.prepared.facts,
+    consumer: {
+      result: { ...association },
+      work: consumerWork,
+      envelope: {
+        sha256: consumerEnvelope.sha256,
+        bytes: consumerEnvelope.bytes,
+        scope: "tool-result-middleware" as const,
+      },
+      completed: true as const,
+    },
+  });
+  const observation = producer.resultObservation;
+  const envelope = observedReportEnvelope(observation);
+  if (observation === null || observation.association === null || envelope === null) {
+    return { ok: false, reason: "the handoff producer result is incomplete" };
+  }
+  const state: HandoffReportState = {
+    factory,
+    root,
+    store,
+    coordinator,
+    adoptionId: handoffAdoptionId,
+    adoption,
+    producer,
+    consumer,
+    expectedWork: work,
+    producerObservation: observation,
+    consumerObservation,
+    consumerWork: consumer.workRef,
+    adoptCallId,
+    adoptPreflight,
+    coreRevalidate: preparedReport.prepared.revalidate,
+    handoffFacts: handoff,
+    rootToken: root.token,
+    rootEpoch: root.epoch,
+    producerPure: null,
+    consumerPure: null,
+    adoptPure: null,
+  };
+  const refreshed = handoffReportRefresh(state, context);
+  if (!refreshed.ok) return { ok: false, reason: refreshed.reason };
+  return { ok: true, handoff, state };
 }
 
 function reportCatalogRow(
@@ -2570,6 +4385,7 @@ async function admitTask(
   event: unknown,
   context: NativeContext,
 ): Promise<unknown> {
+  let handoffReservation: HandoffOfferReservation | null = null;
   try {
     if (!isRecord(event) || typeof event.toolCallId !== "string") {
       return block("task tool call has no usable call id.");
@@ -2580,6 +4396,11 @@ async function admitTask(
     if (!input.ok) {
       recordAdmissionFailure(root, "task-input", input.reason);
       return block(input.reason);
+    }
+    const handoffRef = readHandoffTaskReference(input.task);
+    if (handoffRef.kind === "invalid") {
+      recordAdmissionFailure(root, "task-handoff-reference", handoffRef.reason);
+      return block(handoffRef.reason);
     }
     const selected = root.selectionByName.get(input.agent);
     if (selected === undefined) {
@@ -2642,6 +4463,19 @@ async function admitTask(
     if (!ownsRoot(factory, root) || !root.open || root.phase !== "ready") {
       return block("The native instance root was invalidated while the task call was observed.");
     }
+    if (handoffRef.kind === "handoff") {
+      if (root.handoffStore === null) {
+        const reason = "The native handoff store is unavailable for a referenced task.";
+        recordAdmissionFailure(root, "handoff-store", reason);
+        return block(reason);
+      }
+      const reserved = reserveHandoffOffer(factory, root, handoffRef.offerId, workObservation.ref, context);
+      if (!reserved.ok) {
+        recordAdmissionFailure(root, "handoff-reservation", reserved.reason);
+        return block(reserved.reason);
+      }
+      handoffReservation = reserved.reservation;
+    }
     const pending: PendingAdmission = {
       parentToolCallId: toolCallId,
       agentName: selected.name,
@@ -2653,13 +4487,18 @@ async function admitTask(
       workCaptureReason: workObservation.reason,
       workInspection: workObservation.inspection,
       workInspectionHook: "tool_call",
+      handoff: handoffReservation,
       state: "loading",
     };
     root.seenToolCalls.add(toolCallId);
     root.pending.set(toolCallId, pending);
+    const failReservedHandoff = (reason: string): void => {
+      if (handoffReservation !== null) handoffReservationFailure(root, handoffReservation, reason);
+    };
     const ports = root.ports;
     if (ports === null) {
       root.pending.delete(toolCallId);
+      failReservedHandoff("native ports were unavailable at admission");
       failRoot(factory, root, "native-ports", "Native instance ports are unavailable at admission.");
       return block(root.failure ?? "Native instance ports are unavailable.");
     }
@@ -2673,6 +4512,7 @@ async function admitTask(
           root.pending.delete(toolCallId);
         }
         const reason = "Child snapshot admission timed out; no authority was published and a late load is ignored.";
+        failReservedHandoff(reason);
         recordAdmissionFailure(root, "admission-timeout", reason);
         return block(reason);
       }
@@ -2685,11 +4525,13 @@ async function admitTask(
         || root.workEpoch !== pending.workEpoch) {
         if (root.pending.get(toolCallId) === pending) root.pending.delete(toolCallId);
         const reason = "The child snapshot load became stale after the parent work, root or navigation changed; it was not published.";
+        failReservedHandoff(reason);
         recordAdmissionFailure(root, "admission-stale", reason);
         return block(reason);
       }
       if (!refreshRoot(factory, root, pi, context)) {
         root.pending.delete(toolCallId);
+        failReservedHandoff(root.failure ?? "the native instance root became invalid during admission");
         return block(root.failure ?? "The native instance root became invalid during admission.");
       }
       // Observe the original pre-await reference before the final host
@@ -2710,6 +4552,7 @@ async function admitTask(
           || root.workEpoch !== pending.workEpoch) {
           if (root.pending.get(toolCallId) === pending) root.pending.delete(toolCallId);
           const reason = "The task work observation became stale after admission; the admission was not published.";
+          failReservedHandoff(reason);
           recordAdmissionFailure(root, "admission-stale", reason);
           return block(reason);
         }
@@ -2728,12 +4571,14 @@ async function admitTask(
         || finalFacts.sessionId !== root.sessionId
         || finalFacts.workspaceRoot !== root.workspaceRoot) {
         root.pending.delete(toolCallId);
+        failReservedHandoff("the parent task call identity changed during child snapshot loading");
         failRoot(factory, root, "root-identity", "The parent task call identity changed during child snapshot loading.");
         return block(root.failure ?? "The parent task call identity changed.");
       }
       const finalTools = readActiveTools(pi);
       if (finalTools === null || !sameSet(finalTools, activeTools)) {
         root.pending.delete(toolCallId);
+        failReservedHandoff("the main active tools changed during child snapshot loading");
         failRoot(factory, root, "tools-drift", "The main active tools changed during child snapshot loading.");
         return block(root.failure ?? "The main active tools changed.");
       }
@@ -2742,19 +4587,23 @@ async function admitTask(
         || finalModel.provider !== currentModel.provider
         || finalModel.id !== currentModel.id) {
         root.pending.delete(toolCallId);
+        failReservedHandoff("the main model changed during child snapshot loading");
         failRoot(factory, root, "model-drift", "The main model changed during child snapshot loading.");
         return block(root.failure ?? "The main model changed.");
       }
       if (root.records.length >= factory.limits.maxRecords) {
         root.pending.delete(toolCallId);
         const reason = `Instance record capacity (${factory.limits.maxRecords}) filled during admission; restart OMP.`;
+        failReservedHandoff(reason);
         recordAdmissionFailure(root, "capacity-records", reason);
         return block(reason);
       }
-      const bytes = retainedTextBytes(loaded.snapshot, loaded.skills);
+      const handoffTaskBytes = handoffRef.kind === "handoff" ? Buffer.byteLength(input.task, "utf8") : 0;
+      const bytes = retainedTextBytes(loaded.snapshot, loaded.skills) + handoffTaskBytes;
       if (root.retainedBytes + bytes > factory.limits.maxRetainedTextBytes) {
         root.pending.delete(toolCallId);
         const reason = `Instance retained initial-text capacity (${factory.limits.maxRetainedTextBytes} bytes) is full; restart OMP.`;
+        failReservedHandoff(reason);
         recordAdmissionFailure(root, "capacity-text", reason);
         return block(reason);
       }
@@ -2767,6 +4616,16 @@ async function admitTask(
         parentToolCallId: toolCallId,
         index: 0,
         inputDigest: input.digest,
+        task: handoffRef.kind === "handoff" ? input.task : null,
+        taskBytes: handoffTaskBytes,
+        handoffToken: handoffReservation === null ? Object.freeze({}) : handoffReservation.consumerToken,
+        handoffOfferId: handoffReservation === null ? null : handoffReservation.offerId,
+        handoffOffer: handoffReservation === null ? null : handoffReservation.offer,
+        handoffParentTaskRef: handoffReservation === null ? null : handoffReservation.parentTaskCall,
+        handoffParentRevalidate: handoffReservation === null ? null : handoffReservation.parentRevalidate,
+        handoffPromptGate: "unobserved",
+        handoffContextGate: "unobserved",
+        snapshotPreflights: new Map(),
         admittedEpoch: root.epoch,
         admittedRootToken: root.token,
         admittedWorkEpoch: root.workEpoch,
@@ -2804,6 +4663,22 @@ async function admitTask(
         resultLifecycleConflict: null,
         closedReason: null,
       };
+      // Native pure check and actual host gates finished above. Only now bind
+      // the same pending instance token as the offer consumer.
+      if (handoffReservation !== null) {
+        const localFailure = handoffReservationLocalFailure(root, handoffReservation);
+        if (localFailure !== null) {
+          const reason = `The offer reservation local gate refused: ${localFailure}`;
+          handoffReservationFailure(root, handoffReservation, reason);
+          recordAdmissionFailure(root, "handoff-native-check", reason);
+          return block(reason);
+        }
+        const bindFailure = bindHandoffOfferConsumer(root, handoffReservation, record);
+        if (bindFailure !== null) {
+          recordAdmissionFailure(root, "handoff-bind", bindFailure);
+          return block(bindFailure);
+        }
+      }
       root.records.push(record);
       root.recordByToolCall.set(toolCallId, record);
       root.retainedBytes += bytes;
@@ -2816,10 +4691,12 @@ async function admitTask(
     } catch (error) {
       if (root.pending.get(toolCallId) === pending) root.pending.delete(toolCallId);
       const reason = `Child snapshot admission was refused: ${errorMessage(error)}`;
+      failReservedHandoff(reason);
       recordAdmissionFailure(root, "admission-refused", reason);
       return block(reason);
     }
   } catch (error) {
+    if (handoffReservation !== null) handoffReservationFailure(root, handoffReservation, errorMessage(error));
     recordAdmissionFailure(root, "admission-error", errorMessage(error));
     return block(`Child snapshot admission failed closed: ${errorMessage(error)}`);
   }
@@ -3032,6 +4909,19 @@ function bindChild(factory: FactoryContext, pi: DefinedOmpApi, context: NativeCo
     abortNow(context);
     return;
   }
+  if (record.handoffOffer !== null) {
+    const reservation = offerReservationForRecord(root, record);
+    if (reservation === null
+      || reservation.state !== "bound"
+      || reservation.record !== record
+      || reservation.consumerToken !== record.handoffToken
+      || reservation.parentTaskCall !== record.handoffParentTaskRef
+      || record.task === null) {
+      markRefused(root, record, "handoff-child-binding", "The bound child lost its original handoff offer or task token.");
+      abortNow(context);
+      return;
+    }
+  }
   record.phase = "bound";
   diagnose(factory, "child-bound", `Bound child ${facts.agentId} to ${record.definition.name}.`, {
     instanceId: record.id,
@@ -3104,6 +4994,16 @@ function onChildBeforeAgentStart(
       abortNow(context);
       return undefined;
     }
+    if (record.handoffOffer !== null && record.task !== null) {
+      const actualPrompt = isRecord(event) ? event.prompt : undefined;
+      if (typeof actualPrompt !== "string" || actualPrompt !== HANDOFF_TASK_PREFIX + record.task) {
+        record.handoffPromptGate = "refused";
+        markRefused(root, record, "handoff-task-prompt", "The actual before_agent_start prompt was not the accepted prefix plus the complete original task.");
+        abortNow(context);
+        return undefined;
+      }
+      record.handoffPromptGate = "verified";
+    }
     if (record.roleGate === "refused") {
       abortNow(context);
       return undefined;
@@ -3174,6 +5074,15 @@ function onChildContext(
       abortNow(context);
       return undefined;
     }
+    if (record.handoffOffer !== null && record.task !== null) {
+      if (!verifyHandoffTaskMessage(messages, record.task)) {
+        record.handoffContextGate = "refused";
+        markRefused(root, record, "handoff-task-context", "The native context did not contain exactly one exact user task message for the complete original task.");
+        abortNow(context);
+        return undefined;
+      }
+      record.handoffContextGate = "verified";
+    }
     let result;
     try {
       result = verifyNativeAutoloadSkills(record.skillExpectations, messages);
@@ -3220,14 +5129,42 @@ function childInput(
 function childToolCall(
   factory: FactoryContext,
   pi: DefinedOmpApi,
+  event: unknown,
   context: NativeContext,
 ): { readonly block: true; readonly reason: string } | undefined {
   const root = moduleRoot;
   if (root === null) return block("Native child instance authority is unavailable; no tool ran.");
   const record = childRecord(factory, root, context);
-  if (!childGuard(factory, pi, root, record, context)) {
+  if (!childGuard(factory, pi, root, record, context) || record === null) {
     return block("Native child instance binding or runtime facts are refused; no tool ran.");
   }
+  if (!isRecord(event) || event.toolName !== NATIVE_SNAPSHOT_TOOL) return undefined;
+  if (record.handoffOffer === null || record.handoffToken === null) {
+    return block("agent_snapshot is available only to a child bound to an actual handoff offer.");
+  }
+  if (typeof event.toolCallId !== "string" || !("input" in event)) {
+    return block("The child snapshot tool call lacks a usable call id or input.");
+  }
+  const toolCallId = boundedId(event.toolCallId);
+  if (toolCallId === null) return block("The child snapshot tool call id is unsupported.");
+  const parsed = readNativeSnapshotRequestDescriptor(event.input);
+  if (!parsed.ok) return block(parsed.reason);
+  const existing = record.snapshotPreflights.get(toolCallId);
+  if (existing !== undefined) {
+    if (existing.descriptor.action === parsed.descriptor.action
+      && existing.descriptor.digest === parsed.descriptor.digest) {
+      return undefined;
+    }
+    markRefused(root, record, "handoff-child-preflight", "The same child snapshot tool call id was reused with different parameters.");
+    return block("The same child snapshot tool call id was reused with different parameters.");
+  }
+  if (record.snapshotPreflights.size >= MAX_SNAPSHOT_OPERATIONS) {
+    return block("The bounded child snapshot preflight capacity is exhausted.");
+  }
+  record.snapshotPreflights.set(toolCallId, {
+    descriptor: parsed.descriptor,
+    token: Object.freeze({}),
+  });
   return undefined;
 }
 
@@ -3659,11 +5596,12 @@ export function createInstancedNativeEntry(
       selection: NativeInstanceReportSelection,
       work: NativeReportWorkIdentity,
       context: NativeContext,
+      handoffAdoptionId?: string,
     ): NativeInstanceReportPrepareResult {
       if (portFactory === null) {
         return { ok: false, reason: "the native instance entry is not initialized" };
       }
-      return prepareInstanceReport(portFactory, selection, work, context);
+      return prepareInstanceReport(portFactory, selection, work, context, handoffAdoptionId);
     },
     inspect(
       context: NativeContext,
@@ -3675,6 +5613,58 @@ export function createInstancedNativeEntry(
       return inspectInstanceReportCatalog(portFactory, context, work);
     },
   });
+  // Both tools are registered before D1 chooses the actual definition/tool
+  // catalog. They stay defaultInactive and their resolvers refuse until this
+  // factory and root are fully initialized.
+  let toolFactory: FactoryContext | null = null;
+  let mainPorts: NativeHandoffPorts | null = null;
+  let childPorts: NativeChildPorts | null = null;
+  let handoffEntry: NativeHandoffEntry | null = null;
+  let snapshotEntry: NativeSnapshotEntry | null = null;
+  let toolRegistrationFailure: string | null = null;
+  handoffEntry = createNativeHandoffEntry({
+    resolveRoot(context: NativeContext) {
+      if (toolFactory === null || mainPorts === null) {
+        return { ok: false, reason: "the native handoff entry is not initialized" };
+      }
+      const resolved = mainHandoffRoot(toolFactory, context);
+      if (resolved === null) {
+        return { ok: false, reason: "the actual main handoff root is unavailable" };
+      }
+      return { ok: true, coordinator: resolved.coordinator, ports: mainPorts };
+    },
+  });
+  snapshotEntry = createNativeSnapshotEntry({
+    resolveChildRoot(context: NativeContext) {
+      if (toolFactory === null || childPorts === null) {
+        return { ok: false, reason: "the native child snapshot entry is not initialized" };
+      }
+      const owned = ownedHandoffChild(toolFactory, context);
+      if (owned === null || owned.record.handoffToken === null) {
+        return { ok: false, reason: "no bound handoff child owns this actual snapshot context" };
+      }
+      return {
+        ok: true,
+        coordinator: owned.coordinator,
+        consumerRef: owned.record.handoffToken,
+        ports: childPorts,
+      };
+    },
+  });
+  try {
+    const handoffTool = {
+      ...handoffEntry.tool,
+      description: `${handoffEntry.tool.description} Protocol: capture returns an initial offer that can be dispatched directly; publish another offer only for a new consumer or repair feedback. Put the exact first task line OMP_HANDOFF_REF_V1 <offerId> in the native task; the child reads/checks that offer and returns its result; then adopt the real receipt with the consumerParentToolCallId and use the PASS adoption as handoffAdoptionId in the final report.`,
+    } as unknown as NativeTool;
+    const snapshotTool = {
+      ...snapshotEntry.tool,
+      description: `${snapshotEntry.tool.description} Protocol: this child tool reads or checks the offered snapshot only; perform the offered work/check and return the actual result.`,
+    } as unknown as NativeTool;
+    pi.registerTool(handoffTool);
+    pi.registerTool(snapshotTool);
+  } catch (error) {
+    toolRegistrationFailure = boundedMessage(`Native handoff tool registration failed: ${errorMessage(error)}`);
+  }
   const d1Options: DefinedNativeEntryOptions = {
     ...(options.mainDefinitionPath === undefined ? {} : { definitionPath: options.mainDefinitionPath }),
     ...(options.nativePorts === undefined ? {} : {
@@ -3728,6 +5718,27 @@ export function createInstancedNativeEntry(
     disposed: false,
   };
   portFactory = factory;
+  mainPorts = {
+    identifyMainCall(actualToolCallId, context, priorOriginalNativeCallRef, descriptor) {
+      return identifyMainHandoffCall(factory, actualToolCallId, context, priorOriginalNativeCallRef, descriptor);
+    },
+    prepareMain(request, context) {
+      return prepareMainHandoff(factory, request, context);
+    },
+  };
+  childPorts = {
+    identifyChildCall(actualToolCallId, context, priorChildToolCallRef, descriptor) {
+      return identifyChildHandoffCall(factory, actualToolCallId, context, priorChildToolCallRef, descriptor);
+    },
+    prepareChild(request, context) {
+      return prepareChildHandoff(factory, pi, request, context);
+    },
+    prepareReadObservation(event, context, expectedBinding) {
+      return prepareChildReadObservation(factory, pi, event, context, expectedBinding);
+    },
+  };
+  toolFactory = factory;
+  if (toolRegistrationFailure !== null) factory.refusedReason = toolRegistrationFailure;
   factory.statusCommandRegistered = registerStatusCommand(pi, factory);
   // Readiness is published only after the synchronous registrar succeeded.
   if (factory.statusCommandRegistered) statusFactory = factory;
@@ -3835,7 +5846,7 @@ export function createInstancedNativeEntry(
         if (facts.agentKind === "sub") abortNow(context);
         return block("The instance entry was disposed; no tool ran.");
       }
-      if (facts.agentKind === "sub") return childToolCall(factory, pi, context);
+      if (facts.agentKind === "sub") return childToolCall(factory, pi, event, context);
       if (facts.agentKind !== "main") return block("Unknown agent identity cannot call tools.");
       const root = moduleRoot;
       if (root === null || root.factoryId !== factory.id) {
@@ -3846,6 +5857,9 @@ export function createInstancedNativeEntry(
       }
       if (!refreshRoot(factory, root, pi, context)) {
         return block(root.failure ?? "The native instance root is not valid; no tool ran.");
+      }
+      if (isRecord(event) && event.toolName === NATIVE_HANDOFF_TOOL) {
+        return mainHandoffPreflight(factory, root, event, context);
       }
       return undefined;
     } catch (error) {
@@ -3858,6 +5872,18 @@ export function createInstancedNativeEntry(
   pi.on("tool_result", (event, context) => {
     try {
       if (factory.disposed) return;
+      let resultFacts: HostFacts;
+      try {
+        resultFacts = readHostFacts(context);
+      } catch {
+        return;
+      }
+      if (resultFacts.agentKind === "sub") {
+        // The child snapshot entry independently observes the actual event;
+        // execute output is never echoed into this path by hand.
+        snapshotEntry?.observeToolResult(event, context);
+        return;
+      }
       const root = moduleRoot;
       if (root === null
         || root.factoryId !== factory.id
@@ -3890,6 +5916,17 @@ export function createInstancedNativeEntry(
         || record.parentToolCallId !== toolCallId) {
         return;
       }
+      if (record.handoffOffer !== null) {
+        const effectiveInput = readTaskInput(event.input);
+        if (!effectiveInput.ok
+          || effectiveInput.digest !== record.inputDigest
+          || effectiveInput.agent !== record.definition.name) {
+          const reason = "The parent task result effective input no longer matches the frozen handoff admission.";
+          markRefused(root, record, "handoff-task-result-input", reason);
+          record.resultObservationError ??= reason;
+          return;
+        }
+      }
       const writeAllowed = (): boolean =>
         ownsRoot(factory, root)
         && root.token === record.admittedRootToken
@@ -3916,7 +5953,7 @@ export function createInstancedNativeEntry(
       if (!writeAllowed()) return;
       record.resultObservation = next;
       record.taskResultObserved = true;
-      assessResultLifecycleConflict(record);
+      assessResultLifecycleConflict(root, record);
     } catch {
       // Observations never gate.
     }
@@ -4069,6 +6106,8 @@ export function createInstancedNativeEntry(
         moduleRoot = null;
       }
       factory.rootToken = null;
+      handoffEntry?.dispose();
+      snapshotEntry?.dispose();
       definitionEntry.dispose();
     },
   };

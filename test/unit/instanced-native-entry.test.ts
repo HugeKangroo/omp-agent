@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
+import { mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import {
   DEFINITION_FREEZE_SCOPE,
   DEFINITION_ORIGIN,
@@ -67,13 +70,15 @@ interface SnapshotSpec {
   readonly canonicalPath?: string;
   readonly rawContent?: string;
   readonly selectorNull?: boolean;
+  readonly workspace?: string;
 }
 
 function makeSnapshot(spec: SnapshotSpec): DefinitionSnapshot {
-  const canonicalPath = spec.canonicalPath ?? `${WORKSPACE}/.omp/agents/${spec.name}.md`;
+  const workspace = spec.workspace ?? WORKSPACE;
+  const canonicalPath = spec.canonicalPath ?? `${workspace}/.omp/agents/${spec.name}.md`;
   const model = spec.model ?? MAIN_MODEL;
   const skills = (spec.skills ?? []).map((skill) => {
-    const skillPath = `${WORKSPACE}/.omp/skills/${skill.name}/SKILL.md`;
+    const skillPath = `${workspace}/.omp/skills/${skill.name}/SKILL.md`;
     return {
       name: skill.name,
       description: `${skill.name} description`,
@@ -112,7 +117,7 @@ function makeSnapshot(spec: SnapshotSpec): DefinitionSnapshot {
     origin: DEFINITION_ORIGIN,
     freezeScope: DEFINITION_FREEZE_SCOPE,
     version: spec.version,
-    workspaceRoot: WORKSPACE,
+    workspaceRoot: workspace,
     nativeSourceLabel: "explicit",
     definition,
     skills,
@@ -120,14 +125,18 @@ function makeSnapshot(spec: SnapshotSpec): DefinitionSnapshot {
   }) as DefinitionSnapshot;
 }
 
-function mainSnapshot(): DefinitionSnapshot {
+function mainSnapshot(
+  workspace = WORKSPACE,
+  tools: readonly string[] = ["read", "task"],
+): DefinitionSnapshot {
   return makeSnapshot({
     name: "main",
     body: "MAIN_DEFINITION_BODY",
     version: "main-v1",
-    tools: ["read", "task"],
+    tools,
     model: MAIN_MODEL,
     selectorNull: true,
+    workspace,
   });
 }
 
@@ -141,6 +150,7 @@ function childSnapshot(
     readonly skills?: readonly SkillSpec[];
     readonly canonicalPath?: string;
     readonly rawContent?: string;
+    readonly workspace?: string;
   } = {},
 ): DefinitionSnapshot {
   return makeSnapshot({
@@ -152,6 +162,7 @@ function childSnapshot(
     skills: options.skills ?? [],
     ...(options.canonicalPath === undefined ? {} : { canonicalPath: options.canonicalPath }),
     ...(options.rawContent === undefined ? {} : { rawContent: options.rawContent }),
+    ...(options.workspace === undefined ? {} : { workspace: options.workspace }),
   });
 }
 
@@ -523,6 +534,7 @@ interface RootFixture {
   readonly loadChild: (input: InstancedChildSnapshotInput) => Promise<DefinitionSnapshot>;
   readonly childDefinitions: readonly string[];
   readonly limits: InstancedNativeEntryOptions["limits"];
+  readonly workspace: string;
 }
 
 interface RootOptions {
@@ -536,11 +548,13 @@ interface RootOptions {
   readonly main?: DefinitionSnapshot;
   readonly hostActiveTools?: readonly string[];
   readonly commandRegistration?: "ok" | "missing" | "throws";
+  readonly workspace?: string;
 }
 
 async function startRoot(options: RootOptions = {}): Promise<RootFixture> {
-  const main = options.main ?? mainSnapshot();
-  const children = options.children ?? [childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1")];
+  const workspace = options.workspace ?? WORKSPACE;
+  const main = options.main ?? mainSnapshot(workspace);
+  const children = options.children ?? [childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1", { workspace })];
   const childDefinitions = options.childDefinitions ?? children.map((child) => child.definition.requestedPath);
   const byPath = new Map(children.map((child) => [child.definition.requestedPath, child]));
   const loadChild = options.loadChild ?? (async (input: InstancedChildSnapshotInput) => {
@@ -557,6 +571,8 @@ async function startRoot(options: RootOptions = {}): Promise<RootFixture> {
     ...options.ports,
   });
   const host = new Host({
+    cwd: workspace,
+    sessionId: "session-root",
     activeTools: options.hostActiveTools ?? (options.mainTools ?? ["read", "task"]),
     ...(options.commandRegistration === undefined ? {} : { commandRegistration: options.commandRegistration }),
   });
@@ -573,7 +589,7 @@ async function startRoot(options: RootOptions = {}): Promise<RootFixture> {
   });
   controls.push(entry);
   await host.sessionStart();
-  return { host, entry, main, ports, children, loadChild, childDefinitions, limits: options.limits };
+  return { host, entry, main, ports, children, loadChild, childDefinitions, limits: options.limits, workspace };
 }
 
 interface ChildFixture {
@@ -613,7 +629,7 @@ async function startChild(
     parentId: options.parentId === undefined ? "Main" : options.parentId,
     depth: options.depth ?? 1,
     sessionId: options.sessionId ?? `session-${childId}`,
-    cwd: options.cwd ?? WORKSPACE,
+    cwd: options.cwd ?? root.workspace,
     currentModel: options.currentModel ?? CHILD_MODEL,
     activeTools: options.activeTools ?? ["read"],
     ...(options.bus === undefined ? {} : { bus: options.bus }),
@@ -3500,4 +3516,968 @@ describe("C2 fixed instance report port", () => {
     expect(records(lifecycleFixture.root)[0]!.observation.lifecycleEvidence.aborted).toBe(true);
     expect((await inspectWork(lifecycleFixture.root, "inspect-reentry-lifecycle-after")).current.report ?? null).toBeNull();
   });
+});
+
+const HANDOFF_TASK_PREFIX = "Complete assignment thoroughly:\n\n";
+
+async function tempWorkspace(): Promise<string> {
+  return await realpath(await mkdtemp(path.join(tmpdir(), "omp-a22-")));
+}
+
+function isBlocked(value: unknown): value is { block: true; reason: string } {
+  return isRecord(value) && value.block === true;
+}
+
+async function handoffCall(
+  root: RootFixture,
+  callId: string,
+  params: Record<string, unknown>,
+): Promise<NativeToolResult> {
+  const preflight = await root.host.emit("tool_call", {
+    toolCallId: callId,
+    toolName: "agent_handoff",
+    input: params,
+  });
+  if (isBlocked(preflight)) throw new Error(`handoff preflight blocked: ${preflight.reason}`);
+  const tool = root.host.tools.get("agent_handoff");
+  if (tool === undefined) throw new Error("agent_handoff was not registered");
+  const result = await tool.execute(callId, params, new AbortController().signal, undefined, root.host.context);
+  await root.host.emit("tool_result", {
+    toolCallId: callId,
+    toolName: "agent_handoff",
+    input: params,
+    content: result.content,
+    isError: result.isError === true,
+    details: result.details,
+  });
+  return result;
+}
+
+function details(result: NativeToolResult): Record<string, any> {
+  if (result.isError === true) {
+    throw new Error(`tool failed: ${String((result.content[0] as { text?: string } | undefined)?.text ?? "")}`);
+  }
+  return result.details as Record<string, any>;
+}
+
+function snapshotDetails(result: NativeToolResult): Record<string, any> {
+  if (result.isError === true) {
+    throw new Error(`snapshot tool failed: ${String((result.content[0] as { text?: string } | undefined)?.text ?? "")}`);
+  }
+  const text = (result.content[0] as { text?: string } | undefined)?.text;
+  if (typeof text !== "string") throw new Error("snapshot result has no text payload");
+  return JSON.parse(text) as Record<string, any>;
+}
+
+async function snapshotCall(
+  child: ChildFixture,
+  callId: string,
+  params: Record<string, unknown>,
+): Promise<NativeToolResult> {
+  const preflight = await child.host.emit("tool_call", {
+    toolCallId: callId,
+    toolName: "agent_snapshot",
+    input: params,
+  });
+  if (isBlocked(preflight)) throw new Error(`snapshot preflight blocked: ${preflight.reason}`);
+  const tool = child.host.tools.get("agent_snapshot");
+  if (tool === undefined) throw new Error("agent_snapshot was not registered");
+  const result = await tool.execute(callId, params, new AbortController().signal, undefined, child.host.context);
+  await child.host.emit("tool_result", {
+    toolCallId: callId,
+    toolName: "agent_snapshot",
+    input: params,
+    content: result.content,
+    isError: result.isError === true,
+    details: result.details,
+  });
+  return result;
+}
+
+function handoffTaskResult(
+  call: string,
+  childId: string,
+  agent: string,
+  task: string,
+  output: string,
+): Record<string, unknown> {
+  return {
+    toolCallId: call,
+    toolName: "task",
+    input: { agent, task },
+    content: [{ type: "text", text: output }],
+    isError: false,
+    details: {
+      results: [{
+        index: 0,
+        id: childId,
+        agent,
+        exitCode: 0,
+        aborted: false,
+        truncated: false,
+        output,
+      }],
+    },
+  };
+}
+
+async function admitHandoffTask(
+  root: RootFixture,
+  call: string,
+  task: string,
+): Promise<void> {
+  const result = await root.host.task(call, { agent: "alpha", task });
+  if (isBlocked(result)) throw new Error(`handoff task blocked: ${result.reason}`);
+}
+
+async function handoffChild(
+  root: RootFixture,
+  call: string,
+  childId: string,
+  task: string,
+): Promise<ChildFixture> {
+  const child = await startChild(root, call, childId, {
+    activeTools: ["read", "agent_snapshot"],
+  });
+  const body = root.children[0]!.definition.body;
+  await child.host.emit("before_agent_start", {
+    reason: "prompt",
+    prompt: HANDOFF_TASK_PREFIX + task,
+    systemPrompt: childPrompt(body),
+  });
+  await child.host.emit("context", {
+    messages: [{ role: "user", content: HANDOFF_TASK_PREFIX + task }],
+  });
+  return child;
+}
+
+function statusRecord(root: RootFixture, call: string): InstancedEntryStatus["instances"][number] {
+  const record = records(root).find((entry) => entry.parentToolCallId === call);
+  if (record === undefined) throw new Error(`no status record for ${call}`);
+  return record;
+}
+
+function envelopeSha(record: InstancedEntryStatus["instances"][number]): string {
+  const value = record.observation.result.observation?.envelope.sha256;
+  if (typeof value !== "string") throw new Error("no observed envelope sha");
+  return value;
+}
+
+function producerSelector(record: InstancedEntryStatus["instances"][number]): Record<string, string> {
+  return {
+    instanceId: record.id,
+    parentToolCallId: record.parentToolCallId,
+    envelopeSha256: envelopeSha(record),
+  };
+}
+
+interface HandoffBase {
+  readonly workspace: string;
+  readonly root: RootFixture;
+  readonly alphaBody: string;
+  readonly producerCall: string;
+  readonly producerChildId: string;
+  readonly captureId: string;
+  readonly offerId: string;
+  cleanup(): Promise<void>;
+}
+
+/**
+ * One ordinary source producer, its actual observed result, and an initial
+ * capture/offer produced by the registered main tool. IDs below always come
+ * from these actual outputs; no core handle or private token is manufactured.
+ */
+async function handoffBase(options: {
+  readonly loadChild?: (input: InstancedChildSnapshotInput) => Promise<DefinitionSnapshot>;
+  readonly fileStatus?: "pass" | "fail";
+} = {}): Promise<HandoffBase> {
+  const workspace = await tempWorkspace();
+  const tools = ["read", "task", "agent_handoff", "agent_snapshot"];
+  const alpha = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1", {
+    tools: ["read", "agent_snapshot"],
+    workspace,
+  });
+  const root = await startRoot({
+    workspace,
+    main: mainSnapshot(workspace, tools),
+    children: [alpha],
+    mainTools: tools,
+    hostActiveTools: tools,
+    ...(options.loadChild === undefined ? {} : { loadChild: options.loadChild }),
+  });
+  await writeFile(
+    path.join(workspace, "data.json"),
+    `${JSON.stringify({ status: options.fileStatus ?? "pass" })}\n`,
+    "utf8",
+  );
+  await root.host.input("handoff work", { source: "interactive" });
+  await root.host.prepare("handoff work");
+  const producerCall = "task-producer";
+  const producerChildId = "ChildProducer";
+  await admit(root, producerCall, "alpha", "produce handoff source");
+  const producer = await startChild(root, producerCall, producerChildId, {
+    activeTools: ["read", "agent_snapshot"],
+  });
+  await producer.host.prompt(childPrompt(alpha.definition.body));
+  await producer.host.emitContext([]);
+  await root.host.emit("tool_result", handoffTaskResult(
+    producerCall,
+    producerChildId,
+    "alpha",
+    "produce handoff source",
+    "producer output",
+  ));
+  root.host.lifecycle({
+    status: "completed",
+    id: producerChildId,
+    parentToolCallId: producerCall,
+    index: 0,
+    agent: "alpha",
+  });
+  await producer.host.emit("session_shutdown", {});
+  const capture = details(await handoffCall(root, "handoff-capture-base", {
+    action: "capture",
+    producer: producerSelector(statusRecord(root, producerCall)),
+    relativePath: "data.json",
+    conditions: [{ id: "status", kind: "json-equals", pointer: "/status", value: "pass" }],
+  }));
+  return {
+    workspace,
+    root,
+    alphaBody: alpha.definition.body,
+    producerCall,
+    producerChildId,
+    captureId: capture.captureId as string,
+    offerId: capture.offerId as string,
+    cleanup: () => rm(workspace, { recursive: true, force: true }),
+  };
+}
+
+async function publishHandoffOffer(
+  root: RootFixture,
+  callId: string,
+  captureId: string,
+): Promise<string> {
+  const offer = details(await handoffCall(root, callId, { action: "offer", captureId }));
+  return offer.offerId as string;
+}
+
+async function completeHandoffConsumer(
+  root: RootFixture,
+  options: {
+    readonly call: string;
+    readonly childId: string;
+    readonly offerId: string;
+    readonly task: string;
+    readonly receiptCall: string;
+    readonly checkCall: string;
+    readonly output: string;
+  },
+): Promise<{ readonly child: ChildFixture; readonly receiptId: string }> {
+  const admitted = await root.host.task(options.call, { agent: "alpha", task: options.task });
+  if (isBlocked(admitted)) throw new Error(`handoff consumer blocked: ${admitted.reason}`);
+  const child = await handoffChild(root, options.call, options.childId, options.task);
+  const receipt = snapshotDetails(await snapshotCall(child, options.receiptCall, {
+    action: "check",
+    offerId: options.offerId,
+  }));
+  await root.host.emit("tool_result", handoffTaskResult(
+    options.call,
+    options.childId,
+    "alpha",
+    options.task,
+    options.output,
+  ));
+  root.host.lifecycle({
+    status: "completed",
+    id: options.childId,
+    parentToolCallId: options.call,
+    index: 0,
+    agent: "alpha",
+  });
+  await child.host.emit("session_shutdown", {});
+  return { child, receiptId: receipt.receiptId as string };
+}
+
+describe("actual instanced handoff composition", () => {
+  test("registered main/child tools close capture, read, FAIL repair, PASS adoption, report and sticky preflight refusal", async () => {
+    const workspace = await tempWorkspace();
+    try {
+      const tools = ["read", "task", "agent_handoff", "agent_snapshot"];
+      const alpha = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1", {
+        tools: ["read", "agent_snapshot"],
+        workspace,
+      });
+      const root = await startRoot({
+        workspace,
+        main: mainSnapshot(workspace, tools),
+        children: [alpha],
+        mainTools: tools,
+        hostActiveTools: tools,
+      });
+      expect(root.host.tools.get("agent_handoff")?.defaultInactive).toBe(true);
+      expect(root.host.tools.get("agent_snapshot")?.defaultInactive).toBe(true);
+      await writeFile(path.join(workspace, "data.json"), '{"status":"fail"}\n', "utf8");
+      await root.host.input("handoff work", { source: "interactive" });
+      await root.host.prepare("handoff work");
+
+      // Ordinary producer instance: stable token exists even without an offer.
+      await admit(root, "task-producer", "alpha", "produce v1");
+      const producer = await startChild(root, "task-producer", "ChildProducer", {
+        activeTools: ["read", "agent_snapshot"],
+      });
+      await producer.host.prompt(childPrompt(alpha.definition.body));
+      await producer.host.emitContext([]);
+      await root.host.emit("tool_result", handoffTaskResult(
+        "task-producer",
+        "ChildProducer",
+        "alpha",
+        "produce v1",
+        "producer v1 output",
+      ));
+      root.host.lifecycle({
+        status: "completed",
+        id: "ChildProducer",
+        parentToolCallId: "task-producer",
+        index: 0,
+        agent: "alpha",
+      });
+      await producer.host.emit("session_shutdown", {});
+
+      const producerRow = statusRecord(root, "task-producer");
+      const capture = details(await handoffCall(root, "handoff-capture-v1", {
+        action: "capture",
+        producer: producerSelector(producerRow),
+        relativePath: "data.json",
+        conditions: [{ id: "status", kind: "json-equals", pointer: "/status", value: "pass" }],
+      }));
+      expect(typeof capture.captureId).toBe("string");
+      expect(typeof capture.offerId).toBe("string");
+      const captureV1 = capture.captureId as string;
+      const offerV1 = capture.offerId as string;
+
+      // Native call result is observed; the same original ref still replays
+      // its cached handoff result.
+      const captureReplay = details(await handoffCall(root, "handoff-capture-v1", {
+        action: "capture",
+        producer: producerSelector(producerRow),
+        relativePath: "data.json",
+        conditions: [{ id: "status", kind: "json-equals", pointer: "/status", value: "pass" }],
+      }));
+      expect(captureReplay.captureId).toBe(captureV1);
+
+      const testerTask = `OMP_HANDOFF_REF_V1 ${offerV1}\nCheck the captured file.`;
+      await admitHandoffTask(root, "task-tester-1", testerTask);
+      const tester1 = await handoffChild(root, "task-tester-1", "ChildTester1", testerTask);
+      const failReceipt = snapshotDetails(await snapshotCall(tester1, "snapshot-check-fail", {
+        action: "check",
+        offerId: offerV1,
+      }));
+      await root.host.emit("tool_result", handoffTaskResult(
+        "task-tester-1",
+        "ChildTester1",
+        "alpha",
+        testerTask,
+        "FAIL result",
+      ));
+      root.host.lifecycle({
+        status: "completed",
+        id: "ChildTester1",
+        parentToolCallId: "task-tester-1",
+        index: 0,
+        agent: "alpha",
+      });
+      await tester1.host.emit("session_shutdown", {});
+      const failAdoption = details(await handoffCall(root, "handoff-adopt-fail", {
+        action: "adopt",
+        receiptId: failReceipt.receiptId,
+        captureId: captureV1,
+        consumerParentToolCallId: "task-tester-1",
+      }));
+      expect(failAdoption.outcome).toBe("fail");
+
+      const repairOffer = details(await handoffCall(root, "handoff-offer-repair", {
+        action: "offer",
+        captureId: captureV1,
+        failAdoptionId: failAdoption.adoptionId,
+      }));
+      const offerRepair = repairOffer.offerId as string;
+      const repairTask = `OMP_HANDOFF_REF_V1 ${offerRepair}\nRead the old snapshot, update the file, then return.`;
+      await admitHandoffTask(root, "task-repair", repairTask);
+      const repairChild = await handoffChild(root, "task-repair", "ChildRepair", repairTask);
+      const read = snapshotDetails(await snapshotCall(repairChild, "snapshot-read-repair", {
+        action: "read",
+        offerId: offerRepair,
+      }));
+      expect(typeof read.readId).toBe("string");
+      await writeFile(path.join(workspace, "data.json"), '{"status":"pass"}\n', "utf8");
+      await root.host.emit("tool_result", handoffTaskResult(
+        "task-repair",
+        "ChildRepair",
+        "alpha",
+        repairTask,
+        "repair result",
+      ));
+      root.host.lifecycle({
+        status: "completed",
+        id: "ChildRepair",
+        parentToolCallId: "task-repair",
+        index: 0,
+        agent: "alpha",
+      });
+      await repairChild.host.emit("session_shutdown", {});
+      const repairRow = statusRecord(root, "task-repair");
+      const repairCapture = details(await handoffCall(root, "handoff-capture-v2", {
+        action: "capture",
+        producer: producerSelector(repairRow),
+        fromOfferId: offerRepair,
+      }));
+      const captureV2 = repairCapture.captureId as string;
+      const offerV2 = repairCapture.offerId as string;
+      expect(captureV2).not.toBe(captureV1);
+
+      // The old V1 receipt cannot be adopted against the V2 capture.
+      const oldReceiptResult = await handoffCall(root, "handoff-adopt-old-receipt", {
+        action: "adopt",
+        receiptId: failReceipt.receiptId,
+        captureId: captureV2,
+        consumerParentToolCallId: "task-tester-1",
+      });
+      expect(oldReceiptResult.isError).toBe(true);
+
+      const testerTask2 = `OMP_HANDOFF_REF_V1 ${offerV2}\nCheck the repaired file.`;
+      await admitHandoffTask(root, "task-tester-2", testerTask2);
+      const tester2 = await handoffChild(root, "task-tester-2", "ChildTester2", testerTask2);
+      const passReceipt = snapshotDetails(await snapshotCall(tester2, "snapshot-check-pass", {
+        action: "check",
+        offerId: offerV2,
+      }));
+      await root.host.emit("tool_result", handoffTaskResult(
+        "task-tester-2",
+        "ChildTester2",
+        "alpha",
+        testerTask2,
+        "PASS result",
+      ));
+      root.host.lifecycle({
+        status: "completed",
+        id: "ChildTester2",
+        parentToolCallId: "task-tester-2",
+        index: 0,
+        agent: "alpha",
+      });
+      await tester2.host.emit("session_shutdown", {});
+      const passAdoption = details(await handoffCall(root, "handoff-adopt-pass", {
+        action: "adopt",
+        receiptId: passReceipt.receiptId,
+        captureId: captureV2,
+        consumerParentToolCallId: "task-tester-2",
+      }));
+      expect(passAdoption.outcome).toBe("pass");
+
+      const repairRowAfter = statusRecord(root, "task-repair");
+      const reportParams = {
+        action: "report",
+        checks: [{ toolCallId: "task-repair", purpose: "delegated repair" }],
+        outputFiles: ["data.json"],
+        outcome: "completed",
+        instanceResult: {
+          instanceId: repairRowAfter.id,
+          parentToolCallId: "task-repair",
+          envelopeSha256: envelopeSha(repairRowAfter),
+        },
+        handoffAdoptionId: passAdoption.adoptionId,
+      };
+      const report = await selectedReport(root, reportParams, { toolCallId: "report-handoff-pass" });
+      const reportDetails = details(report);
+      expect(reportDetails.instanceResult?.handoff?.adoption?.outcome).toBe("pass");
+
+      // Reading the same adopted call's input reflectively must sticky-fail
+      // the existing preflight instead of escaping to the outer hook catch.
+      const toolCallHandler = root.host.handlers.get("tool_call")?.at(-1);
+      if (toolCallHandler === undefined) throw new Error("tool_call handler is missing");
+      const throwingInput = {
+        toolCallId: "handoff-adopt-pass",
+        toolName: "agent_handoff",
+        get input(): never {
+          throw new Error("synthetic input read failure");
+        },
+      };
+      const reflected = await toolCallHandler(throwingInput, root.host.context);
+      expect(isBlocked(reflected)).toBe(true);
+      expect(blockedReason(reflected)).toMatch(/unreadable input/i);
+      const reflectedReport = await selectedReport(root, reportParams, {
+        toolCallId: "report-handoff-reflected-input",
+      });
+      expect(reflectedReport.isError).toBe(true);
+
+      // A later same-call parameter conflict is sticky and invalidates the
+      // original adoption for any final report.
+      const conflict = await root.host.emit("tool_call", {
+        toolCallId: "handoff-adopt-pass",
+        toolName: "agent_handoff",
+        input: {
+          action: "adopt",
+          receiptId: "other-receipt",
+          captureId: "other-capture",
+          consumerParentToolCallId: "other-consumer",
+          unknownField: true,
+        },
+      });
+      expect(isBlocked(conflict)).toBe(true);
+      const refusedReport = await selectedReport(root, reportParams, {
+        toolCallId: "report-handoff-sticky",
+      });
+      expect(refusedReport.isError).toBe(true);
+      expect(String((refusedReport.content[0] as { text?: string } | undefined)?.text ?? ""))
+        .toMatch(/preflight|failed|No report was recorded/i);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("a source producer that fails during async definition load cannot bind a later offer consumption", async () => {
+    const workspace = await tempWorkspace();
+    try {
+      const tools = ["read", "task", "agent_handoff", "agent_snapshot"];
+      const alpha = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1", {
+        tools: ["read", "agent_snapshot"],
+        workspace,
+      });
+      const byPath = new Map([[alpha.definition.requestedPath, alpha]]);
+      let delay = false;
+      let startedResolve!: () => void;
+      let releaseResolve!: () => void;
+      const started = new Promise<void>((resolve) => { startedResolve = resolve; });
+      const release = new Promise<void>((resolve) => { releaseResolve = resolve; });
+      const loadChild = async (input: InstancedChildSnapshotInput): Promise<DefinitionSnapshot> => {
+        if (delay) {
+          startedResolve();
+          await release;
+        }
+        const snapshot = byPath.get(input.definitionPath);
+        if (snapshot === undefined) throw new Error(`no fixture snapshot for ${input.definitionPath}`);
+        return snapshot;
+      };
+      const root = await startRoot({
+        workspace,
+        main: mainSnapshot(workspace, tools),
+        children: [alpha],
+        mainTools: tools,
+        hostActiveTools: tools,
+        loadChild,
+      });
+      await writeFile(path.join(workspace, "data.json"), '{"status":"fail"}\n', "utf8");
+      await root.host.input("handoff work", { source: "interactive" });
+      await root.host.prepare("handoff work");
+
+      await admit(root, "task-producer", "alpha", "produce v1");
+      const producer = await startChild(root, "task-producer", "ChildProducer", {
+        activeTools: ["read", "agent_snapshot"],
+      });
+      await producer.host.prompt(childPrompt(alpha.definition.body));
+      await producer.host.emitContext([]);
+      await root.host.emit("tool_result", handoffTaskResult(
+        "task-producer",
+        "ChildProducer",
+        "alpha",
+        "produce v1",
+        "producer v1 output",
+      ));
+      root.host.lifecycle({
+        status: "completed",
+        id: "ChildProducer",
+        parentToolCallId: "task-producer",
+        index: 0,
+        agent: "alpha",
+      });
+      await producer.host.emit("session_shutdown", {});
+      const capture = details(await handoffCall(root, "handoff-capture-stale", {
+        action: "capture",
+        producer: producerSelector(statusRecord(root, "task-producer")),
+        relativePath: "data.json",
+        conditions: [{ id: "status", kind: "json-equals", pointer: "/status", value: "pass" }],
+      }));
+      const task = `OMP_HANDOFF_REF_V1 ${capture.offerId}\nCheck the file.`;
+
+      delay = true;
+      const pending = root.host.task("task-stale", { agent: "alpha", task });
+      await started;
+      // The source producer is ordinary (no handoffOffer), so this lifecycle
+      // failure cannot invalidate through the consumer path. The reservation
+      // must still reject at final bind.
+      root.host.lifecycle({
+        status: "failed",
+        id: "ChildProducer",
+        parentToolCallId: "task-producer",
+        index: 0,
+        agent: "alpha",
+      });
+      releaseResolve();
+      const blocked = await pending;
+      expect(isBlocked(blocked)).toBe(true);
+      expect(blockedReason(blocked)).toMatch(/reservation local gate/i);
+      expect(blockedReason(blocked)).toMatch(/lifecycle.*failure|failure or abort/i);
+      const second = await root.host.task("task-stale-2", { agent: "alpha", task });
+      expect(isBlocked(second)).toBe(true);
+      expect(String((second as { reason?: string }).reason)).toMatch(/permanent|reservation|offer/i);
+      expect(records(root).filter((record) => record.parentToolCallId === "task-stale")).toHaveLength(0);
+      expect(records(root).filter((record) => record.parentToolCallId === "task-stale-2")).toHaveLength(0);
+    } finally {
+      await rm(workspace, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("two async task admissions reserve one offer before loading; the loser and a failed load leave permanent failed reservations", async () => {
+    let mode: "normal" | "hold" | "throw" = "normal";
+    let loadCount = 0;
+    let barrier: {
+      readonly started: Promise<void>;
+      readonly released: Promise<void>;
+      start(): void;
+      release(): void;
+    } | null = null;
+    const makeBarrier = () => {
+      let started!: () => void;
+      let release!: () => void;
+      const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+      const releasedPromise = new Promise<void>((resolve) => { release = resolve; });
+      return {
+        started: startedPromise,
+        released: releasedPromise,
+        start: started,
+        release,
+      };
+    };
+    const workspace = await tempWorkspace();
+    const tools = ["read", "task", "agent_handoff", "agent_snapshot"];
+    const alpha = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1", {
+      tools: ["read", "agent_snapshot"],
+      workspace,
+    });
+    const byPath = new Map([[alpha.definition.requestedPath, alpha]]);
+    const root = await startRoot({
+      workspace,
+      main: mainSnapshot(workspace, tools),
+      children: [alpha],
+      mainTools: tools,
+      hostActiveTools: tools,
+      async loadChild(input: InstancedChildSnapshotInput): Promise<DefinitionSnapshot> {
+        loadCount += 1;
+        if (mode !== "normal") {
+          if (barrier === null) throw new Error("loader barrier is missing");
+          const active = barrier;
+          active.start();
+          await active.released;
+          if (mode === "throw") throw new Error("synthetic definition load failure");
+        }
+        const snapshot = byPath.get(input.definitionPath);
+        if (snapshot === undefined) throw new Error(`no fixture snapshot for ${input.definitionPath}`);
+        return snapshot;
+      },
+    });
+    try {
+      await writeFile(path.join(workspace, "data.json"), '{"status":"pass"}\n', "utf8");
+      await root.host.input("handoff work", { source: "interactive" });
+      await root.host.prepare("handoff work");
+      await admit(root, "task-producer", "alpha", "produce handoff source");
+      const producer = await startChild(root, "task-producer", "ChildProducer", {
+        activeTools: ["read", "agent_snapshot"],
+      });
+      await producer.host.prompt(childPrompt(alpha.definition.body));
+      await producer.host.emitContext([]);
+      await root.host.emit("tool_result", handoffTaskResult(
+        "task-producer",
+        "ChildProducer",
+        "alpha",
+        "produce handoff source",
+        "producer output",
+      ));
+      root.host.lifecycle({
+        status: "completed",
+        id: "ChildProducer",
+        parentToolCallId: "task-producer",
+        index: 0,
+        agent: "alpha",
+      });
+      await producer.host.emit("session_shutdown", {});
+      const capture = details(await handoffCall(root, "handoff-capture-base", {
+        action: "capture",
+        producer: producerSelector(statusRecord(root, "task-producer")),
+        relativePath: "data.json",
+        conditions: [{ id: "status", kind: "json-equals", pointer: "/status", value: "pass" }],
+      }));
+      const offer = capture.offerId as string;
+      const captureId = capture.captureId as string;
+      const task = `OMP_HANDOFF_REF_V1 ${offer}\nCheck the competing offer.`;
+      const before = loadCount;
+      barrier = makeBarrier();
+      mode = "hold";
+      const first = root.host.task("task-compete-1", { agent: "alpha", task });
+      await barrier.started;
+      expect(loadCount).toBe(before + 1);
+      const second = await root.host.task("task-compete-2", { agent: "alpha", task });
+      expect(isBlocked(second)).toBe(true);
+      expect(blockedReason(second)).toMatch(/already has a permanent consumption reservation/i);
+      // The reservation is taken before definition loading, so the losing
+      // admission never asks the loader for a snapshot.
+      expect(loadCount).toBe(before + 1);
+      const third = await root.host.task("task-compete-3", { agent: "alpha", task });
+      expect(isBlocked(third)).toBe(true);
+      expect(loadCount).toBe(before + 1);
+      barrier.release();
+      const firstResult = await first;
+      expect(isBlocked(firstResult)).toBe(false);
+      expect(records(root).filter((record) => record.parentToolCallId === "task-compete-1"))
+        .toHaveLength(1);
+      expect(records(root).filter((record) => record.parentToolCallId === "task-compete-2"))
+        .toHaveLength(0);
+      expect(records(root).filter((record) => record.parentToolCallId === "task-compete-3"))
+        .toHaveLength(0);
+      const afterBind = await root.host.task("task-compete-4", { agent: "alpha", task });
+      expect(isBlocked(afterBind)).toBe(true);
+      expect(loadCount).toBe(before + 1);
+
+      // A late failing load never releases its reservation for reuse.
+      const failedOffer = await publishHandoffOffer(root, "handoff-offer-failed-load", captureId);
+      const failedTask = `OMP_HANDOFF_REF_V1 ${failedOffer}\nCheck the failed load offer.`;
+      const failedBefore = loadCount;
+      barrier = makeBarrier();
+      mode = "throw";
+      const failed = root.host.task("task-load-fail", { agent: "alpha", task: failedTask });
+      await barrier.started;
+      expect(loadCount).toBe(failedBefore + 1);
+      barrier.release();
+      const failedResult = await failed;
+      expect(isBlocked(failedResult)).toBe(true);
+      const retry = await root.host.task("task-load-retry", { agent: "alpha", task: failedTask });
+      expect(isBlocked(retry)).toBe(true);
+      expect(blockedReason(retry)).toMatch(/permanent|reservation/i);
+      expect(loadCount).toBe(failedBefore + 1);
+      expect(records(root).filter((record) => record.parentToolCallId === "task-load-fail"))
+        .toHaveLength(0);
+      expect(records(root).filter((record) => record.parentToolCallId === "task-load-retry"))
+        .toHaveLength(0);
+    } finally {
+      mode = "normal";
+      await rm(workspace, { recursive: true, force: true });
+    }
+  }, 20_000);
+
+  test("changed parent task result input invalidates its handoff receipt while a no-ref task still observes the changed input, and new work rejects the old offer", async () => {
+    const base = await handoffBase();
+    try {
+      const secondOffer = await publishHandoffOffer(base.root, "handoff-offer-second", base.captureId);
+      const consumerTask = `OMP_HANDOFF_REF_V1 ${base.offerId}\nCheck changed input.`;
+      const admitted = await base.root.host.task("task-input-consumer", { agent: "alpha", task: consumerTask });
+      expect(isBlocked(admitted)).toBe(false);
+      const child = await handoffChild(base.root, "task-input-consumer", "ChildInputConsumer", consumerTask);
+      const receipt = snapshotDetails(await snapshotCall(child, "snapshot-input-receipt", {
+        action: "check",
+        offerId: base.offerId,
+      }));
+      const changedTask = `${consumerTask}\nchanged body`;
+      await base.root.host.emit("tool_result", handoffTaskResult(
+        "task-input-consumer",
+        "ChildInputConsumer",
+        "alpha",
+        changedTask,
+        "PASS result",
+      ));
+      const consumer = statusRecord(base.root, "task-input-consumer");
+      expect(consumer.phase).toBe("refused");
+      expect(consumer.refusalCode).toBe("handoff-task-result-input");
+      const adopt = await handoffCall(base.root, "handoff-adopt-invalid-input", {
+        action: "adopt",
+        receiptId: receipt.receiptId,
+        captureId: base.captureId,
+        consumerParentToolCallId: "task-input-consumer",
+      });
+      expect(adopt.isError).toBe(true);
+      const reuse = await base.root.host.task("task-input-reuse", { agent: "alpha", task: consumerTask });
+      expect(isBlocked(reuse)).toBe(true);
+      expect(blockedReason(reuse)).toMatch(/permanent|reservation|offer|failed/i);
+
+      // The input mismatch rule is scoped to handoff admissions. A normal
+      // no-reference task keeps its prior observation behavior.
+      const normalTask = "normal task body";
+      const normalAdmitted = await base.root.host.task("task-normal-input", { agent: "alpha", task: normalTask });
+      expect(isBlocked(normalAdmitted)).toBe(false);
+      await startChild(base.root, "task-normal-input", "ChildNormalInput", {
+        activeTools: ["read", "agent_snapshot"],
+      });
+      await base.root.host.emit("tool_result", handoffTaskResult(
+        "task-normal-input",
+        "ChildNormalInput",
+        "alpha",
+        `${normalTask} changed`,
+        "normal output",
+      ));
+      const normal = statusRecord(base.root, "task-normal-input");
+      expect(normal.refusalCode).toBeNull();
+      expect(normal.taskResultObserved).toBe(true);
+      expect(normal.observation.result.observation?.state).toBe("observed");
+
+      // A new parent work generation invalidates the remaining old offer.
+      await base.root.host.emit("agent_end", {});
+      await base.root.host.input("next handoff work", { source: "interactive" });
+      await base.root.host.prepare("next handoff work");
+      const staleTask = `OMP_HANDOFF_REF_V1 ${secondOffer}\nCheck after new work.`;
+      const stale = await base.root.host.task("task-old-offer-new-work", { agent: "alpha", task: staleTask });
+      expect(isBlocked(stale)).toBe(true);
+      const staleRetry = await base.root.host.task("task-old-offer-new-work-2", { agent: "alpha", task: staleTask });
+      expect(isBlocked(staleRetry)).toBe(true);
+      expect(blockedReason(staleRetry)).toMatch(/permanent|reservation/i);
+      expect(records(base.root).filter((record) => record.parentToolCallId === "task-old-offer-new-work"))
+        .toHaveLength(0);
+      expect(records(base.root).filter((record) => record.parentToolCallId === "task-old-offer-new-work-2"))
+        .toHaveLength(0);
+    } finally {
+      await base.cleanup();
+    }
+  }, 20_000);
+
+  test("changed full prompt or context task cannot check/read the same offer, and drifted child context refuses its prepared call", async () => {
+    const base = await handoffBase();
+    try {
+      const promptTask = `OMP_HANDOFF_REF_V1 ${base.offerId}\nCheck prompt identity.`;
+      const promptAdmission = await base.root.host.task("task-wrong-prompt", { agent: "alpha", task: promptTask });
+      expect(isBlocked(promptAdmission)).toBe(false);
+      const wrongPromptChild = await startChild(base.root, "task-wrong-prompt", "ChildWrongPrompt", {
+        activeTools: ["read", "agent_snapshot"],
+      });
+      await wrongPromptChild.host.emit("before_agent_start", {
+        reason: "prompt",
+        prompt: `${HANDOFF_TASK_PREFIX}${promptTask}\nchanged`,
+        systemPrompt: childPrompt(base.alphaBody),
+      });
+      const promptRow = statusRecord(base.root, "task-wrong-prompt");
+      expect(promptRow.phase).toBe("refused");
+      expect(promptRow.refusalCode).toBe("handoff-task-prompt");
+      const promptCheck = await wrongPromptChild.host.emit("tool_call", {
+        toolCallId: "snapshot-wrong-prompt",
+        toolName: "agent_snapshot",
+        input: { action: "check", offerId: base.offerId },
+      });
+      expect(isBlocked(promptCheck)).toBe(true);
+
+      const contextOffer = await publishHandoffOffer(base.root, "handoff-offer-context", base.captureId);
+      const contextTask = `OMP_HANDOFF_REF_V1 ${contextOffer}\nCheck context identity.`;
+      const contextAdmission = await base.root.host.task("task-wrong-context", { agent: "alpha", task: contextTask });
+      expect(isBlocked(contextAdmission)).toBe(false);
+      const wrongContextChild = await startChild(base.root, "task-wrong-context", "ChildWrongContext", {
+        activeTools: ["read", "agent_snapshot"],
+      });
+      await wrongContextChild.host.emit("before_agent_start", {
+        reason: "prompt",
+        prompt: `${HANDOFF_TASK_PREFIX}${contextTask}`,
+        systemPrompt: childPrompt(base.alphaBody),
+      });
+      await wrongContextChild.host.emit("context", {
+        messages: [{ role: "user", content: `${HANDOFF_TASK_PREFIX}${contextTask}\nchanged` }],
+      });
+      const contextRow = statusRecord(base.root, "task-wrong-context");
+      expect(contextRow.phase).toBe("refused");
+      expect(contextRow.refusalCode).toBe("handoff-task-context");
+      const contextCheck = await wrongContextChild.host.emit("tool_call", {
+        toolCallId: "snapshot-wrong-context",
+        toolName: "agent_snapshot",
+        input: { action: "check", offerId: contextOffer },
+      });
+      expect(isBlocked(contextCheck)).toBe(true);
+
+      const driftOffer = await publishHandoffOffer(base.root, "handoff-offer-drift", base.captureId);
+      const driftTask = `OMP_HANDOFF_REF_V1 ${driftOffer}\nCheck drifted child context.`;
+      const driftAdmission = await base.root.host.task("task-child-drift", { agent: "alpha", task: driftTask });
+      expect(isBlocked(driftAdmission)).toBe(false);
+      const driftChild = await handoffChild(base.root, "task-child-drift", "ChildDrift", driftTask);
+      const prepared = await driftChild.host.emit("tool_call", {
+        toolCallId: "snapshot-drift-child",
+        toolName: "agent_snapshot",
+        input: { action: "check", offerId: driftOffer },
+      });
+      expect(isBlocked(prepared)).toBe(false);
+      // The preflight passed, then the real child context changed before
+      // commit. The captured pure revalidation must refuse the execution.
+      driftChild.host.currentModel = OTHER_MODEL;
+      const snapshotTool = driftChild.host.tools.get("agent_snapshot");
+      if (snapshotTool === undefined) throw new Error("agent_snapshot was not registered");
+      const refused = await snapshotTool.execute(
+        "snapshot-drift-child",
+        { action: "check", offerId: driftOffer },
+        new AbortController().signal,
+        undefined,
+        driftChild.host.context,
+      );
+      expect(refused.isError).toBe(true);
+      expect(statusRecord(base.root, "task-child-drift").refusalCode).toBe("child-model");
+      driftChild.entry.dispose();
+    } finally {
+      await base.cleanup();
+    }
+  }, 20_000);
+
+  test("actual failure after normal completed+shutdown invalidates the adopted consumer report and adoption eligibility", async () => {
+    const base = await handoffBase();
+    try {
+      const consumerTask = `OMP_HANDOFF_REF_V1 ${base.offerId}\nCheck completed consumer.`;
+      const consumer = await completeHandoffConsumer(base.root, {
+        call: "task-failed-after-complete",
+        childId: "ChildFailedAfterComplete",
+        offerId: base.offerId,
+        task: consumerTask,
+        receiptCall: "snapshot-completed-receipt",
+        checkCall: "snapshot-completed-check",
+        output: "PASS result",
+      });
+      const adoption = details(await handoffCall(base.root, "handoff-adopt-completed", {
+        action: "adopt",
+        receiptId: consumer.receiptId,
+        captureId: base.captureId,
+        consumerParentToolCallId: "task-failed-after-complete",
+      }));
+      expect(adoption.outcome).toBe("pass");
+      const producerRow = statusRecord(base.root, base.producerCall);
+      const reportParams = {
+        action: "report",
+        checks: [{ toolCallId: base.producerCall, purpose: "delegated source" }],
+        outputFiles: ["data.json"],
+        outcome: "completed",
+        instanceResult: {
+          instanceId: producerRow.id,
+          parentToolCallId: base.producerCall,
+          envelopeSha256: envelopeSha(producerRow),
+        },
+        handoffAdoptionId: adoption.adoptionId,
+      };
+      const accepted = await selectedReport(base.root, reportParams, { toolCallId: "report-completed-consumer" });
+      expect(accepted.isError).not.toBe(true);
+
+      // The normal completed+shutdown above is accepted; a real failed
+      // lifecycle arriving later must still invalidate adoption/report.
+      base.root.host.lifecycle({
+        status: "failed",
+        id: "ChildFailedAfterComplete",
+        parentToolCallId: "task-failed-after-complete",
+        index: 0,
+        agent: "alpha",
+      });
+      const consumerRow = statusRecord(base.root, "task-failed-after-complete");
+      expect(consumerRow.observation.lifecycleEvidence.failed).toBe(true);
+      expect(consumerRow.observation.conflict?.code).toBe("lifecycle-failed-result-completed");
+      expectReportRefused(
+        await selectedReport(base.root, reportParams, { toolCallId: "report-after-consumer-failure" }),
+        /failed|conflict|adoption|No report was recorded/i,
+      );
+      const readopt = await handoffCall(base.root, "handoff-adopt-after-failure", {
+        action: "adopt",
+        receiptId: consumer.receiptId,
+        captureId: base.captureId,
+        consumerParentToolCallId: "task-failed-after-complete",
+      });
+      expect(readopt.isError).toBe(true);
+    } finally {
+      await base.cleanup();
+    }
+  }, 20_000);
 });

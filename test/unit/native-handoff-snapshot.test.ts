@@ -6,6 +6,7 @@ import {
   MAX_SNAPSHOT_OPERATION_RESPONSE_BYTES,
   MAX_SNAPSHOT_READ_RESPONSE_BYTES,
   createNativeSnapshotEntry,
+  readNativeSnapshotRequestDescriptor,
   type NativeChildCallIdentity,
   type NativeChildObservationPreparation,
   type NativeChildPorts,
@@ -1033,5 +1034,18 @@ describe("signals, close, dispose and encoding bounds", () => {
     expect(check.isError).toBe(false);
     expect(JSON.parse(resultText(check)).outcome).toBe("pass");
     expect(offerView(h, h.initial.offer).checked).toBe(true);
+  });
+
+  test("the internal preflight descriptor reader uses the exact same bounded parser", () => {
+    const parsed = readNativeSnapshotRequestDescriptor({ action: "read", offerId: "offer-1" });
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) return;
+    expect(parsed.descriptor.action).toBe("read");
+    expect(parsed.descriptor.params).toEqual({ action: "read", offerId: "offer-1" });
+    expect(parsed.descriptor.digest).toMatch(/^[0-9a-f]{64}$/);
+    expect(readNativeSnapshotRequestDescriptor({ action: "read", offerId: "offer-1", path: "x" }))
+      .toEqual({ ok: false, reason: expect.any(String) });
+    expect(readNativeSnapshotRequestDescriptor({ action: "write", offerId: "offer-1" }).ok)
+      .toBe(false);
   });
 });

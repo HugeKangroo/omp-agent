@@ -524,6 +524,27 @@ function parseArguments(value: unknown): ParsedArguments {
   };
 }
 
+export type NativeSnapshotRequestDescriptorRead =
+  | { readonly ok: true; readonly descriptor: NativeSnapshotRequestDescriptor }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * INTERNAL: the same bounded strict parser used by the child tool, exported
+ * for the actual instanced preflight so it cannot drift from execute. A
+ * reflection failure is a bounded refusal, never a second schema.
+ */
+export function readNativeSnapshotRequestDescriptor(
+  value: unknown,
+): NativeSnapshotRequestDescriptorRead {
+  try {
+    const parsed = parseArguments(value);
+    if (!parsed.ok) return { ok: false, reason: parsed.reason };
+    return { ok: true, descriptor: parsed.descriptor };
+  } catch {
+    return { ok: false, reason: "agent_snapshot arguments could not be inspected" };
+  }
+}
+
 type PortSnapshot =
   | {
       readonly ok: true;
