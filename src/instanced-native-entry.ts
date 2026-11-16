@@ -89,7 +89,14 @@ import {
   NATIVE_HARNESS_TOOL,
   type NativeHarnessDelegationCoordinator,
   type NativeHarnessDelegationPolicy,
+  type NativeHarnessOutputSelection,
+  type NativeHarnessOutputSelectionCode,
+  type NativeHarnessOutputSelectionFailure,
 } from "./native-harness-delegation.ts";
+import {
+  captureNativeHarnessOutput,
+  matchesNativeHarnessOutputCapture,
+} from "./native-harness-output.ts";
 import {
   createNativeHarnessEntry,
   type NativeHarnessEntry,
@@ -495,6 +502,16 @@ export interface InstancedNativeEntryControls {
   readonly nativeEntry: ReturnType<typeof createDefinedNativeEntry>["nativeEntry"];
   /** Host-only non-authoritative diagnostics; absent when Harness is not configured. */
   readonly harnessInspect?: (context: NativeContext) => NativeHarnessEntryInspection | null;
+  /**
+   * Host-only output capture for an already-observed source result. There is no
+   * model tool for this path; the supplied signal is the new capture request's
+   * actual host signal and never the source execution's old signal.
+   */
+  harnessCaptureOutput?(
+    sourceToolCallId: unknown,
+    signal: AbortSignal,
+    context: NativeContext,
+  ): Promise<NativeHarnessOutputSelection>;
   getStatus(): InstancedEntryStatus;
   dispose(): void;
 }
@@ -3053,6 +3070,9 @@ function admitHarnessRoot(
   const scope = new AsyncLocalStorage<NativeContext>();
   const mainTools = Object.freeze([...activeTools]);
   const mainModel = Object.freeze({ provider: currentModel.provider, id: currentModel.id });
+  // Captured once from this admission. The owner predicate is pure local
+  // identity/state and never reads host context, active tools, model or settings.
+  const admittedRootToken = root.token;
   const coordinator = createNativeHarnessDelegation({
     native: factory.definitionEntry.nativeEntry,
     ...(config.policy === undefined ? {} : { policy: config.policy }),
@@ -3073,6 +3093,29 @@ function admitHarnessRoot(
       return backend.prepare(request, preparedContext);
     },
     runner: backend.runner,
+    output: {
+      capture(backendValue, guard, signal) {
+        return captureNativeHarnessOutput(backendValue, guard, signal);
+      },
+      matches(backendValue, capture) {
+        return matchesNativeHarnessOutputCapture(backendValue, capture);
+      },
+      revalidateOwner() {
+        if (factory.disposed) return "the instanced native entry was disposed";
+        if (moduleRoot !== root) return "the instance root was replaced";
+        if (root.factoryId !== factory.id) return "the instance root factory changed";
+        if (factory.rootToken === null || factory.rootToken !== admittedRootToken) {
+          return "the instance root token changed";
+        }
+        if (root.token !== admittedRootToken) return "the instance root generation changed";
+        if (!root.open || root.phase !== "ready") return "the instance root is no longer open and ready";
+        const harness = root.harness;
+        if (harness === null || harness.coordinator !== coordinator) {
+          return "the root Harness coordinator changed";
+        }
+        return null;
+      },
+    },
     enabled: true,
   });
   if (!harnessStartupCurrent(factory, root, startupEpoch)) {
@@ -3218,8 +3261,29 @@ function resolveMainHarnessRoot(
           return Promise.reject(new Error("the owning main Harness root is no longer current"));
         }
         return harness.scope.run(scopedContext, () => {
+          // The trusted operation can run synchronous host callbacks before it
+          // returns (for example, a capture guard that reads the session
+          // identity and lets real session_stop hooks run). Capture the atomic
+          // launch facts first, then track the exact original promise before
+          // rechecking, so a work end during that synchronous launch cancels
+          // the now-registered original id through the existing coordinator.
+          const launchedRoot = root;
+          const launchedHarness = harness;
+          const launchedWorkEpoch = root.workEpoch;
           const operationPromise = operation();
-          return trackHarnessCall(harness, actualToolCallId, operationPromise);
+          const tracked = trackHarnessCall(harness, actualToolCallId, operationPromise);
+          if (root.workEpoch !== launchedWorkEpoch
+            || root.harness !== launchedHarness
+            || !ownsRoot(factory, launchedRoot)
+            || !root.open
+            || root.phase !== "ready") {
+            try {
+              launchedHarness.coordinator.cancel(actualToolCallId);
+            } catch {
+              // Cancellation is best effort; native work currentness remains the gate.
+            }
+          }
+          return tracked;
         });
       },
       diagnostics(): readonly unknown[] {
@@ -3232,6 +3296,66 @@ function resolveMainHarnessRoot(
       },
     },
   };
+}
+
+function harnessCaptureFailure(
+  code: NativeHarnessOutputSelectionCode,
+  reason: string,
+): NativeHarnessOutputSelectionFailure {
+  return Object.freeze({
+    ok: false as const,
+    code,
+    reason: boundedMessage(reason),
+  });
+}
+
+/**
+ * Host-only admission for a new output read. The source id only indexes the
+ * existing original Slot inside this resolved coordinator; no run id, path or
+ * caller digest is accepted. Tracking uses the existing root call map and the
+ * operation is scoped to the actual supplied main context.
+ */
+function captureHarnessOutput(
+  factory: FactoryContext,
+  pi: DefinedOmpApi,
+  sourceToolCallId: unknown,
+  signal: AbortSignal,
+  context: NativeContext,
+): Promise<NativeHarnessOutputSelection> {
+  if (typeof sourceToolCallId !== "string") {
+    return Promise.resolve(harnessCaptureFailure(
+      "invalid-caller",
+      "the actual source tool call id is unavailable",
+    ));
+  }
+  const toolCallId = boundedId(sourceToolCallId);
+  if (toolCallId === null) {
+    return Promise.resolve(harnessCaptureFailure(
+      "invalid-caller",
+      "the actual source tool call id is unavailable",
+    ));
+  }
+  const resolved = resolveMainHarnessRoot(factory, context, pi);
+  if (!resolved.ok) {
+    return Promise.resolve(harnessCaptureFailure("authority-lost", resolved.reason));
+  }
+  const root = resolved.root;
+  try {
+    return root.runWithContext(context, toolCallId, () =>
+      root.coordinator.captureOutput(toolCallId, signal),
+    ).then(
+      (selection) => selection,
+      () => harnessCaptureFailure(
+        "authority-lost",
+        "the Harness output capture could not be scoped to the owning main root",
+      ),
+    );
+  } catch {
+    return Promise.resolve(harnessCaptureFailure(
+      "authority-lost",
+      "the Harness output capture could not be scoped to the owning main root",
+    ));
+  }
 }
 
 function handoffMainRefreshFailure(
@@ -6636,6 +6760,19 @@ export function createInstancedNativeEntry(
     ...(harnessEntryForInspect === null ? {} : {
       harnessInspect(context: NativeContext): NativeHarnessEntryInspection | null {
         return harnessEntryForInspect.inspect(context);
+      },
+      harnessCaptureOutput(
+        sourceToolCallId: unknown,
+        signal: AbortSignal,
+        context: NativeContext,
+      ): Promise<NativeHarnessOutputSelection> {
+        if (toolFactory === null) {
+          return Promise.resolve(harnessCaptureFailure(
+            "authority-lost",
+            "the native instance entry is not initialized",
+          ));
+        }
+        return captureHarnessOutput(toolFactory, pi, sourceToolCallId, signal, context);
       },
     }),
     getStatus() {
