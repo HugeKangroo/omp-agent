@@ -1215,8 +1215,10 @@ async function runGit(
     const deadline = Date.now() + budgetMs;
     while (true) {
       const state = groupState();
+      // Only an observed ESRCH proves the group gone. Unknown (for example
+      // EPERM) may resolve within the existing budget, so reobserve rather
+      // than treating it as gone or abandoning the budget immediately.
       if (state === "gone") return true;
-      if (state === "unknown") return false;
       const remaining = deadline - Date.now();
       if (remaining <= 0) return false;
       await delay(Math.min(20, remaining));
@@ -1226,7 +1228,12 @@ async function runGit(
     if (pgid === null) return "gone";
     const initial = groupState();
     if (initial === "gone") return "gone";
-    if (initial === "unknown") return "unknown";
+    if (initial === "unknown") {
+      // Unreadable group state neither licenses signaling nor permits
+      // cleanup. Reobserve within the existing close grace; exhaustion stays
+      // unknown so the owned root is preserved.
+      return (await waitGroupGone(ctx.ports.gitCloseGraceMs)) ? "gone" : "unknown";
+    }
     signalGroup("SIGTERM");
     if (await waitGroupGone(ctx.ports.gitKillGraceMs)) return "gone";
     signalGroup("SIGKILL");

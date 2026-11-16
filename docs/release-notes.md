@@ -1,5 +1,11 @@
 # Release notes
 
+## Host-only native capture actions (G5-3B1b)
+
+`NativeHarnessDelegationCoordinator` adds host-only `captureOutputForCall(...)` and `registerOutputCaptureProjection(...)`. Capture/check share 16 admissions on the original Slot; no new registry/observer/scheduler/model tool is added; legacy host capture/check remain. Original action ref/signal/deferred Promise bind before leaf launch and cached host reads; identical running calls join the exact Promise, while foreign/different-signal/cross-type attempts cannot steal it. Actual-action cancel aborts only owned capture; completed replay returns original response facts through fresh gates, without external Promise identity or filesystem freshness. The normalized projection registers via the existing observer at ≤64 KiB; pending is unobserved and a changed duplicate conflicts.
+
+Freeze 02 passed type checking, 1,081 unit tests (52 files, 38,367 assertions) and 15 simulated human-review tests (155 assertions), 0 failures; focused capture/check passed 30/540 and workspace 23/373. A bounded Git-cleanup unknown-reobservation repair follows a retained workspace failure; it does not prove the original errno. Capture stays host-only with no model tool/read/inspect/report/reread/apply/recovery/default policy or semantic acceptance; `taskAccepted:false`, `semanticAcceptance:"not-evaluated"`. Next: B1c read/inspect and the model adapter, B2 reread/report, B3 actual host integration; G5 precedes G4, full release open. See [Testing](testing.md#host-only-native-capture-action-checks-g5-3b1b).
+
 ## Bounded host-only output check (G5-3B1a)
 
 `NativeHarnessDelegationCoordinator` now exposes synchronous host-only `checkOutput(actualCheckToolCallId,input,actualSignal)` and `registerOutputCheckProjection(...)` on the original output Slot. The check accepts exactly `action:"check"`, `sourceToolCallId`, `captureId`, `captureDigest`, `path` and `conditions`; it selects only the original capture and one relative captured path, opens no file, starts no backend, and uses the existing fixed text checker with authentic frozen snapshots, plans and receipts. No model tool is registered. This is an internal host-only increment, not model-visible check/report.

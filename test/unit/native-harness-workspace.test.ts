@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import {
   chmod,
   lstat,
@@ -142,6 +143,89 @@ async function makeExecutable(directory: string, name: string, body: string): Pr
   await writeFile(target, body);
   await chmod(target, 0o700);
   return target;
+}
+
+interface KillObservationInjection {
+  readonly count: () => number;
+  readonly restore: () => void;
+}
+
+/**
+ * Test-local wrapper around the process-wide kill seam. It forwards every real
+ * signal and only injects bounded EPERM failures for zero-signal observations
+ * of the owned process group, simulating a transiently unreadable group state.
+ */
+function injectOwnedGroupObservationErrors(options: {
+  readonly ownedPgid: () => number | null;
+  readonly windowMs: number;
+  readonly maxInjections: number;
+}): KillObservationInjection {
+  const actualKill = process.kill;
+  const deadline = Date.now() + options.windowMs;
+  let count = 0;
+  const replacement = ((pid: number, signal?: number | NodeJS.Signals) => {
+    if (signal === 0 && pid < 0 && count < options.maxInjections && Date.now() < deadline) {
+      const owned = options.ownedPgid();
+      if (owned !== null && pid === -owned) {
+        count += 1;
+        const error = new Error("injected EPERM for owned group observation") as NodeJS.ErrnoException;
+        error.code = "EPERM";
+        throw error;
+      }
+    }
+    return signal === undefined
+      ? Reflect.apply(actualKill, process, [pid])
+      : Reflect.apply(actualKill, process, [pid, signal]);
+  }) as typeof process.kill;
+  process.kill = replacement;
+  let restored = false;
+  return {
+    count: () => count,
+    restore() {
+      if (restored) return;
+      restored = true;
+      if (process.kill === replacement) process.kill = actualKill;
+    },
+  };
+}
+
+function readPidFile(target: string): number | null {
+  try {
+    const pid = Number(readFileSync(target, "utf8").trim());
+    return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Fixture-only teardown: the recorded shell leader is the detached group id.
+ * Kill that verified group and its recorded child, then confirm both are gone.
+ * Must run after the real process.kill has been restored.
+ */
+async function cleanupOwnedFixtureProcesses(pidFile: string, childPidFile: string): Promise<void> {
+  const leader = readPidFile(pidFile);
+  const child = readPidFile(childPidFile);
+  if (leader !== null) {
+    try {
+      process.kill(-leader, "SIGKILL");
+    } catch {
+      // The owned group was already gone.
+    }
+  }
+  for (const pid of [leader, child]) {
+    if (pid === null) continue;
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // The product already reaped this fixture process.
+    }
+  }
+  for (const pid of [leader, child]) {
+    if (pid === null) continue;
+    await waitForPidGone(pid);
+    expect(isPidAlive(pid)).toBe(false);
+  }
 }
 
 function gitRootOf(workspaceRoot: string): string {
@@ -864,6 +948,105 @@ describe("native harness private workspace", () => {
     expect(isPidAlive(pid)).toBe(false);
     expect(isPidAlive(childPid)).toBe(false);
     expect(await readdir(storage)).toEqual([]);
+  });
+
+  test("reobserves a transient unknown git group state within the close grace", async () => {
+    const { base, source, storage } = await makeFixture();
+    await writeSource(source, "a.txt", "a\n");
+    const pidFile = path.join(base, "git-transient.pid");
+    const childPidFile = path.join(base, "git-transient-child.pid");
+    const fakeGit = await makeExecutable(base, "fake-git-transient", [
+      "#!/bin/sh",
+      `echo $$ > ${shellQuote(pidFile)}`,
+      "sleep 5 &",
+      "child=$!",
+      `echo \"$child\" > ${shellQuote(childPidFile)}`,
+      "wait \"$child\"",
+      "",
+    ].join("\n"));
+    const injection = injectOwnedGroupObservationErrors({
+      ownedPgid: () => readPidFile(pidFile),
+      windowMs: 5000,
+      maxInjections: 5,
+    });
+    try {
+      const failure = await expectFailure(
+        prepareNativeHarnessWorkspace(
+          config(source, storage, ["a.txt"]),
+          noopGuard,
+          new AbortController().signal,
+          {
+            gitExecutable: fakeGit,
+            gitTimeoutMs: 1000,
+            gitKillGraceMs: 50,
+            gitCloseGraceMs: 4000,
+          },
+        ),
+        "git-timeout",
+      );
+      expect(injection.count()).toBeGreaterThanOrEqual(1);
+      expect(failure.cleanup).toBe("removed");
+      expect(await readdir(storage)).toEqual([]);
+    } finally {
+      // Restore the real kill seam before cleaning only this fixture's owned
+      // group, and always run it even if the product assertions above fail.
+      injection.restore();
+      await cleanupOwnedFixtureProcesses(pidFile, childPidFile);
+    }
+  });
+
+  test("preserves the owned root while the git group state stays unreadable", async () => {
+    const { base, source, storage } = await makeFixture();
+    await writeSource(source, "a.txt", "a\n");
+    const pidFile = path.join(base, "git-unknown.pid");
+    const childPidFile = path.join(base, "git-unknown-child.pid");
+    const fakeGit = await makeExecutable(base, "fake-git-unknown", [
+      "#!/bin/sh",
+      `echo $$ > ${shellQuote(pidFile)}`,
+      "sleep 5 &",
+      "child=$!",
+      `echo \"$child\" > ${shellQuote(childPidFile)}`,
+      "wait \"$child\"",
+      "",
+    ].join("\n"));
+    const injection = injectOwnedGroupObservationErrors({
+      ownedPgid: () => readPidFile(pidFile),
+      windowMs: 5000,
+      maxInjections: 10_000,
+    });
+    const started = Date.now();
+    try {
+      const failure = await expectFailure(
+        prepareNativeHarnessWorkspace(
+          config(source, storage, ["a.txt"]),
+          noopGuard,
+          new AbortController().signal,
+          {
+            gitExecutable: fakeGit,
+            gitTimeoutMs: 1000,
+            gitKillGraceMs: 50,
+            gitCloseGraceMs: 300,
+          },
+        ),
+        "git-cleanup-unknown",
+      );
+      // Persistent unknown must never be reported as gone: the product keeps
+      // its directory and the injected observations prove the unknown path.
+      expect(injection.count()).toBeGreaterThanOrEqual(1);
+      expect(failure.cleanup).toBe("preserved");
+      expect(failure.preparedRoot).not.toBeNull();
+      const preparedRoot = failure.preparedRoot as string;
+      expect(await exists(preparedRoot)).toBe(true);
+      expect(await exists(path.join(preparedRoot, "workspace"))).toBe(true);
+      expect(await readdir(storage)).toEqual([path.basename(preparedRoot)]);
+      // Persistent unknown stays bounded by the existing close grace.
+      expect(Date.now() - started).toBeLessThan(5000);
+    } finally {
+      // Restore the real kill seam before cleaning only this fixture's owned
+      // group, and always run it even if the product assertions above fail.
+      injection.restore();
+      await cleanupOwnedFixtureProcesses(pidFile, childPidFile);
+    }
   });
 
   test("does not let a short close grace cancel a pending KILL to the whole group", async () => {

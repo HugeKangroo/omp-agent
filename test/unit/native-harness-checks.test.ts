@@ -23,6 +23,7 @@ import type { NativeHarnessOutputCapture } from "../../src/native-harness-output
 import {
   NATIVE_HARNESS_MAX_CHECK_ACTIONS,
   NATIVE_HARNESS_RESULT_TOOL,
+  normalizeNativeHarnessCaptureInput,
   normalizeNativeHarnessCheckInput,
   type NativeHarnessCheckOutcome,
   type NativeHarnessCheckSuccess,
@@ -233,6 +234,7 @@ function setup(
     capture?: () => NativeHarnessOutputCapture;
     runner?: Runner;
     native?: NativeEntryControls;
+    now?: () => number;
   } = {},
 ): Harness {
   let captureCalls = 0;
@@ -280,6 +282,7 @@ function setup(
     },
     runner,
     output,
+    ...(hooks.now === undefined ? {} : { now: hooks.now }),
     enabled: true,
   });
   coordinators.push(coordinator);
@@ -398,6 +401,78 @@ async function checkedFixture(
   const normalized = normalizeNativeHarnessCheckInput(raw);
   if (!normalized.ok) throw new Error(normalized.reason);
   return { f, h, source, raw, normalizedInput: normalized.input };
+}
+
+function captureActionInput(sourceToolCallId: string): Record<string, unknown> {
+  return { action: "capture", sourceToolCallId };
+}
+
+async function preflightCaptureAction(
+  f: Fixture,
+  toolCallId: string,
+  rawInput: unknown,
+): Promise<void> {
+  const normalized = normalizeNativeHarnessCaptureInput(rawInput);
+  expect(normalized.ok).toBe(true);
+  if (!normalized.ok) throw new Error(normalized.reason);
+  await f.host.emit("tool_call", {
+    toolCallId,
+    toolName: NATIVE_HARNESS_RESULT_TOOL,
+    input: normalized.input,
+  }, f.ctx);
+}
+
+function captureWire(selection: NativeHarnessOutputSelection): NativeToolResult {
+  return {
+    content: [{ type: "text", text: JSON.stringify(selection) }],
+    details: selection,
+    isError: false,
+  };
+}
+
+async function emitCaptureResult(
+  f: Fixture,
+  toolCallId: string,
+  wire: NativeToolResult,
+  input: unknown,
+  overrides: Record<string, unknown> = {},
+): Promise<void> {
+  await f.host.emit("tool_result", {
+    toolCallId,
+    toolName: NATIVE_HARNESS_RESULT_TOOL,
+    input,
+    content: wire.content,
+    details: wire.details,
+    isError: false,
+    ...overrides,
+  }, f.ctx);
+}
+
+async function registeredSource(
+  f: Fixture,
+  h: Harness,
+  toolCallId: string,
+): Promise<NativeHarnessDelegationResult> {
+  await callSource(f, toolCallId);
+  const signal = new AbortController().signal;
+  const result = await settle(h.coordinator.invoke(toolCallId, { task: WORK_TASK }, signal));
+  expect(result.outcome).toBe("backend-completed");
+  const wire = projectionFor(result);
+  expect(h.coordinator.registerToolResultProjection(toolCallId, result, wire, signal).ok).toBe(true);
+  await emitSourceResult(f, toolCallId, wire);
+  return result;
+}
+
+async function tick(ms = 0): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitFor(predicate: () => boolean, label: string, ms = 1000): Promise<void> {
+  const until = Date.now() + ms;
+  while (!predicate()) {
+    if (Date.now() > until) throw new Error(`timed out waiting for ${label}`);
+    await tick(2);
+  }
 }
 
 describe("host-only bounded checks over a captured Harness Slot", () => {
@@ -1294,5 +1369,503 @@ describe("host-only bounded checks over a captured Harness Slot", () => {
     const state = h.coordinator.inspect().operations[0]!.output.checks;
     expect(state.retainedBytes).toBeLessThanOrEqual(64 * 1024);
     expect(state.paths).toBe(accepted);
+  });
+
+  test("capture action performs one guarded capture and registers the exact projection", async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.workspace, PATH_A), "capture action text\n", { mode: 0o600 });
+    const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+    const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+    const h = setup(f, { capture: () => capture });
+    await startWork(f);
+    await registeredSource(f, h, "source-1");
+    const raw = captureActionInput("source-1");
+    await preflightCaptureAction(f, "cap-1", raw);
+    const signal = new AbortController().signal;
+    const first = h.coordinator.captureOutputForCall("cap-1", raw, signal);
+    const joined = h.coordinator.captureOutputForCall("cap-1", raw, signal);
+    expect(joined).toBe(first);
+    const selection = await settle(first);
+    expect(selection.ok).toBe(true);
+    if (!selection.ok) throw new Error(selection.reason);
+    expect(selection.capture).toBe(capture);
+    expect(selection.association).toMatchObject({
+      toolCallId: "source-1",
+      toolName: "agent_harness",
+    });
+    expect(selection.observation).toBe("captured-now");
+    expect(h.captureCalls()).toBe(1);
+    expect(h.executeCalls()).toBe(1);
+
+    const wire = captureWire(selection);
+    const copiedResponse = { ...selection };
+    expect(h.coordinator.registerOutputCaptureProjection(
+      "source-1",
+      "cap-1",
+      copiedResponse,
+      wire,
+      signal,
+    ).ok).toBe(false);
+    expect(h.coordinator.registerOutputCaptureProjection(
+      "source-1",
+      "cap-1",
+      selection,
+      wire,
+      new AbortController().signal,
+    ).ok).toBe(false);
+    expect(h.coordinator.registerOutputCaptureProjection(
+      "source-2",
+      "cap-1",
+      selection,
+      wire,
+      signal,
+    ).ok).toBe(false);
+    const oversized: NativeToolResult = {
+      content: [{ type: "text", text: "a".repeat(70 * 1024) }],
+      details: selection,
+      isError: false,
+    };
+    expect(h.coordinator.registerOutputCaptureProjection(
+      "source-1",
+      "cap-1",
+      selection,
+      oversized,
+      signal,
+    ).ok).toBe(false);
+    expect(h.coordinator.registerOutputCaptureProjection(
+      "source-1",
+      "cap-1",
+      selection,
+      wire,
+      signal,
+    ).ok).toBe(true);
+    expect(h.coordinator.registerOutputCaptureProjection(
+      "source-1",
+      "cap-1",
+      selection,
+      wire,
+      signal,
+    ).ok).toBe(true);
+    await emitCaptureResult(f, "cap-1", wire, raw);
+    const replay = await settle(h.coordinator.captureOutputForCall("cap-1", raw, signal));
+    expect(replay.ok).toBe(true);
+    if (replay.ok) {
+      expect(replay.capture).toBe(capture);
+      expect(replay.observation).toBe("captured-now");
+    }
+    expect(h.captureCalls()).toBe(1);
+
+    // An altered duplicate action result remains a source conflict.
+    await emitCaptureResult(f, "cap-1", wire, raw, {
+      content: [{ type: "text", text: "changed action result" }],
+    });
+    const alteredReplay = await settle(h.coordinator.captureOutputForCall("cap-1", raw, signal));
+    expect(alteredReplay.ok).toBe(false);
+    if (!alteredReplay.ok) expect(alteredReplay.code).toBe("source-conflict");
+    expect(h.captureCalls()).toBe(1);
+  });
+
+  test("invalid capture actions perform zero I/O and consume zero action slots", async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.workspace, PATH_A), "reject me\n", { mode: 0o600 });
+    const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+    const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+    const h = setup(f, { capture: () => capture });
+    await startWork(f);
+    await registeredSource(f, h, "source-1");
+    const signal = new AbortController().signal;
+    const accessor = Object.defineProperty({}, "action", {
+      enumerable: true,
+      get() {
+        throw new Error("getter must not run");
+      },
+    });
+    const rejected: unknown[] = [
+      null,
+      { action: "check", sourceToolCallId: "source-1" },
+      { action: "capture", sourceToolCallId: "source-1", extra: true },
+      accessor,
+      captureActionInput("source-missing"),
+      captureActionInput("source-1"),
+    ];
+    for (const [index, value] of rejected.entries()) {
+      const actionId = index === rejected.length - 1 ? "source-1" : `bad-${index}`;
+      const outcome = await settle(h.coordinator.captureOutputForCall(actionId, value, signal));
+      expect(outcome.ok).toBe(false);
+    }
+    expect(h.captureCalls()).toBe(0);
+    expect(h.coordinator.inspect().operations[0]!.output.checks.actions).toBe(0);
+    expect(h.coordinator.inspect().output.reservedBytes).toBe(0);
+  });
+
+  test("cancel through the actual action id keeps the launched promise pending until leaf settlement", async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.workspace, PATH_A), "cancelled leaf\n", { mode: 0o600 });
+    const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+    const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let captureCalls = 0;
+    const port: NativeHarnessOutputPort = {
+      capture() {
+        captureCalls += 1;
+        return gate.then(() => ({ ok: true as const, capture }));
+      },
+      matches() {
+        return true;
+      },
+      revalidateOwner() {
+        return null;
+      },
+    };
+    const h = setup(f, { output: port });
+    await startWork(f);
+    await registeredSource(f, h, "source-1");
+    const raw = captureActionInput("source-1");
+    await preflightCaptureAction(f, "cap-1", raw);
+    const signal = new AbortController().signal;
+    const pending = h.coordinator.captureOutputForCall("cap-1", raw, signal);
+    expect(captureCalls).toBe(1);
+    let settled = false;
+    void pending.then(() => {
+      settled = true;
+    });
+    expect(h.coordinator.cancel("cap-1")).toBe(true);
+    await tick(10);
+    expect(settled).toBe(false);
+    expect(h.coordinator.cancel("cap-1")).toBe(false);
+    expect(h.coordinator.inspect().output.reservedBytes).toBe(1024 * 1024);
+    expect(h.executeCalls()).toBe(1);
+    release();
+    const outcome = await settle(pending);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.code).toBe("cancelled");
+    await waitFor(() => h.coordinator.inspect().output.reservedBytes === 0, "reservation release");
+    expect(h.coordinator.inspect().output.retainedCaptures).toBe(0);
+    expect(captureCalls).toBe(1);
+    expect(h.executeCalls()).toBe(1);
+  });
+
+  test("a cooperative guard checkpoint expires the bound action budget without retention", async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.workspace, PATH_A), "expired leaf\n", { mode: 0o600 });
+    const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+    const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+    let clock = 1000;
+    let captureCalls = 0;
+    const port: NativeHarnessOutputPort = {
+      capture(_backend: unknown, guard: () => void) {
+        captureCalls += 1;
+        clock += 31_000;
+        try {
+          guard();
+        } catch (error) {
+          return Promise.reject(error);
+        }
+        return Promise.resolve({ ok: true as const, capture });
+      },
+      matches() {
+        return true;
+      },
+      revalidateOwner() {
+        return null;
+      },
+    };
+    const h = setup(f, { output: port, now: () => clock });
+    await startWork(f);
+    await registeredSource(f, h, "source-1");
+    const raw = captureActionInput("source-1");
+    await preflightCaptureAction(f, "cap-1", raw);
+    const outcome = await settle(h.coordinator.captureOutputForCall(
+      "cap-1",
+      raw,
+      new AbortController().signal,
+    ));
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.code).toBe("deadline");
+    expect(captureCalls).toBe(1);
+    expect(h.coordinator.inspect().output.retainedCaptures).toBe(0);
+    expect(h.coordinator.inspect().output.reservedBytes).toBe(0);
+  });
+
+  test("dispose settles a bound capture and does not start a new run", async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.workspace, PATH_A), "disposed leaf\n", { mode: 0o600 });
+    const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+    const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const port: NativeHarnessOutputPort = {
+      capture() {
+        return gate.then(() => ({ ok: true as const, capture }));
+      },
+      matches() {
+        return true;
+      },
+      revalidateOwner() {
+        return null;
+      },
+    };
+    const h = setup(f, { output: port });
+    await startWork(f);
+    await registeredSource(f, h, "source-1");
+    const raw = captureActionInput("source-1");
+    await preflightCaptureAction(f, "cap-1", raw);
+    const pending = h.coordinator.captureOutputForCall("cap-1", raw, new AbortController().signal);
+    h.coordinator.dispose();
+    expect(h.coordinator.inspect().output.reservedBytes).toBe(1024 * 1024);
+    release();
+    const outcome = await settle(pending);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.code).toBe("cancelled");
+    await waitFor(() => h.coordinator.inspect().output.reservedBytes === 0, "disposed reservation release");
+    expect(h.executeCalls()).toBe(1);
+  });
+
+  test("cross-type action ids are sticky without poisoning foreign calls", async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.workspace, PATH_A), "the thing is present\n", { mode: 0o600 });
+    const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+    const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+    const h = setup(f, { capture: () => capture });
+    await startWork(f);
+    await registeredSource(f, h, "source-1");
+    const rawCapture = captureActionInput("source-1");
+    await preflightCaptureAction(f, "cap-1", rawCapture);
+    const actionSignal = new AbortController().signal;
+    const captured = await settle(h.coordinator.captureOutputForCall("cap-1", rawCapture, actionSignal));
+    expect(captured.ok).toBe(true);
+    if (!captured.ok) throw new Error(captured.reason);
+    const checkRaw = checkInput("source-1", captured.capture, PATH_A, [
+      { id: "thing", kind: "text-includes", value: "thing" },
+    ]);
+    const wrongSignal = h.coordinator.checkOutput(
+      "cap-1",
+      checkRaw,
+      new AbortController().signal,
+    );
+    expect(wrongSignal.ok).toBe(false);
+    const crossType = h.coordinator.checkOutput("cap-1", checkRaw, actionSignal);
+    expect(crossType.ok).toBe(false);
+    if (!crossType.ok) expect(crossType.code).toBe("source-conflict");
+    const replay = await settle(h.coordinator.captureOutputForCall("cap-1", rawCapture, actionSignal));
+    expect(replay.ok).toBe(false);
+    if (!replay.ok) expect(replay.code).toBe("source-conflict");
+  });
+
+  test("a capture request on a check action id is a sticky changed type", async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.workspace, PATH_A), "the thing is present\n", { mode: 0o600 });
+    const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+    const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+    const h = setup(f, { capture: () => capture });
+    await startWork(f);
+    await captureSource(f, h, "source-1");
+    const rawCheck = checkInput("source-1", capture, PATH_A, [
+      { id: "thing", kind: "text-includes", value: "thing" },
+    ]);
+    await preflightCheck(f, "check-1", rawCheck);
+    const signal = new AbortController().signal;
+    expect(h.coordinator.checkOutput("check-1", rawCheck, signal).ok).toBe(true);
+    const rawCapture = captureActionInput("source-1");
+    const refused = await settle(h.coordinator.captureOutputForCall("check-1", rawCapture, signal));
+    expect(refused.ok).toBe(false);
+    if (!refused.ok) expect(refused.code).toBe("source-conflict");
+    const replay = h.coordinator.checkOutput("check-1", rawCheck, signal);
+    expect(replay.ok).toBe(false);
+    if (!replay.ok) expect(replay.code).toBe("source-conflict");
+    expect(h.captureCalls()).toBe(1);
+  });
+
+  test("cached late owner loss is terminal for the original action and preserves history", async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.workspace, PATH_A), "cached history\n", { mode: 0o600 });
+    const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+    const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+    let ownerCalls = 0;
+    let loseAfter = -1;
+    let captureCalls = 0;
+    const port: NativeHarnessOutputPort = {
+      async capture() {
+        captureCalls += 1;
+        return { ok: true as const, capture };
+      },
+      matches() {
+        return true;
+      },
+      revalidateOwner() {
+        ownerCalls += 1;
+        return loseAfter >= 0 && ownerCalls > loseAfter ? "the owner was lost" : null;
+      },
+    };
+    const h = setup(f, { output: port });
+    await startWork(f);
+    const source = await captureSource(f, h, "source-1");
+    const retainedBytes = h.coordinator.inspect().operations[0]!.output.retainedBytes;
+    const raw = captureActionInput("source-1");
+    await preflightCaptureAction(f, "cap-1", raw);
+    loseAfter = ownerCalls + 1;
+    const originalSignal = new AbortController().signal;
+    const failed = await settle(h.coordinator.captureOutputForCall("cap-1", raw, originalSignal));
+    expect(failed.ok).toBe(false);
+    if (!failed.ok) expect(failed.code).toBe("authority-lost");
+    expect(captureCalls).toBe(1);
+    expect(h.coordinator.inspect().output.reservedBytes).toBe(0);
+    expect(h.coordinator.inspect().output.retainedCaptures).toBe(1);
+    expect(h.coordinator.inspect().operations[0]!.output.retainedBytes).toBe(retainedBytes);
+    expect(h.coordinator.inspect().operations[0]!.output.captureId).toBe(source.capture.captureId);
+
+    loseAfter = -1;
+    const retryNewSignal = await settle(h.coordinator.captureOutputForCall(
+      "cap-1",
+      raw,
+      new AbortController().signal,
+    ));
+    expect(retryNewSignal.ok).toBe(false);
+    if (!retryNewSignal.ok) expect(retryNewSignal.code).toBe("invalid-caller");
+    const retryOriginal = await settle(h.coordinator.captureOutputForCall(
+      "cap-1",
+      raw,
+      originalSignal,
+    ));
+    expect(retryOriginal.ok).toBe(false);
+    if (!retryOriginal.ok) expect(retryOriginal.code).toBe("authority-lost");
+    expect(captureCalls).toBe(1);
+    expect(h.coordinator.inspect().operations[0]!.output.captureId).toBe(source.capture.captureId);
+  });
+
+  test("cancel through the actual id during cached selection prevents success", async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.workspace, PATH_A), "cached cancel\n", { mode: 0o600 });
+    const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+    const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+    let coordinatorRef!: NativeHarnessDelegationCoordinator;
+    let ownerCalls = 0;
+    let cancelAt = -1;
+    let cancelResult: boolean | null = null;
+    let captureCalls = 0;
+    const port: NativeHarnessOutputPort = {
+      async capture() {
+        captureCalls += 1;
+        return { ok: true as const, capture };
+      },
+      matches() {
+        return true;
+      },
+      revalidateOwner() {
+        ownerCalls += 1;
+        if (cancelAt >= 0 && ownerCalls === cancelAt) {
+          cancelResult = coordinatorRef.cancel("cap-1");
+        }
+        return null;
+      },
+    };
+    const h = setup(f, { output: port });
+    coordinatorRef = h.coordinator;
+    await startWork(f);
+    const source = await captureSource(f, h, "source-1");
+    const retainedBytes = h.coordinator.inspect().operations[0]!.output.retainedBytes;
+    const raw = captureActionInput("source-1");
+    await preflightCaptureAction(f, "cap-1", raw);
+    cancelAt = ownerCalls + 2;
+    const outcome = await settle(h.coordinator.captureOutputForCall(
+      "cap-1",
+      raw,
+      new AbortController().signal,
+    ));
+    expect(cancelResult as boolean | null).toBe(true);
+    expect(outcome.ok).toBe(false);
+    if (!outcome.ok) expect(outcome.code).toBe("cancelled");
+    expect(captureCalls).toBe(1);
+    expect(h.coordinator.inspect().output.reservedBytes).toBe(0);
+    expect(h.coordinator.inspect().output.retainedCaptures).toBe(1);
+    expect(h.coordinator.inspect().operations[0]!.output.retainedBytes).toBe(retainedBytes);
+    expect(h.coordinator.inspect().operations[0]!.output.captureId).toBe(source.capture.captureId);
+  });
+
+  test("a completed source id never cancels a current cached action", async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.workspace, PATH_A), "cached source cancel\n", { mode: 0o600 });
+    const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+    const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+    let coordinatorRef!: NativeHarnessDelegationCoordinator;
+    let ownerCalls = 0;
+    let cancelAt = -1;
+    let cancelResult: boolean | null = null;
+    let captureCalls = 0;
+    const port: NativeHarnessOutputPort = {
+      async capture() {
+        captureCalls += 1;
+        return { ok: true as const, capture };
+      },
+      matches() {
+        return true;
+      },
+      revalidateOwner() {
+        ownerCalls += 1;
+        if (cancelAt >= 0 && ownerCalls === cancelAt) {
+          cancelResult = coordinatorRef.cancel("source-1");
+        }
+        return null;
+      },
+    };
+    const h = setup(f, { output: port });
+    coordinatorRef = h.coordinator;
+    await startWork(f);
+    await captureSource(f, h, "source-1");
+    const raw = captureActionInput("source-1");
+    await preflightCaptureAction(f, "cap-1", raw);
+    cancelAt = ownerCalls + 2;
+    const outcome = await settle(h.coordinator.captureOutputForCall(
+      "cap-1",
+      raw,
+      new AbortController().signal,
+    ));
+    expect(cancelResult as boolean | null).toBe(false);
+    expect(outcome.ok).toBe(true);
+    if (outcome.ok) {
+      expect(outcome.capture).toBe(capture);
+      expect(outcome.observation).toBe("cached-historical");
+    }
+    expect(h.captureCalls()).toBe(0);
+    expect(captureCalls).toBe(1);
+    expect(h.coordinator.inspect().output.reservedBytes).toBe(0);
+  });
+
+  test("sixteen mixed action slots are shared and cached captures add no I/O", async () => {
+    const f = await fixture();
+    await writeFile(path.join(f.workspace, PATH_A), "shared budget\n", { mode: 0o600 });
+    const snapshot = await captureWorkspaceText(f.workspace, PATH_A);
+    const capture = syntheticCapture(WORK_TASK, [{ path: PATH_A, snapshot }]);
+    const h = setup(f, { capture: () => capture });
+    await startWork(f);
+    const source = await captureSource(f, h, "source-1");
+    expect(h.captureCalls()).toBe(1);
+    const retainedBytes = h.coordinator.inspect().operations[0]!.output.retainedBytes;
+    const signal = new AbortController().signal;
+    const raw = captureActionInput("source-1");
+    for (let index = 0; index < NATIVE_HARNESS_MAX_CHECK_ACTIONS; index++) {
+      const id = `cap-${index}`;
+      await preflightCaptureAction(f, id, raw);
+      const selected = await settle(h.coordinator.captureOutputForCall(id, raw, signal));
+      expect(selected.ok).toBe(true);
+      if (selected.ok) {
+        expect(selected.capture).toBe(source.capture);
+        expect(selected.observation).toBe("cached-historical");
+      }
+    }
+    expect(h.captureCalls()).toBe(1);
+    expect(h.coordinator.inspect().operations[0]!.output.checks.actions).toBe(16);
+    const overflowRaw = captureActionInput("source-1");
+    await preflightCaptureAction(f, "cap-overflow", overflowRaw);
+    const overflow = await settle(h.coordinator.captureOutputForCall("cap-overflow", overflowRaw, signal));
+    expect(overflow.ok).toBe(false);
+    if (!overflow.ok) expect(overflow.code).toBe("capacity");
+    expect(h.captureCalls()).toBe(1);
+    expect(h.coordinator.inspect().operations[0]!.output.retainedBytes).toBe(retainedBytes);
   });
 });

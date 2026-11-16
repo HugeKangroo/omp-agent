@@ -1,4 +1,9 @@
 import type { NativeWorkCallReference } from "./native-entry.ts";
+import type {
+  NativeHarnessOutputSelection,
+  NativeHarnessOutputSelectionFailure,
+  NativeHarnessOutputSelectionSuccess,
+} from "./native-harness-delegation.ts";
 import { fingerprintNativeJson } from "./native-instance-result.ts";
 import {
   NATIVE_TEXT_CHECKER_ID,
@@ -149,9 +154,49 @@ export type NativeHarnessCheckActionRecord =
   | NativeHarnessCheckRetainedActionRecord
   | NativeHarnessCheckTerminalActionRecord;
 
+/** Exact frozen two-field input for one original-Slot capture action. */
+export interface NativeHarnessCaptureInput {
+  readonly action: "capture";
+  readonly sourceToolCallId: string;
+}
+
+export type NativeHarnessCaptureActionState =
+  | "pending"
+  | "succeeded"
+  | "cancelled"
+  | "failed"
+  | "conflicted";
+
+/**
+ * One capture action bound to the same original Slot and the same bounded
+ * action table as checks. The response references the authentic retained
+ * capture; no raw text is copied here.
+ */
+export interface NativeHarnessCaptureActionRecord {
+  readonly kind: "capture";
+  readonly actionRef: NativeWorkCallReference;
+  readonly actionToolCallId: string;
+  readonly sourceToolCallId: string;
+  readonly input: NativeHarnessCaptureInput;
+  readonly inputSha256: string;
+  readonly signal: AbortSignal;
+  state: NativeHarnessCaptureActionState;
+  conflictReason: string | null;
+  promise: Promise<NativeHarnessOutputSelection> | null;
+  selection: NativeHarnessOutputSelectionSuccess | null;
+  failure: NativeHarnessOutputSelectionFailure | null;
+  registrationSha256: string | null;
+  registrationBytes: number | null;
+  registrationConflict: string | null;
+}
+
+export type NativeHarnessActionRecord =
+  | NativeHarnessCheckActionRecord
+  | NativeHarnessCaptureActionRecord;
+
 export interface NativeHarnessCheckState {
   readonly paths: NativeHarnessCheckPathRecord[];
-  readonly actions: Map<string, NativeHarnessCheckActionRecord>;
+  readonly actions: Map<string, NativeHarnessActionRecord>;
   retainedMetadataBytes: number;
   busy: boolean;
 }
@@ -295,6 +340,84 @@ export type NativeHarnessCheckNormalization =
     readonly plan: NativeTextCheckPlan;
   }
   | NativeHarnessCheckFailure;
+
+const CAPTURE_INPUT_KEYS = Object.freeze(["action", "sourceToolCallId"] as const);
+
+export type NativeHarnessCaptureNormalization =
+  | {
+    readonly ok: true;
+    readonly input: NativeHarnessCaptureInput;
+    readonly digest: string;
+  }
+  | NativeHarnessCheckFailure;
+
+/**
+ * One exact-shape read and one canonical fingerprint for a capture action.
+ * Getters, coercion and unknown keys are refused before any action record can
+ * exist; the frozen stable input is the only value used afterwards.
+ */
+export function normalizeNativeHarnessCaptureInput(value: unknown): NativeHarnessCaptureNormalization {
+  if (typeof value !== "object" || value === null) {
+    return protocolFailure("the capture input must be a plain object with exactly two own data fields");
+  }
+  let array: boolean;
+  let prototype: object | null;
+  let keys: (string | symbol)[];
+  try {
+    array = Array.isArray(value);
+    prototype = Object.getPrototypeOf(value);
+    keys = Reflect.ownKeys(value);
+  } catch {
+    return protocolFailure("the capture input could not be inspected");
+  }
+  if (array || (prototype !== Object.prototype && prototype !== null)) {
+    return protocolFailure("the capture input must be a plain object");
+  }
+  if (keys.length !== CAPTURE_INPUT_KEYS.length) {
+    return protocolFailure("the capture input must contain exactly action and sourceToolCallId");
+  }
+  const fields = new Map<string, unknown>();
+  for (const key of keys) {
+    if (typeof key !== "string" || !(CAPTURE_INPUT_KEYS as readonly string[]).includes(key)) {
+      return protocolFailure("the capture input must contain only its two string data fields");
+    }
+    let descriptor: PropertyDescriptor | undefined;
+    try {
+      descriptor = Object.getOwnPropertyDescriptor(value, key);
+    } catch {
+      return protocolFailure("the capture input fields could not be inspected");
+    }
+    if (
+      descriptor === undefined
+      || !("value" in descriptor)
+      || descriptor.get !== undefined
+      || descriptor.set !== undefined
+      || descriptor.enumerable !== true
+    ) {
+      return protocolFailure("the capture input must contain only enumerable own data properties");
+    }
+    fields.set(key, descriptor.value);
+  }
+  if (!fields.has("action") || !fields.has("sourceToolCallId")) {
+    return protocolFailure("the capture input must contain exactly action and sourceToolCallId");
+  }
+  if (fields.get("action") !== "capture") {
+    return protocolFailure('the capture input action must be "capture"');
+  }
+  const sourceToolCallId = boundedId(fields.get("sourceToolCallId"));
+  if (sourceToolCallId === null) {
+    return protocolFailure("the capture input sourceToolCallId is not a bounded id");
+  }
+  const input: NativeHarnessCaptureInput = Object.freeze({
+    action: "capture" as const,
+    sourceToolCallId,
+  });
+  const fingerprint = fingerprintNativeJson(input);
+  if (!fingerprint.ok) {
+    return protocolFailure(`the frozen capture input could not be fingerprinted: ${fingerprint.reason}`);
+  }
+  return Object.freeze({ ok: true as const, input, digest: fingerprint.sha256 });
+}
 
 /**
  * One exact-shape read, one checker-plan normalization, one frozen stable
