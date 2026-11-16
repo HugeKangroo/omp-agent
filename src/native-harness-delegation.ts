@@ -12,6 +12,32 @@ import type {
   NativeHarnessOutputCaptureResult,
 } from "./native-harness-output.ts";
 import { deepFreeze, isNativeWorkspaceTextSnapshot } from "./native-work.ts";
+import {
+  NATIVE_HARNESS_MAX_CHECK_ACTIONS,
+  NATIVE_HARNESS_MAX_CHECK_CONDITIONS,
+  NATIVE_HARNESS_MAX_CHECK_METADATA_BYTES,
+  NATIVE_HARNESS_MAX_CHECK_PATHS,
+  NATIVE_HARNESS_RESULT_TOOL,
+  createNativeHarnessCheckActionRecord,
+  createNativeHarnessCheckFailure,
+  createNativeHarnessCheckPathRecord,
+  createNativeHarnessCheckResponse,
+  createNativeHarnessCheckState,
+  createNativeHarnessCheckTerminalActionRecord,
+  nativeHarnessCheckView,
+  normalizeNativeHarnessCheckInput,
+  sameNativeHarnessCheckPlan,
+  type NativeHarnessCheckActionRecord,
+  type NativeHarnessCheckFailure,
+  type NativeHarnessCheckFailureCode,
+  type NativeHarnessCheckInput,
+  type NativeHarnessCheckOutcome,
+  type NativeHarnessCheckRetainedActionRecord,
+  type NativeHarnessCheckState,
+} from "./native-harness-checks.ts";
+import { fingerprintNativeJson } from "./native-instance-result.ts";
+import { fingerprintExpectedCallResult } from "./native-result-expectation.ts";
+import { runNativeTextChecks } from "./native-snapshot-checker.ts";
 import type {
   Runner,
   WorkerRequest,
@@ -252,6 +278,11 @@ export interface NativeHarnessSnapshotOutput {
   readonly retainedBytes: number;
   readonly code: NativeHarnessOutputSelectionCode | null;
   readonly reason: string | null;
+  readonly checks: {
+    readonly paths: number;
+    readonly actions: number;
+    readonly retainedBytes: number;
+  };
 }
 
 export interface NativeHarnessSnapshotOperation {
@@ -344,6 +375,27 @@ export interface NativeHarnessDelegationCoordinator {
     actualSourceToolCallId: unknown,
     captureSignal: unknown,
   ): Promise<NativeHarnessOutputSelection>;
+  /**
+   * Host-only synchronous check over one already captured output Slot. The
+   * selectors must exactly match the retained capture and one changed path;
+   * no file is opened and no capture, backend or I/O is started.
+   */
+  checkOutput(
+    actualCheckToolCallId: unknown,
+    input: unknown,
+    actualSignal: unknown,
+  ): NativeHarnessCheckOutcome;
+  /**
+   * Host-only registration of the exact check response's frozen input and
+   * projected tool wire on the retained action reference.
+   */
+  registerOutputCheckProjection(
+    actualSourceToolCallId: unknown,
+    actualCheckToolCallId: unknown,
+    exactCheckResponse: unknown,
+    actualProjectedResult: unknown,
+    originalCheckSignal: unknown,
+  ): { readonly ok: boolean; readonly reason: string | null };
   /** Idempotent local cancellation request for one retained operation. */
   cancel(actualToolCallId: unknown): boolean;
   /** Idempotent local disposal; never disposes the native controls/owner. */
@@ -425,6 +477,7 @@ interface SlotOutput {
   retainedBytes: number;
   startedAt: number | null;
   lastClock: number | null;
+  checks: NativeHarnessCheckState | null;
 }
 
 interface Slot {
@@ -2351,6 +2404,958 @@ function registerToolResultProjectionInternal(
   }
 }
 
+function checkFailureFromOutput(failure: NativeHarnessOutputSelectionFailure): NativeHarnessCheckFailure {
+  const code = failure.code === "output-unavailable" || failure.code === "capture-failed"
+    ? "check-unavailable"
+    : failure.code;
+  return createNativeHarnessCheckFailure(code, failure.reason);
+}
+
+interface PreparedCheckSource {
+  readonly output: OutputPort;
+  readonly registration: OutputRegistration;
+  readonly capture: NativeHarnessOutputCapture;
+  readonly prepared: PreparedOutputCheck;
+}
+
+interface RetainedCheckAction {
+  readonly slot: Slot;
+  readonly record: NativeHarnessCheckActionRecord;
+}
+
+/**
+ * Bounded search over the existing Slot records before routing by the
+ * caller-supplied source selector. A retained action id cannot move to another
+ * Slot and gain a fresh preflight comparison.
+ */
+function findRetainedCheckAction(
+  state: CoordinatorState,
+  actionToolCallId: string,
+): RetainedCheckAction | null {
+  for (const slot of state.slots.values()) {
+    const checks = slot.output.checks;
+    if (checks === null) continue;
+    const record = checks.actions.get(actionToolCallId);
+    if (record !== undefined) return { slot, record };
+  }
+  return null;
+}
+
+interface ActionAssociation {
+  readonly observationId: string;
+  readonly generation: number;
+  readonly sessionId: string;
+  readonly workspaceRoot: string;
+  readonly toolCallId: string;
+  readonly toolName: string;
+}
+
+function actionAssociationOf(reference: NativeWorkCallReference): ActionAssociation {
+  return {
+    observationId: reference.observationId,
+    generation: reference.generation,
+    sessionId: reference.sessionId,
+    workspaceRoot: reference.workspaceRoot,
+    toolCallId: reference.toolCallId,
+    toolName: reference.toolName,
+  };
+}
+
+function sameActionWorkIdentity(slot: Slot, association: ActionAssociation): boolean {
+  return association.observationId === slot.association.observationId
+    && association.generation === slot.association.generation
+    && association.sessionId === slot.association.sessionId
+    && association.workspaceRoot === slot.association.workspaceRoot;
+}
+
+function sameActionAssociation(value: unknown, expected: ActionAssociation): boolean {
+  if (!isRecord(value)) return false;
+  try {
+    return value.observationId === expected.observationId
+      && value.generation === expected.generation
+      && value.sessionId === expected.sessionId
+      && value.workspaceRoot === expected.workspaceRoot
+      && value.toolCallId === expected.toolCallId
+      && value.toolName === expected.toolName;
+  } catch {
+    return false;
+  }
+}
+
+function prepareCheckSource(
+  state: CoordinatorState,
+  slot: Slot,
+): PreparedCheckSource | NativeHarnessCheckFailure {
+  if (state.disposed) {
+    return createNativeHarnessCheckFailure("authority-lost", "the delegation coordinator was disposed");
+  }
+  if (!state.enabled) {
+    return createNativeHarnessCheckFailure("authority-lost", "the delegation coordinator is disabled");
+  }
+  const out = slot.output;
+  if (out.state !== "captured" || out.capture === null || out.registration === null) {
+    return createNativeHarnessCheckFailure("not-ready", "the source output has not been captured");
+  }
+  const output = state.output;
+  if (output === null) {
+    return createNativeHarnessCheckFailure("check-unavailable", "the trusted output port is unavailable");
+  }
+  const prepared = prepareOutputCheck(slot, state, out.registration, true);
+  if (!prepared.ok) return checkFailureFromOutput(prepared);
+  const source = sourceSuccessProblem(slot, slot.response);
+  if (source !== null) {
+    return createNativeHarnessCheckFailure("source-conflict", source);
+  }
+  const backend = slot.backend?.receiver;
+  if (backend === undefined || !outputMatches(output, backend, out.capture)) {
+    return createNativeHarnessCheckFailure(
+      "source-conflict",
+      "the issued output capture is no longer bound to this backend",
+    );
+  }
+  return {
+    output,
+    registration: out.registration,
+    capture: out.capture,
+    prepared,
+  };
+}
+
+function captureCheckAction(
+  state: CoordinatorState,
+  slot: Slot,
+  context: NativeContext,
+  actionToolCallId: string,
+): { readonly ref: NativeWorkCallReference; readonly inputSha256: string } | NativeHarnessCheckFailure {
+  let capture: NativeCallCapture;
+  try {
+    capture = Reflect.apply(state.native.captureCall, state.native.receiver, [
+      { toolCallId: actionToolCallId, toolName: NATIVE_HARNESS_RESULT_TOOL },
+      context,
+    ]);
+  } catch (error) {
+    return createNativeHarnessCheckFailure(
+      "authority-lost",
+      `native check action capture threw: ${outputThrownReason(error, "check action capture failed")}`,
+    );
+  }
+  if (!capture.ok) {
+    return createNativeHarnessCheckFailure("authority-lost", nativeInspectionReason(capture.inspection));
+  }
+  const inspection = capture.inspection;
+  if (inspection.state !== "current" || inspection.evidenceState !== "available") {
+    return createNativeHarnessCheckFailure("authority-lost", nativeInspectionReason(inspection));
+  }
+  let association: ActionAssociation;
+  try {
+    association = actionAssociationOf(capture.ref);
+  } catch {
+    return createNativeHarnessCheckFailure(
+      "authority-lost",
+      "native check action capture returned unreadable association facts",
+    );
+  }
+  if (association.toolCallId !== actionToolCallId || association.toolName !== NATIVE_HARNESS_RESULT_TOOL) {
+    return createNativeHarnessCheckFailure(
+      "invalid-caller",
+      "native check action capture returned a different actual tool call",
+    );
+  }
+  if (!sameActionWorkIdentity(slot, association)) {
+    return createNativeHarnessCheckFailure(
+      "source-conflict",
+      "the check action does not belong to the original source work identity",
+    );
+  }
+  if (!isHex64(inspection.callInputSha256)) {
+    return createNativeHarnessCheckFailure(
+      "source-conflict",
+      "the check action preflight input digest is unavailable or ambiguous",
+    );
+  }
+  return { ref: capture.ref, inputSha256: inspection.callInputSha256 };
+}
+
+interface PreparedCheckAction {
+  readonly check: ReadyCallCheck;
+  readonly inspection: NativeWorkCallInspection;
+  readonly context: NativeContext;
+  readonly inputSha256: string;
+}
+
+function prepareCheckAction(
+  state: CoordinatorState,
+  slot: Slot,
+  actionRef: NativeWorkCallReference,
+  context: NativeContext,
+  registration: { readonly sha256: string; readonly bytes: number } | null,
+): PreparedCheckAction | NativeHarnessCheckFailure {
+  let check: NativeCallCheckPreparation;
+  try {
+    check = Reflect.apply(state.native.prepareCallCheck, state.native.receiver, [actionRef, context]);
+  } catch (error) {
+    return createNativeHarnessCheckFailure(
+      "authority-lost",
+      `native check action revalidation threw: ${outputThrownReason(error, "check action revalidation failed")}`,
+    );
+  }
+  if (!check.ok) {
+    return createNativeHarnessCheckFailure(
+      projectionConflict(check.inspection) ? "source-conflict" : "authority-lost",
+      nativeInspectionReason(check.inspection),
+    );
+  }
+  const inspection = check.inspection;
+  if (inspection.state !== "current" || inspection.evidenceState !== "available") {
+    return createNativeHarnessCheckFailure(
+      projectionConflict(inspection) ? "source-conflict" : "authority-lost",
+      nativeInspectionReason(inspection),
+    );
+  }
+  if (inspection.requestAttribution !== "matched-user-input") {
+    return createNativeHarnessCheckFailure(
+      "authority-lost",
+      "the check action is no longer associated with matched user input",
+    );
+  }
+  if (inspection.pendingInputCount !== 0 || inspection.pendingInputsDropped !== 0) {
+    return createNativeHarnessCheckFailure("authority-lost", "the check action work has queued or dropped inputs");
+  }
+  if (!sameActionAssociation(inspection.association, {
+    observationId: slot.association.observationId,
+    generation: slot.association.generation,
+    sessionId: slot.association.sessionId,
+    workspaceRoot: slot.association.workspaceRoot,
+    toolCallId: actionRef.toolCallId,
+    toolName: NATIVE_HARNESS_RESULT_TOOL,
+  })) {
+    return createNativeHarnessCheckFailure(
+      "source-conflict",
+      "the check action now has an incompatible native association",
+    );
+  }
+  const inputSha256 = inspection.callInputSha256;
+  if (!isHex64(inputSha256)) {
+    return createNativeHarnessCheckFailure(
+      "source-conflict",
+      "the check action preflight input digest is unavailable or ambiguous",
+    );
+  }
+  const projection = inspection.resultProjection;
+  if (!isRecord(projection)) {
+    return createNativeHarnessCheckFailure("source-conflict", "the check action result projection is unavailable");
+  }
+  if (registration === null) {
+    if (projection.state !== "unregistered") {
+      return createNativeHarnessCheckFailure(
+        "source-conflict",
+        `the check action result projection is ${String(projection.state)}`,
+      );
+    }
+  } else {
+    if (projection.expectedSha256 !== registration.sha256
+      || projection.expectedBytes !== registration.bytes) {
+      return createNativeHarnessCheckFailure(
+        "source-conflict",
+        "the check action expected result fingerprint is not the retained registration",
+      );
+    }
+    if (projection.state === "pending") {
+      // The registered expectation has not been observed yet.
+    } else if (projection.state === "matched") {
+      if (projection.observedSha256 !== registration.sha256
+        || projection.observedBytes !== registration.bytes) {
+        return createNativeHarnessCheckFailure(
+          "source-conflict",
+          "the observed check action result is not the retained registration",
+        );
+      }
+    } else {
+      return createNativeHarnessCheckFailure(
+        "source-conflict",
+        `the check action result projection is ${String(projection.state)}`,
+      );
+    }
+  }
+  return { check, inspection, context, inputSha256 };
+}
+
+/**
+ * Authenticated admission point for one genuine check action. All host
+ * inspection parsing (source revalidation, action capture, preflight input
+ * digest) must already be complete: every check below is pure or reads local
+ * coordinator state only. A refusal here creates no action record, so an
+ * initially invalid owner, signal, work or capacity stays correctable.
+ */
+function initialCheckAdmission(
+  state: CoordinatorState,
+  slot: Slot,
+  source: PreparedCheckSource,
+  checks: NativeHarnessCheckState,
+  signalValue: unknown,
+): NativeHarnessCheckFailure | null {
+  const owner = ownerPredicateReason(source.output);
+  if (owner !== null) return createNativeHarnessCheckFailure("authority-lost", owner);
+  const signal = readActualAbortSignal(signalValue);
+  if (!signal.ok) return createNativeHarnessCheckFailure("invalid-caller", signal.reason);
+  if (signal.aborted) {
+    return createNativeHarnessCheckFailure("cancelled", "the actual check signal was aborted");
+  }
+  const sourcePure = pureCheckReason(source.prepared.check);
+  if (sourcePure !== null) return createNativeHarnessCheckFailure("source-conflict", sourcePure);
+  if (state.disposed) {
+    return createNativeHarnessCheckFailure("authority-lost", "the delegation coordinator was disposed");
+  }
+  if (!state.enabled) {
+    return createNativeHarnessCheckFailure("authority-lost", "the delegation coordinator is disabled");
+  }
+  if (state.slots.get(slot.toolCallId) !== slot) {
+    return createNativeHarnessCheckFailure("source-conflict", "the original source Slot was replaced");
+  }
+  const out = slot.output;
+  if (out.state !== "captured"
+    || out.capture !== source.capture
+    || out.registration !== source.registration
+    || out.checks !== checks) {
+    return createNativeHarnessCheckFailure("source-conflict", "the retained source capture changed during the check");
+  }
+  if (checks.actions.size >= NATIVE_HARNESS_MAX_CHECK_ACTIONS) {
+    return createNativeHarnessCheckFailure("capacity", "the retained check action count is exhausted");
+  }
+  return null;
+}
+
+function finalCheckGate(
+  state: CoordinatorState,
+  slot: Slot,
+  source: PreparedCheckSource,
+  action: PreparedCheckAction,
+  signalValue: unknown,
+  checks: NativeHarnessCheckState,
+): NativeHarnessCheckFailure | null {
+  // Final sequence, no host data read after the pure checks except the listed
+  // actual signal check: original pure owner, actual action signal, prepared
+  // source pure check, prepared action pure check, then local exact state.
+  const owner = ownerPredicateReason(source.output);
+  if (owner !== null) return createNativeHarnessCheckFailure("authority-lost", owner);
+  const signal = readActualAbortSignal(signalValue);
+  if (!signal.ok) return createNativeHarnessCheckFailure("invalid-caller", signal.reason);
+  if (signal.aborted) {
+    return createNativeHarnessCheckFailure("cancelled", "the actual check signal was aborted");
+  }
+  const sourcePure = pureCheckReason(source.prepared.check);
+  if (sourcePure !== null) return createNativeHarnessCheckFailure("source-conflict", sourcePure);
+  const actionPure = pureCheckReason(action.check);
+  if (actionPure !== null) return createNativeHarnessCheckFailure("source-conflict", actionPure);
+  if (state.disposed) {
+    return createNativeHarnessCheckFailure("authority-lost", "the delegation coordinator was disposed");
+  }
+  if (!state.enabled) {
+    return createNativeHarnessCheckFailure("authority-lost", "the delegation coordinator is disabled");
+  }
+  if (state.slots.get(slot.toolCallId) !== slot) {
+    return createNativeHarnessCheckFailure("source-conflict", "the original source Slot was replaced");
+  }
+  const out = slot.output;
+  if (out.state !== "captured"
+    || out.capture !== source.capture
+    || out.registration !== source.registration
+    || out.checks !== checks) {
+    return createNativeHarnessCheckFailure("source-conflict", "the retained source capture changed during the check");
+  }
+  return null;
+}
+
+function isCheckFailure(value: unknown): value is NativeHarnessCheckFailure {
+  return typeof value === "object"
+    && value !== null
+    && (value as { readonly ok?: unknown }).ok === false;
+}
+
+/**
+ * Consumes one bounded action slot for a genuine action ref whose admission
+ * failed after capture. No prospective path, plan conditions or receipt are
+ * retained; the same actual call becomes terminal for its original signal.
+ */
+function retainTerminalCheckAction(
+  state: CoordinatorState,
+  checks: NativeHarnessCheckState,
+  actionToolCallId: string,
+  sourceToolCallId: string,
+  actionRef: NativeWorkCallReference,
+  inputSha256: string,
+  signal: AbortSignal,
+  failure: NativeHarnessCheckFailure,
+): void {
+  if (state.disposed || !state.enabled) return;
+  if (checks.actions.has(actionToolCallId)) return;
+  if (checks.actions.size >= NATIVE_HARNESS_MAX_CHECK_ACTIONS) return;
+  checks.actions.set(actionToolCallId, createNativeHarnessCheckTerminalActionRecord({
+    actionRef,
+    actionToolCallId,
+    sourceToolCallId,
+    inputSha256,
+    signal,
+    failureCode: failure.code,
+    reason: failure.reason,
+  }));
+}
+
+function retainedRegistration(
+  record: NativeHarnessCheckRetainedActionRecord,
+): { readonly sha256: string; readonly bytes: number } | null | undefined {
+  if (record.registrationSha256 === null && record.registrationBytes === null) return null;
+  if (record.registrationSha256 === null || record.registrationBytes === null) return undefined;
+  return { sha256: record.registrationSha256, bytes: record.registrationBytes };
+}
+
+function admitCheckOutput(
+  state: CoordinatorState,
+  slot: Slot,
+  actionToolCallId: string,
+  normalized: Extract<ReturnType<typeof normalizeNativeHarnessCheckInput>, { readonly ok: true }>,
+  signalValue: unknown,
+): NativeHarnessCheckOutcome {
+  const input = normalized.input;
+  const out = slot.output;
+  if (out.state !== "captured" || out.capture === null || out.registration === null) {
+    return createNativeHarnessCheckFailure("not-ready", "the source output has not been captured");
+  }
+  const capture = out.capture;
+  if (input.captureId !== capture.captureId || input.captureDigest !== capture.digest) {
+    return createNativeHarnessCheckFailure(
+      "source-conflict",
+      "the check selectors do not exactly match the retained source capture",
+    );
+  }
+  const change = capture.changes.find((record) => record.path === input.path);
+  if (change === undefined) {
+    return createNativeHarnessCheckFailure(
+      "source-conflict",
+      "the check path is not one of the retained capture changes",
+    );
+  }
+  if (!isNativeWorkspaceTextSnapshot(change.snapshot)) {
+    return createNativeHarnessCheckFailure("source-conflict", "the selected capture path has no native snapshot");
+  }
+  if (out.checks === null) out.checks = createNativeHarnessCheckState();
+  const checks = out.checks;
+  if (checks.busy) {
+    return createNativeHarnessCheckFailure("not-ready", "a check operation is already in progress for this source Slot");
+  }
+  checks.busy = true;
+  try {
+    const source = prepareCheckSource(state, slot);
+    if (isCheckFailure(source)) return source;
+
+    let path = checks.paths.find((record) =>
+      record.captureId === capture.captureId && record.path === input.path) ?? null;
+    let newPath = false;
+    if (path !== null) {
+      if (!sameNativeHarnessCheckPlan(path.plan, normalized.plan)) {
+        return createNativeHarnessCheckFailure(
+          "source-conflict",
+          "different check conditions already exist for this captured path",
+        );
+      }
+      if (path.captureDigest !== capture.digest || path.snapshot !== change.snapshot) {
+        return createNativeHarnessCheckFailure(
+          "source-conflict",
+          "the retained path record no longer matches the original capture snapshot",
+        );
+      }
+    } else {
+      if (checks.paths.length >= NATIVE_HARNESS_MAX_CHECK_PATHS) {
+        return createNativeHarnessCheckFailure("capacity", "the retained check path count is exhausted");
+      }
+      const conditions = checks.paths.reduce((total, record) => total + record.plan.conditions.length, 0);
+      if (conditions + normalized.plan.conditions.length > NATIVE_HARNESS_MAX_CHECK_CONDITIONS) {
+        return createNativeHarnessCheckFailure("capacity", "the retained check condition budget is exhausted");
+      }
+      let receipt;
+      try {
+        receipt = runNativeTextChecks(change.snapshot, normalized.plan);
+      } catch (error) {
+        return createNativeHarnessCheckFailure(
+          "check-unavailable",
+          `the fixed text checks refused: ${outputThrownReason(error, "check computation failed")}`,
+        );
+      }
+      const candidate = createNativeHarnessCheckPathRecord({
+        captureId: capture.captureId,
+        captureDigest: capture.digest,
+        path: input.path,
+        snapshot: change.snapshot,
+        plan: normalized.plan,
+        receipt,
+        computedByToolCallId: actionToolCallId,
+      });
+      if (candidate === null) {
+        return createNativeHarnessCheckFailure(
+          "check-unavailable",
+          "the fixed text check receipt is not authentic for the retained snapshot and plan",
+        );
+      }
+      if (checks.retainedMetadataBytes + candidate.planBytes + candidate.receiptBytes
+        > NATIVE_HARNESS_MAX_CHECK_METADATA_BYTES) {
+        return createNativeHarnessCheckFailure("capacity", "the retained check metadata byte budget is exhausted");
+      }
+      path = candidate;
+      newPath = true;
+    }
+
+    // A temporary candidate plan is discarded for an existing path. The
+    // retained action input is rebuilt from the once-copied selectors and the
+    // original path plan's frozen conditions, then re-fingerprinted. The
+    // canonical digest must be identical to the candidate normalization.
+    let retainedInput: NativeHarnessCheckInput = normalized.input;
+    let retainedDigest = normalized.digest;
+    if (!newPath) {
+      const stable: NativeHarnessCheckInput = Object.freeze({
+        action: "check" as const,
+        sourceToolCallId: input.sourceToolCallId,
+        captureId: input.captureId,
+        captureDigest: input.captureDigest,
+        path: input.path,
+        conditions: path.plan.conditions,
+      });
+      const fingerprint = fingerprintNativeJson(stable);
+      if (!fingerprint.ok || fingerprint.sha256 !== normalized.digest) {
+        return createNativeHarnessCheckFailure(
+          "source-conflict",
+          "the retained path plan does not describe the same frozen check input",
+        );
+      }
+      retainedInput = stable;
+      retainedDigest = fingerprint.sha256;
+    }
+
+    const captured = captureCheckAction(state, slot, source.prepared.context, actionToolCallId);
+    if (isCheckFailure(captured)) return captured;
+    // A captured ref is not authenticated admission. The genuine native
+    // preflight input must equal the frozen normalized input before this call
+    // can consume an action slot or become terminal.
+    if (captured.inputSha256 !== retainedDigest) {
+      return createNativeHarnessCheckFailure(
+        "protocol",
+        "the actual check call preflight input differs from the frozen normalized input",
+      );
+    }
+    // Explicit authenticated admission before the later action preparation
+    // callbacks: source gates, authentic capture and exact input proof are
+    // above; the pure owner/signal/source-purecheck, local Slot and capacity
+    // gates are here. No host inspection is parsed after this point.
+    const initial = initialCheckAdmission(state, slot, source, checks, signalValue);
+    if (initial !== null) return initial;
+
+    // Authenticated. Any later terminal refusal retains only the first action
+    // ref/signal/digest for this actual call; no successful path, plan
+    // conditions or receipt is committed.
+    const failAfterCapture = (failure: NativeHarnessCheckFailure): NativeHarnessCheckFailure => {
+      retainTerminalCheckAction(
+        state,
+        checks,
+        actionToolCallId,
+        input.sourceToolCallId,
+        captured.ref,
+        retainedDigest,
+        signalValue as AbortSignal,
+        failure,
+      );
+      return failure;
+    };
+    const action = prepareCheckAction(state, slot, captured.ref, source.prepared.context, null);
+    if (isCheckFailure(action)) return failAfterCapture(action);
+    if (action.inputSha256 !== retainedDigest) {
+      return failAfterCapture(createNativeHarnessCheckFailure(
+        "protocol",
+        "the actual check call preflight input differs from the frozen normalized input",
+      ));
+    }
+
+    const response = createNativeHarnessCheckResponse(actionToolCallId, retainedInput, path);
+    const final = finalCheckGate(state, slot, source, action, signalValue, checks);
+    if (final !== null) return failAfterCapture(final);
+
+    // One local commit. No host getter, callback, clock or input reread follows.
+    if (state.disposed || !state.enabled) {
+      return failAfterCapture(createNativeHarnessCheckFailure(
+        "authority-lost",
+        "the delegation coordinator changed during the check",
+      ));
+    }
+    if (state.slots.get(input.sourceToolCallId) !== slot || slot.toolCallId !== input.sourceToolCallId) {
+      return failAfterCapture(createNativeHarnessCheckFailure(
+        "source-conflict",
+        "the original source Slot was replaced",
+      ));
+    }
+    if (out.state !== "captured"
+      || out.capture !== capture
+      || out.registration !== source.registration
+      || out.checks !== checks
+      || checks.busy !== true
+      || checks.actions.has(actionToolCallId)) {
+      return failAfterCapture(createNativeHarnessCheckFailure(
+        "source-conflict",
+        "the retained check state changed during admission",
+      ));
+    }
+    if (newPath) {
+      if (checks.paths.length >= NATIVE_HARNESS_MAX_CHECK_PATHS) {
+        return failAfterCapture(createNativeHarnessCheckFailure(
+          "capacity",
+          "the retained check path count is exhausted",
+        ));
+      }
+      const conditions = checks.paths.reduce((total, record) => total + record.plan.conditions.length, 0);
+      if (conditions + path.plan.conditions.length > NATIVE_HARNESS_MAX_CHECK_CONDITIONS) {
+        return failAfterCapture(createNativeHarnessCheckFailure(
+          "capacity",
+          "the retained check condition budget is exhausted",
+        ));
+      }
+      if (checks.retainedMetadataBytes + path.planBytes + path.receiptBytes
+        > NATIVE_HARNESS_MAX_CHECK_METADATA_BYTES) {
+        return failAfterCapture(createNativeHarnessCheckFailure(
+          "capacity",
+          "the retained check metadata byte budget is exhausted",
+        ));
+      }
+      checks.paths.push(path);
+      checks.retainedMetadataBytes += path.planBytes + path.receiptBytes;
+    } else if (!checks.paths.includes(path)) {
+      return failAfterCapture(createNativeHarnessCheckFailure(
+        "source-conflict",
+        "the retained check path record disappeared",
+      ));
+    }
+    checks.actions.set(actionToolCallId, createNativeHarnessCheckActionRecord({
+      actionRef: captured.ref,
+      input: retainedInput,
+      inputSha256: retainedDigest,
+      signal: signalValue as AbortSignal,
+      path,
+      response,
+    }));
+    return response;
+  } finally {
+    checks.busy = false;
+  }
+}
+
+function checkOutputInternal(
+  state: CoordinatorState,
+  actualCheckToolCallIdValue: unknown,
+  inputValue: unknown,
+  signalValue: unknown,
+): NativeHarnessCheckOutcome {
+  try {
+    if (state.disposed) {
+      return createNativeHarnessCheckFailure("authority-lost", "the delegation coordinator was disposed");
+    }
+    if (!state.enabled) {
+      return createNativeHarnessCheckFailure("authority-lost", "the delegation coordinator is disabled");
+    }
+    const actionToolCallId = boundedString(actualCheckToolCallIdValue, MAX_TOOL_CALL_ID_CHARS);
+    if (actionToolCallId === null) {
+      return createNativeHarnessCheckFailure("invalid-caller", "the actual check tool call id is unavailable");
+    }
+    const normalized = normalizeNativeHarnessCheckInput(inputValue);
+    if (!normalized.ok) return normalized;
+    const input = normalized.input;
+    const signal = readActualAbortSignal(signalValue);
+    if (!signal.ok) return createNativeHarnessCheckFailure("invalid-caller", signal.reason);
+
+    const retained = findRetainedCheckAction(state, actionToolCallId);
+    if (retained === null) {
+      if (signal.aborted) {
+        return createNativeHarnessCheckFailure("cancelled", "the actual check signal was aborted before admission");
+      }
+      if (actionToolCallId === input.sourceToolCallId) {
+        return createNativeHarnessCheckFailure(
+          "invalid-caller",
+          "the check action must use a different actual tool call id than the source",
+        );
+      }
+      const slot = state.slots.get(input.sourceToolCallId);
+      if (slot === undefined) {
+        return createNativeHarnessCheckFailure(
+          "not-ready",
+          "no retained delegation operation has this source id",
+        );
+      }
+      return admitCheckOutput(state, slot, actionToolCallId, normalized, signalValue);
+    }
+
+    const slot = retained.slot;
+    const record = retained.record;
+    if (record.signal !== signalValue) {
+      return createNativeHarnessCheckFailure(
+        "invalid-caller",
+        "the actual check signal is not the original action signal",
+      );
+    }
+    const checks = slot.output.checks;
+    if (checks === null) {
+      return createNativeHarnessCheckFailure("source-conflict", "the retained check state is unavailable");
+    }
+    if (checks.busy) {
+      return createNativeHarnessCheckFailure("not-ready", "a check operation is already in progress for this source Slot");
+    }
+    if (record.kind === "terminal") {
+      return createNativeHarnessCheckFailure(
+        record.state === "cancelled" ? "cancelled" : "source-conflict",
+        record.reason,
+      );
+    }
+    if (record.state !== "admitted") {
+      return createNativeHarnessCheckFailure(
+        record.state === "cancelled" ? "cancelled" : "source-conflict",
+        record.conflictReason ?? `the retained check action is ${record.state}`,
+      );
+    }
+    checks.busy = true;
+    try {
+      const source = prepareCheckSource(state, slot);
+      if (isCheckFailure(source)) return source;
+      const registration = retainedRegistration(record);
+      if (registration === undefined) {
+        return createNativeHarnessCheckFailure(
+          "source-conflict",
+          "the retained check registration fingerprint is incomplete",
+        );
+      }
+      const action = prepareCheckAction(state, slot, record.actionRef, source.prepared.context, registration);
+      if (isCheckFailure(action)) return action;
+
+      const inputChanged = normalized.digest !== record.inputSha256
+        || action.inputSha256 !== record.inputSha256;
+      const selectorsChanged = record.input.sourceToolCallId !== input.sourceToolCallId
+        || record.input.captureId !== input.captureId
+        || record.input.captureDigest !== input.captureDigest
+        || record.input.path !== input.path;
+      const capture = slot.output.capture;
+      const pathInvalid = capture === null
+        || record.path.captureId !== capture.captureId
+        || record.path.captureDigest !== capture.digest
+        || !checks.paths.includes(record.path);
+
+      // Authenticate the retained action and its original owner/signal/pure
+      // refs before changing any existing record state. A foreign or
+      // authority-lost caller only refuses and cannot poison this action.
+      const final = finalCheckGate(state, slot, source, action, signalValue, checks);
+      if (final !== null) {
+        if (final.code === "cancelled" && record.state === "admitted") {
+          record.state = "cancelled";
+          record.conflictReason = final.reason;
+        }
+        return final;
+      }
+
+      // The retained action is authenticated. A changed effective input is
+      // sticky for this actual call even if the caller later restores it.
+      if (inputChanged) {
+        record.state = "conflicted";
+        record.conflictReason = "the same check action call changed its input";
+        return createNativeHarnessCheckFailure(
+          "source-conflict",
+          "the same check action call changed its input",
+        );
+      }
+      if (selectorsChanged) {
+        record.state = "conflicted";
+        record.conflictReason = "the same check action call changed its selectors";
+        return createNativeHarnessCheckFailure(
+          "source-conflict",
+          "the same check action call changed its selectors",
+        );
+      }
+      if (pathInvalid) {
+        record.state = "conflicted";
+        record.conflictReason = "the retained check path no longer matches the original capture";
+        return createNativeHarnessCheckFailure(
+          "source-conflict",
+          "the retained check path no longer matches the original capture",
+        );
+      }
+      if (record.registrationConflict !== null) {
+        return createNativeHarnessCheckFailure("source-conflict", record.registrationConflict);
+      }
+      return record.response;
+    } finally {
+      checks.busy = false;
+    }
+  } catch (error) {
+    return createNativeHarnessCheckFailure(
+      "check-unavailable",
+      `the host-only check failed unexpectedly: ${outputThrownReason(error, "check operation failed")}`,
+    );
+  }
+}
+
+function registerOutputCheckProjectionInternal(
+  state: CoordinatorState,
+  actualSourceToolCallId: unknown,
+  actualCheckToolCallId: unknown,
+  exactCheckResponse: unknown,
+  actualProjectedResult: unknown,
+  originalCheckSignal: unknown,
+): { readonly ok: boolean; readonly reason: string | null } {
+  let checks: NativeHarnessCheckState | null = null;
+  let busyAcquired = false;
+  try {
+    if (state.disposed) return registrationFailure("the delegation coordinator was disposed");
+    if (!state.enabled) return registrationFailure("the delegation coordinator is disabled");
+    const sourceToolCallId = boundedString(actualSourceToolCallId, MAX_TOOL_CALL_ID_CHARS);
+    if (sourceToolCallId === null) return registrationFailure("the actual source tool call id is unavailable");
+    const actionToolCallId = boundedString(actualCheckToolCallId, MAX_TOOL_CALL_ID_CHARS);
+    if (actionToolCallId === null) return registrationFailure("the actual check tool call id is unavailable");
+    const retained = findRetainedCheckAction(state, actionToolCallId);
+    if (retained === null) return registrationFailure("no retained check action has this tool call id");
+    const slot = retained.slot;
+    const record = retained.record;
+    if (record.kind === "terminal") {
+      return registrationFailure(record.reason);
+    }
+    if (slot.toolCallId !== sourceToolCallId || record.sourceToolCallId !== sourceToolCallId) {
+      return registrationFailure("the check action does not belong to this source tool call");
+    }
+    if (exactCheckResponse !== record.response) {
+      return registrationFailure("the check response is not the exact retained action response");
+    }
+    if (originalCheckSignal !== record.signal) {
+      return registrationFailure("the original check signal is not the retained action signal");
+    }
+    const signal = readActualAbortSignal(originalCheckSignal);
+    if (!signal.ok) return registrationFailure(signal.reason);
+    if (signal.aborted) {
+      // Registration does not change record state here. Only a fresh
+      // authenticated check admission may make the aborted call terminal.
+      return registrationFailure("the original check action signal was aborted at registration");
+    }
+    checks = slot.output.checks;
+    if (checks === null) return registrationFailure("the retained check state is unavailable");
+    if (record.state !== "admitted") {
+      return registrationFailure(record.conflictReason ?? `the retained check action is ${record.state}`);
+    }
+    if (record.registrationConflict !== null) return registrationFailure(record.registrationConflict);
+    if (checks.busy) return registrationFailure("a check operation is already in progress for this source Slot");
+
+    // Acquire this Slot's owned lock before any caller-wire reflection. A
+    // getter/Proxy trap that reenters sees busy and cannot start a second
+    // registration. The whole projection is still fingerprinted once before
+    // any host callback below.
+    checks.busy = true;
+    busyAcquired = true;
+    const expected = fingerprintExpectedCallResult({ input: record.input, result: actualProjectedResult });
+    if (!expected.ok) {
+      return registrationFailure(`result expectation unavailable: ${expected.reason}`);
+    }
+    if (expected.inputFingerprint.sha256 !== record.inputSha256) {
+      return registrationFailure("the projected input fingerprint is not the retained check input");
+    }
+
+    const source = prepareCheckSource(state, slot);
+    if (isCheckFailure(source)) return registrationFailure(source.reason);
+    const preRegistration = retainedRegistration(record);
+    if (preRegistration === undefined) {
+      return registrationFailure("the retained check registration fingerprint is incomplete");
+    }
+    const action = prepareCheckAction(state, slot, record.actionRef, source.prepared.context, preRegistration);
+    if (isCheckFailure(action)) return registrationFailure(action.reason);
+    const existing = retainedRegistration(record);
+    const inputChanged = action.inputSha256 !== record.inputSha256;
+    const registrationChanged = existing !== null && existing !== undefined
+      && (existing.sha256 !== expected.fingerprint.sha256 || existing.bytes !== expected.fingerprint.bytes);
+    if (inputChanged || registrationChanged) {
+      // Authenticate the retained action and original owner/signal/pure refs
+      // before turning this action conflicted or registration-unusable.
+      const beforeMutation = finalCheckGate(state, slot, source, action, originalCheckSignal, checks);
+      if (beforeMutation !== null) return registrationFailure(beforeMutation.reason);
+      if (inputChanged) {
+        record.state = "conflicted";
+        record.conflictReason = "the same check action call changed its input";
+        return registrationFailure(record.conflictReason);
+      }
+      record.registrationConflict = "a different result projection was already registered for this check action";
+      return registrationFailure(record.registrationConflict);
+    }
+    const register = state.native.registerCallResultExpectation;
+    if (register === null) {
+      return registrationFailure("native result expectation registration is unavailable");
+    }
+    let raw: unknown;
+    try {
+      raw = Reflect.apply(register, state.native.receiver, [
+        record.actionRef,
+        { input: record.input, result: actualProjectedResult },
+        source.prepared.context,
+      ]);
+    } catch (error) {
+      return registrationFailure(`native result expectation registration threw: ${outputThrownReason(error, "registration failed")}`);
+    }
+    const fingerprint = readRegistrationFingerprint(raw);
+    if (!fingerprint.ok) return registrationFailure(fingerprint.reason);
+    if (fingerprint.sha256 !== expected.fingerprint.sha256
+      || fingerprint.bytes !== expected.fingerprint.bytes) {
+      return registrationFailure("the native registered fingerprint is not the precomputed check projection");
+    }
+
+    // Registration replaced the native expectation identity. Both prepared
+    // checks must be refreshed; the pre-registration pure checks are stale.
+    const refreshedSource = prepareCheckSource(state, slot);
+    if (isCheckFailure(refreshedSource)) return registrationFailure(refreshedSource.reason);
+    if (refreshedSource.prepared.workPromptSha256 !== source.prepared.workPromptSha256
+      || refreshedSource.prepared.callInputSha256 !== source.prepared.callInputSha256) {
+      return registrationFailure("the original source work prompt or call input changed during registration");
+    }
+    const refreshedAction = prepareCheckAction(
+      state,
+      slot,
+      record.actionRef,
+      refreshedSource.prepared.context,
+      expected.fingerprint,
+    );
+    if (isCheckFailure(refreshedAction)) return registrationFailure(refreshedAction.reason);
+    if (refreshedAction.inputSha256 !== record.inputSha256) {
+      const beforeMutation = finalCheckGate(
+        state,
+        slot,
+        refreshedSource,
+        refreshedAction,
+        originalCheckSignal,
+        checks,
+      );
+      if (beforeMutation !== null) return registrationFailure(beforeMutation.reason);
+      record.state = "conflicted";
+      record.conflictReason = "the same check action call changed its input";
+      return registrationFailure(record.conflictReason);
+    }
+    const final = finalCheckGate(state, slot, refreshedSource, refreshedAction, originalCheckSignal, checks);
+    if (final !== null) return registrationFailure(final.reason);
+    if (state.disposed || !state.enabled) {
+      return registrationFailure("the delegation coordinator changed during check registration");
+    }
+    if (state.slots.get(sourceToolCallId) !== slot
+      || slot.output.checks !== checks
+      || checks.actions.get(actionToolCallId) !== record
+      || record.state !== "admitted"
+      || record.registrationConflict !== null
+      || record.response !== exactCheckResponse
+      || record.signal !== originalCheckSignal) {
+      return registrationFailure("the retained check action state changed during registration");
+    }
+    record.registrationSha256 = expected.fingerprint.sha256;
+    record.registrationBytes = expected.fingerprint.bytes;
+    return registrationSuccess();
+  } catch (error) {
+    return registrationFailure(error);
+  } finally {
+    if (busyAcquired && checks !== null) checks.busy = false;
+  }
+}
+
 function beginCancellation(slot: Slot, reason: SlotCancelReason): void {
   if (slot.state !== "running" || slot.cancelRequested) return;
   slot.cancelRequested = true;
@@ -3510,6 +4515,7 @@ function createSlot(
       retainedBytes: 0,
       startedAt: null,
       lastClock: null,
+      checks: null,
     },
   };
   // The listener is assigned after the slot exists so it can identify itself.
@@ -3575,6 +4581,7 @@ function buildSnapshot(state: CoordinatorState): NativeHarnessDelegationSnapshot
         retainedBytes: out.retainedBytes,
         code: outputFailure?.code ?? null,
         reason: outputFailure === null ? null : boundedOutputReason(outputFailure.reason),
+        checks: nativeHarnessCheckView(out.checks),
       }),
     }));
   }
@@ -3864,6 +4871,29 @@ export function createNativeHarnessDelegation(
       captureSignal: unknown,
     ): Promise<NativeHarnessOutputSelection> {
       return captureOutputInternal(state, actualSourceToolCallId, captureSignal);
+    },
+    checkOutput(
+      actualCheckToolCallId: unknown,
+      input: unknown,
+      actualSignal: unknown,
+    ): NativeHarnessCheckOutcome {
+      return checkOutputInternal(state, actualCheckToolCallId, input, actualSignal);
+    },
+    registerOutputCheckProjection(
+      actualSourceToolCallId: unknown,
+      actualCheckToolCallId: unknown,
+      exactCheckResponse: unknown,
+      actualProjectedResult: unknown,
+      originalCheckSignal: unknown,
+    ): { readonly ok: boolean; readonly reason: string | null } {
+      return registerOutputCheckProjectionInternal(
+        state,
+        actualSourceToolCallId,
+        actualCheckToolCallId,
+        exactCheckResponse,
+        actualProjectedResult,
+        originalCheckSignal,
+      );
     },
     cancel(actualToolCallId: unknown): boolean {
       const toolCallId = boundedString(actualToolCallId, MAX_TOOL_CALL_ID_CHARS);

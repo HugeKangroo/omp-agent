@@ -230,6 +230,16 @@ Independent same-frozen-source review used a deterministic Runner and ordered fa
 
 The original actual failure remains recorded: a synchronous stop landed after capture reserved capacity but before the root registered the operation, so output was previously retained. The repair returns cancelled with zero retained output and releases capacity only on settlement. Private initial driver syntax and child-context fixture failures were fixture defects, not product defects. Prior actual 2C paid evidence remains the historical fixed `bd8e3f9`; no fresh actual OMP run was made for this increment. These are bounded engineering checks, not model-visible capture/report, semantic acceptance, full G5 or release evidence.
 
+## Bounded host-only output check (G5-3B1a)
+
+Focused `bun test test/unit/native-harness-checks.test.ts` passed 19 tests and 343 assertions. Frozen full `bun run check` passed type checking, 1,068 unit tests (52 files, 38,150 assertions) and 15 simulated human-review tests (155 assertions), 0 failures.
+
+Independent review used the same frozen source, not a later revision, and made no actual OMP process, model or paid call. Fourteen authority, reentry, input and cancellation cases covered a genuine late abort and late owner loss with capture count 1→1 and every preparation using the first ref; an initially bad input or owner with zero actions; and an original legitimate conflict remaining sticky without foreign pollution. Five actual native-plus-Controller-plus-output-plus-checker compositions used a deterministic Runner, fake host hooks and a real filesystem. They covered PASS, FAIL, original receipt identity and no FAIL weakening; the existing observer moving pending→matched→conflicted; 16 actions with the 17th refused; 32 conditions with the 33rd refused; and an independently encoded 65,536-byte metadata case accepted while 65,537 bytes was refused with the prior 53,436 bytes across four paths retained. Three workers produced one capture with no extra dispatch, and the raw capture budget and original source stayed unchanged. Moving the winner directory before the check still used the frozen bytes. That is evidence for historical snapshot use, not a comprehensive OS I/O audit.
+
+Retained corrections: the first registration reflection reentry occurred before the owned lock; a late abort initially retried the same call with a new signal; unauthorized input or wire initially poisoned an existing record; a repair briefly retained a terminal record for a wrong preflight input; and a failure-code filter initially allowed late owner loss to retry with a new ref. The explicit initial authentication point and final gates now close those probes, and the original failures remain recorded. Fixture failures are distinguished from product defects.
+
+The check path remains synchronous, host-only and read-only. It registers no model tool, performs no disk open or backend run, exposes no raw text or private path, and proves no condition completeness, whole-task semantic acceptance, report freshness, recovery, apply or default policy. B1b actual capture/read/inspect action guards and model entry, B2 same-version reread/report, and B3 actual-root/model integration remain next; broad quality, full G5, G4 and release remain open.
+
 ## Commands
 
 ```sh
