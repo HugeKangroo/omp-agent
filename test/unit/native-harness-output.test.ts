@@ -17,6 +17,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import {
   captureNativeHarnessOutput,
+  compareNativeHarnessOutputVersion,
   matchesNativeHarnessOutputCapture,
   type NativeHarnessOutputCapture,
   type NativeHarnessOutputCheckpoint,
@@ -34,7 +35,7 @@ import {
 } from "../../src/native-harness-delegation.ts";
 import type { NativeContext } from "../../src/native-entry.ts";
 import { createNativeTextCheckPlan, runNativeTextChecks } from "../../src/native-snapshot-checker.ts";
-import { isNativeWorkspaceTextSnapshot } from "../../src/native-work.ts";
+import { NativeFileError, isNativeWorkspaceTextSnapshot, nodeFileIo } from "../../src/native-work.ts";
 import type { Runner, WorkerRequest, WorkerResult } from "../../vendor/harness2/index.ts";
 
 const PLAN_RESPONSE = JSON.stringify({
@@ -295,6 +296,11 @@ async function capture(
 function requireCapture(result: Awaited<ReturnType<typeof capture>>): NativeHarnessOutputCapture {
   if (!result.ok) throw new Error(`capture failed: ${result.code} ${result.reason}`);
   return result.capture;
+}
+
+function requireFailure(result: Awaited<ReturnType<typeof capture>>) {
+  if (result.ok) throw new Error("expected capture failure");
+  return result;
 }
 
 describe("G5-3A1b bounded native Harness output capture", () => {
@@ -647,5 +653,476 @@ describe("G5-3A1b bounded native Harness output capture", () => {
     expect(forged.ok).toBe(false);
     if (!forged.ok) expect(forged.code).toBe("source-unavailable");
     expect(matchesNativeHarnessOutputCapture({}, {})).toBe(false);
+  });
+});
+
+describe("G5-3B2a1 issued version comparison and observed mismatch", () => {
+  test("two issued captures of one completion compare equal while observations differ", async () => {
+    const run = await executed();
+    const first = requireCapture(await capture(run.backend));
+    const firstText = first.changes[0]!.snapshot.text;
+    const firstJson = JSON.stringify(first);
+    await Bun.sleep(2);
+    const second = requireCapture(await capture(run.backend));
+
+    expect(second).not.toBe(first);
+    expect(second.captureId).not.toBe(first.captureId);
+    expect(second.changes[0]!.snapshot.captureId).not.toBe(first.changes[0]!.snapshot.captureId);
+    // Capture and snapshot IDs prove distinct observations. Timestamps are
+    // also ignored even when Date.now() collides at millisecond resolution.
+    const version = compareNativeHarnessOutputVersion(run.backend, first, second);
+    expect(version).toEqual({ ok: true, sameVersion: true });
+    expect(Object.isFrozen(version)).toBe(true);
+    expect(compareNativeHarnessOutputVersion(run.backend, second, first))
+      .toEqual({ ok: true, sameVersion: true });
+    expect(first.changes[0]!.snapshot.text).toBe(firstText);
+    expect(JSON.stringify(first)).toBe(firstJson);
+  });
+
+  test("replay, clones, foreign captures and hostile or revoked objects refuse", async () => {
+    const firstRun = await executed();
+    const first = requireCapture(await capture(firstRun.backend));
+    const second = requireCapture(await capture(firstRun.backend));
+    const foreignRun = await executed();
+    const foreign = requireCapture(await capture(foreignRun.backend));
+
+    const replay = compareNativeHarnessOutputVersion(firstRun.backend, first, first);
+    expect(replay).toEqual({ ok: false, code: "invalid-binding", section: "binding" });
+    expect(Object.isFrozen(replay)).toBe(true);
+
+    for (const clone of [{ ...first }, JSON.parse(JSON.stringify(first))]) {
+      expect(compareNativeHarnessOutputVersion(firstRun.backend, first, clone))
+        .toEqual({ ok: false, code: "invalid-binding", section: "binding" });
+      expect(compareNativeHarnessOutputVersion(firstRun.backend, clone, first))
+        .toEqual({ ok: false, code: "invalid-binding", section: "binding" });
+    }
+
+    for (const comparison of [
+      compareNativeHarnessOutputVersion(firstRun.backend, first, foreign),
+      compareNativeHarnessOutputVersion(foreignRun.backend, first, foreign),
+      compareNativeHarnessOutputVersion(firstRun.backend, foreign, first),
+      compareNativeHarnessOutputVersion({ ...firstRun.backend }, first, second),
+      compareNativeHarnessOutputVersion(firstRun.backend, {}, second),
+      compareNativeHarnessOutputVersion(firstRun.backend, first, {}),
+      compareNativeHarnessOutputVersion(null, first, second),
+      compareNativeHarnessOutputVersion(firstRun.backend, null, second),
+      compareNativeHarnessOutputVersion(firstRun.backend, first, null),
+    ]) {
+      expect(comparison).toEqual({ ok: false, code: "invalid-binding", section: "binding" });
+    }
+
+    let reads = 0;
+    const hostile = new Proxy({}, {
+      get() {
+        reads += 1;
+        throw new Error("caller getter must not run");
+      },
+      has() {
+        reads += 1;
+        throw new Error("caller has trap must not run");
+      },
+      getOwnPropertyDescriptor() {
+        reads += 1;
+        throw new Error("caller descriptor trap must not run");
+      },
+    });
+    expect(compareNativeHarnessOutputVersion(firstRun.backend, hostile, second))
+      .toEqual({ ok: false, code: "invalid-binding", section: "binding" });
+    expect(compareNativeHarnessOutputVersion(firstRun.backend, first, hostile))
+      .toEqual({ ok: false, code: "invalid-binding", section: "binding" });
+    expect(compareNativeHarnessOutputVersion(hostile, first, second))
+      .toEqual({ ok: false, code: "invalid-binding", section: "binding" });
+    expect(reads).toBe(0);
+
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    expect(compareNativeHarnessOutputVersion(revoked.proxy, first, second))
+      .toEqual({ ok: false, code: "invalid-binding", section: "binding" });
+    expect(compareNativeHarnessOutputVersion(firstRun.backend, revoked.proxy, second))
+      .toEqual({ ok: false, code: "invalid-binding", section: "binding" });
+    expect(compareNativeHarnessOutputVersion(firstRun.backend, first, revoked.proxy))
+      .toEqual({ ok: false, code: "invalid-binding", section: "binding" });
+  });
+
+  test("empty-directory addition keeps the digest but changes stage facts", async () => {
+    const run = await executed();
+    const first = requireCapture(await capture(run.backend));
+    const emptyDirectory = path.join(run.completion.winner.cwd, "empty-output-directory");
+    await mkdir(emptyDirectory);
+    try {
+      const second = requireCapture(await capture(run.backend));
+      expect(second.digest).toBe(first.digest);
+      expect(second.changes.map((change) => [
+        change.path,
+        change.kind,
+        change.mode,
+        change.controllerHash,
+        change.snapshot.text,
+      ])).toEqual(first.changes.map((change) => [
+        change.path,
+        change.kind,
+        change.mode,
+        change.controllerHash,
+        change.snapshot.text,
+      ]));
+      const firstWinner = first.stages.find((stage) => stage.candidate === "baseline")!;
+      const secondWinner = second.stages.find((stage) => stage.candidate === "baseline")!;
+      expect(secondWinner.directoryCount).toBe(firstWinner.directoryCount + 1);
+      expect(compareNativeHarnessOutputVersion(run.backend, first, second))
+        .toEqual({ ok: false, code: "version-mismatch", section: "stages" });
+    } finally {
+      await rm(emptyDirectory, { recursive: true, force: true });
+    }
+    expect((await capture(run.backend)).ok).toBe(true);
+  });
+
+  test("actual source byte drift keeps changed and marks the mismatch", async () => {
+    const run = await executed();
+    const sourcePath = path.join(run.completion.prepared.sourceRoot, "a.txt");
+    const sourceBytes = await readFile(sourcePath);
+    await writeFile(sourcePath, "alpha drift\n", { mode: 0o600 });
+    try {
+      const failure = requireFailure(await capture(run.backend));
+      expect(failure.code).toBe("changed");
+      expect(failure.observedMismatch).toBe(true);
+      expect(failure.reason).toBe("A selected original source file no longer matches the frozen input manifest.");
+      expect(failure.reason.length).toBeLessThanOrEqual(320);
+      expect(JSON.parse(JSON.stringify(failure))).toMatchObject({
+        ok: false,
+        code: "changed",
+        observedMismatch: true,
+      });
+    } finally {
+      await writeFile(sourcePath, sourceBytes, { mode: 0o600 });
+    }
+    expect((await capture(run.backend)).ok).toBe(true);
+  });
+
+  test("actual base byte and mode drift keep changed and mark the mismatch", async () => {
+    const bytesRun = await executed();
+    const basePath = path.join(bytesRun.completion.base.root, "a.txt");
+    const baseBytes = await readFile(basePath);
+    await writeFile(basePath, "alpha base drift\n", { mode: 0o600 });
+    try {
+      const failure = requireFailure(await capture(bytesRun.backend));
+      expect(failure.code).toBe("changed");
+      expect(failure.observedMismatch).toBe(true);
+      expect(failure.reason).toBe("A base snapshot input does not match the frozen manifests.");
+    } finally {
+      await writeFile(basePath, baseBytes, { mode: 0o600 });
+    }
+    expect((await capture(bytesRun.backend)).ok).toBe(true);
+
+    const modeRun = await executed();
+    const modePath = path.join(modeRun.completion.base.root, "b.txt");
+    await chmod(modePath, 0o644);
+    try {
+      const failure = requireFailure(await capture(modeRun.backend));
+      expect(failure.code).toBe("changed");
+      expect(failure.observedMismatch).toBe(true);
+    } finally {
+      await chmod(modePath, 0o600);
+    }
+    expect((await capture(modeRun.backend)).ok).toBe(true);
+  });
+
+  test("actual winner change-manifest drift keeps changed and marks the mismatch", async () => {
+    const run = await executed();
+    const winnerPath = path.join(run.completion.winner.cwd, "candidate.txt");
+    const winnerBytes = await readFile(winnerPath);
+    await writeFile(winnerPath, "candidate drift\n", { mode: 0o600 });
+    try {
+      const failure = requireFailure(await capture(run.backend));
+      expect(failure.code).toBe("changed");
+      expect(failure.observedMismatch).toBe(true);
+      expect(failure.reason).toBe("A stage change manifest does not match its frozen artifact hash.");
+    } finally {
+      await writeFile(winnerPath, winnerBytes, { mode: 0o600 });
+    }
+    expect((await capture(run.backend)).ok).toBe(true);
+  });
+
+  test("source change after the text read carries the observed marker", async () => {
+    const run = await executed();
+    const sourcePath = path.join(run.completion.prepared.sourceRoot, "a.txt");
+    const sourceBytes = await readFile(sourcePath);
+    try {
+      const failure = requireFailure(await capture(run.backend, {
+        checkpoint: async (event) => {
+          if (event.point === "after-text-read" && event.stage === null && event.relativePath === "a.txt") {
+            await writeFile(sourcePath, "alpha changed after read\n", { mode: 0o600 });
+          }
+        },
+      }));
+      expect(failure.code).toBe("changed");
+      expect(failure.observedMismatch).toBe(true);
+      expect(failure.reason).toBe("File identity or mode changed during capture: a.txt");
+    } finally {
+      await writeFile(sourcePath, sourceBytes, { mode: 0o600 });
+    }
+    expect((await capture(run.backend)).ok).toBe(true);
+  });
+
+  test("winner existing-input mode change carries the observed marker", async () => {
+    const run = await executed();
+    const winnerPath = path.join(run.completion.winner.cwd, "a.txt");
+    await chmod(winnerPath, 0o644);
+    try {
+      const failure = requireFailure(await capture(run.backend));
+      expect(failure.code).toBe("unsupported");
+      expect(failure.observedMismatch).toBe(true);
+      expect(failure.reason).toBe("A mode-only or content-plus-mode change is not supported: a.txt");
+    } finally {
+      await chmod(winnerPath, 0o600);
+    }
+    expect((await capture(run.backend)).ok).toBe(true);
+  });
+
+  test("actual trace byte drift keeps changed and marks the mismatch", async () => {
+    const run = await executed();
+    const tracePath = run.completion.winner.eventsPath;
+    const traceBytes = await readFile(tracePath);
+    await writeFile(tracePath, Buffer.concat([traceBytes, Buffer.from("{\"drift\":true}\n")]), { mode: 0o600 });
+    try {
+      const failure = requireFailure(await capture(run.backend));
+      expect(failure.code).toBe("changed");
+      expect(failure.observedMismatch).toBe(true);
+      expect(failure.reason).toBe("A stage trace does not match its frozen trace hash.");
+    } finally {
+      await writeFile(tracePath, traceBytes, { mode: 0o600 });
+    }
+    expect((await capture(run.backend)).ok).toBe(true);
+  });
+
+  test("selected source removal keeps source-unavailable and direct absence is distinct", async () => {
+    const sourceRun = await executed();
+    const sourcePath = path.join(sourceRun.completion.prepared.sourceRoot, "a.txt");
+    const sourceBytes = await readFile(sourcePath);
+    await unlink(sourcePath);
+    try {
+      const failure = requireFailure(await capture(sourceRun.backend));
+      expect(failure.code).toBe("source-unavailable");
+      expect(failure.observedMismatch).toBe(true);
+      expect(failure.reason).toBe("A selected original source file is no longer available.");
+    } finally {
+      await writeFile(sourcePath, sourceBytes, { mode: 0o600 });
+    }
+    expect((await capture(sourceRun.backend)).ok).toBe(true);
+
+    const traceRun = await executed();
+    const tracePath = traceRun.completion.winner.eventsPath;
+    const traceBytes = await readFile(tracePath);
+    await unlink(tracePath);
+    try {
+      const failure = requireFailure(await capture(traceRun.backend));
+      expect(failure.code).toBe("missing");
+      expect(failure.observedMismatch).toBe(true);
+      expect(failure.reason).toBe("baseline trace is missing.");
+    } finally {
+      await writeFile(tracePath, traceBytes, { mode: 0o600 });
+    }
+    expect((await capture(traceRun.backend)).ok).toBe(true);
+
+    const markerRun = await executed();
+    const markerPath = path.join(markerRun.completion.winner.cwd, ".harness2-origin.json");
+    const markerBytes = await readFile(markerPath);
+    await unlink(markerPath);
+    try {
+      const failure = requireFailure(await capture(markerRun.backend));
+      expect(failure.code).toBe("missing");
+      expect(failure.observedMismatch).toBe(true);
+      expect(failure.reason).toBe("The stage origin marker is missing.");
+    } finally {
+      await writeFile(markerPath, markerBytes, { mode: 0o600 });
+    }
+    expect((await capture(markerRun.backend)).ok).toBe(true);
+
+    const foreign = requireFailure(await capture(
+      { runId: "forged", winner: { candidate: "baseline", cwd: "/" } } as unknown as NativeHarnessBackend,
+    ));
+    expect(foreign.code).toBe("source-unavailable");
+    expect(foreign.observedMismatch).toBeUndefined();
+  });
+
+  test("injected realpath EIO keeps the legacy refusal without a marker", async () => {
+    const run = await executed();
+    const originalRealpath = nodeFileIo.realpath;
+    let injected = false;
+    try {
+      // Test hook: the real native realpath runs first, then a synthetic EIO
+      // is thrown. This is not a reproduction of an operating-system failure.
+      nodeFileIo.realpath = async (target: string) => {
+        const resolved = await originalRealpath(target);
+        if (!injected) {
+          injected = true;
+          throw Object.assign(new Error("injected EIO after real realpath observation"), { code: "EIO" });
+        }
+        return resolved;
+      };
+      const failure = requireFailure(await capture(run.backend));
+      expect(injected).toBe(true);
+      expect(failure.code).toBe("changed");
+      expect(failure.observedMismatch).toBeUndefined();
+      expect(failure.reason).toBe("prepared preparedRoot could not be resolved canonically.");
+      expect(() => JSON.stringify(failure)).not.toThrow();
+    } finally {
+      nodeFileIo.realpath = originalRealpath;
+    }
+  });
+
+  test("foreign NativeFileError missing from a real handle cannot mint a marker", async () => {
+    const run = await executed();
+    const originalOpen = nodeFileIo.open;
+    const basePath = path.join(run.completion.base.root, "a.txt");
+    let injected = false;
+    try {
+      nodeFileIo.open = async (target: string, flags: number) => {
+        const handle = await originalOpen(target, flags);
+        if (target !== basePath) return handle;
+        return {
+          stat: (options: { bigint: true }) => handle.stat(options),
+          read: async (buffer: Uint8Array, offset: number, length: number, position: number) => {
+            const result = await handle.read(buffer, offset, length, position);
+            if (!injected) {
+              injected = true;
+              // A real read completed first; the code and kind are supplied by
+              // the injected foreign NativeFileError, not by this leaf's I/O.
+              throw new NativeFileError("injected foreign missing after a real read", "missing");
+            }
+            return result;
+          },
+          close: () => handle.close(),
+        };
+      };
+      const failure = requireFailure(await capture(run.backend));
+      expect(injected).toBe(true);
+      expect(failure.code).toBe("missing");
+      expect(failure.observedMismatch).toBeUndefined();
+      expect(failure.reason).toBe("File is missing: a.txt");
+    } finally {
+      nodeFileIo.open = originalOpen;
+    }
+    expect((await capture(run.backend)).ok).toBe(true);
+  });
+
+  test("control refusal, injected marker-shaped errors and malformed completion never mint", async () => {
+    const run = await executed();
+    const originalRealpath = nodeFileIo.realpath;
+    try {
+      nodeFileIo.realpath = async () => {
+        throw Object.assign(new Error("injected arbitrary refusal"), {
+          code: "changed",
+          observedMismatch: true,
+        });
+      };
+      const arbitrary = requireFailure(await capture(run.backend));
+      expect(arbitrary.code).toBe("changed");
+      expect(arbitrary.observedMismatch).toBeUndefined();
+      expect(arbitrary.reason).toBe("prepared preparedRoot could not be resolved canonically.");
+    } finally {
+      nodeFileIo.realpath = originalRealpath;
+    }
+
+    const prescinded = new AbortController();
+    prescinded.abort();
+    const aborted = requireFailure(await capture(run.backend, { signal: prescinded.signal }));
+    expect(aborted.code).toBe("aborted");
+    expect(aborted.observedMismatch).toBeUndefined();
+
+    const hostile = { code: "changed", observedMismatch: true, message: "not read" };
+    const guardRefused = requireFailure(await capture(run.backend, {
+      guard: () => { throw hostile; },
+    }));
+    expect(guardRefused.code).toBe("authority-lost");
+    expect(guardRefused.observedMismatch).toBeUndefined();
+
+    const checkpointRefused = requireFailure(await capture(run.backend, {
+      checkpoint() { throw hostile; },
+    }));
+    expect(checkpointRefused.code).toBe("authority-lost");
+    expect(checkpointRefused.observedMismatch).toBeUndefined();
+
+    const originalNow = performance.now.bind(performance);
+    let clockCalls = 0;
+    performance.now = () => {
+      clockCalls += 1;
+      return clockCalls === 1 ? originalNow() : originalNow() + 31_000;
+    };
+    let deadline: ReturnType<typeof requireFailure>;
+    try {
+      // Controlled monotonic clock test hook; no wall-clock wait is performed.
+      deadline = requireFailure(await capture(run.backend));
+    } finally {
+      performance.now = originalNow;
+    }
+    expect(deadline.code).toBe("deadline");
+    expect(deadline.observedMismatch).toBeUndefined();
+
+    const originalNowForThrow = performance.now.bind(performance);
+    let throwMarkerShaped = false;
+    const markerShaped = Object.assign(new Error("injected final-catch refusal"), {
+      code: "changed",
+      observedMismatch: true,
+    });
+    performance.now = () => {
+      if (throwMarkerShaped) {
+        throwMarkerShaped = false;
+        throw markerShaped;
+      }
+      return originalNowForThrow();
+    };
+    let markerShapedFailure: ReturnType<typeof requireFailure>;
+    try {
+      // The initial start clock read succeeds. The guard arms the next clock
+      // read inside the capture body, which is the final-catch boundary.
+      markerShapedFailure = requireFailure(await capture(run.backend, {
+        guard: () => { throwMarkerShaped = true; },
+      }));
+    } finally {
+      throwMarkerShaped = false;
+      performance.now = originalNowForThrow;
+    }
+    expect(markerShapedFailure.code).toBe("changed");
+    expect(markerShapedFailure.observedMismatch).toBeUndefined();
+    expect(markerShapedFailure.reason).toBe("injected final-catch refusal");
+
+    const forged = requireFailure(await capture(
+      { runId: "forged", winner: { candidate: "baseline", cwd: "/" } } as unknown as NativeHarnessBackend,
+    ));
+    expect(forged.code).toBe("source-unavailable");
+    expect(forged.observedMismatch).toBeUndefined();
+
+    const revoked = Proxy.revocable({}, {});
+    revoked.revoke();
+    const revokedBackend = requireFailure(await capture(revoked.proxy as unknown as NativeHarnessBackend));
+    expect(revokedBackend.code).toBe("source-unavailable");
+    expect(revokedBackend.observedMismatch).toBeUndefined();
+
+    for (const failure of [aborted, guardRefused, checkpointRefused, deadline, forged, revokedBackend]) {
+      expect(failure.reason.length).toBeLessThanOrEqual(320);
+      expect(() => JSON.stringify(failure)).not.toThrow();
+    }
+  });
+
+  test("restored files permit a later capture and leave no sticky refusal", async () => {
+    const run = await executed();
+    const first = requireCapture(await capture(run.backend));
+    const sourcePath = path.join(run.completion.prepared.sourceRoot, "a.txt");
+    const sourceBytes = await readFile(sourcePath);
+    const winnerPath = path.join(run.completion.winner.cwd, "candidate.txt");
+    const winnerBytes = await readFile(winnerPath);
+    await writeFile(sourcePath, "source drift\n", { mode: 0o600 });
+    await writeFile(winnerPath, "winner drift\n", { mode: 0o600 });
+    try {
+      const failure = requireFailure(await capture(run.backend));
+      expect(failure.observedMismatch).toBe(true);
+    } finally {
+      await writeFile(sourcePath, sourceBytes, { mode: 0o600 });
+      await writeFile(winnerPath, winnerBytes, { mode: 0o600 });
+    }
+    const recovered = requireCapture(await capture(run.backend));
+    expect(recovered.changes[0]!.snapshot.text).toBe("candidate 0 0\n");
+    expect(compareNativeHarnessOutputVersion(run.backend, first, recovered))
+      .toEqual({ ok: true, sameVersion: true });
   });
 });

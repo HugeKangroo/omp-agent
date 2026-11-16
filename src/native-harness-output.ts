@@ -80,7 +80,32 @@ export interface NativeHarnessOutputFailureResult {
   readonly ok: false;
   readonly code: NativeHarnessOutputFailure;
   readonly reason: string;
+  /**
+   * Positive evidence that a required observation differs from the frozen or
+   * previously issued facts. Absence means unavailable, uncertain, interrupted
+   * or unclassified; it never means equality.
+   */
+  readonly observedMismatch?: true;
 }
+
+/** Fixed section label for a failed comparison; never caller text. */
+export type NativeHarnessOutputVersionSection =
+  | "binding"
+  | "identity"
+  | "winner"
+  | "changes"
+  | "sources"
+  | "base"
+  | "stages"
+  | "digest";
+
+export type NativeHarnessOutputVersionComparison =
+  | { readonly ok: true; readonly sameVersion: true }
+  | {
+    readonly ok: false;
+    readonly code: "invalid-binding" | "version-mismatch";
+    readonly section: NativeHarnessOutputVersionSection;
+  };
 
 /** Fixed test-only checkpoint names. Production callers pass no ports. */
 export type NativeHarnessOutputCheckpointPoint =
@@ -227,14 +252,17 @@ const issuedOutputCaptures = new WeakMap<
   { readonly backend: unknown; readonly completion: NativeHarnessBackendCompletion }
 >();
 
+interface IssuedFailure {
+  readonly code: NativeHarnessOutputFailure;
+  readonly reason: string;
+  readonly observedMismatch?: true;
+}
+
 /**
  * Bounded failure records keyed by our own error objects. Normalizing here
  * avoids reading code/message/toString from an arbitrary thrown value.
  */
-const issuedFailures = new WeakMap<
-  OutputError,
-  { readonly code: NativeHarnessOutputFailure; readonly reason: string }
->();
+const issuedFailures = new WeakMap<OutputError, IssuedFailure>();
 
 const NATIVE_FILE_FAILURE_CODES = new Set([
   "invalid-path",
@@ -258,11 +286,33 @@ function boundedReason(value: string): string {
   return cleaned.length <= MAX_REASON_CHARS ? cleaned : cleaned.slice(0, MAX_REASON_CHARS);
 }
 
-function fail(code: NativeHarnessOutputFailure, reason: string): never {
+function fail(code: NativeHarnessOutputFailure, reason: string, observedMismatch?: true): never {
   const normalized = boundedReason(reason);
   const error = new OutputError(code, normalized);
-  issuedFailures.set(error, { code, reason: normalized });
+  issuedFailures.set(
+    error,
+    observedMismatch === true
+      ? { code, reason: normalized, observedMismatch: true }
+      : { code, reason: normalized },
+  );
   throw error;
+}
+
+/** Mark only a positively established inequality, shape or required absence. */
+function failObserved(code: NativeHarnessOutputFailure, reason: string): never {
+  return fail(code, reason, true);
+}
+
+/** Reads the marker only from this leaf's own issued failure entry. */
+function issuedObservedMismatch(error: unknown): true | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  return issuedFailures.get(error as OutputError)?.observedMismatch;
+}
+
+function failureResult(failure: IssuedFailure): NativeHarnessOutputFailureResult {
+  return failure.observedMismatch === true
+    ? { ok: false, code: failure.code, reason: failure.reason, observedMismatch: true }
+    : { ok: false, code: failure.code, reason: failure.reason };
 }
 
 function isErrno(error: unknown, code: string): boolean {
@@ -572,7 +622,7 @@ function createGuardedIo(ctx: Omit<Context, "io">): NativeFileIo {
       try {
         const opened = await handle.stat({ bigint: true });
         if (opened.isSymbolicLink() || !opened.isFile()) {
-          fail("unsupported", "An opened handle is not a regular non-link file.");
+          failObserved("unsupported", "An opened handle is not a regular non-link file.");
         }
         return {
           async stat(options: { bigint: true }): Promise<NativeFileStats> {
@@ -640,7 +690,7 @@ async function lstatOrFail(ctx: Context, absolute: string, label: string): Promi
     return await ctx.io.lstat(absolute, { bigint: true });
   } catch (error) {
     if (error instanceof OutputError) throw error;
-    if (isErrno(error, "ENOENT")) fail("missing", `${label} is missing.`);
+    if (isErrno(error, "ENOENT")) failObserved("missing", `${label} is missing.`);
     fail("io-failure", `${label} could not be inspected.`);
   }
 }
@@ -681,7 +731,7 @@ async function readDirectoryNames(ctx: Context, absolute: string, stage: string 
   try {
     directory = await opendir(absolute);
   } catch (error) {
-    if (isErrno(error, "ENOENT")) fail("missing", "A trusted directory disappeared.");
+    if (isErrno(error, "ENOENT")) failObserved("missing", "A trusted directory disappeared.");
     fail("io-failure", "A trusted directory could not be opened.");
   }
   // The protected cleanup lifetime starts before the checkpoint can throw.
@@ -733,8 +783,8 @@ async function observeTextFile(
 ): Promise<ObservedTextFile> {
   const absolute = path.join(root, ...relativePath.split("/"));
   const before = await lstatOrFail(ctx, absolute, `file ${relativePath}`);
-  if (before.isSymbolicLink()) fail("unsafe-path", `Symbolic links are not supported: ${relativePath}`);
-  if (!before.isFile()) fail("unsupported", `A special file is not supported: ${relativePath}`);
+  if (before.isSymbolicLink()) failObserved("unsafe-path", `Symbolic links are not supported: ${relativePath}`);
+  if (!before.isFile()) failObserved("unsupported", `A special file is not supported: ${relativePath}`);
   const beforeSignature = signatureOf(before);
   assertOrdinaryMode(beforeSignature, relativePath);
   if (before.size > BigInt(NATIVE_HARNESS_OUTPUT_LIMITS.maxStageFileBytes)) {
@@ -766,7 +816,7 @@ async function observeTextFile(
   await runCheckpoint(ctx, "after-text-read", stage, relativePath, snapshot.file.bytes);
   const after = await lstatOrFail(ctx, absolute, `file ${relativePath}`);
   if (after.isSymbolicLink() || !after.isFile() || !sameFileSignature(beforeSignature, signatureOf(after))) {
-    fail("changed", `File identity or mode changed during capture: ${relativePath}`);
+    failObserved("changed", `File identity or mode changed during capture: ${relativePath}`);
   }
   if (snapshot.file.relativePath !== relativePath) {
     fail("changed", `Issued snapshot path differs from the observed path: ${relativePath}`);
@@ -806,7 +856,7 @@ async function inventoryTree(ctx: Context, options: TreeOptions): Promise<TreeOb
       }
       const absolute = path.join(options.root, ...relativePath.split("/"));
       const info = await lstatOrFail(ctx, absolute, `tree entry ${relativePath}`);
-      if (info.isSymbolicLink()) fail("unsafe-path", `Symbolic links are not supported: ${relativePath}`);
+      if (info.isSymbolicLink()) failObserved("unsafe-path", `Symbolic links are not supported: ${relativePath}`);
       const signature = signatureOf(info);
 
       if (info.isDirectory()) {
@@ -822,7 +872,7 @@ async function inventoryTree(ctx: Context, options: TreeOptions): Promise<TreeOb
       }
 
       if (!info.isFile()) {
-        fail("unsupported", `A special file is not supported: ${relativePath}`);
+        failObserved("unsupported", `A special file is not supported: ${relativePath}`);
       }
 
       const markerName = name.toLowerCase() === ORIGIN_MARKER;
@@ -847,11 +897,11 @@ async function inventoryTree(ctx: Context, options: TreeOptions): Promise<TreeOb
           }
           await runCheckpoint(ctx, "after-text-read", options.stage?.candidate ?? null, relativePath, snapshot.file.bytes);
           if (snapshot.text !== options.expectedMarkerBytes) {
-            fail("changed", "The origin marker bytes do not match the fixed materialized marker.");
+            failObserved("changed", "The origin marker bytes do not match the fixed materialized marker.");
           }
           const after = await lstatOrFail(ctx, absolute, "origin marker");
           if (!after.isFile() || after.isSymbolicLink() || !sameFileSignature(signature, signatureOf(after))) {
-            fail("changed", "The origin marker changed during capture.");
+            failObserved("changed", "The origin marker changed during capture.");
           }
         }
         markerSignature = signature;
@@ -994,12 +1044,16 @@ async function observeSources(
       observed = await observeTextFile(ctx, sourceRoot, input.relativePath, null, true);
     } catch (error) {
       if (error instanceof OutputError && error.code === "missing") {
-        fail("source-unavailable", "A selected original source file is no longer available.");
+        fail(
+          "source-unavailable",
+          "A selected original source file is no longer available.",
+          issuedObservedMismatch(error),
+        );
       }
       throw error;
     }
     if (observed.snapshot.file.bytes !== input.bytes || observed.snapshot.file.sha256 !== input.sha256) {
-      fail("changed", "A selected original source file no longer matches the frozen input manifest.");
+      failObserved("changed", "A selected original source file no longer matches the frozen input manifest.");
     }
     total += input.bytes;
     if (total > NATIVE_HARNESS_OUTPUT_LIMITS.maxSourceTotalBytes) {
@@ -1049,7 +1103,7 @@ async function observeBase(
   });
   if (!sameDirectoryIdentity(identity, tree.identity)) fail("changed", "The base snapshot root changed during inventory.");
   if (tree.fileCount !== declared.entries.size || tree.files.size !== declared.entries.size) {
-    fail("unsupported", "The base snapshot regular files do not exactly match the frozen base manifest.");
+    failObserved("unsupported", "The base snapshot regular files do not exactly match the frozen base manifest.");
   }
   const observedPaths = [...tree.files.keys()].sort(comparePaths);
   const declaredPaths = [...declared.entries.keys()].sort(comparePaths);
@@ -1058,7 +1112,7 @@ async function observeBase(
   }
   for (let index = 0; index < observedPaths.length; index += 1) {
     if (observedPaths[index] !== declaredPaths[index]) {
-      fail("unsupported", "The base snapshot regular files do not exactly match the frozen base manifest.");
+      failObserved("unsupported", "The base snapshot regular files do not exactly match the frozen base manifest.");
     }
   }
   for (const [relativePath, file] of tree.files) {
@@ -1076,7 +1130,7 @@ async function observeBase(
       || signature.mode !== entry.mode
       || file.controllerHash !== entry.hash
     ) {
-      fail("changed", "A base snapshot input does not match the frozen manifests.");
+      failObserved("changed", "A base snapshot input does not match the frozen manifests.");
     }
   }
   return tree;
@@ -1111,7 +1165,7 @@ function stageChanges(
     }
     if (before === undefined || after === undefined) continue;
     if (before.mode !== after.signature.mode) {
-      fail("unsupported", `A mode-only or content-plus-mode change is not supported: ${relativePath}`);
+      failObserved("unsupported", `A mode-only or content-plus-mode change is not supported: ${relativePath}`);
     }
     if (before.hash === after.controllerHash) continue;
     changes.push({
@@ -1216,12 +1270,12 @@ async function observeStages(
       maxTotalBytes: NATIVE_HARNESS_OUTPUT_LIMITS.maxStageTotalBytes,
       readFiles: true,
     });
-    if (tree.markerSignature === null) fail("missing", "The stage origin marker is missing.");
+    if (tree.markerSignature === null) failObserved("missing", "The stage origin marker is missing.");
     if (!sameDirectoryIdentity(stageIdentity, tree.identity)) fail("changed", "A stage root changed during inventory.");
     const changes = stageChanges(base, tree.files);
     const manifestDigest = sha256Hex(JSON.stringify(changes));
     if (manifestDigest !== selection.artifactHash) {
-      fail("changed", "A stage change manifest does not match its frozen artifact hash.");
+      failObserved("changed", "A stage change manifest does not match its frozen artifact hash.");
     }
     const trace = await observeTrace(ctx, selection, artifactDir, eventsPath, tracePass);
     observations.push({ selection, tree, changes, trace });
@@ -1254,7 +1308,7 @@ async function observeTrace(
       handle = await ctx.io.open(eventsPath, ctx.io.O_RDONLY | ctx.io.O_NOFOLLOW | O_NONBLOCK);
     } catch (error) {
       if (error instanceof OutputError) throw error;
-      if (isErrno(error, "ENOENT")) fail("missing", "A stage trace disappeared.");
+      if (isErrno(error, "ENOENT")) failObserved("missing", "A stage trace disappeared.");
       if (isErrno(error, "ELOOP")) fail("unsafe-path", "A stage trace is a symbolic link.");
       fail("io-failure", "A stage trace could not be opened.");
     }
@@ -1268,7 +1322,7 @@ async function observeTrace(
       fail("io-failure", "A stage trace handle could not be inspected.");
     }
     if (!opened.isFile() || !sameFileSignature(beforeSignature, signatureOf(opened))) {
-      fail("changed", "A stage trace changed before it was read.");
+      failObserved("changed", "A stage trace changed before it was read.");
     }
     await runCheckpoint(ctx, "after-trace-open", selection.candidate, path.basename(eventsPath), Number(opened.size));
     const size = Number(opened.size);
@@ -1288,12 +1342,12 @@ async function observeTrace(
         if (error instanceof OutputError) throw error;
         fail("io-failure", "A stage trace could not be read.");
       }
-      if (result.bytesRead <= 0) fail("changed", "A stage trace ended before its observed size.");
+      if (result.bytesRead <= 0) failObserved("changed", "A stage trace ended before its observed size.");
       hash.update(buffer.subarray(0, result.bytesRead));
       position += result.bytesRead;
       assertAuthority(ctx);
     }
-    if (position !== size) fail("changed", "A stage trace did not read its observed size.");
+    if (position !== size) failObserved("changed", "A stage trace did not read its observed size.");
     let after: NativeFileStats;
     try {
       after = await handle.stat({ bigint: true });
@@ -1302,7 +1356,7 @@ async function observeTrace(
       fail("io-failure", "A stage trace handle could not be rechecked.");
     }
     if (!sameFileSignature(signatureOf(opened), signatureOf(after))) {
-      fail("changed", "A stage trace changed while it was being read.");
+      failObserved("changed", "A stage trace changed while it was being read.");
     }
     pass.totalBytes += size;
     await runCheckpoint(ctx, "after-trace-read", selection.candidate, path.basename(eventsPath), size);
@@ -1312,7 +1366,7 @@ async function observeTrace(
       || !finalizedAtPath.isFile()
       || !sameFileSignature(signatureOf(opened), signatureOf(finalizedAtPath))
     ) {
-      fail("changed", "A stage trace path changed after it was read.");
+      failObserved("changed", "A stage trace path changed after it was read.");
     }
     const artifactIdentity = ctx.directories.get(artifactDir);
     if (artifactIdentity === undefined) fail("io-failure", "The stage artifact directory was not observed.");
@@ -1326,7 +1380,7 @@ async function observeTrace(
     }
     const digest = hash.digest("hex");
     if (digest !== selection.traceHash) {
-      fail("changed", "A stage trace does not match its frozen trace hash.");
+      failObserved("changed", "A stage trace does not match its frozen trace hash.");
     }
     return {
       candidate: selection.candidate,
@@ -1361,7 +1415,7 @@ async function recheckSources(
       || again.snapshot.file.sha256 !== observation.fact.sha256
       || !sameFileSignature(observation.signature, again.signature)
     ) {
-      fail("changed", "An original source file changed during capture.");
+      failObserved("changed", "An original source file changed during capture.");
     }
   }
 }
@@ -1369,7 +1423,7 @@ async function recheckSources(
 async function recheckTree(ctx: Context, tree: TreeObservation, options: Omit<TreeOptions, "readFiles">): Promise<void> {
   const again = await inventoryTree(ctx, { ...options, readFiles: false });
   if (!sameTree(tree, again)) {
-    fail("changed", "A captured private tree changed during capture.");
+    failObserved("changed", "A captured private tree changed during capture.");
   }
 }
 
@@ -1382,7 +1436,7 @@ async function recheckTraceObservations(
     const again = await observeTrace(ctx, stage.selection, stage.trace.artifactDir, stage.trace.eventsPath, pass);
     if (again.bytes !== stage.trace.bytes || again.sha256 !== stage.trace.sha256
       || !sameFileSignature(stage.trace.signature, again.signature)) {
-      fail("changed", "A stage trace changed during capture.");
+      failObserved("changed", "A stage trace changed during capture.");
     }
   }
 }
@@ -1511,7 +1565,7 @@ function buildCapture(
 
   for (const stage of stageFacts) {
     if (stage.changeManifestSha256 !== stage.artifactHash) {
-      fail("changed", "A stage change manifest changed before capture issue.");
+      failObserved("changed", "A stage change manifest changed before capture issue.");
     }
   }
 
@@ -1720,13 +1774,13 @@ export async function captureNativeHarnessOutput(
     if (controlFailure.value !== null) {
       const failure = issuedFailures.get(controlFailure.value);
       if (failure !== undefined) {
-        return { ok: false, code: failure.code, reason: failure.reason };
+        return failureResult(failure);
       }
     }
     if (typeof error === "object" && error !== null) {
       const failure = issuedFailures.get(error as OutputError);
       if (failure !== undefined) {
-        return { ok: false, code: failure.code, reason: failure.reason };
+        return failureResult(failure);
       }
     }
     const nativeCode = readOwnString(error, "code");
@@ -1770,4 +1824,195 @@ export function matchesNativeHarnessOutputCapture(backend: unknown, capture: unk
   if (issued === undefined) return false;
   if (issued.backend !== backend) return false;
   return matchesNativeHarnessBackendCompletion(backend, issued.completion);
+}
+
+const SAME_ISSUED_VERSION: NativeHarnessOutputVersionComparison = Object.freeze({
+  ok: true as const,
+  sameVersion: true as const,
+});
+
+function invalidBinding(section: NativeHarnessOutputVersionSection): NativeHarnessOutputVersionComparison {
+  return Object.freeze({ ok: false as const, code: "invalid-binding" as const, section });
+}
+
+function versionMismatch(section: NativeHarnessOutputVersionSection): NativeHarnessOutputVersionComparison {
+  return Object.freeze({ ok: false as const, code: "version-mismatch" as const, section });
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+function hasIssuedCaptureShape(value: NativeHarnessOutputCapture): boolean {
+  return value.schema === NATIVE_HARNESS_OUTPUT_SCHEMA
+    && value.originKind === NATIVE_HARNESS_OUTPUT_ORIGIN
+    && isRecord(value.winner)
+    && Array.isArray(value.changes)
+    && Array.isArray(value.sources)
+    && Array.isArray(value.baseInputs)
+    && Array.isArray(value.stages);
+}
+
+/**
+ * Compares two captures that this module genuinely issued for the same exact
+ * backend and original completion object. Authentication happens before any
+ * capture field is read. The result is a fixed section label only; this
+ * performs no I/O, callback, clock, coercion, deep copy or freshness check and
+ * deliberately ignores capture IDs, file-snapshot IDs and observation
+ * timestamps. Equality of two historical observations does not establish when
+ * the second was obtained, later stability, current native work or acceptance.
+ */
+export function compareNativeHarnessOutputVersion(
+  backend: unknown,
+  original: unknown,
+  reread: unknown,
+): NativeHarnessOutputVersionComparison {
+  if (typeof backend !== "object" || backend === null) return invalidBinding("binding");
+  if (typeof original !== "object" || original === null) return invalidBinding("binding");
+  if (typeof reread !== "object" || reread === null) return invalidBinding("binding");
+  const originalEntry = issuedOutputCaptures.get(original as NativeHarnessOutputCapture);
+  const rereadEntry = issuedOutputCaptures.get(reread as NativeHarnessOutputCapture);
+  if (originalEntry === undefined || rereadEntry === undefined) return invalidBinding("binding");
+  if (original === reread) return invalidBinding("binding");
+  if (originalEntry.backend !== backend || rereadEntry.backend !== backend) return invalidBinding("binding");
+  if (originalEntry.completion !== rereadEntry.completion) return invalidBinding("binding");
+  if (!matchesNativeHarnessBackendCompletion(backend, originalEntry.completion)) {
+    return invalidBinding("binding");
+  }
+
+  const left = original as NativeHarnessOutputCapture;
+  const right = reread as NativeHarnessOutputCapture;
+  if (!hasIssuedCaptureShape(left) || !hasIssuedCaptureShape(right)) return invalidBinding("binding");
+
+  if (
+    left.schema !== right.schema
+    || left.originKind !== right.originKind
+    || left.completionId !== right.completionId
+    || left.sourceId !== right.sourceId
+    || left.runId !== right.runId
+    || left.taskSha256 !== right.taskSha256
+    || left.baseSnapshotId !== right.baseSnapshotId
+    || left.manifestSha256 !== right.manifestSha256
+  ) {
+    return versionMismatch("identity");
+  }
+
+  const leftWinner = left.winner;
+  const rightWinner = right.winner;
+  if (!isRecord(leftWinner) || !isRecord(rightWinner)) return invalidBinding("winner");
+  if (
+    leftWinner.candidate !== rightWinner.candidate
+    || leftWinner.attempt !== rightWinner.attempt
+    || leftWinner.artifactHash !== rightWinner.artifactHash
+    || leftWinner.traceHash !== rightWinner.traceHash
+  ) {
+    return versionMismatch("winner");
+  }
+
+  if (left.changes.length !== right.changes.length) return versionMismatch("changes");
+  for (let index = 0; index < left.changes.length; index += 1) {
+    const leftChange = left.changes[index];
+    const rightChange = right.changes[index];
+    if (
+      leftChange === undefined
+      || rightChange === undefined
+      || !isRecord(leftChange.snapshot)
+      || !isRecord(rightChange.snapshot)
+      || !isRecord(leftChange.snapshot.file)
+      || !isRecord(rightChange.snapshot.file)
+    ) {
+      return invalidBinding("changes");
+    }
+    if (
+      leftChange.path !== rightChange.path
+      || leftChange.kind !== rightChange.kind
+      || leftChange.mode !== rightChange.mode
+      || leftChange.controllerHash !== rightChange.controllerHash
+      || leftChange.snapshot.file.relativePath !== rightChange.snapshot.file.relativePath
+      || leftChange.snapshot.file.bytes !== rightChange.snapshot.file.bytes
+      || leftChange.snapshot.file.sha256 !== rightChange.snapshot.file.sha256
+      || leftChange.snapshot.text !== rightChange.snapshot.text
+    ) {
+      return versionMismatch("changes");
+    }
+  }
+
+  if (left.sources.length !== right.sources.length) return versionMismatch("sources");
+  for (let index = 0; index < left.sources.length; index += 1) {
+    const leftSource = left.sources[index];
+    const rightSource = right.sources[index];
+    if (leftSource === undefined || rightSource === undefined || !isRecord(leftSource) || !isRecord(rightSource)) {
+      return invalidBinding("sources");
+    }
+    if (
+      leftSource.relativePath !== rightSource.relativePath
+      || leftSource.bytes !== rightSource.bytes
+      || leftSource.sha256 !== rightSource.sha256
+    ) {
+      return versionMismatch("sources");
+    }
+  }
+
+  if (left.baseInputs.length !== right.baseInputs.length) return versionMismatch("base");
+  for (let index = 0; index < left.baseInputs.length; index += 1) {
+    const leftBase = left.baseInputs[index];
+    const rightBase = right.baseInputs[index];
+    if (leftBase === undefined || rightBase === undefined || !isRecord(leftBase) || !isRecord(rightBase)) {
+      return invalidBinding("base");
+    }
+    if (
+      leftBase.relativePath !== rightBase.relativePath
+      || leftBase.bytes !== rightBase.bytes
+      || leftBase.sha256 !== rightBase.sha256
+      || leftBase.mode !== rightBase.mode
+      || leftBase.controllerHash !== rightBase.controllerHash
+    ) {
+      return versionMismatch("base");
+    }
+  }
+
+  if (left.stages.length !== right.stages.length) return versionMismatch("stages");
+  for (let index = 0; index < left.stages.length; index += 1) {
+    const leftStage = left.stages[index];
+    const rightStage = right.stages[index];
+    if (
+      leftStage === undefined
+      || rightStage === undefined
+      || !isRecord(leftStage)
+      || !isRecord(rightStage)
+      || !isRecord(leftStage.trace)
+      || !isRecord(rightStage.trace)
+    ) {
+      return invalidBinding("stages");
+    }
+    if (
+      leftStage.candidate !== rightStage.candidate
+      || leftStage.attempt !== rightStage.attempt
+      || leftStage.artifactHash !== rightStage.artifactHash
+      || leftStage.changeManifestSha256 !== rightStage.changeManifestSha256
+      || leftStage.changeCount !== rightStage.changeCount
+      || leftStage.ordinaryFileCount !== rightStage.ordinaryFileCount
+      || leftStage.directoryCount !== rightStage.directoryCount
+      || leftStage.trace.bytes !== rightStage.trace.bytes
+      || leftStage.trace.sha256 !== rightStage.trace.sha256
+    ) {
+      return versionMismatch("stages");
+    }
+  }
+
+  if (left.digest !== right.digest) return versionMismatch("digest");
+
+  // Repeat the pure binding check after comparison: no capture field is read
+  // through an unauthenticated object and no await can interleave here.
+  if (
+    issuedOutputCaptures.get(original as NativeHarnessOutputCapture) !== originalEntry
+    || issuedOutputCaptures.get(reread as NativeHarnessOutputCapture) !== rereadEntry
+    || originalEntry.backend !== backend
+    || rereadEntry.backend !== backend
+    || originalEntry.completion !== rereadEntry.completion
+    || !matchesNativeHarnessBackendCompletion(backend, originalEntry.completion)
+  ) {
+    return invalidBinding("binding");
+  }
+  return SAME_ISSUED_VERSION;
 }
