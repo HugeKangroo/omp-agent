@@ -31,6 +31,7 @@ import {
   captureNativeHarnessOutput,
   matchesNativeHarnessOutputCapture,
   type NativeHarnessOutputCapture,
+  type NativeHarnessOutputCaptureResult,
 } from "../../src/native-harness-output.ts";
 import {
   createNativeHarnessBackend,
@@ -2158,6 +2159,100 @@ describe("native Harness2 host-only delegation", () => {
     expect(h.coordinator.inspect().output.reservedBytes).toBe(0);
     expect(h.coordinator.inspect().output.retainedCaptures).toBe(0);
     expect(h.coordinator.inspect().operations[0]!.output.state).toBe("failed");
+  });
+
+  test("legacy capture accepts observedMismatch only on genuine known failures", async () => {
+    const knownReason = "the observed source result changed";
+    const captureLeaf = async (
+      leafFor: (f: Fixture) => unknown | Promise<unknown>,
+    ): Promise<NativeHarnessOutputSelection> => {
+      const f = await preparedFixture();
+      const h = setup(f, {
+        output: {
+          async capture() {
+            return await leafFor(f) as NativeHarnessOutputCaptureResult;
+          },
+          matches() {
+            return true;
+          },
+          revalidateOwner() {
+            return null;
+          },
+        },
+      });
+      const signal = new AbortController().signal;
+      const result = await settle(h.coordinator.invoke("call-1", { task: WORK_TASK }, signal));
+      const wire = projectionFor(result);
+      expect(h.coordinator.registerToolResultProjection("call-1", result, wire, signal).ok).toBe(true);
+      await emitResult(f, "call-1", wire);
+      const selection = await settle(h.coordinator.captureOutput("call-1", new AbortController().signal));
+      const snapshot = h.coordinator.inspect();
+      expect(snapshot.output.reservedBytes).toBe(0);
+      expect(snapshot.output.active).toBe(false);
+      expect(snapshot.output.retainedCaptures).toBe(0);
+      expect(snapshot.operations[0]!.output.state).toBe("failed");
+      expect(snapshot.lifetime.budgetBlocked).toBe(false);
+      return selection;
+    };
+
+    for (const code of ["changed", "missing", "source-unavailable"] as const) {
+      for (const marked of [false, true]) {
+        const selection = await captureLeaf(() => ({
+          ok: false as const,
+          code,
+          reason: knownReason,
+          ...(marked ? { observedMismatch: true as const } : {}),
+        }));
+        expect(selection.ok).toBe(false);
+        if (!selection.ok) {
+          expect(selection.code).toBe("source-conflict");
+          expect(selection.reason).toBe(knownReason);
+        }
+      }
+    }
+
+    const malformed = [
+      { ok: false as const, code: "changed" as const, reason: knownReason, observedMismatch: false },
+      { ok: false as const, code: "changed" as const, reason: knownReason, observedMismatch: undefined },
+      { ok: false as const, code: "changed" as const, reason: knownReason, observedMismatch: "true" },
+      { ok: false as const, code: "changed" as const, reason: knownReason, unknownField: true },
+    ];
+    for (const leaf of malformed) {
+      const selection = await captureLeaf(() => leaf);
+      expect(selection.ok).toBe(false);
+      if (!selection.ok) expect(selection.code).toBe("capture-failed");
+    }
+    const symbolLeaf = { ok: false as const, code: "changed" as const, reason: knownReason };
+    Object.defineProperty(symbolLeaf, Symbol("extra"), { value: true, enumerable: true });
+    const symbolSelection = await captureLeaf(() => symbolLeaf);
+    expect(symbolSelection.ok).toBe(false);
+    if (!symbolSelection.ok) expect(symbolSelection.code).toBe("capture-failed");
+
+    const markerOnSuccess = await captureLeaf(async (f) => {
+      await writeFile(path.join(f.workspace, "tiny.txt"), "x", { mode: 0o600 });
+      const snapshot = await captureWorkspaceText(f.workspace, "tiny.txt");
+      return {
+        ok: true as const,
+        capture: syntheticCapture(snapshot, 1, WORK_TASK),
+        observedMismatch: true as const,
+      };
+    });
+    expect(markerOnSuccess.ok).toBe(false);
+    if (!markerOnSuccess.ok) expect(markerOnSuccess.code).toBe("capture-failed");
+
+    let accessorCalls = 0;
+    const accessorLeaf = { ok: false as const, code: "changed" as const, reason: knownReason };
+    Object.defineProperty(accessorLeaf, "observedMismatch", {
+      enumerable: true,
+      get() {
+        accessorCalls += 1;
+        return true;
+      },
+    });
+    const accessorRefused = await captureLeaf(() => accessorLeaf);
+    expect(accessorRefused.ok).toBe(false);
+    if (!accessorRefused.ok) expect(accessorRefused.code).toBe("capture-failed");
+    expect(accessorCalls).toBe(0);
   });
 
   test("actual native controls, backend, runner and output leaf register and capture once", async () => {

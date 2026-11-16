@@ -10,14 +10,34 @@ import type {
 import type {
   NativeHarnessOutputCapture,
   NativeHarnessOutputCaptureResult,
+  NativeHarnessOutputRecord,
 } from "./native-harness-output.ts";
-import { deepFreeze, isNativeWorkspaceTextSnapshot, type NativeWorkspaceTextSnapshot } from "./native-work.ts";
+import {
+  NATIVE_WORK_TOOL,
+  deepFreeze,
+  isNativeWorkspaceTextSnapshot,
+  type NativeWorkspaceTextSnapshot,
+} from "./native-work.ts";
+import {
+  NATIVE_HARNESS_REPORT_MAX_SELECTED_CHECKS,
+  createNativeHarnessReportFailure,
+  createNativeHarnessReportFacts,
+  normalizeNativeHarnessReportRequest,
+  type NativeHarnessReportBindingFailure,
+  type NativeHarnessReportBindingFacts,
+  type NativeHarnessReportBindingPreparation,
+  type NativeHarnessReportBindingResult,
+  type NativeHarnessReportFailureCode,
+  type NativeHarnessReportFileFacts,
+  type NativeHarnessReportNormalizedRequest,
+} from "./native-harness-report.ts";
 import {
   NATIVE_HARNESS_MAX_CHECK_ACTIONS,
   NATIVE_HARNESS_MAX_CHECK_CONDITIONS,
   NATIVE_HARNESS_MAX_CHECK_METADATA_BYTES,
   NATIVE_HARNESS_MAX_CHECK_PATHS,
   NATIVE_HARNESS_MAX_CHECK_PATH_CHARS,
+  NATIVE_HARNESS_CHECK_PLAN_SOURCE,
   NATIVE_HARNESS_RESULT_TOOL,
   createNativeHarnessCheckActionRecord,
   createNativeHarnessCheckFailure,
@@ -39,12 +59,18 @@ import {
   type NativeHarnessCheckFailureCode,
   type NativeHarnessCheckInput,
   type NativeHarnessCheckOutcome,
+  type NativeHarnessCheckPathRecord,
   type NativeHarnessCheckRetainedActionRecord,
   type NativeHarnessCheckState,
 } from "./native-harness-checks.ts";
 import { fingerprintNativeJson } from "./native-instance-result.ts";
 import { fingerprintExpectedCallResult } from "./native-result-expectation.ts";
-import { runNativeTextChecks } from "./native-snapshot-checker.ts";
+import {
+  NATIVE_TEXT_CHECKER_ID,
+  NATIVE_TEXT_CHECKER_VERSION,
+  matchesNativeTextCheckReceipt,
+  runNativeTextChecks,
+} from "./native-snapshot-checker.ts";
 import type {
   Runner,
   WorkerRequest,
@@ -490,6 +516,14 @@ export interface NativeHarnessDelegationCoordinator {
     actualSignal: unknown,
   ): NativeHarnessCheckOutcome;
   /**
+   * Host-only read-only preparation of one typed report binding. It
+   * authenticates the issued report reference, binds the original captured
+   * source and selected retained checks, and returns frozen allowlisted facts
+   * with synchronous refresh and pure revalidation. It never reads files,
+   * runs checks, captures output, starts workers or publishes a report.
+   */
+  prepareReport(request: unknown, actualSignal: unknown): NativeHarnessReportBindingResult;
+  /**
    * Host-only registration of the exact check response's frozen input and
    * projected tool wire on the retained action reference.
    */
@@ -690,6 +724,7 @@ interface CoordinatorState {
   outputActive: Slot | null;
   outputJoinValidating: boolean;
   outputObservationInProgress: boolean;
+  reportBindingInProgress: boolean;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -2040,8 +2075,12 @@ function readCapturedOutput(
   registration: OutputRegistration,
 ): { readonly ok: true; readonly capture: NativeHarnessOutputCapture; readonly bytes: number }
   | NativeHarnessOutputSelectionFailure {
-  const fields = readStrictFields(value, ["ok", "capture", "code", "reason"], ["ok"]);
+  const fields = readStrictFields(value, ["ok", "capture", "code", "reason", "observedMismatch"], ["ok"]);
   if (fields === null) {
+    return outputFailure("capture-failed", "the trusted output capture returned an unreadable result");
+  }
+  if (fields.has("observedMismatch")
+    && (fields.get("observedMismatch") !== true || fields.get("ok") !== false)) {
     return outputFailure("capture-failed", "the trusted output capture returned an unreadable result");
   }
   if (fields.get("ok") !== true) {
@@ -3316,6 +3355,1050 @@ function finalCheckGate(
     return createNativeHarnessCheckFailure("source-conflict", "the retained source capture changed during the check");
   }
   return null;
+}
+
+type ReportRegistration = { readonly sha256: string; readonly bytes: number };
+
+interface ReportFileBinding {
+  readonly path: string;
+  readonly change: NativeHarnessOutputRecord;
+  readonly kind: "add" | "modify";
+  readonly mode: number;
+  readonly controllerHash: string;
+  readonly fileSnapshotId: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly observedAt: number;
+  record: NativeHarnessCheckRetainedActionRecord | null;
+  pathRecord: NativeHarnessCheckPathRecord | null;
+  registration: ReportRegistration | null;
+}
+
+interface ReportBindingCandidate {
+  readonly slot: Slot;
+  readonly capture: NativeHarnessOutputCapture;
+  readonly outputSelection: NativeHarnessOutputSelectionSuccess;
+  readonly registration: OutputRegistration;
+  readonly checks: NativeHarnessCheckState | null;
+  readonly files: readonly ReportFileBinding[];
+  readonly observedSha256: string;
+  readonly observedBytes: number;
+}
+
+interface ReportBindingRevision {
+  readonly source: PreparedCheckSource;
+  readonly report: ReadyCallCheck;
+  readonly reportInspection: NativeWorkCallInspection;
+  readonly reportAssociation: ActionAssociation;
+  readonly selected: readonly {
+    readonly record: NativeHarnessCheckRetainedActionRecord;
+    readonly action: PreparedCheckAction;
+  }[];
+}
+
+interface ReportBindingState {
+  readonly slot: Slot;
+  readonly sourceId: string;
+  readonly reportId: string;
+  readonly reportRef: object;
+  readonly reportAssociation: ActionAssociation;
+  readonly reportInputSha256: string;
+  /** The exact brand-checked actual report signal, never a source/check signal. */
+  readonly reportSignal: unknown;
+  readonly request: NativeHarnessReportNormalizedRequest;
+  readonly capture: NativeHarnessOutputCapture;
+  readonly outputSelection: NativeHarnessOutputSelectionSuccess;
+  readonly registration: OutputRegistration;
+  readonly checks: NativeHarnessCheckState | null;
+  readonly files: readonly ReportFileBinding[];
+  readonly observedSha256: string;
+  readonly observedBytes: number;
+  readonly facts: NativeHarnessReportBindingFacts;
+  revision: ReportBindingRevision;
+}
+
+function isReportFailure(value: unknown): value is NativeHarnessReportBindingFailure {
+  return typeof value === "object"
+    && value !== null
+    && (value as { readonly ok?: unknown }).ok === false;
+}
+
+function reportFailureFromCheckFailure(
+  failure: NativeHarnessCheckFailure,
+): NativeHarnessReportBindingFailure {
+  const code: NativeHarnessReportFailureCode = failure.code === "source-conflict"
+      || failure.code === "protocol"
+    ? "source-conflict"
+    : failure.code === "invalid-caller"
+      ? "invalid-caller"
+      : failure.code === "authority-lost"
+          || failure.code === "cancelled"
+          || failure.code === "deadline"
+        ? "authority-lost"
+        : "not-ready";
+  return createNativeHarnessReportFailure(code, failure.reason);
+}
+
+function sameReportWorkIdentity(
+  left: {
+    readonly observationId: string;
+    readonly generation: number;
+    readonly sessionId: string;
+    readonly workspaceRoot: string;
+  },
+  right: {
+    readonly observationId: string;
+    readonly generation: number;
+    readonly sessionId: string;
+    readonly workspaceRoot: string;
+  },
+): boolean {
+  return left.observationId === right.observationId
+    && left.generation === right.generation
+    && left.sessionId === right.sessionId
+    && left.workspaceRoot === right.workspaceRoot;
+}
+
+/**
+ * Descriptor-only read of the already-authenticated issued report reference.
+ * It never invokes a getter; a missing/accessor field refuses.
+ */
+function readReportRefAssociation(ref: object): ActionAssociation | null {
+  const observationId = readOwnField(ref, "observationId");
+  const generation = readOwnField(ref, "generation");
+  const sessionId = readOwnField(ref, "sessionId");
+  const workspaceRoot = readOwnField(ref, "workspaceRoot");
+  const toolCallId = readOwnField(ref, "toolCallId");
+  const toolName = readOwnField(ref, "toolName");
+  if (observationId.kind !== "data"
+    || generation.kind !== "data"
+    || sessionId.kind !== "data"
+    || workspaceRoot.kind !== "data"
+    || toolCallId.kind !== "data"
+    || toolName.kind !== "data") {
+    return null;
+  }
+  const observedId = boundedString(observationId.value, MAX_TOOL_CALL_ID_CHARS);
+  const observedGeneration = generation.value;
+  const observedSession = boundedString(sessionId.value, 4096);
+  const observedRoot = boundedString(workspaceRoot.value, 4096);
+  const observedCall = boundedString(toolCallId.value, MAX_TOOL_CALL_ID_CHARS);
+  const observedTool = boundedString(toolName.value, MAX_TOOL_CALL_ID_CHARS);
+  if (observedId === null
+    || typeof observedGeneration !== "number"
+    || !Number.isSafeInteger(observedGeneration)
+    || observedGeneration < 1
+    || observedSession === null
+    || observedRoot === null
+    || observedCall === null
+    || observedTool === null) {
+    return null;
+  }
+  return {
+    observationId: observedId,
+    generation: observedGeneration,
+    sessionId: observedSession,
+    workspaceRoot: observedRoot,
+    toolCallId: observedCall,
+    toolName: observedTool,
+  };
+}
+
+function reportInspectionProblem(
+  state: CoordinatorState,
+  inspection: NativeWorkCallInspection,
+  request: NativeHarnessReportNormalizedRequest,
+  supplied: ActionAssociation,
+): NativeHarnessReportBindingFailure | null {
+  if (inspection.state !== "current" || inspection.evidenceState !== "available") {
+    return createNativeHarnessReportFailure("authority-lost", nativeInspectionReason(inspection));
+  }
+  if (!isRecord(inspection.association) || !sameActionAssociation(inspection.association, supplied)) {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      "the report reference native association changed",
+    );
+  }
+  if (supplied.toolName !== NATIVE_WORK_TOOL) {
+    return createNativeHarnessReportFailure("invalid-caller", "the report reference is not an agent_work call");
+  }
+  if (!sameReportWorkIdentity(supplied, request.work)) {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      "the report reference does not belong to the requested original work",
+    );
+  }
+  if (inspection.requestAttribution !== "matched-user-input") {
+    return createNativeHarnessReportFailure(
+      "authority-lost",
+      "the report reference is no longer associated with matched user input",
+    );
+  }
+  if (inspection.pendingInputCount !== 0 || inspection.pendingInputsDropped !== 0) {
+    return createNativeHarnessReportFailure("authority-lost", "the report work has queued or dropped inputs");
+  }
+  if (!isHex64(inspection.callInputSha256)
+    || inspection.callInputSha256 !== request.reportInputSha256) {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      "the actual report preflight input differs from reportInputSha256",
+    );
+  }
+  if (inspection.callResultState !== "preflight") {
+    return createNativeHarnessReportFailure(
+      "not-ready",
+      "the report reference is not an unexecuted preflight call",
+    );
+  }
+  const projection = inspection.resultProjection;
+  if (!isRecord(projection) || projection.state !== "unregistered") {
+    return createNativeHarnessReportFailure(
+      "not-ready",
+      "the report reference already has a registered or observed result projection",
+    );
+  }
+  if (supplied.toolCallId === request.selection.sourceToolCallId
+    || request.selection.checkToolCallIds.includes(supplied.toolCallId)) {
+    return createNativeHarnessReportFailure(
+      "invalid-caller",
+      "the report call id collides with the source or a selected check action",
+    );
+  }
+  if (state.slots.has(supplied.toolCallId) || findRetainedAction(state, supplied.toolCallId) !== null) {
+    return createNativeHarnessReportFailure(
+      "invalid-caller",
+      "the report call id is already retained by another source or action",
+    );
+  }
+  return null;
+}
+
+function prepareReportRefCheck(
+  state: CoordinatorState,
+  ref: object,
+  context: NativeContext,
+  request: NativeHarnessReportNormalizedRequest,
+): { readonly check: ReadyCallCheck; readonly inspection: NativeWorkCallInspection; readonly association: ActionAssociation }
+  | NativeHarnessReportBindingFailure {
+  let check: NativeCallCheckPreparation;
+  try {
+    check = Reflect.apply(state.native.prepareCallCheck, state.native.receiver, [ref, context]);
+  } catch (error) {
+    return createNativeHarnessReportFailure(
+      "authority-lost",
+      `native report revalidation threw: ${outputThrownReason(error, "report binding failed")}`,
+    );
+  }
+  if (!check.ok) {
+    return createNativeHarnessReportFailure(
+      projectionConflict(check.inspection) ? "source-conflict" : "authority-lost",
+      nativeInspectionReason(check.inspection),
+    );
+  }
+  const inspection = check.inspection;
+  if (inspection.state !== "current" || inspection.evidenceState !== "available") {
+    return createNativeHarnessReportFailure(
+      projectionConflict(inspection) ? "source-conflict" : "authority-lost",
+      nativeInspectionReason(inspection),
+    );
+  }
+  // Native membership/authenticity was established above; only now may the
+  // exact supplied reference fields be read.
+  const supplied = readReportRefAssociation(ref);
+  if (supplied === null) {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      "the authenticated report reference has unreadable association facts",
+    );
+  }
+  if (!isRecord(inspection.association) || !sameActionAssociation(inspection.association, supplied)) {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      "the report reference association is not the exact supplied association",
+    );
+  }
+  const problem = reportInspectionProblem(state, inspection, request, supplied);
+  if (problem !== null) return problem;
+  return { check, inspection, association: supplied };
+}
+
+function reportFileBinding(change: NativeHarnessOutputRecord): ReportFileBinding | null {
+  if (change.kind !== "add" && change.kind !== "modify") return null;
+  if (!isNativeWorkspaceTextSnapshot(change.snapshot)) return null;
+  const filePath = boundedString(change.path, NATIVE_HARNESS_MAX_CHECK_PATH_CHARS);
+  if (filePath === null) return null;
+  const file = change.snapshot.file;
+  if (file === null || typeof file !== "object") return null;
+  if (file.relativePath !== filePath) return null;
+  if (typeof change.mode !== "number"
+    || !Number.isSafeInteger(change.mode)
+    || change.mode < 0
+    || change.mode > 0o7777) {
+    return null;
+  }
+  if (!isHex64(change.controllerHash)) return null;
+  if (typeof file.bytes !== "number"
+    || !Number.isSafeInteger(file.bytes)
+    || file.bytes < 0
+    || file.bytes > MAX_OUTPUT_CHANGE_BYTES) {
+    return null;
+  }
+  if (!isHex64(file.sha256)) return null;
+  if (typeof file.observedAt !== "number"
+    || !Number.isSafeInteger(file.observedAt)
+    || file.observedAt < 0) {
+    return null;
+  }
+  const fileSnapshotId = boundedString(change.snapshot.captureId, MAX_TOOL_CALL_ID_CHARS);
+  if (fileSnapshotId === null) return null;
+  return {
+    path: filePath,
+    change,
+    kind: change.kind,
+    mode: change.mode,
+    controllerHash: change.controllerHash,
+    fileSnapshotId,
+    bytes: file.bytes,
+    sha256: file.sha256,
+    observedAt: file.observedAt,
+    record: null,
+    pathRecord: null,
+    registration: null,
+  };
+}
+
+function selectedReportRecordProblem(
+  sourceId: string,
+  capture: NativeHarnessOutputCapture,
+  checks: NativeHarnessCheckState,
+  files: readonly ReportFileBinding[],
+  record: NativeHarnessCheckRetainedActionRecord,
+): string | null {
+  if (record.kind !== "retained") return "the selected action is not a retained check record";
+  if (record.state !== "admitted") return "the selected check action is not admitted";
+  if (record.registrationConflict !== null) return record.registrationConflict;
+  const registration = retainedRegistration(record);
+  if (registration === undefined) return "the selected check registration fingerprint is incomplete";
+  if (registration === null) return "the selected check result has not been registered";
+  if (!isHex64(record.inputSha256)) return "the selected check input digest is unavailable";
+  if (record.sourceToolCallId !== sourceId) return "the selected check belongs to another source";
+  const path = record.path;
+  if (record.actionToolCallId.length < 1
+    || record.actionToolCallId.length > MAX_TOOL_CALL_ID_CHARS) {
+    return "the selected check tool call id is unavailable";
+  }
+  if (path.captureId !== capture.captureId || path.captureDigest !== capture.digest) {
+    return "the selected check path belongs to another capture";
+  }
+  if (!checks.paths.includes(path)) return "the selected check path record is not retained";
+  if (path.origin !== NATIVE_HARNESS_CHECK_PLAN_SOURCE) {
+    return "the selected check plan source is not the model-proposed-after-capture source";
+  }
+  if (path.plan.checkerId !== NATIVE_TEXT_CHECKER_ID
+    || path.plan.checkerVersion !== NATIVE_TEXT_CHECKER_VERSION
+    || !isHex64(path.plan.digest)) {
+    return "the selected check plan identity is malformed";
+  }
+  if (!matchesNativeTextCheckReceipt(path.receipt, path.snapshot, path.plan)) {
+    return "the selected check receipt is not authentic for the retained snapshot and plan";
+  }
+  const row = files.find((candidate) => candidate.path === path.path);
+  if (row === undefined) return "the selected check path is not in the original capture";
+  if (row.change.snapshot !== path.snapshot) {
+    return "the selected check snapshot is not the original capture snapshot";
+  }
+  const response = record.response;
+  if (response.checkToolCallId !== record.actionToolCallId
+    || response.computedByToolCallId !== path.computedByToolCallId
+    || response.sourceToolCallId !== sourceId
+    || response.captureId !== capture.captureId
+    || response.captureDigest !== capture.digest
+    || response.path !== path.path
+    || response.planDigest !== path.plan.digest
+    || response.planSource !== path.origin
+    || response.checkerId !== NATIVE_TEXT_CHECKER_ID
+    || response.checkerVersion !== NATIVE_TEXT_CHECKER_VERSION
+    || response.receipt !== path.receipt) {
+    return "the retained check response does not bind the original path, plan and receipt";
+  }
+  if (files.some((candidate) => candidate !== row && candidate.record === record)) {
+    return "the same selected check record appears on more than one path";
+  }
+  return null;
+}
+
+/**
+ * Local-only resolution of the original Slot, capture, selected records and
+ * authentic receipts. No host callback, clock or file read occurs here.
+ */
+function resolveReportBindingCandidate(
+  state: CoordinatorState,
+  request: NativeHarnessReportNormalizedRequest,
+): ReportBindingCandidate | NativeHarnessReportBindingFailure {
+  const sourceId = request.selection.sourceToolCallId;
+  const slot = state.slots.get(sourceId);
+  if (slot === undefined) {
+    return createNativeHarnessReportFailure("not-ready", "no retained delegation operation has this source id");
+  }
+  if (slot.toolCallId !== sourceId) {
+    return createNativeHarnessReportFailure("source-conflict", "the original source Slot id changed");
+  }
+  if (!sameReportWorkIdentity(slot.association, request.work)) {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      "the requested work identity is not the original source work",
+    );
+  }
+  const out = slot.output;
+  if (out.state !== "captured" || out.capture === null || out.selection === null) {
+    return createNativeHarnessReportFailure("not-ready", "the source output has not been captured");
+  }
+  const capture = out.capture;
+  const selection = out.selection;
+  if (out.registration === null) {
+    return createNativeHarnessReportFailure(
+      "not-ready",
+      out.registrationFailure ?? "the source result projection is not registered",
+    );
+  }
+  if (out.registrationFailure !== null) {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      "the source registration also retains a failure state",
+    );
+  }
+  const registration = out.registration;
+  if (request.selection.captureId !== capture.captureId
+    || request.selection.captureDigest !== capture.digest) {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      "the report selection does not exactly match the retained source capture",
+    );
+  }
+  if (selection.capture !== capture) {
+    return createNativeHarnessReportFailure("source-conflict", "the retained capture selection identity changed");
+  }
+  if (selection.runId !== capture.runId
+    || selection.taskSha256 !== capture.taskSha256
+    || registration.runId !== capture.runId
+    || registration.taskSha256 !== capture.taskSha256) {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      "the capture run or task identity does not match the original source registration",
+    );
+  }
+  const sourceProblem = sourceSuccessProblem(slot, slot.response);
+  if (sourceProblem !== null) {
+    return createNativeHarnessReportFailure("source-conflict", sourceProblem);
+  }
+  if (!isHex64(registration.taskSha256)
+    || !isHex64(registration.workPromptSha256)
+    || !isHex64(registration.callInputSha256)
+    || !isHex64(registration.expectedSha256)
+    || typeof registration.expectedBytes !== "number"
+    || !Number.isSafeInteger(registration.expectedBytes)
+    || registration.expectedBytes < 0) {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      "the original source registration fingerprint is incomplete",
+    );
+  }
+  const observedSha256 = out.observedSha256;
+  const observedBytes = out.observedBytes;
+  if (!isHex64(observedSha256)
+    || typeof observedBytes !== "number"
+    || !Number.isSafeInteger(observedBytes)
+    || observedBytes < 0
+    || observedSha256 !== registration.expectedSha256
+    || observedBytes !== registration.expectedBytes
+    || selection.observedResultSha256 !== observedSha256) {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      "the observed source result fingerprint is not the registered match",
+    );
+  }
+  if (capture.changes.length > MAX_OUTPUT_CHANGES) {
+    return createNativeHarnessReportFailure("source-conflict", "the capture has too many output changes");
+  }
+  const files: ReportFileBinding[] = [];
+  const seenPaths = new Set<string>();
+  for (const change of capture.changes) {
+    const row = reportFileBinding(change);
+    if (row === null) {
+      return createNativeHarnessReportFailure("source-conflict", "the capture contains an unusable output file row");
+    }
+    if (seenPaths.has(row.path)) {
+      return createNativeHarnessReportFailure("source-conflict", "the capture contains duplicate output paths");
+    }
+    seenPaths.add(row.path);
+    files.push(row);
+  }
+
+  const checks = out.checks;
+  const selectedCount = request.selection.checkToolCallIds.length;
+  if (selectedCount > 0 && checks === null) {
+    return createNativeHarnessReportFailure("not-ready", "the selected check records are not retained");
+  }
+  if (checks !== null && selectedCount > NATIVE_HARNESS_REPORT_MAX_SELECTED_CHECKS) {
+    return createNativeHarnessReportFailure("coverage", "too many selected checks");
+  }
+  if (checks !== null) {
+    const selectedPaths = new Set<string>();
+    for (const checkToolCallId of request.selection.checkToolCallIds) {
+      const record = checks.actions.get(checkToolCallId);
+      if (record === undefined) {
+        return createNativeHarnessReportFailure(
+          "not-ready",
+          "a selected check id is not retained in this exact source",
+        );
+      }
+      if (record.kind !== "retained") {
+        return createNativeHarnessReportFailure(
+          "source-conflict",
+          "a selected check id is a capture or terminal record",
+        );
+      }
+      const problem = selectedReportRecordProblem(sourceId, capture, checks, files, record);
+      if (problem !== null) {
+        return createNativeHarnessReportFailure(
+          problem.includes("not registered") || problem.includes("not retained")
+            ? "not-ready"
+            : "source-conflict",
+          problem,
+        );
+      }
+      const row = files.find((candidate) => candidate.path === record.path.path);
+      if (row === undefined) {
+        return createNativeHarnessReportFailure("source-conflict", "a selected check path disappeared");
+      }
+      if (selectedPaths.has(row.path)) {
+        return createNativeHarnessReportFailure("source-conflict", "duplicate selected check paths are refused");
+      }
+      selectedPaths.add(row.path);
+      const registrationForCheck = retainedRegistration(record);
+      if (registrationForCheck === null || registrationForCheck === undefined) {
+        return createNativeHarnessReportFailure("not-ready", "a selected check registration is unavailable");
+      }
+      row.record = record;
+      row.pathRecord = record.path;
+      row.registration = registrationForCheck;
+    }
+  }
+
+  const selectedRows = files.filter((row) => row.record !== null);
+  if (request.outcome === "completed") {
+    if (files.length === 0 || selectedRows.length !== files.length) {
+      return createNativeHarnessReportFailure(
+        "coverage",
+        "completed requires one selected check for every captured path",
+      );
+    }
+    for (const row of selectedRows) {
+      if (row.pathRecord === null || row.pathRecord.receipt.outcome !== "pass") {
+        return createNativeHarnessReportFailure(
+          "coverage",
+          "completed requires an authentic PASS receipt for every captured path",
+        );
+      }
+    }
+  }
+
+  return {
+    slot,
+    capture,
+    outputSelection: selection,
+    registration,
+    checks,
+    files: Object.freeze(files.map((row) => Object.freeze(row))),
+    observedSha256,
+    observedBytes,
+  };
+}
+
+function createReportFacts(
+  candidate: ReportBindingCandidate,
+  request: NativeHarnessReportNormalizedRequest,
+): NativeHarnessReportBindingFacts | NativeHarnessReportBindingFailure {
+  const files: NativeHarnessReportFileFacts[] = candidate.files.map((row) => Object.freeze({
+    path: row.path,
+    kind: row.kind,
+    mode: row.mode,
+    controllerHash: row.controllerHash,
+    fileSnapshotId: row.fileSnapshotId,
+    bytes: row.bytes,
+    sha256: row.sha256,
+    observedAt: row.observedAt,
+    check: row.record === null || row.pathRecord === null
+      ? null
+      : Object.freeze({
+        checkToolCallId: row.record.actionToolCallId,
+        computedByToolCallId: row.pathRecord.computedByToolCallId,
+        checkerId: NATIVE_TEXT_CHECKER_ID,
+        checkerVersion: NATIVE_TEXT_CHECKER_VERSION,
+        planSource: row.pathRecord.origin,
+        planDigest: row.pathRecord.plan.digest,
+        receipt: row.pathRecord.receipt,
+      }),
+  }));
+  const result = createNativeHarnessReportFacts({
+    modelDeclaredOutcome: request.outcome,
+    source: {
+      toolCallId: request.selection.sourceToolCallId,
+      observationId: request.work.observationId,
+      generation: request.work.generation,
+      taskSha256: candidate.registration.taskSha256,
+      promptSha256: candidate.registration.workPromptSha256,
+      inputSha256: candidate.registration.callInputSha256,
+      observedEnvelopeSha256: candidate.observedSha256,
+      observedEnvelopeBytes: candidate.observedBytes,
+    },
+    capture: {
+      captureId: candidate.capture.captureId,
+      captureDigest: candidate.capture.digest,
+      originKind: candidate.capture.originKind,
+      completionId: candidate.capture.completionId,
+      runId: candidate.capture.runId,
+      baseSnapshotId: candidate.capture.baseSnapshotId,
+      manifestSha256: candidate.capture.manifestSha256,
+      winner: {
+        candidate: candidate.capture.winner.candidate,
+        attempt: candidate.capture.winner.attempt,
+        artifactHash: candidate.capture.winner.artifactHash,
+        traceHash: candidate.capture.winner.traceHash,
+      },
+      observedAt: candidate.capture.observedAt,
+    },
+    files,
+  });
+  return result.ok ? result.facts : result;
+}
+
+function selectedActionProblem(
+  state: CoordinatorState,
+  slot: Slot,
+  record: NativeHarnessCheckRetainedActionRecord,
+  registration: ReportRegistration,
+  action: PreparedCheckAction,
+): NativeHarnessReportBindingFailure | null {
+  if (action.inputSha256 !== record.inputSha256) {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      "the selected check preflight input changed",
+    );
+  }
+  if (!isRecord(action.inspection.association)
+    || !sameActionAssociation(action.inspection.association, {
+      observationId: slot.association.observationId,
+      generation: slot.association.generation,
+      sessionId: slot.association.sessionId,
+      workspaceRoot: slot.association.workspaceRoot,
+      toolCallId: record.actionRef.toolCallId,
+      toolName: NATIVE_HARNESS_RESULT_TOOL,
+    })) {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      "the selected check now has an incompatible native association",
+    );
+  }
+  if (action.inspection.callResultState !== "observed") {
+    return createNativeHarnessReportFailure(
+      "not-ready",
+      "the selected check result has not been observed",
+    );
+  }
+  const projection = action.inspection.resultProjection;
+  if (!isRecord(projection) || projection.state !== "matched") {
+    return createNativeHarnessReportFailure(
+      "not-ready",
+      "the selected check result projection is not matched",
+    );
+  }
+  if (projection.expectedSha256 !== registration.sha256
+    || projection.expectedBytes !== registration.bytes
+    || projection.observedSha256 !== registration.sha256
+    || projection.observedBytes !== registration.bytes) {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      "the selected check observed result fingerprint is not the retained registration",
+    );
+  }
+  if (state.slots.get(record.sourceToolCallId) !== slot) {
+    return createNativeHarnessReportFailure("source-conflict", "the original source Slot was replaced");
+  }
+  return null;
+}
+
+function prepareReportSelections(
+  state: CoordinatorState,
+  binding: ReportBindingState,
+  context: NativeContext,
+): readonly {
+  readonly record: NativeHarnessCheckRetainedActionRecord;
+  readonly action: PreparedCheckAction;
+}[] | NativeHarnessReportBindingFailure {
+  const selected: { record: NativeHarnessCheckRetainedActionRecord; action: PreparedCheckAction }[] = [];
+  for (const row of binding.files) {
+    if (row.record === null || row.registration === null) continue;
+    const action = prepareCheckAction(state, binding.slot, row.record.actionRef, context, row.registration);
+    if (isCheckFailure(action)) return reportFailureFromCheckFailure(action);
+    const problem = selectedActionProblem(state, binding.slot, row.record, row.registration, action);
+    if (problem !== null) return problem;
+    selected.push(Object.freeze({ record: row.record, action }));
+  }
+  return Object.freeze(selected);
+}
+
+function localReportIdentityProblem(
+  state: CoordinatorState,
+  binding: ReportBindingState,
+): string | null {
+  if (state.disposed) return "the delegation coordinator was disposed";
+  if (!state.enabled) return "the delegation coordinator is disabled";
+  if (state.slots.get(binding.sourceId) !== binding.slot) {
+    return "the original source Slot was replaced";
+  }
+  if (binding.slot.toolCallId !== binding.sourceId
+    || !sameReportWorkIdentity(binding.slot.association, binding.request.work)) {
+    return "the original source work identity changed";
+  }
+  const out = binding.slot.output;
+  const selectedCheckStateRequired = binding.files.some((row) => row.record !== null);
+  const checkStateChanged = out.checks !== binding.checks
+    && (selectedCheckStateRequired || binding.checks !== null);
+  if (out.state !== "captured"
+    || out.capture !== binding.capture
+    || out.selection !== binding.outputSelection
+    || out.registration !== binding.registration
+    || checkStateChanged) {
+    return "the retained source capture or check state changed";
+  }
+  if (out.observedSha256 !== binding.observedSha256
+    || out.observedBytes !== binding.observedBytes
+    || binding.capture.captureId !== binding.request.selection.captureId
+    || binding.capture.digest !== binding.request.selection.captureDigest) {
+    return "the retained source observed fingerprint changed";
+  }
+  const checks = binding.checks;
+  for (const row of binding.files) {
+    if (row.record === null || row.pathRecord === null || row.registration === null) continue;
+    if (checks === null) return "the retained check state disappeared";
+    if (checks.actions.get(row.record.actionToolCallId) !== row.record) {
+      return "a selected check action record was replaced";
+    }
+    if (!checks.paths.includes(row.pathRecord)) {
+      return "a selected check path record was removed";
+    }
+    if (row.record.state !== "admitted"
+      || row.record.registrationConflict !== null
+      || row.record.path !== row.pathRecord
+      || row.record.sourceToolCallId !== binding.sourceId
+      || row.record.response.receipt !== row.pathRecord.receipt
+      || row.pathRecord.snapshot !== row.change.snapshot) {
+      return "a selected check record changed";
+    }
+    const registration = retainedRegistration(row.record);
+    if (registration === null
+      || registration === undefined
+      || registration.sha256 !== row.registration.sha256
+      || registration.bytes !== row.registration.bytes) {
+      return "a selected check registration changed";
+    }
+  }
+  if (state.slots.has(binding.reportId)
+    || findRetainedAction(state, binding.reportId) !== null) {
+    return "the report call id now collides with another retained source or action";
+  }
+  if (!Object.isFrozen(binding.facts)) return "the report facts are not frozen";
+  return null;
+}
+
+/**
+ * Final initial-preparation sequence: pure original owner, actual report
+ * signal, every captured native pure check, then local exact identities.
+ * Nothing after the pure checks reads a host object.
+ */
+function finalReportGate(
+  state: CoordinatorState,
+  binding: ReportBindingState,
+  revision: ReportBindingRevision,
+  signalValue: unknown,
+): NativeHarnessReportBindingFailure | null {
+  const owner = ownerPredicateReason(revision.source.output);
+  if (owner !== null) {
+    return createNativeHarnessReportFailure("authority-lost", owner);
+  }
+  if (signalValue !== null) {
+    const signal = readActualAbortSignal(signalValue);
+    if (!signal.ok) {
+      return createNativeHarnessReportFailure("invalid-caller", signal.reason);
+    }
+    if (signal.aborted) {
+      return createNativeHarnessReportFailure("authority-lost", "the actual report signal was aborted");
+    }
+  }
+  const sourcePure = pureCheckReason(revision.source.prepared.check);
+  if (sourcePure !== null) {
+    return createNativeHarnessReportFailure("source-conflict", sourcePure);
+  }
+  for (const selected of revision.selected) {
+    const pure = pureCheckReason(selected.action.check);
+    if (pure !== null) {
+      return createNativeHarnessReportFailure("source-conflict", pure);
+    }
+  }
+  const reportPure = pureCheckReason(revision.report);
+  if (reportPure !== null) {
+    return createNativeHarnessReportFailure("source-conflict", reportPure);
+  }
+  const local = localReportIdentityProblem(state, binding);
+  if (local !== null) return createNativeHarnessReportFailure("source-conflict", local);
+  return null;
+}
+
+/**
+ * Repeats the bounded host reads for one existing preparation. It never
+ * rebuilds facts, mints refs, rereads files or changes retained action state.
+ */
+function refreshReportPreparation(
+  state: CoordinatorState,
+  binding: ReportBindingState,
+): string | null {
+  try {
+    return refreshReportPreparationUnchecked(state, binding);
+  } catch {
+    return "the host-only report refresh failed unexpectedly";
+  }
+}
+
+function refreshReportPreparationUnchecked(
+  state: CoordinatorState,
+  binding: ReportBindingState,
+): string | null {
+  if (state.disposed) return "the delegation coordinator was disposed";
+  if (!state.enabled) return "the delegation coordinator is disabled";
+  if (state.reportBindingInProgress) {
+    return "reentrant report binding preparation or refresh was refused";
+  }
+  state.reportBindingInProgress = true;
+  try {
+    const local = localReportIdentityProblem(state, binding);
+    if (local !== null) return local;
+    const reportSignal = readActualAbortSignal(binding.reportSignal);
+    if (!reportSignal.ok) return reportSignal.reason;
+    if (reportSignal.aborted) return "the actual report signal was aborted";
+    const main = readMainContext(state);
+    if (!main.ok) return main.reason;
+    const source = prepareCheckSource(state, binding.slot);
+    if (isCheckFailure(source)) return source.reason;
+    if (source.capture !== binding.capture
+      || source.registration !== binding.registration
+      || source.prepared.observedSha256 !== binding.observedSha256
+      || source.prepared.observedBytes !== binding.observedBytes) {
+      return "the original source capture or observation changed";
+    }
+    const report = prepareReportRefCheck(state, binding.reportRef, source.prepared.context, binding.request);
+    if (isReportFailure(report)) return report.reason;
+    const selected = prepareReportSelections(state, binding, source.prepared.context);
+    if (isReportFailure(selected)) return selected.reason;
+    const lateMain = readMainContext(state);
+    if (!lateMain.ok) return lateMain.reason;
+    const lateReport = prepareReportRefCheck(state, binding.reportRef, lateMain.context, binding.request);
+    if (isReportFailure(lateReport)) return lateReport.reason;
+    if (!sameActionAssociation(report.association, lateReport.association)
+      || report.inspection.callInputSha256 !== lateReport.inspection.callInputSha256
+      || lateReport.inspection.callInputSha256 !== binding.reportInputSha256
+      || lateReport.association.toolCallId !== binding.reportId) {
+      return "the report reference association or input changed during refresh";
+    }
+    const revision: ReportBindingRevision = {
+      source,
+      report: lateReport.check,
+      reportInspection: lateReport.inspection,
+      reportAssociation: lateReport.association,
+      selected,
+    };
+    const final = finalReportGate(state, binding, revision, binding.reportSignal);
+    if (final !== null) return final.reason;
+    binding.revision = revision;
+    return null;
+  } finally {
+    state.reportBindingInProgress = false;
+  }
+}
+
+/**
+ * Captured-identity check. Only the declared pure original owner predicate,
+ * the exact retained report signal, the captured native pure validators and
+ * local exact identities run; no current host-context read, I/O, clock or
+ * encoding is performed. Returns only null or a bounded primitive refusal.
+ */
+function revalidateReportPreparation(
+  state: CoordinatorState,
+  binding: ReportBindingState,
+): string | null {
+  try {
+    return revalidateReportPreparationUnchecked(state, binding);
+  } catch {
+    return "the host-only report revalidation failed unexpectedly";
+  }
+}
+
+function revalidateReportPreparationUnchecked(
+  state: CoordinatorState,
+  binding: ReportBindingState,
+): string | null {
+  if (state.disposed) return "the delegation coordinator was disposed";
+  if (!state.enabled) return "the delegation coordinator is disabled";
+  const revision = binding.revision;
+  const owner = ownerPredicateReason(revision.source.output);
+  if (owner !== null) return owner;
+  const reportSignal = readActualAbortSignal(binding.reportSignal);
+  if (!reportSignal.ok) return reportSignal.reason;
+  if (reportSignal.aborted) return "the actual report signal was aborted";
+  const sourcePure = pureCheckReason(revision.source.prepared.check);
+  if (sourcePure !== null) return sourcePure;
+  for (const selected of revision.selected) {
+    const pure = pureCheckReason(selected.action.check);
+    if (pure !== null) return pure;
+  }
+  const reportPure = pureCheckReason(revision.report);
+  if (reportPure !== null) return reportPure;
+  const local = localReportIdentityProblem(state, binding);
+  if (local !== null) return local;
+  if (!isRecord(revision.reportInspection.association)
+    || !sameActionAssociation(revision.reportInspection.association, revision.reportAssociation)
+    || revision.reportInspection.callInputSha256 !== binding.reportInputSha256) {
+    return "the captured report reference identity changed";
+  }
+  return null;
+}
+
+function prepareReportInternal(
+  state: CoordinatorState,
+  requestValue: unknown,
+  signalValue: unknown,
+): NativeHarnessReportBindingResult {
+  if (state.disposed) {
+    return createNativeHarnessReportFailure("authority-lost", "the delegation coordinator was disposed");
+  }
+  if (!state.enabled) {
+    return createNativeHarnessReportFailure("authority-lost", "the delegation coordinator is disabled");
+  }
+  if (state.reportBindingInProgress) {
+    return createNativeHarnessReportFailure(
+      "not-ready",
+      "reentrant report binding preparation or refresh was refused",
+    );
+  }
+  // The guard covers caller descriptor/Proxy reflection and every later host
+  // callback. Only this owning call clears it.
+  state.reportBindingInProgress = true;
+  try {
+    const normalized = normalizeNativeHarnessReportRequest(requestValue);
+    if (!normalized.ok) return normalized;
+    const request = normalized.request;
+    const signal = readActualAbortSignal(signalValue);
+    if (!signal.ok) return createNativeHarnessReportFailure("invalid-caller", signal.reason);
+    if (signal.aborted) {
+      return createNativeHarnessReportFailure("authority-lost", "the actual report signal was aborted before preparation");
+    }
+
+    // Caller reflection and facts encoding finish before any host prepare.
+    const candidate = resolveReportBindingCandidate(state, request);
+    if (isReportFailure(candidate)) return candidate;
+    const facts = createReportFacts(candidate, request);
+    if (isReportFailure(facts)) return facts;
+
+    const main = readMainContext(state);
+    if (!main.ok) return createNativeHarnessReportFailure("authority-lost", main.reason);
+    // Authenticate the opaque report ref before reading any of its fields or
+    // performing any source-side native preparation.
+    const firstReport = prepareReportRefCheck(state, request.reportRef, main.context, request);
+    if (isReportFailure(firstReport)) return firstReport;
+
+    const source = prepareCheckSource(state, candidate.slot);
+    if (isCheckFailure(source)) return reportFailureFromCheckFailure(source);
+    if (source.capture !== candidate.capture
+      || source.registration !== candidate.registration
+      || source.prepared.observedSha256 !== candidate.observedSha256
+      || source.prepared.observedBytes !== candidate.observedBytes) {
+      return createNativeHarnessReportFailure(
+        "source-conflict",
+        "the original source capture or observation changed during preparation",
+      );
+    }
+
+    const provisional: ReportBindingState = {
+      slot: candidate.slot,
+      sourceId: request.selection.sourceToolCallId,
+      reportId: firstReport.association.toolCallId,
+      reportRef: request.reportRef,
+      reportAssociation: firstReport.association,
+      reportInputSha256: request.reportInputSha256,
+      reportSignal: signalValue,
+      request,
+      capture: candidate.capture,
+      outputSelection: candidate.outputSelection,
+      registration: candidate.registration,
+      checks: candidate.checks,
+      files: candidate.files,
+      observedSha256: candidate.observedSha256,
+      observedBytes: candidate.observedBytes,
+      facts,
+      revision: {
+        source,
+        report: firstReport.check,
+        reportInspection: firstReport.inspection,
+        reportAssociation: firstReport.association,
+        selected: Object.freeze([]),
+      },
+    };
+    const selected = prepareReportSelections(state, provisional, source.prepared.context);
+    if (isReportFailure(selected)) return selected;
+
+    // Refresh the actual report ref after the last selected-record callback.
+    const lateMain = readMainContext(state);
+    if (!lateMain.ok) return createNativeHarnessReportFailure("authority-lost", lateMain.reason);
+    const lateReport = prepareReportRefCheck(state, request.reportRef, lateMain.context, request);
+    if (isReportFailure(lateReport)) return lateReport;
+    if (!sameActionAssociation(firstReport.association, lateReport.association)
+      || firstReport.inspection.callInputSha256 !== lateReport.inspection.callInputSha256
+      || lateReport.inspection.callInputSha256 !== request.reportInputSha256
+      || lateReport.association.toolCallId !== provisional.reportId) {
+      return createNativeHarnessReportFailure(
+        "source-conflict",
+        "the report reference association or input changed during preparation",
+      );
+    }
+
+    const revision: ReportBindingRevision = {
+      source,
+      report: lateReport.check,
+      reportInspection: lateReport.inspection,
+      reportAssociation: lateReport.association,
+      selected,
+    };
+    const final = finalReportGate(state, provisional, revision, signalValue);
+    if (final !== null) return final;
+    provisional.revision = revision;
+    const prepared: NativeHarnessReportBindingPreparation = Object.freeze({
+      facts,
+      refresh(): string | null {
+        return refreshReportPreparation(state, provisional);
+      },
+      revalidate(): string | null {
+        return revalidateReportPreparation(state, provisional);
+      },
+    });
+    return Object.freeze({ ok: true as const, prepared });
+  } catch (error) {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      `the host-only report binding failed unexpectedly: ${outputThrownReason(error, "report binding failed")}`,
+    );
+  } finally {
+    state.reportBindingInProgress = false;
+  }
 }
 
 function isCheckFailure(value: unknown): value is NativeHarnessCheckFailure {
@@ -6574,6 +7657,7 @@ export function createNativeHarnessDelegation(
     outputActive: null,
     outputJoinValidating: false,
     outputObservationInProgress: false,
+    reportBindingInProgress: false,
   };
 
   const coordinator: NativeHarnessDelegationCoordinator = Object.freeze({
@@ -6718,6 +7802,12 @@ export function createNativeHarnessDelegation(
       actualSignal: unknown,
     ): NativeHarnessCheckOutcome {
       return checkOutputInternal(state, actualCheckToolCallId, input, actualSignal);
+    },
+    prepareReport(
+      request: unknown,
+      actualSignal: unknown,
+    ): NativeHarnessReportBindingResult {
+      return prepareReportInternal(state, request, actualSignal);
     },
     registerOutputCheckProjection(
       actualSourceToolCallId: unknown,
