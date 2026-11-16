@@ -13,10 +13,12 @@ import path from "node:path";
 import {
   createNativeEntry,
   NATIVE_WORK_GUIDANCE,
+  type CallResultExpectationRegistration,
   type NativeContext,
   type NativeEntryControls,
   type NativeOmpApi,
   type NativeToolResult,
+  type NativeWorkCallReference,
   type NativeWorkReport,
 } from "../../src/native-entry.ts";
 import {
@@ -2014,5 +2016,906 @@ describe("native work entry", () => {
     expect(inspected.current).toBeNull();
     expect(inspected.retainedWorks.items[0]?.status).toBe("unknown");
     expect(inspected.retainedWorks.items[0]?.endReason).toContain("session clear");
+  });
+});
+
+async function registerableCall(
+  f: Fixture,
+  prompt: string,
+  toolCallId: string,
+  toolName = "read",
+  callInput: unknown = {},
+): Promise<NativeWorkCallReference> {
+  await input(f.host, f.ctx, prompt);
+  await prepare(f.host, f.ctx, prompt);
+  await f.host.emit("tool_call", { toolCallId, toolName, input: callInput }, f.ctx);
+  const capture = f.entry.captureCall({ toolCallId, toolName }, f.ctx);
+  if (!capture.ok) throw new Error(`capture failed: ${capture.inspection.reason}`);
+  return capture.ref;
+}
+
+function expectRegistrationFailure(
+  result: CallResultExpectationRegistration,
+  pattern?: RegExp,
+): void {
+  expect(result.ok).toBe(false);
+  if (!result.ok && pattern !== undefined) expect(result.reason).toMatch(pattern);
+}
+
+describe("native result expectation controls", () => {
+  test("registers pending, matches the exact envelope, and keeps equal duplicates pure", async () => {
+    const f = await fixture();
+    const prompt = "exact result request";
+    const ref = await registerableCall(f, prompt, "exact-1", "read", { path: "a" });
+    expect(f.host.handlers.get("tool_result")?.length).toBe(1);
+
+    const expected = { input: { path: "a" }, result: { content: [{ type: "text", text: "ok" }] } };
+    const registration = f.entry.registerCallResultExpectation!(ref, expected, f.ctx);
+    expect(registration.ok).toBe(true);
+    if (!registration.ok) return;
+
+    const pending = f.entry.inspectCall(ref, f.ctx);
+    expect(pending.resultProjection).toMatchObject({
+      state: "pending",
+      expectedSha256: registration.fingerprint.sha256,
+      expectedBytes: registration.fingerprint.bytes,
+      observedSha256: null,
+      observedBytes: null,
+    });
+    expect(pending.callResultState).toBe("preflight");
+    expect(pending.workPromptSha256).toBe(createHash("sha256").update(prompt, "utf8").digest("hex"));
+    expect(pending.callInputSha256).toBe(createHash("sha256").update('{"path":"a"}', "utf8").digest("hex"));
+    expect(pending.workPromptSha256).not.toBe(pending.callInputSha256);
+
+    const event = {
+      toolCallId: "exact-1",
+      toolName: "read",
+      input: { path: "a" },
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+    };
+    await f.host.emit("tool_result", event, f.ctx);
+    const matched = f.entry.inspectCall(ref, f.ctx);
+    expect(matched.resultProjection).toMatchObject({
+      state: "matched",
+      expectedSha256: registration.fingerprint.sha256,
+      observedSha256: registration.fingerprint.sha256,
+      observedBytes: registration.fingerprint.bytes,
+    });
+    expect(matched.callResultState).toBe("observed");
+
+    const repeated = f.entry.registerCallResultExpectation!(ref, expected, f.ctx);
+    expect(repeated).toEqual(registration);
+    expect(f.entry.inspectCall(ref, f.ctx).resultProjection!.state).toBe("matched");
+
+    const afterMatch = f.entry.prepareCallCheck(ref, f.ctx);
+    expect(afterMatch.ok).toBe(true);
+    if (!afterMatch.ok) return;
+    expect(afterMatch.revalidate()).toBeNull();
+    await f.host.emit("tool_result", event, f.ctx);
+    expect(afterMatch.revalidate()).toBeNull();
+
+    await f.host.emit("tool_result", { ...event, content: [{ type: "text", text: "changed" }] }, f.ctx);
+    const conflicted = f.entry.inspectCall(ref, f.ctx);
+    expect(conflicted.resultProjection!.state).toBe("conflicted");
+    expect(conflicted.callResultState).toBe("unknown");
+    expect(afterMatch.revalidate()).toBe("call-result-changed");
+
+    await f.host.emit("tool_result", event, f.ctx);
+    const replayed = f.entry.inspectCall(ref, f.ctx);
+    expect(replayed.resultProjection!.state).toBe("conflicted");
+    expect(replayed.callResultState).toBe("unknown");
+  });
+
+  test("registration after a legacy observed result is refused without blessing it", async () => {
+    const f = await fixture();
+    const ref = await registerableCall(f, "late registration request", "late-1");
+    await f.host.emit("tool_result", {
+      toolCallId: "late-1",
+      toolName: "read",
+      input: {},
+      content: [{ type: "text", text: "legacy observed" }],
+      isError: false,
+    }, f.ctx);
+
+    expectRegistrationFailure(
+      f.entry.registerCallResultExpectation!(ref, {
+        input: {},
+        result: { content: [{ type: "text", text: "legacy observed" }] },
+      }, f.ctx),
+      /observed|too late/,
+    );
+    const inspected = f.entry.inspectCall(ref, f.ctx);
+    expect(inspected.resultProjection!.state).toBe("unregistered");
+    expect(inspected.callResultState).toBe("observed");
+  });
+
+  test("full input, content, details and error-bit mismatches refuse exact evidence", async () => {
+    const f = await fixture();
+    await input(f.host, f.ctx, "mismatch request");
+    await prepare(f.host, f.ctx, "mismatch request");
+    const expected = { input: { q: "same" }, result: { content: [{ type: "text", text: "ok" }] } };
+
+    async function registered(id: string, event: Record<string, unknown>): Promise<any> {
+      await f.host.emit("tool_call", { toolCallId: id, toolName: "read", input: { q: "same" } }, f.ctx);
+      const capture = f.entry.captureCall({ toolCallId: id, toolName: "read" }, f.ctx);
+      expect(capture.ok).toBe(true);
+      if (!capture.ok) throw new Error("capture failed");
+      expect(f.entry.registerCallResultExpectation!(capture.ref, expected, f.ctx).ok).toBe(true);
+      await f.host.emit("tool_result", { toolCallId: id, toolName: "read", ...event }, f.ctx);
+      return f.entry.inspectCall(capture.ref, f.ctx);
+    }
+
+    const inputMismatch = await registered("m-input", {
+      input: { q: "other" },
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+    });
+    expect(inputMismatch.resultProjection!.state).toBe("conflicted");
+    expect(inputMismatch.callResultState).toBe("unknown");
+
+    const stringContent = await registered("m-string-content", {
+      input: { q: "same" },
+      content: "ok",
+      isError: false,
+    });
+    expect(stringContent.resultProjection!.state).toBe("unavailable");
+    expect(stringContent.callResultState).toBe("unknown");
+
+    const contentMismatch = await registered("m-content", {
+      input: { q: "same" },
+      content: [{ type: "text", text: "changed" }],
+      isError: false,
+    });
+    expect(contentMismatch.resultProjection!.state).toBe("conflicted");
+
+    const detailsMismatch = await registered("m-details", {
+      input: { q: "same" },
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+      details: { extra: true },
+    });
+    expect(detailsMismatch.resultProjection!.state).toBe("conflicted");
+
+    const errorMismatch = await registered("m-error", {
+      input: { q: "same" },
+      content: [{ type: "text", text: "ok" }],
+      isError: true,
+    });
+    expect(errorMismatch.resultProjection!.state).toBe("conflicted");
+
+    const missingInput = await registered("m-missing-input", {
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+    });
+    expect(missingInput.resultProjection!.state).toBe("unavailable");
+
+    const missingContent = await registered("m-missing-content", {
+      input: { q: "same" },
+      isError: false,
+    });
+    expect(missingContent.resultProjection!.state).toBe("unavailable");
+
+    const missingError = await registered("m-missing-error", {
+      input: { q: "same" },
+      content: [{ type: "text", text: "ok" }],
+    });
+    expect(missingError.resultProjection!.state).toBe("unavailable");
+
+    await f.host.emit("tool_call", { toolCallId: "bad-expected", toolName: "read", input: { q: "same" } }, f.ctx);
+    const badCapture = f.entry.captureCall({ toolCallId: "bad-expected", toolName: "read" }, f.ctx);
+    expect(badCapture.ok).toBe(true);
+    if (!badCapture.ok) return;
+    expectRegistrationFailure(
+      f.entry.registerCallResultExpectation!(badCapture.ref, {
+        input: { q: "same" },
+        result: { content: "not-an-array" },
+      }, f.ctx),
+      /content|unavailable/,
+    );
+    const badInspection = f.entry.inspectCall(badCapture.ref, f.ctx);
+    expect(badInspection.resultProjection!.state).toBe("unavailable");
+    expect(badInspection.callResultState).toBe("unknown");
+
+    await f.host.emit("tool_call", { toolCallId: "image-expected", toolName: "read", input: { q: "same" } }, f.ctx);
+    const imageCapture = f.entry.captureCall({ toolCallId: "image-expected", toolName: "read" }, f.ctx);
+    expect(imageCapture.ok).toBe(true);
+    if (!imageCapture.ok) return;
+    expectRegistrationFailure(
+      f.entry.registerCallResultExpectation!(imageCapture.ref, {
+        input: { q: "same" },
+        result: { content: [{ type: "image", data: "x" }] },
+      }, f.ctx),
+      /content|unavailable/,
+    );
+
+    await f.host.emit("tool_call", { toolCallId: "empty", toolName: "read", input: { q: "empty" } }, f.ctx);
+    const emptyCapture = f.entry.captureCall({ toolCallId: "empty", toolName: "read" }, f.ctx);
+    expect(emptyCapture.ok).toBe(true);
+    if (!emptyCapture.ok) return;
+    expect(f.entry.registerCallResultExpectation!(emptyCapture.ref, {
+      input: { q: "empty" },
+      result: { content: [] },
+    }, f.ctx).ok).toBe(true);
+    await f.host.emit("tool_result", {
+      toolCallId: "empty",
+      toolName: "read",
+      input: { q: "empty" },
+      content: [],
+      isError: false,
+    }, f.ctx);
+    expect(f.entry.inspectCall(emptyCapture.ref, f.ctx).resultProjection!.state).toBe("matched");
+
+    await f.host.emit("tool_call", {
+      toolCallId: "undefined-details",
+      toolName: "read",
+      input: { q: "undefined" },
+    }, f.ctx);
+    const undefinedCapture = f.entry.captureCall({ toolCallId: "undefined-details", toolName: "read" }, f.ctx);
+    expect(undefinedCapture.ok).toBe(true);
+    if (!undefinedCapture.ok) return;
+    expect(f.entry.registerCallResultExpectation!(undefinedCapture.ref, {
+      input: { q: "undefined" },
+      result: { content: [], details: undefined },
+    }, f.ctx).ok).toBe(true);
+    await f.host.emit("tool_result", {
+      toolCallId: "undefined-details",
+      toolName: "read",
+      input: { q: "undefined" },
+      content: [],
+      isError: false,
+    }, f.ctx);
+    expect(f.entry.inspectCall(undefinedCapture.ref, f.ctx).resultProjection!.state).toBe("matched");
+
+    await f.host.emit("tool_call", { toolCallId: "wrong-input", toolName: "read", input: { q: "right" } }, f.ctx);
+    const wrongCapture = f.entry.captureCall({ toolCallId: "wrong-input", toolName: "read" }, f.ctx);
+    expect(wrongCapture.ok).toBe(true);
+    if (!wrongCapture.ok) return;
+    expectRegistrationFailure(
+      f.entry.registerCallResultExpectation!(wrongCapture.ref, {
+        input: { q: "wrong" },
+        result: { content: [] },
+      }, f.ctx),
+      /input|preflight/,
+    );
+    expect(f.entry.inspectCall(wrongCapture.ref, f.ctx).resultProjection!.state).toBe("unregistered");
+  });
+
+  test("a differing expectation after a match is sticky and cannot be healed", async () => {
+    const f = await fixture();
+    const ref = await registerableCall(f, "sticky expectation request", "sticky-1");
+    const expected = { input: {}, result: { content: [{ type: "text", text: "ok" }] } };
+    expect(f.entry.registerCallResultExpectation!(ref, expected, f.ctx).ok).toBe(true);
+    const event = {
+      toolCallId: "sticky-1",
+      toolName: "read",
+      input: {},
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+    };
+    await f.host.emit("tool_result", event, f.ctx);
+    expect(f.entry.inspectCall(ref, f.ctx).resultProjection!.state).toBe("matched");
+
+    expectRegistrationFailure(
+      f.entry.registerCallResultExpectation!(ref, {
+        input: {},
+        result: { content: [{ type: "text", text: "different" }] },
+      }, f.ctx),
+      /different|conflict/,
+    );
+    const conflicted = f.entry.inspectCall(ref, f.ctx);
+    expect(conflicted.resultProjection!.state).toBe("conflicted");
+    expect(conflicted.callResultState).toBe("unknown");
+
+    expectRegistrationFailure(
+      f.entry.registerCallResultExpectation!(ref, expected, f.ctx),
+      /current|conflict|unavailable/,
+    );
+    await f.host.emit("tool_result", event, f.ctx);
+    expect(f.entry.inspectCall(ref, f.ctx).resultProjection!.state).toBe("conflicted");
+  });
+
+  test("malformed re-registration after a match makes the call unusable", async () => {
+    const f = await fixture();
+    const ref = await registerableCall(f, "malformed repeat request", "malformed-repeat");
+    expect(f.entry.registerCallResultExpectation!(ref, {
+      input: {},
+      result: { content: [{ type: "text", text: "ok" }] },
+    }, f.ctx).ok).toBe(true);
+    await f.host.emit("tool_result", {
+      toolCallId: "malformed-repeat",
+      toolName: "read",
+      input: {},
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+    }, f.ctx);
+    expect(f.entry.inspectCall(ref, f.ctx).resultProjection!.state).toBe("matched");
+
+    const malformedResult: Record<string, unknown> = {};
+    Object.defineProperty(malformedResult, "content", {
+      enumerable: true,
+      get() {
+        throw new Error("malformed re-registration getter must not run");
+      },
+    });
+    expectRegistrationFailure(
+      f.entry.registerCallResultExpectation!(ref, {
+        input: {},
+        result: malformedResult,
+      }, f.ctx),
+      /unavailable|accessor/,
+    );
+    const inspected = f.entry.inspectCall(ref, f.ctx);
+    expect(inspected.resultProjection!.state).toBe("unavailable");
+    expect(inspected.resultProjection!.expectedSha256).not.toBeNull();
+    expect(inspected.callResultState).toBe("unknown");
+  });
+
+  test("foreign and cloned references cannot register or poison the genuine call", async () => {
+    const f = await fixture();
+    const ref = await registerableCall(f, "foreign reference request", "foreign-1");
+    const expected = { input: {}, result: { content: [] } };
+    expect(f.entry.registerCallResultExpectation!(ref, expected, f.ctx).ok).toBe(true);
+
+    expectRegistrationFailure(
+      f.entry.registerCallResultExpectation!(structuredClone(ref), expected, f.ctx),
+      /foreign/,
+    );
+    expectRegistrationFailure(
+      f.entry.registerCallResultExpectation!({ ...ref }, expected, f.ctx),
+      /foreign/,
+    );
+
+    let getterReads = 0;
+    const proxyRef = new Proxy({}, {
+      get() {
+        getterReads += 1;
+        return "foreign";
+      },
+      getOwnPropertyDescriptor() {
+        getterReads += 1;
+        return { configurable: true, enumerable: true, value: "foreign", writable: true };
+      },
+    });
+    expectRegistrationFailure(
+      f.entry.registerCallResultExpectation!(proxyRef, expected, f.ctx),
+      /foreign/,
+    );
+    expect(getterReads).toBe(0);
+
+    const other = await fixture();
+    const otherRef = await registerableCall(other, "other request", "foreign-1");
+    expectRegistrationFailure(
+      f.entry.registerCallResultExpectation!(otherRef, expected, f.ctx),
+      /foreign/,
+    );
+
+    const pending = f.entry.inspectCall(ref, f.ctx);
+    expect(pending.resultProjection!.state).toBe("pending");
+    await f.host.emit("tool_result", {
+      toolCallId: "foreign-1",
+      toolName: "read",
+      input: {},
+      content: [],
+      isError: false,
+    }, f.ctx);
+    expect(f.entry.inspectCall(ref, f.ctx).resultProjection!.state).toBe("matched");
+  });
+
+  test("foreign same-id result events do not poison a registered call", async () => {
+    const f = await fixture();
+    const ref = await registerableCall(f, "foreign event request", "foreign-event");
+    const expected = { input: {}, result: { content: [{ type: "text", text: "ok" }] } };
+    expect(f.entry.registerCallResultExpectation!(ref, expected, f.ctx).ok).toBe(true);
+
+    await f.host.emit("tool_result", {
+      toolCallId: "foreign-event",
+      toolName: "write",
+      input: {},
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+    }, f.ctx);
+    let inspected = f.entry.inspectCall(ref, f.ctx);
+    expect(inspected.resultProjection!.state).toBe("pending");
+    expect(inspected.callResultState).toBe("preflight");
+
+    const handler = f.host.handlers.get("tool_result")![0]!;
+    let toolNameReads = 0;
+    const accessorEvent = {
+      toolCallId: "foreign-event",
+      input: {},
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+      get toolName() {
+        toolNameReads += 1;
+        throw new Error("toolName getter must not run");
+      },
+    };
+    handler(accessorEvent, f.ctx);
+    expect(toolNameReads).toBe(0);
+    expect(f.entry.inspectCall(ref, f.ctx).resultProjection!.state).toBe("pending");
+
+    f.setLiveCwd(f.root);
+    await f.host.emit("tool_result", {
+      toolCallId: "foreign-event",
+      toolName: "read",
+      input: {},
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+    }, f.ctx);
+    inspected = f.entry.inspectCall(ref, f.ctx);
+    expect(inspected.resultProjection!.state).toBe("pending");
+    expect(inspected.callResultState).toBe("preflight");
+
+    f.setLiveCwd(f.workspace);
+    await f.host.emit("tool_result", {
+      toolCallId: "foreign-event",
+      toolName: "read",
+      input: {},
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+    }, f.ctx);
+    expect(f.entry.inspectCall(ref, f.ctx).resultProjection!.state).toBe("matched");
+  });
+
+  test("malformed registered results clear evidence without invoking accessors", async () => {
+    const f = await fixture();
+    const ref = await registerableCall(f, "accessor result request", "accessor-result");
+    const expected = { input: {}, result: { content: [{ type: "text", text: "ok" }] } };
+    expect(f.entry.registerCallResultExpectation!(ref, expected, f.ctx).ok).toBe(true);
+
+    const handler = f.host.handlers.get("tool_result")![0]!;
+    let contentReads = 0;
+    const event: Record<string, unknown> = {
+      toolCallId: "accessor-result",
+      toolName: "read",
+      input: {},
+      isError: false,
+    };
+    Object.defineProperty(event, "content", {
+      enumerable: true,
+      get() {
+        contentReads += 1;
+        throw new Error("content getter must not run");
+      },
+    });
+    handler(event, f.ctx);
+    expect(contentReads).toBe(0);
+
+    const inspected = f.entry.inspectCall(ref, f.ctx);
+    expect(inspected.resultProjection!.state).toBe("unavailable");
+    expect(inspected.callResultState).toBe("unknown");
+
+    await f.host.emit("tool_result", {
+      toolCallId: "accessor-result",
+      toolName: "read",
+      input: {},
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+    }, f.ctx);
+    expect(f.entry.inspectCall(ref, f.ctx).resultProjection!.state).toBe("unavailable");
+  });
+
+  test("changed duplicate preflight input invalidates the pure check and is not healed", async () => {
+    const f = await fixture();
+    const ref = await registerableCall(f, "duplicate input request", "dup-input", "read", { a: 1 });
+    const prepared = f.entry.prepareCallCheck(ref, f.ctx);
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) return;
+    expect(prepared.revalidate()).toBeNull();
+
+    await f.host.emit("tool_call", { toolCallId: "dup-input", toolName: "read", input: { a: 1 } }, f.ctx);
+    expect(prepared.revalidate()).toBeNull();
+
+    await f.host.emit("tool_call", { toolCallId: "dup-input", toolName: "read", input: { a: 2 } }, f.ctx);
+    expect(prepared.revalidate()).toBe("call-result-changed");
+    expect(f.entry.inspectCall(ref, f.ctx).callInputSha256).toBeNull();
+    expectRegistrationFailure(
+      f.entry.registerCallResultExpectation!(ref, {
+        input: { a: 1 },
+        result: { content: [] },
+      }, f.ctx),
+      /input|ambiguous|unavailable/,
+    );
+
+    await f.host.emit("tool_call", { toolCallId: "dup-input", toolName: "read", input: { a: 1 } }, f.ctx);
+    expect(prepared.revalidate()).toBe("call-result-changed");
+    expectRegistrationFailure(
+      f.entry.registerCallResultExpectation!(ref, {
+        input: { a: 1 },
+        result: { content: [] },
+      }, f.ctx),
+      /input|ambiguous|unavailable/,
+    );
+  });
+
+  test("proxy ABA cannot split expected input, projection or legacy facts", async () => {
+    const f = await fixture();
+    await input(f.host, f.ctx, "ABA request");
+    await prepare(f.host, f.ctx, "ABA request");
+
+    await f.host.emit("tool_call", { toolCallId: "aba-input", toolName: "read", input: { task: "A" } }, f.ctx);
+    const inputCapture = f.entry.captureCall({ toolCallId: "aba-input", toolName: "read" }, f.ctx);
+    expect(inputCapture.ok).toBe(true);
+    if (!inputCapture.ok) return;
+    let inputReads = 0;
+    const proxyInput = new Proxy({ task: "A" }, {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === "task") {
+          inputReads += 1;
+          return {
+            configurable: true,
+            enumerable: true,
+            writable: true,
+            value: inputReads === 1 ? "A" : "B",
+          };
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    expect(f.entry.registerCallResultExpectation!(inputCapture.ref, {
+      input: proxyInput,
+      result: { content: [{ type: "text", text: "ok" }] },
+    }, f.ctx).ok).toBe(true);
+    expect(inputReads).toBe(1);
+    expect(f.entry.inspectCall(inputCapture.ref, f.ctx).callInputSha256).toBe(
+      createHash("sha256").update('{"task":"A"}', "utf8").digest("hex"),
+    );
+    await f.host.emit("tool_result", {
+      toolCallId: "aba-input",
+      toolName: "read",
+      input: { task: "B" },
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+    }, f.ctx);
+    expect(f.entry.inspectCall(inputCapture.ref, f.ctx).resultProjection!.state).toBe("conflicted");
+
+    await f.host.emit("tool_call", { toolCallId: "aba-content", toolName: "read", input: { q: "c" } }, f.ctx);
+    const contentCapture = f.entry.captureCall({ toolCallId: "aba-content", toolName: "read" }, f.ctx);
+    expect(contentCapture.ok).toBe(true);
+    if (!contentCapture.ok) return;
+    expect(f.entry.registerCallResultExpectation!(contentCapture.ref, {
+      input: { q: "c" },
+      result: { content: [{ type: "text", text: "ok" }] },
+    }, f.ctx).ok).toBe(true);
+    let textReads = 0;
+    const proxyBlock = new Proxy({ type: "text", text: "initial" }, {
+      getOwnPropertyDescriptor(target, key) {
+        if (key === "text") {
+          textReads += 1;
+          return {
+            configurable: true,
+            enumerable: true,
+            writable: true,
+            value: textReads === 1 ? "ok" : "spoofed",
+          };
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    await f.host.emit("tool_result", {
+      toolCallId: "aba-content",
+      toolName: "read",
+      input: { q: "c" },
+      content: [proxyBlock],
+      isError: false,
+    }, f.ctx);
+    expect(textReads).toBe(1);
+    expect(f.entry.inspectCall(contentCapture.ref, f.ctx).resultProjection!.state).toBe("matched");
+    const view = await inspect(f.host, f.ctx, "inspect-aba-content");
+    const call = view.current.calls.find((item: any) => item.toolCallId === "aba-content");
+    expect(call.resultExcerpt).toBe("ok");
+  });
+
+  test("ended, disposed, owned, dropped and replaced calls cannot register", async () => {
+    const ended = await fixture();
+    const endedRef = await registerableCall(ended, "ended request", "ended-1");
+    await terminalEnd(ended.host, ended.ctx);
+    expectRegistrationFailure(
+      ended.entry.registerCallResultExpectation!(endedRef, { input: {}, result: { content: [] } }, ended.ctx),
+      /current|ended/,
+    );
+
+    const disposed = await fixture();
+    const disposedRef = await registerableCall(disposed, "disposed request", "disposed-1");
+    disposed.entry.dispose();
+    expectRegistrationFailure(
+      disposed.entry.registerCallResultExpectation!(disposedRef, { input: {}, result: { content: [] } }, disposed.ctx),
+      /disposed/,
+    );
+
+    const owned = await fixture();
+    const ownedRef = await registerableCall(owned, "owned request", "owned-1");
+    publishTaskOwner({ ownerId: "late-expectation-owner" } as unknown as TaskOwner);
+    expectRegistrationFailure(
+      owned.entry.registerCallResultExpectation!(ownedRef, { input: {}, result: { content: [] } }, owned.ctx),
+      /managed|owner/,
+    );
+    clearPublishedTaskOwner();
+
+    const dropped = await fixture({ maxCallsPerWork: 1 });
+    const droppedRef = await registerableCall(dropped, "dropped request", "dropped-1");
+    await dropped.host.emit("tool_call", { toolCallId: "dropped-2", toolName: "read", input: {} }, dropped.ctx);
+    expectRegistrationFailure(
+      dropped.entry.registerCallResultExpectation!(droppedRef, { input: {}, result: { content: [] } }, dropped.ctx),
+      /retained/,
+    );
+
+    const replaced = await fixture();
+    const replacedRef = await registerableCall(replaced, "replaced request", "replaced-1");
+    await terminalEnd(replaced.host, replaced.ctx);
+    await input(replaced.host, replaced.ctx, "replacement request");
+    await prepare(replaced.host, replaced.ctx, "replacement request");
+    expectRegistrationFailure(
+      replaced.entry.registerCallResultExpectation!(replacedRef, { input: {}, result: { content: [] } }, replaced.ctx),
+      /replaced/,
+    );
+
+    const reused = await fixture();
+    const reusedRef = await registerableCall(reused, "reused request", "reused-1");
+    await terminalEnd(reused.host, reused.ctx);
+    await input(reused.host, reused.ctx, "reused replacement");
+    await prepare(reused.host, reused.ctx, "reused replacement");
+    await reused.host.emit("tool_call", { toolCallId: "reused-1", toolName: "read", input: {} }, reused.ctx);
+    expect(reused.entry.inspectCall(reusedRef, reused.ctx).state).toBe("stale");
+    expectRegistrationFailure(
+      reused.entry.registerCallResultExpectation!(reusedRef, { input: {}, result: { content: [] } }, reused.ctx),
+      /replaced|rebound|conflict/,
+    );
+  });
+
+  test("session and workspace changes refuse registration without touching the call", async () => {
+    const session = await fixture();
+    const sessionRef = await registerableCall(session, "session request", "session-1");
+    session.setSessionId("other-session");
+    expectRegistrationFailure(
+      session.entry.registerCallResultExpectation!(sessionRef, { input: {}, result: { content: [] } }, session.ctx),
+      /session/,
+    );
+    expect(session.entry.inspectCall(sessionRef, session.ctx).resultProjection!.state).toBe("unregistered");
+
+    const workspace = await fixture();
+    const workspaceRef = await registerableCall(workspace, "workspace request", "workspace-1");
+    workspace.setLiveCwd(workspace.root);
+    expectRegistrationFailure(
+      workspace.entry.registerCallResultExpectation!(workspaceRef, { input: {}, result: { content: [] } }, workspace.ctx),
+      /workspace/,
+    );
+    expect(workspace.entry.inspectCall(workspaceRef, workspace.ctx).resultProjection!.state).toBe("unregistered");
+  });
+
+  test("proxy callback during preflight fingerprint cannot overwrite a newer work association", async () => {
+    const f = await fixture();
+    await input(f.host, f.ctx, "work A");
+    await prepare(f.host, f.ctx, "work A");
+
+    let fired = false;
+    const proxyInput = new Proxy({ payload: 1 }, {
+      getOwnPropertyDescriptor(target, key) {
+        if (!fired) {
+          fired = true;
+          f.host.emitSync("agent_end", { messages: [], willContinue: false }, f.ctx);
+          f.host.emitSync("input", { text: "work B", source: "rpc" }, f.ctx);
+          f.host.emitSync("before_agent_start", {
+            reason: "prompt",
+            prompt: "work B",
+            systemPrompt: [],
+          }, f.ctx);
+          f.host.emitSync("tool_call", {
+            toolCallId: "same-id",
+            toolName: "read",
+            input: { b: 1 },
+          }, f.ctx);
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    await f.host.emit("tool_call", {
+      toolCallId: "same-id",
+      toolName: "read",
+      input: proxyInput,
+    }, f.ctx);
+    expect(fired).toBe(true);
+
+    const capture = f.entry.captureCall({ toolCallId: "same-id", toolName: "read" }, f.ctx);
+    expect(capture.ok).toBe(true);
+    if (!capture.ok) return;
+    const inspected = f.entry.inspectCall(capture.ref, f.ctx);
+    expect(inspected.state).toBe("current");
+    expect(inspected.reason).toBe("current-work");
+    expect(inspected.callInputSha256).toBe(
+      createHash("sha256").update('{"b":1}', "utf8").digest("hex"),
+    );
+  });
+
+  test("clock callback during preflight cannot overwrite a newer work association", async () => {
+    let armed = false;
+    let f: Fixture;
+    f = await fixture({
+      now: () => {
+        if (armed) {
+          armed = false;
+          f.host.emitSync("agent_end", { messages: [], willContinue: false }, f.ctx);
+          f.host.emitSync("input", { text: "clock B", source: "rpc" }, f.ctx);
+          f.host.emitSync("before_agent_start", {
+            reason: "prompt",
+            prompt: "clock B",
+            systemPrompt: [],
+          }, f.ctx);
+          f.host.emitSync("tool_call", {
+            toolCallId: "clock-same",
+            toolName: "read",
+            input: { b: 1 },
+          }, f.ctx);
+        }
+        return 100;
+      },
+    });
+    await input(f.host, f.ctx, "clock A");
+    await prepare(f.host, f.ctx, "clock A");
+    armed = true;
+    await f.host.emit("tool_call", {
+      toolCallId: "clock-same",
+      toolName: "read",
+      input: { a: 1 },
+    }, f.ctx);
+
+    const capture = f.entry.captureCall({ toolCallId: "clock-same", toolName: "read" }, f.ctx);
+    expect(capture.ok).toBe(true);
+    if (!capture.ok) return;
+    expect(f.entry.inspectCall(capture.ref, f.ctx).callInputSha256).toBe(
+      createHash("sha256").update('{"b":1}', "utf8").digest("hex"),
+    );
+  });
+
+  test("input action getter during preflight cannot overwrite a newer work association", async () => {
+    const f = await fixture();
+    await input(f.host, f.ctx, "action A");
+    await prepare(f.host, f.ctx, "action A");
+
+    let fired = false;
+    const proxyInput: Record<string, unknown> = { data: 1 };
+    Object.defineProperty(proxyInput, "action", {
+      enumerable: false,
+      get() {
+        if (!fired) {
+          fired = true;
+          f.host.emitSync("agent_end", { messages: [], willContinue: false }, f.ctx);
+          f.host.emitSync("input", { text: "action B", source: "rpc" }, f.ctx);
+          f.host.emitSync("before_agent_start", {
+            reason: "prompt",
+            prompt: "action B",
+            systemPrompt: [],
+          }, f.ctx);
+          f.host.emitSync("tool_call", {
+            toolCallId: "action-same",
+            toolName: "read",
+            input: { b: 1 },
+          }, f.ctx);
+        }
+        return "inspect";
+      },
+    });
+    await f.host.emit("tool_call", {
+      toolCallId: "action-same",
+      toolName: AGENT_WORK,
+      input: proxyInput,
+    }, f.ctx);
+    expect(fired).toBe(true);
+
+    const capture = f.entry.captureCall({ toolCallId: "action-same", toolName: "read" }, f.ctx);
+    expect(capture.ok).toBe(true);
+    if (!capture.ok) return;
+    expect(f.entry.inspectCall(capture.ref, f.ctx).callInputSha256).toBe(
+      createHash("sha256").update('{"b":1}', "utf8").digest("hex"),
+    );
+  });
+
+  test("result projection reentry that changes agent kind cannot publish", async () => {
+    const f = await fixture();
+    const ref = await registerableCall(f, "agent change request", "agent-change");
+    expect(f.entry.registerCallResultExpectation!(ref, {
+      input: {},
+      result: { content: [{ type: "text", text: "ok" }] },
+    }, f.ctx).ok).toBe(true);
+
+    let fired = false;
+    const details = new Proxy({ x: 1 }, {
+      getOwnPropertyDescriptor(target, key) {
+        if (!fired) {
+          fired = true;
+          f.setAgentKind("sub");
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    await f.host.emit("tool_result", {
+      toolCallId: "agent-change",
+      toolName: "read",
+      input: {},
+      content: [{ type: "text", text: "ok" }],
+      isError: false,
+      details,
+    }, f.ctx);
+    expect(fired).toBe(true);
+    f.setAgentKind("main");
+    const inspected = f.entry.inspectCall(ref, f.ctx);
+    expect(inspected.resultProjection!.state).toBe("pending");
+    expect(inspected.callResultState).toBe("preflight");
+  });
+
+  test("proxy reflection reentry during registration and result cannot publish", async () => {
+    const registration = await fixture();
+    const registrationRef = await registerableCall(registration, "proxy registration request", "proxy-register");
+    let registrationFired = false;
+    const registrationDetails = new Proxy({ x: 1 }, {
+      getOwnPropertyDescriptor(target, key) {
+        if (!registrationFired) {
+          registrationFired = true;
+          registration.host.emitSync("tool_result", {
+            toolCallId: "proxy-register",
+            toolName: "read",
+            input: {},
+            content: [{ type: "text", text: "nested" }],
+            isError: false,
+          }, registration.ctx);
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    expectRegistrationFailure(
+      registration.entry.registerCallResultExpectation!(registrationRef, {
+        input: {},
+        result: { content: [], details: registrationDetails },
+      }, registration.ctx),
+      /changed|association/,
+    );
+    expect(registrationFired).toBe(true);
+    const registrationInspection = registration.entry.inspectCall(registrationRef, registration.ctx);
+    expect(registrationInspection.resultProjection!.state).toBe("unregistered");
+    expect(registrationInspection.callResultState).toBe("observed");
+    const registrationView = await inspect(registration.host, registration.ctx, "inspect-proxy-registration");
+    const registrationCall = registrationView.current.calls
+      .find((item: any) => item.toolCallId === "proxy-register");
+    expect(registrationCall.resultExcerpt).toBe("nested");
+
+    const result = await fixture();
+    const resultRef = await registerableCall(result, "proxy result request", "proxy-result");
+    expect(result.entry.registerCallResultExpectation!(resultRef, {
+      input: {},
+      result: { content: [{ type: "text", text: "ok" }] },
+    }, result.ctx).ok).toBe(true);
+    let resultFired = false;
+    const resultDetails = new Proxy({ x: 1 }, {
+      getOwnPropertyDescriptor(target, key) {
+        if (!resultFired) {
+          resultFired = true;
+          result.host.emitSync("tool_result", {
+            toolCallId: "proxy-result",
+            toolName: "read",
+            input: {},
+            content: [{ type: "text", text: "ok" }],
+            isError: false,
+          }, result.ctx);
+        }
+        return Reflect.getOwnPropertyDescriptor(target, key);
+      },
+    });
+    await result.host.emit("tool_result", {
+      toolCallId: "proxy-result",
+      toolName: "read",
+      input: {},
+      content: [{ type: "text", text: "outer" }],
+      isError: false,
+      details: resultDetails,
+    }, result.ctx);
+    expect(resultFired).toBe(true);
+    const resultInspection = result.entry.inspectCall(resultRef, result.ctx);
+    expect(resultInspection.resultProjection!.state).toBe("matched");
+    expect(resultInspection.callResultState).toBe("observed");
+    const resultView = await inspect(result.host, result.ctx, "inspect-proxy-result");
+    const resultCall = resultView.current.calls
+      .find((item: any) => item.toolCallId === "proxy-result");
+    expect(resultCall.resultExcerpt).toBe("ok");
   });
 });

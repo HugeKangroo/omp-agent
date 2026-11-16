@@ -401,6 +401,16 @@ function encodeCanonical(value: unknown): EncodeResult {
   }
 }
 
+export type NativeJsonFingerprint = EncodeResult;
+
+/**
+ * Thin public wrapper around the existing bounded canonical encoder. It keeps
+ * the same 64 KiB/depth/node limits and never calls getters or toJSON.
+ */
+export function fingerprintNativeJson(value: unknown): NativeJsonFingerprint {
+  return encodeCanonical(value);
+}
+
 function associationDigest(association: NativeInstanceResultAssociation | null): string | null {
   if (association === null) return null;
   const encoded = encodeCanonical(association);

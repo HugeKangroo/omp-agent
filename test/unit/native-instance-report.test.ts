@@ -1462,27 +1462,52 @@ describe("C2 handoff adoption report surface", () => {
     await taskWork(reentrant);
     await writeFile(path.join(reentrant.workspace, "out.txt"), HANDOFF_TEXT, "utf8");
     reentrant.port.handoffFactory = (selection, work) => makeHandoffFacts(selection, work);
+    const params = reportArgs(
+      [{ toolCallId: "task-1", purpose: "delegated" }],
+      ["out.txt"],
+      selector(),
+      "x",
+      "adoption-1",
+    );
+    const callId = "report-handoff-reentrant";
+    await reentrant.host.emit(
+      "tool_call",
+      { toolCallId: callId, toolName: AGENT_WORK, input: params },
+      reentrant.ctx,
+    );
     let getterCount = 0;
-    let conflictSeen = false;
-    reentrant.port.revalidateHook = () => conflictSeen
+    let mutationSeen = false;
+    let refreshCount = 0;
+    reentrant.port.refreshHook = () => {
+      refreshCount += 1;
+      if (refreshCount === 2) {
+        // The next live getter is the final live snapshot; it arms the exact
+        // final revalidation failure after the final refresh.
+        reentrant.setCwdGetterHook(() => {
+          getterCount += 1;
+          mutationSeen = true;
+        });
+      }
+      return { ok: true };
+    };
+    reentrant.port.revalidateHook = () => mutationSeen
       ? "revalidate saw the final host read mutation"
       : null;
-    reentrant.setCwdGetterHook(() => {
-      getterCount += 1;
-      if (getterCount >= 3) conflictSeen = true;
-    });
-    expectError(await reentrant.host.call(
-      "report-handoff-reentrant",
-      reportArgs(
-        [{ toolCallId: "task-1", purpose: "delegated" }],
-        ["out.txt"],
-        selector(),
-        "x",
-        "adoption-1",
-      ),
-      reentrant.ctx,
+    const tool = reentrant.host.tools.get(AGENT_WORK);
+    if (tool === undefined) throw new Error("agent_work was not registered");
+    expectError(await tool.execute(
+      callId,
+      params,
       reentrant.signal(),
+      undefined,
+      reentrant.ctx,
     ), /final host read mutation/);
+    expect(getterCount).toBe(1);
+    expect(refreshCount).toBe(2);
+    expect(reentrant.port.refreshCalls).toBe(2);
+    expect(reentrant.port.revalidateCalls).toBe(2);
+    expect(mutationSeen).toBe(true);
+    reentrant.setCwdGetterHook(null);
     expect((await inspect(reentrant)).current?.report ?? null).toBeNull();
   });
 
@@ -1645,43 +1670,111 @@ describe("C2 selected fresh-work gates and final ordering", () => {
     }
   });
 
-  test("final clock mutation and reentrant getter failure are caught before publication", async () => {
+  test("clock mutation during report preflight is caught by the routing gate before any report binding", async () => {
     const clock = await fixture();
     await taskWork(clock);
     clock.setNow(() => {
-      clock.setSessionId("changed-by-final-clock");
+      clock.setSessionId("changed-by-preflight-clock");
       return 5000;
     });
     expectError(await clock.host.call(
-      "report-clock-mutation",
+      "report-clock-preflight-mutation",
       reportArgs([{ toolCallId: "task-1", purpose: "delegated" }], [], selector()),
       clock.ctx,
       clock.signal(),
-    ), /session or workspace changed|current live work/);
+    ), /no matching tool_call preflight/);
+    expect(clock.port.prepareCalls).toBe(0);
     clock.setNow(() => 6000);
     expect((await inspect(clock)).current?.report ?? null).toBeNull();
+  });
 
+  test("final report clock mutation is refused after the final refresh and publishes nothing", async () => {
+    const clock = await fixture();
+    await taskWork(clock);
+    const params = reportArgs([{ toolCallId: "task-1", purpose: "delegated" }], [], selector());
+    const callId = "report-final-clock-mutation";
+    await clock.host.emit(
+      "tool_call",
+      { toolCallId: callId, toolName: AGENT_WORK, input: params },
+      clock.ctx,
+    );
+    let refreshCount = 0;
+    let clockReads = 0;
+    clock.port.refreshHook = () => {
+      refreshCount += 1;
+      if (refreshCount === 2) {
+        clock.setNow(() => {
+          clockReads += 1;
+          clock.setSessionId("changed-by-final-clock");
+          return 5000;
+        });
+      }
+      return { ok: true };
+    };
+    const tool = clock.host.tools.get(AGENT_WORK);
+    if (tool === undefined) throw new Error("agent_work was not registered");
+    expectError(await tool.execute(
+      callId,
+      params,
+      clock.signal(),
+      undefined,
+      clock.ctx,
+    ), /session or workspace changed while observing outputs/);
+    expect(refreshCount).toBe(2);
+    // No output files are selected, so the only clock read after final-refresh
+    // arming is the report's final recordedAt read.
+    expect(clockReads).toBe(1);
+    clock.setNow(() => 6000);
+    expect((await inspect(clock)).current?.report ?? null).toBeNull();
+  });
+
+  test("reentrant getter mutation at the final live snapshot is refused after the final refresh", async () => {
     const reentrant = await fixture();
     await taskWork(reentrant);
+    const params = reportArgs([{ toolCallId: "task-1", purpose: "delegated" }], [], selector());
+    const callId = "report-reentrant-revalidate";
+    await reentrant.host.emit(
+      "tool_call",
+      { toolCallId: callId, toolName: AGENT_WORK, input: params },
+      reentrant.ctx,
+    );
     let getterCount = 0;
-    let conflictSeen = false;
-    reentrant.port.revalidateHook = () => conflictSeen
+    let mutationSeen = false;
+    let refreshCount = 0;
+    reentrant.port.refreshHook = () => {
+      refreshCount += 1;
+      if (refreshCount === 2) {
+        // The next live getter is the final live snapshot; it arms the exact
+        // final revalidation failure after the final refresh.
+        reentrant.setCwdGetterHook(() => {
+          getterCount += 1;
+          mutationSeen = true;
+        });
+      }
+      return { ok: true };
+    };
+    reentrant.port.revalidateHook = () => mutationSeen
       ? "revalidate saw the final host read mutation"
       : null;
-    reentrant.setCwdGetterHook(() => {
-      getterCount += 1;
-      // One getter read belongs to the report tool_call preflight, one to the
-      // pre-I/O live snapshot, and the third to the final live snapshot.
-      if (getterCount >= 3) conflictSeen = true;
-    });
-    expectError(await reentrant.host.call(
-      "report-reentrant-revalidate",
-      reportArgs([{ toolCallId: "task-1", purpose: "delegated" }], [], selector()),
-      reentrant.ctx,
+    const tool = reentrant.host.tools.get(AGENT_WORK);
+    if (tool === undefined) throw new Error("agent_work was not registered");
+    expectError(await tool.execute(
+      callId,
+      params,
       reentrant.signal(),
+      undefined,
+      reentrant.ctx,
     ), /final host read mutation/);
+    expect(getterCount).toBe(1);
+    expect(refreshCount).toBe(2);
+    expect(reentrant.port.refreshCalls).toBe(2);
+    expect(reentrant.port.revalidateCalls).toBe(2);
+    expect(mutationSeen).toBe(true);
+    reentrant.setCwdGetterHook(null);
     expect((await inspect(reentrant)).current?.report ?? null).toBeNull();
+  });
 
+  test("agent_end during the final refresh is caught before publication", async () => {
     const ended = await fixture();
     await taskWork(ended);
     let refreshCount = 0;

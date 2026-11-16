@@ -35,6 +35,11 @@ import {
   type NativeInstanceReportSelection,
   type NativeReportWorkIdentity,
 } from "./native-instance-report.ts";
+import { fingerprintNativeJson } from "./native-instance-result.ts";
+import {
+  fingerprintExpectedCallResult,
+  fingerprintObservedCallResult,
+} from "./native-result-expectation.ts";
 
 /**
  * Explicitly loaded alternative entry for ordinary OMP-native work.
@@ -176,6 +181,13 @@ export type NativeWorkCallReason =
   | "work-evidence-unavailable"
   | "call-evidence-unknown";
 
+export type NativeResultProjectionState =
+  | "unregistered"
+  | "pending"
+  | "matched"
+  | "unavailable"
+  | "conflicted";
+
 export interface NativeWorkCallInspection {
   readonly schema: typeof NATIVE_WORK_CALL_INSPECTION_SCHEMA;
   readonly authority: "non-authoritative";
@@ -188,6 +200,17 @@ export interface NativeWorkCallInspection {
   readonly callResultState: "preflight" | "observed" | "unknown" | null;
   readonly pendingInputCount: number | null;
   readonly pendingInputsDropped: number | null;
+  /** Digest of the actual prepared Work prompt, not a requirements or managed-task digest. */
+  readonly workPromptSha256?: string | null;
+  /** Bounded canonical fingerprint of this call's preflight tool input, not the prompt digest. */
+  readonly callInputSha256?: string | null;
+  readonly resultProjection?: {
+    readonly state: NativeResultProjectionState;
+    readonly expectedSha256: string | null;
+    readonly observedSha256: string | null;
+    readonly expectedBytes: number | null;
+    readonly observedBytes: number | null;
+  };
 }
 
 export type NativeWorkCallCapture =
@@ -223,7 +246,19 @@ export interface NativeEntryControls {
   captureCall(selector: NativeWorkCallSelector, context: NativeContext): NativeWorkCallCapture;
   inspectCall(ref: unknown, context: NativeContext): NativeWorkCallInspection;
   prepareCallCheck(ref: unknown, context: NativeContext): NativeCallCheckPreparation;
+  registerCallResultExpectation?(
+    ref: unknown,
+    expected: { readonly input: unknown; readonly result: unknown },
+    context: NativeContext,
+  ): CallResultExpectationRegistration;
 }
+
+export type CallResultExpectationRegistration =
+  | {
+      readonly ok: true;
+      readonly fingerprint: { readonly bytes: number; readonly sha256: string };
+    }
+  | { readonly ok: false; readonly reason: string };
 
 type WorkStatus = "active" | "ended" | "unknown";
 export type RequestAttribution = "matched-user-input" | "unknown" | "unavailable";
@@ -255,6 +290,7 @@ interface ToolResultLike {
   type: "tool_result";
   toolCallId: string;
   toolName: string;
+  input: unknown;
   content: unknown;
   isError: unknown;
   details: unknown;
@@ -295,12 +331,29 @@ interface ObservedResult {
   observedAt: number;
 }
 
+interface CallInputFingerprint {
+  readonly state: "available" | "unavailable" | "ambiguous";
+  readonly bytes: number | null;
+  readonly sha256: string | null;
+}
+
+interface CallResultExpectation {
+  readonly state: "pending" | "matched" | "unavailable" | "conflicted";
+  readonly expectedSha256: string | null;
+  readonly expectedBytes: number | null;
+  readonly observedSha256: string | null;
+  readonly observedBytes: number | null;
+}
+
 interface ObservedCall {
   toolCallId: string;
   toolName: string;
   preflightAt: number;
   /** Digest of canonical preflight input; null means a repeat cannot be proven identical. */
   preflightDigest: string | null;
+  /** Separate bounded encoder fingerprint for exact-result registration. */
+  inputFingerprint: CallInputFingerprint;
+  resultExpectation: CallResultExpectation | null;
   resultState: ResultState;
   result: ObservedResult | null;
   unknownReason: string | null;
@@ -481,6 +534,94 @@ function canonicalInputDigest(value: unknown): string | null {
   } catch {
     return null;
   }
+}
+
+function fingerprintCallInput(value: unknown): CallInputFingerprint {
+  const encoded = fingerprintNativeJson(value);
+  if (!encoded.ok) {
+    return Object.freeze({ state: "unavailable" as const, bytes: null, sha256: null });
+  }
+  return Object.freeze({
+    state: "available" as const,
+    bytes: encoded.bytes,
+    sha256: encoded.sha256,
+  });
+}
+
+interface NativeResultFingerprintLike {
+  readonly bytes: number;
+  readonly sha256: string;
+}
+
+function sameInputFingerprint(left: CallInputFingerprint, right: CallInputFingerprint): boolean {
+  return left.state === "available"
+    && right.state === "available"
+    && left.bytes === right.bytes
+    && left.sha256 === right.sha256;
+}
+
+function inputMatchesFingerprint(
+  input: CallInputFingerprint,
+  expected: NativeResultFingerprintLike,
+): boolean {
+  return input.state === "available"
+    && input.bytes === expected.bytes
+    && input.sha256 === expected.sha256;
+}
+
+/** A repeated id with different/unreadable input makes exact-result input association permanently ambiguous. */
+function poisonCallInput(state: EntryState, call: ObservedCall): void {
+  if (call.inputFingerprint.state === "ambiguous") return;
+  call.inputFingerprint = Object.freeze({ state: "ambiguous" as const, bytes: null, sha256: null });
+  const expectation = call.resultExpectation;
+  if (expectation === null || (expectation.state !== "pending" && expectation.state !== "matched")) {
+    return;
+  }
+  call.resultExpectation = Object.freeze({ ...expectation, state: "unavailable" as const });
+  call.resultState = "unknown";
+  call.result = null;
+  call.unknownReason = "repeated preflight input made exact-result input association ambiguous";
+  invalidateReportRouting(state, call.toolCallId, call);
+}
+
+function updateCallInputFingerprint(
+  state: EntryState,
+  call: ObservedCall,
+  next: CallInputFingerprint,
+): void {
+  if (call.inputFingerprint.state === "ambiguous") return;
+  if (sameInputFingerprint(call.inputFingerprint, next)) return;
+  poisonCallInput(state, call);
+}
+
+function callInputSha256(call: ObservedCall): string | null {
+  return call.inputFingerprint.state === "available" ? call.inputFingerprint.sha256 : null;
+}
+
+function resultProjectionView(call: ObservedCall): {
+  readonly state: NativeResultProjectionState;
+  readonly expectedSha256: string | null;
+  readonly observedSha256: string | null;
+  readonly expectedBytes: number | null;
+  readonly observedBytes: number | null;
+} {
+  const expectation = call.resultExpectation;
+  if (expectation === null) {
+    return Object.freeze({
+      state: "unregistered" as const,
+      expectedSha256: null,
+      observedSha256: null,
+      expectedBytes: null,
+      observedBytes: null,
+    });
+  }
+  return Object.freeze({
+    state: expectation.state,
+    expectedSha256: expectation.expectedSha256,
+    observedSha256: expectation.observedSha256,
+    expectedBytes: expectation.expectedBytes,
+    observedBytes: expectation.observedBytes,
+  });
 }
 
 function errorMessage(error: unknown): string {
@@ -1410,13 +1551,50 @@ function recordToolCall(state: EntryState, event: ToolCallLike, context: NativeC
   const toolName = typeof event.toolName === "string" ? event.toolName : "";
   if (toolCallId.length < 1 || toolCallId.length > MAX_TOOL_CALL_ID_CHARS || toolName.length < 1) return;
 
-  const input = isRecord(event.input) ? event.input : null;
-  const preflightDigest = toolName === NATIVE_WORK_TOOL ? canonicalInputDigest(event.input) : null;
-  const existing = work.callIndex.get(toolCallId);
+  const originalWork = work;
+  const originalWorks = state.works;
+  const originalCallIndex = work.callIndex;
+  const originalCallBindings = state.callBindings;
+  const originalCallIdMemory = state.callIdMemory;
+  const originalBinding = state.callBindings.get(toolCallId);
+  const originalIndexed = work.callIndex.get(toolCallId);
+  const originalMemory = state.callIdMemory.get(toolCallId);
+
+  // Both legacy canonicalization and the new auxiliary encoder may run Proxy
+  // reflection traps. Finish those reads, then require the original work/
+  // current/binding identity before recording any association.
+  const rawInput = event.input;
+  const preflightDigest = toolName === NATIVE_WORK_TOOL ? canonicalInputDigest(rawInput) : null;
+  const isReportAction = toolName === NATIVE_WORK_TOOL
+    && isRecord(rawInput)
+    && rawInput.action === "report";
+  const auxiliaryInput = fingerprintCallInput(rawInput);
+  const preflightAt = originalIndexed === undefined ? state.now() : null;
+  const afterHost = readCallPortHost(context, true);
+  if (callEntryFailure(state, afterHost) !== null) return;
+  if (afterHost.sessionId !== sessionId || afterHost.workspaceRoot !== workspaceRoot) return;
+  if (state.current !== originalWork
+    || state.works !== originalWorks
+    || !state.works.includes(originalWork)
+    || originalWork.invalidated
+    || originalWork.status !== "active"
+    || originalWork.sessionId !== sessionId
+    || originalWork.workspaceRoot !== workspaceRoot
+    || originalWork.callIndex !== originalCallIndex
+    || state.callBindings !== originalCallBindings
+    || state.callIdMemory !== originalCallIdMemory
+    || state.callBindings.get(toolCallId) !== originalBinding
+    || originalWork.callIndex.get(toolCallId) !== originalIndexed
+    || state.callIdMemory.get(toolCallId) !== originalMemory) {
+    return;
+  }
+
+  const existing = originalIndexed;
   if (existing !== undefined) {
     const conflictingIdentity = existing.toolName !== toolName
       || (toolName === NATIVE_WORK_TOOL && (preflightDigest === null || preflightDigest !== existing.preflightDigest));
     if (conflictingIdentity) {
+      poisonCallInput(state, existing);
       existing.resultState = "unknown";
       existing.result = null;
       existing.unknownReason = "conflicting tool identity or preflight input for the same call id";
@@ -1424,7 +1602,8 @@ function recordToolCall(state: EntryState, event: ToolCallLike, context: NativeC
       invalidateReportRouting(state, toolCallId, existing);
       return;
     }
-    if (toolName === NATIVE_WORK_TOOL && input?.action === "report" && !existing.associationConflict) {
+    updateCallInputFingerprint(state, existing, auxiliaryInput);
+    if (toolName === NATIVE_WORK_TOOL && isReportAction && !existing.associationConflict) {
       const binding = state.reportBindings.get(toolCallId);
       if (binding === undefined) {
         // An identical wrapper repeat may restore a routing entry that bounded
@@ -1442,6 +1621,8 @@ function recordToolCall(state: EntryState, event: ToolCallLike, context: NativeC
     return;
   }
 
+  if (preflightAt === null) return;
+
   // Host ids are run-scoped, not globally unique across retained prompts. A
   // bounded global memory keeps reused ids ambiguous even after the owning call
   // or work has been evicted from visible retention. Report routing ids use the
@@ -1457,8 +1638,10 @@ function recordToolCall(state: EntryState, event: ToolCallLike, context: NativeC
   const call: ObservedCall = {
     toolCallId,
     toolName,
-    preflightAt: state.now(),
+    preflightAt,
     preflightDigest,
+    inputFingerprint: auxiliaryInput,
+    resultExpectation: null,
     resultState: reuseConflictReason === null ? "preflight" : "unknown",
     result: null,
     unknownReason: reuseConflictReason,
@@ -1483,7 +1666,7 @@ function recordToolCall(state: EntryState, event: ToolCallLike, context: NativeC
     }
   }
 
-  if (toolName === NATIVE_WORK_TOOL && input?.action === "report") {
+  if (toolName === NATIVE_WORK_TOOL && isReportAction) {
     // Bind even a conflicted report preflight so every later attempt resolves
     // to its own ambiguous routing entry instead of an unrelated work.
     state.reportBindings.set(toolCallId, createReportBinding(work, call));
@@ -1491,13 +1674,217 @@ function recordToolCall(state: EntryState, event: ToolCallLike, context: NativeC
   }
 }
 
+type OwnFieldRead =
+  | { readonly kind: "missing" }
+  | { readonly kind: "accessor" }
+  | { readonly kind: "data"; readonly value: unknown };
+
+/** Descriptor-only field read for the registered result branch. Never invokes a getter. */
+function readOwnField(target: unknown, key: string): OwnFieldRead {
+  try {
+    if (target === null || (typeof target !== "object" && typeof target !== "function")) {
+      return { kind: "missing" };
+    }
+    const descriptor = Object.getOwnPropertyDescriptor(target as object, key);
+    if (descriptor === undefined) return { kind: "missing" };
+    if (!("value" in descriptor)) return { kind: "accessor" };
+    return { kind: "data", value: descriptor.value };
+  } catch {
+    return { kind: "accessor" };
+  }
+}
+
+interface RegisteredResultSnapshot {
+  readonly binding: { work: Work; call: ObservedCall };
+  readonly work: Work;
+  readonly call: ObservedCall;
+  readonly expectation: CallResultExpectation;
+  readonly inputFingerprint: CallInputFingerprint;
+  readonly resultState: ResultState;
+  readonly result: ObservedResult | null;
+  readonly associationConflict: boolean;
+  readonly toolCallId: string;
+  readonly toolName: string;
+  readonly worksList: Work[];
+  readonly callIndex: Map<string, ObservedCall>;
+  readonly callBindings: Map<string, { work: Work; call: ObservedCall }>;
+  readonly callIdMemory: Map<string, number>;
+  readonly sessionId: string | null;
+  readonly workspaceRoot: string | null;
+  readonly promptDigest: string;
+}
+
+/** Pure, synchronous identity check after every registered-branch read. */
+function registeredSnapshotMatches(
+  state: EntryState,
+  snapshot: RegisteredResultSnapshot,
+): boolean {
+  const { work, call, binding } = snapshot;
+  if (state.disposed || !state.enabled) return false;
+  if (state.works !== snapshot.worksList) return false;
+  if (state.callBindings !== snapshot.callBindings) return false;
+  if (state.callBindings.get(snapshot.toolCallId) !== binding) return false;
+  if (work.callIndex !== snapshot.callIndex) return false;
+  if (work.callIndex.get(snapshot.toolCallId) !== call) return false;
+  if (state.callIdMemory !== snapshot.callIdMemory) return false;
+  if (state.callIdMemory.get(snapshot.toolCallId) !== work.generation) return false;
+  if (work.invalidated) return false;
+  if (work.sessionId !== snapshot.sessionId || work.workspaceRoot !== snapshot.workspaceRoot) return false;
+  if (work.promptDigest !== snapshot.promptDigest) return false;
+  if (call.toolCallId !== snapshot.toolCallId || call.toolName !== snapshot.toolName) return false;
+  if (call.inputFingerprint !== snapshot.inputFingerprint) return false;
+  if (call.resultExpectation !== snapshot.expectation) return false;
+  if (call.resultState !== snapshot.resultState || call.result !== snapshot.result) return false;
+  if (call.associationConflict !== snapshot.associationConflict) return false;
+  return true;
+}
+
+/**
+ * Exact-result branch for calls with a registered expectation. A foreign
+ * same-id event is ignored without touching the original call. All canonical,
+ * legacy-fact, clock and context reads finish before the pure commit gate.
+ */
+function onRegisteredToolResult(
+  state: EntryState,
+  event: ToolResultLike,
+  context: NativeContext,
+  binding: { work: Work; call: ObservedCall },
+): void {
+  const work = binding.work;
+  const call = binding.call;
+  const expectation = call.resultExpectation;
+  if (expectation === null) return;
+  if (expectation.state === "conflicted" || expectation.state === "unavailable") return;
+  if (call.associationConflict) return;
+  if (work.invalidated) return;
+  if (state.callBindings.get(call.toolCallId) !== binding) return;
+  if (work.callIndex.get(call.toolCallId) !== call) return;
+  if (state.callIdMemory.get(call.toolCallId) !== work.generation) return;
+
+  // Capture the original association before even the event's own tool-name
+  // descriptor is read. Any trap-driven replacement then fails the final gate.
+  const snapshot: RegisteredResultSnapshot = {
+    binding,
+    work,
+    call,
+    expectation,
+    inputFingerprint: call.inputFingerprint,
+    resultState: call.resultState,
+    result: call.result,
+    associationConflict: call.associationConflict,
+    toolCallId: call.toolCallId,
+    toolName: call.toolName,
+    worksList: state.works,
+    callIndex: work.callIndex,
+    callBindings: state.callBindings,
+    callIdMemory: state.callIdMemory,
+    sessionId: work.sessionId,
+    workspaceRoot: work.workspaceRoot,
+    promptDigest: work.promptDigest,
+  };
+
+  const eventName = readOwnField(event, "toolName");
+  if (eventName.kind !== "data" || typeof eventName.value !== "string") return;
+  if (eventName.value !== snapshot.toolName) return;
+
+  const sessionId = readSessionId(context);
+  const workspaceRoot = readWorkspace(context);
+  if (sessionId !== snapshot.sessionId || workspaceRoot !== snapshot.workspaceRoot) return;
+
+  const observed = fingerprintObservedCallResult(event, MAX_RESULT_EXCERPT_CHARS);
+
+  let nextExpectation: CallResultExpectation;
+  let nextResult: ObservedResult | null = null;
+  let clearEvidence = false;
+  let clearReason: string | null = null;
+
+  if (!observed.ok) {
+    nextExpectation = Object.freeze({
+      ...expectation,
+      state: "unavailable" as const,
+    });
+    clearEvidence = true;
+    clearReason = `result expectation unavailable: ${observed.reason}`;
+  } else if (observed.fingerprint.sha256 !== expectation.expectedSha256
+    || observed.fingerprint.bytes !== expectation.expectedBytes) {
+    nextExpectation = Object.freeze({
+      ...expectation,
+      state: "conflicted" as const,
+      observedSha256: observed.fingerprint.sha256,
+      observedBytes: observed.fingerprint.bytes,
+    });
+    clearEvidence = true;
+    clearReason = "tool result projection did not match the registered expectation";
+  } else if (expectation.state === "matched") {
+    // Equal duplicate: preserve the exact immutable expectation record.
+    if (expectation.observedSha256 === observed.fingerprint.sha256
+      && expectation.observedBytes === observed.fingerprint.bytes) {
+      return;
+    }
+    nextExpectation = Object.freeze({
+      ...expectation,
+      state: "conflicted" as const,
+      observedSha256: observed.fingerprint.sha256,
+      observedBytes: observed.fingerprint.bytes,
+    });
+    clearEvidence = true;
+    clearReason = "matched expectation record changed for the same call";
+  } else {
+    nextExpectation = Object.freeze({
+      ...expectation,
+      state: "matched" as const,
+      observedSha256: observed.fingerprint.sha256,
+      observedBytes: observed.fingerprint.bytes,
+    });
+    nextResult = {
+      observationScope: "plugin-tool-result-after-middleware",
+      isErrorObserved: observed.facts.isErrorObserved,
+      textExcerpt: observed.facts.textExcerpt,
+      textTruncated: observed.facts.textTruncated,
+      textBlocks: observed.facts.textBlocks,
+      imageBlocks: observed.facts.imageBlocks,
+      detailsPresent: observed.facts.detailsPresent,
+      exitCodeFromToolDetails: observed.facts.exitCodeFromToolDetails,
+      observedAt: state.now(),
+    };
+  }
+
+  // Re-read every live context identity after projection/clock work, then make
+  // one pure commit decision. No host field or raw envelope read follows.
+  const afterHost = readCallPortHost(context, true);
+  if (afterHost.main !== true || afterHost.ownerKnown !== true || afterHost.ownerPresent !== false) return;
+  if (afterHost.sessionId !== snapshot.sessionId || afterHost.workspaceRoot !== snapshot.workspaceRoot) return;
+  if (!registeredSnapshotMatches(state, snapshot)) return;
+
+  call.resultExpectation = nextExpectation;
+  if (clearEvidence) {
+    call.resultState = "unknown";
+    call.result = null;
+    call.unknownReason = clearReason;
+    invalidateReportRouting(state, call.toolCallId, call);
+    return;
+  }
+  if (nextResult !== null) {
+    call.result = nextResult;
+    call.resultState = "observed";
+    call.unknownReason = null;
+  }
+}
+
 function onToolResult(state: EntryState, event: ToolResultLike, context: NativeContext): void {
   if (!usable(state) || !readMain(context)) return;
-  const toolCallId = typeof event.toolCallId === "string" ? event.toolCallId : "";
+  const toolCallIdField = readOwnField(event, "toolCallId");
+  const toolCallId = toolCallIdField.kind === "data" && typeof toolCallIdField.value === "string"
+    ? toolCallIdField.value
+    : "";
   if (toolCallId.length < 1) return;
   const binding = state.callBindings.get(toolCallId);
   if (binding === undefined) return;
   const call = binding.call;
+  if (call.resultExpectation !== null) {
+    onRegisteredToolResult(state, event, context, binding);
+    return;
+  }
   if (call.associationConflict) {
     // Once multiple identities/call generations claimed this id, a later
     // matching name does not establish a unique association.
@@ -1816,6 +2203,9 @@ function callView(state: EntryState, work: Work, call: ObservedCall): Record<str
     associationConflict: call.associationConflict,
     unknownReason: call.unknownReason,
     preflightAt: call.preflightAt,
+    workPromptSha256: work.promptDigest,
+    callInputSha256: callInputSha256(call),
+    resultProjection: resultProjectionView(call),
     observationScope: result?.observationScope ?? null,
     isErrorObserved: result?.isErrorObserved ?? null,
     resultExcerpt: result?.textExcerpt ?? null,
@@ -2852,6 +3242,9 @@ function callInspection(
     callResultState: call === null ? null : call.resultState,
     pendingInputCount: work === null ? null : state.pending.length,
     pendingInputsDropped: work === null ? null : state.pendingDropped,
+    workPromptSha256: work === null ? null : work.promptDigest,
+    callInputSha256: call === null ? null : callInputSha256(call),
+    ...(call === null ? {} : { resultProjection: resultProjectionView(call) }),
   });
 }
 
@@ -3094,6 +3487,238 @@ function inspectCall(
   );
 }
 
+interface RegistrationSnapshot {
+  readonly binding: { work: Work; call: ObservedCall };
+  readonly work: Work;
+  readonly call: ObservedCall;
+  readonly expectation: CallResultExpectation | null;
+  readonly inputFingerprint: CallInputFingerprint;
+  readonly resultState: ResultState;
+  readonly result: ObservedResult | null;
+  readonly associationConflict: boolean;
+  readonly toolCallId: string;
+  readonly toolName: string;
+  readonly worksList: Work[];
+  readonly callIndex: Map<string, ObservedCall>;
+  readonly callBindings: Map<string, { work: Work; call: ObservedCall }>;
+  readonly callIdMemory: Map<string, number>;
+  readonly sessionId: string | null;
+  readonly workspaceRoot: string | null;
+  readonly promptDigest: string;
+}
+
+/** Pure commit gate after every expected-shape/context read has finished. */
+function registrationSnapshotMatches(
+  state: EntryState,
+  snapshot: RegistrationSnapshot,
+  host: CallPortHost,
+): boolean {
+  const { work, call, binding } = snapshot;
+  if (state.disposed || !state.enabled) return false;
+  if (state.current !== work) return false;
+  if (state.works !== snapshot.worksList) return false;
+  if (!state.works.includes(work)) return false;
+  if (work.invalidated) return false;
+  if (work.sessionId !== snapshot.sessionId || work.workspaceRoot !== snapshot.workspaceRoot) return false;
+  if (work.promptDigest !== snapshot.promptDigest) return false;
+  if (state.callBindings !== snapshot.callBindings) return false;
+  if (state.callBindings.get(snapshot.toolCallId) !== binding) return false;
+  if (work.callIndex !== snapshot.callIndex) return false;
+  if (work.callIndex.get(snapshot.toolCallId) !== call) return false;
+  if (state.callIdMemory !== snapshot.callIdMemory) return false;
+  if (state.callIdMemory.get(snapshot.toolCallId) !== work.generation) return false;
+  if (call.toolCallId !== snapshot.toolCallId || call.toolName !== snapshot.toolName) return false;
+  if (call.associationConflict !== snapshot.associationConflict) return false;
+  if (call.inputFingerprint !== snapshot.inputFingerprint) return false;
+  if (call.resultExpectation !== snapshot.expectation) return false;
+  if (call.resultState !== snapshot.resultState || call.result !== snapshot.result) return false;
+  if (host.main !== true || host.ownerKnown !== true || host.ownerPresent !== false) return false;
+  if (host.sessionId !== snapshot.sessionId || host.workspaceRoot !== snapshot.workspaceRoot) return false;
+  if (classifyCallAssociation(state, work, call).state !== "current") return false;
+  return true;
+}
+
+function registrationFailure(reason: string): CallResultExpectationRegistration {
+  return deepFreeze({ ok: false as const, reason });
+}
+
+function registrationSuccess(fingerprint: NativeResultFingerprintLike): CallResultExpectationRegistration {
+  return deepFreeze({
+    ok: true as const,
+    fingerprint: { bytes: fingerprint.bytes, sha256: fingerprint.sha256 },
+  });
+}
+
+function installExpectationConflict(
+  state: EntryState,
+  call: ObservedCall,
+  reason: string,
+): void {
+  const existing = call.resultExpectation;
+  call.resultExpectation = Object.freeze({
+    state: "conflicted" as const,
+    expectedSha256: existing?.expectedSha256 ?? null,
+    expectedBytes: existing?.expectedBytes ?? null,
+    observedSha256: existing?.observedSha256 ?? null,
+    observedBytes: existing?.observedBytes ?? null,
+  });
+  call.resultState = "unknown";
+  call.result = null;
+  call.unknownReason = reason;
+  invalidateReportRouting(state, call.toolCallId, call);
+}
+
+function installExpectationUnavailable(
+  state: EntryState,
+  call: ObservedCall,
+  reason: string,
+): void {
+  const existing = call.resultExpectation;
+  call.resultExpectation = Object.freeze({
+    state: "unavailable" as const,
+    expectedSha256: existing?.expectedSha256 ?? null,
+    expectedBytes: existing?.expectedBytes ?? null,
+    observedSha256: existing?.observedSha256 ?? null,
+    observedBytes: existing?.observedBytes ?? null,
+  });
+  call.resultState = "unknown";
+  call.result = null;
+  call.unknownReason = reason;
+  invalidateReportRouting(state, call.toolCallId, call);
+}
+
+/**
+ * Register a plugin-authored result expectation before any real result for the
+ * exact issued call. The expected input is compared through the separate
+ * bounded encoder fingerprint; it is not a model-supplied digest.
+ */
+function registerCallResultExpectation(
+  state: EntryState,
+  issuedReferences: WeakSet<object>,
+  ref: unknown,
+  expected: unknown,
+  context: NativeContext,
+): CallResultExpectationRegistration {
+  // Membership is checked before reading any foreign ref property.
+  if (ref === null
+    || (typeof ref !== "object" && typeof ref !== "function")
+    || !issuedReferences.has(ref as object)) {
+    return registrationFailure("foreign-reference");
+  }
+  const observedRef = readIssuedReference(ref);
+  if (observedRef === null) return registrationFailure("foreign-reference");
+
+  const host = readCallPortHost(context, true);
+  const entryFailure = callEntryFailure(state, host);
+  if (entryFailure !== null) return registrationFailure(entryFailure);
+
+  const work = state.works.find((candidate) =>
+    candidate.observationId === observedRef.observationId
+    && candidate.generation === observedRef.generation
+  ) ?? null;
+  if (work === null) return registrationFailure("work-not-retained");
+  if (work.sessionId !== observedRef.sessionId || work.workspaceRoot !== observedRef.workspaceRoot) {
+    return registrationFailure("work-replaced");
+  }
+  if (work.invalidated) return registrationFailure("work-invalidated");
+  if (state.current !== work) return registrationFailure("work-replaced");
+  const call = work.callIndex.get(observedRef.toolCallId);
+  if (call === undefined) return registrationFailure("call-not-retained");
+  if (call.toolCallId !== observedRef.toolCallId || call.toolName !== observedRef.toolName) {
+    return registrationFailure("call-rebound");
+  }
+  const binding = state.callBindings.get(observedRef.toolCallId);
+  if (binding === undefined) return registrationFailure("call-not-retained");
+  if (binding.work !== work || binding.call !== call) return registrationFailure("call-rebound");
+  if (call.associationConflict) return registrationFailure("call-conflicted");
+  if (state.callIdMemory.get(observedRef.toolCallId) !== work.generation) {
+    return registrationFailure("call-rebound");
+  }
+  if (host.sessionId !== work.sessionId) return registrationFailure("live-session-changed");
+  if (host.workspaceRoot !== work.workspaceRoot) return registrationFailure("live-workspace-changed");
+  if (call.resultExpectation === null) {
+    if (call.resultState !== "preflight" || call.result !== null) {
+      return registrationFailure("call already has an observed result; expectation registration is too late");
+    }
+  }
+  if (call.inputFingerprint.state !== "available") {
+    return registrationFailure("call preflight input fingerprint is unavailable or ambiguous");
+  }
+  if (classifyCallAssociation(state, work, call).state !== "current") {
+    return registrationFailure("call association is not current");
+  }
+  const existing = call.resultExpectation;
+  if (existing !== null && (existing.state === "conflicted" || existing.state === "unavailable")) {
+    return registrationFailure("the call result expectation is already conflicted or unavailable");
+  }
+
+  const snapshot: RegistrationSnapshot = {
+    binding,
+    work,
+    call,
+    expectation: existing,
+    inputFingerprint: call.inputFingerprint,
+    resultState: call.resultState,
+    result: call.result,
+    associationConflict: call.associationConflict,
+    toolCallId: call.toolCallId,
+    toolName: call.toolName,
+    worksList: state.works,
+    callIndex: work.callIndex,
+    callBindings: state.callBindings,
+    callIdMemory: state.callIdMemory,
+    sessionId: work.sessionId,
+    workspaceRoot: work.workspaceRoot,
+    promptDigest: work.promptDigest,
+  };
+
+  // Expected-object reflection/encoding is the only remaining external work.
+  const projected = fingerprintExpectedCallResult(expected);
+  const afterHost = readCallPortHost(context, true);
+  if (callEntryFailure(state, afterHost) !== null) {
+    return registrationFailure("call association changed during expectation registration");
+  }
+  if (!registrationSnapshotMatches(state, snapshot, afterHost)) {
+    return registrationFailure("call association changed during expectation registration");
+  }
+
+  if (!projected.ok) {
+    const reason = `result expectation unavailable: ${projected.reason}`;
+    installExpectationUnavailable(state, call, reason);
+    return registrationFailure(reason);
+  }
+
+  if (!inputMatchesFingerprint(snapshot.inputFingerprint, projected.inputFingerprint)) {
+    if (snapshot.expectation === null) {
+      return registrationFailure("expected input fingerprint does not match the preflight input for this call");
+    }
+    const reason = "a different result expectation was registered for the same call";
+    installExpectationConflict(state, call, reason);
+    return registrationFailure(reason);
+  }
+
+  if (snapshot.expectation === null) {
+    call.resultExpectation = Object.freeze({
+      state: "pending" as const,
+      expectedSha256: projected.fingerprint.sha256,
+      expectedBytes: projected.fingerprint.bytes,
+      observedSha256: null,
+      observedBytes: null,
+    });
+    return registrationSuccess(projected.fingerprint);
+  }
+
+  if (snapshot.expectation.expectedSha256 === projected.fingerprint.sha256
+    && snapshot.expectation.expectedBytes === projected.fingerprint.bytes) {
+    // Identical registration is idempotent, including after a match.
+    return registrationSuccess(projected.fingerprint);
+  }
+
+  const reason = "a different result expectation was registered for the same call";
+  installExpectationConflict(state, call, reason);
+  return registrationFailure(reason);
+}
+
 interface PreparedCallState {
   readonly state: EntryState;
   readonly refFacts: NativeWorkCallReference;
@@ -3106,6 +3731,9 @@ interface PreparedCallState {
   readonly callIdMemory: Map<string, number>;
   readonly resultState: ResultState;
   readonly result: ObservedResult | null;
+  readonly workPromptSha256: string;
+  readonly inputFingerprint: CallInputFingerprint;
+  readonly resultExpectation: CallResultExpectation | null;
 }
 
 /** Pure, synchronous re-read of the prepared identities and bounded state. */
@@ -3144,6 +3772,9 @@ function checkPreparedCall(prepared: PreparedCallState): NativeCallCheckReason |
   }
   if (call.associationConflict) return "call-conflicted";
   if (state.callIdMemory.get(refFacts.toolCallId) !== refFacts.generation) return "call-rebound";
+  if (work.promptDigest !== prepared.workPromptSha256) return "call-result-changed";
+  if (call.inputFingerprint !== prepared.inputFingerprint) return "call-result-changed";
+  if (call.resultExpectation !== prepared.resultExpectation) return "call-result-changed";
 
   const classification = classifyCallAssociation(state, work, call);
   if (classification.state !== "current") return classification.reason;
@@ -3312,6 +3943,9 @@ function prepareCallCheck(
     callIdMemory: state.callIdMemory,
     resultState: call.resultState,
     result: call.result,
+    workPromptSha256: work.promptDigest,
+    inputFingerprint: call.inputFingerprint,
+    resultExpectation: call.resultExpectation,
   };
   const inspection = callInspection(state, "current", "current-work", observed, work, call);
   const revalidate = (): NativeCallCheckReason | null => checkPreparedCall(prepared);
@@ -3345,6 +3979,9 @@ function createControls(state: EntryState): NativeEntryControls {
     },
     prepareCallCheck(ref, context) {
       return prepareCallCheck(state, issuedReferences, ref, context);
+    },
+    registerCallResultExpectation(ref, expected, context) {
+      return registerCallResultExpectation(state, issuedReferences, ref, expected, context);
     },
   };
 }
