@@ -1,5 +1,16 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readActualAbortSignal } from "./native-abort.ts";
+import {
+  NATIVE_HARNESS_ACCOUNTING_TRANSITION_SCHEMA,
+  openNativeHarnessAccountingOwner,
+  projectNativeHarnessAccounting,
+  type NativeHarnessAccountingCheckpoint,
+  type NativeHarnessAccountingHandle,
+  type NativeHarnessAccountingIdentity,
+  type NativeHarnessAccountingPrepared,
+  type NativeHarnessAccountingProjection,
+  type NativeHarnessAccountingSettlementMode,
+} from "./native-harness-accounting.ts";
 import type {
   CallResultExpectationRegistration,
   NativeCallCheckPreparation,
@@ -182,6 +193,32 @@ export interface NativeHarnessBackend {
   get?(runId: string): Promise<unknown>;
 }
 
+/**
+ * Trusted host-only durable accounting seam. The future original-root
+ * association wrapper returns only the confirmed identity; it never returns a
+ * handle, checkpoint, budget balance or execution permission. This coordinator
+ * opens the existing owner itself after the callback returns.
+ */
+export interface NativeHarnessDelegationAccountingPort {
+  /** Trusted canonical absolute, host-selected storage root. */
+  readonly storageRoot: string;
+  associate(
+    context: NativeContext,
+    signal: AbortSignal,
+    deadlineAt: number,
+    normalizedLimitsText: string,
+  ): Promise<NativeHarnessAccountingIdentity>;
+}
+
+/** Owned durable facts handed to trusted preparation after a real reserve. */
+export interface NativeHarnessPrepareAccounting {
+  readonly ownerId: string;
+  readonly admissionId: string;
+  readonly reserveRevision: number;
+  readonly sourceAssociationSha256: string;
+  readonly admittedAt: number;
+}
+
 export interface NativeHarnessPrepareRequest {
   readonly association: NativeHarnessAssociation;
   readonly budget: NativeHarnessAdmittedBudget;
@@ -192,10 +229,20 @@ export interface NativeHarnessPrepareRequest {
    * preparation effect and must not retain it after returning.
    */
   readonly guard: () => void;
+  /**
+   * Present only after this coordinator confirmed a real durable reserve and
+   * fresh authority. Omitted entirely by legacy coordinators.
+   */
+  readonly accounting?: NativeHarnessPrepareAccounting;
 }
 
 export type NativeHarnessPrepareResult =
-  | { readonly ok: true; readonly backend: NativeHarnessBackend }
+  | {
+      readonly ok: true;
+      readonly backend: NativeHarnessBackend;
+      /** Required for a durable preparation; exact A2a1 prepared facts. */
+      readonly accountingPrepared?: NativeHarnessAccountingPrepared;
+    }
   | { readonly ok: false; readonly reason: string };
 
 export type NativeHarnessBackendStatus =
@@ -410,6 +457,18 @@ export interface NativeHarnessSnapshotOperation {
   readonly output: NativeHarnessSnapshotOutput;
 }
 
+export interface NativeHarnessSnapshotAccounting {
+  /**
+   * `unloaded`/`pending`/`unavailable` explicitly deny that the lifetime
+   * fields below are current persistent totals. `observed` mirrors the last
+   * real checkpoint projection, not a locally added balance.
+   */
+  readonly observation: "unloaded" | "pending" | "observed" | "unavailable";
+  readonly revision: number | null;
+  readonly lastCheckpoint: NativeHarnessAccountingProjection | null;
+  readonly reason: string | null;
+}
+
 export interface NativeHarnessDelegationSnapshot {
   readonly schema: typeof NATIVE_HARNESS_DELEGATION_SNAPSHOT_SCHEMA;
   readonly enabled: boolean;
@@ -417,6 +476,7 @@ export interface NativeHarnessDelegationSnapshot {
   readonly limits: NativeHarnessDelegationLimits;
   readonly retainedOperations: number;
   readonly activeOperations: number;
+  readonly accounting?: NativeHarnessSnapshotAccounting;
   readonly output: {
     readonly retainedCaptures: number;
     readonly retainedBytes: number;
@@ -453,6 +513,12 @@ export interface NativeHarnessDelegationOptions {
   readonly enabled?: boolean;
   /** Optional trusted host-only output leaf; missing/malformed means output unavailable. */
   readonly output?: NativeHarnessOutputPort;
+  /**
+   * Optional trusted host-only durable accounting leaf. Absent keeps the
+   * legacy in-memory accounting path exactly. Present opens the existing
+   * original-root owner; it never creates or mints one.
+   */
+  readonly accounting?: NativeHarnessDelegationAccountingPort;
 }
 
 export interface NativeHarnessDelegationCoordinator {
@@ -657,6 +723,50 @@ interface SlotOutput {
   reportCurrentUseRefusal: string | null;
 }
 
+interface AccountingRuntime {
+  readonly storageRoot: string;
+  readonly limitsText: string;
+  readonly receiver: NativeHarnessDelegationAccountingPort;
+  readonly associate: NativeHarnessDelegationAccountingPort["associate"];
+}
+
+type AccountingPendingKind = "reserve" | "bindPrepared" | "bindRun" | "blockBudget" | "settle";
+
+interface AccountingFixedFacts {
+  readonly noDispatch: boolean;
+  readonly known: boolean;
+  readonly observedUsd: number | null;
+  readonly concurrencyHeld: boolean;
+  readonly canSettle: boolean;
+}
+
+/**
+ * One durable subrecord under the original Slot. It never holds a second
+ * executable call, slot, promise or dollar balance; amounts come only from a
+ * real checkpoint projection.
+ */
+interface SlotAccounting {
+  readonly admissionId: string;
+  identity: NativeHarnessAccountingIdentity | null;
+  handle: NativeHarnessAccountingHandle | null;
+  checkpoint: NativeHarnessAccountingCheckpoint | null;
+  reserveRevision: number | null;
+  readonly sourceAssociationSha256: string;
+  preparedConfirmed: boolean;
+  runConfirmed: boolean;
+  phase: "idle" | "associating" | "reserved" | "unavailable";
+  pending: Promise<NativeHarnessAccountingCheckpoint> | null;
+  pendingKind: AccountingPendingKind | null;
+  settleStarted: boolean;
+  settleConfirmed: boolean;
+  blockCommitted: boolean;
+  finalizing: boolean;
+  finalization: Promise<void> | null;
+  finalFacts: AccountingFixedFacts | null;
+  lateSettlementArmed: boolean;
+  unavailableReason: string | null;
+}
+
 interface Slot {
   readonly toolCallId: string;
   readonly originalRef: NativeWorkCallReference;
@@ -711,12 +821,14 @@ interface Slot {
   finalExecutionState: NativeHarnessExecutionState;
   finalTermination: NativeHarnessTermination;
   finalCost: NativeHarnessDelegationCost | null;
+  readonly accounting: SlotAccounting;
   readonly output: SlotOutput;
 }
 
 interface CoordinatorState {
   readonly native: NativeCallPort;
   readonly output: OutputPort | null;
+  readonly accounting: AccountingRuntime | null;
   readonly limits: NativeHarnessDelegationLimits;
   readonly getContext: () => NativeContext;
   readonly prepare: (
@@ -728,6 +840,12 @@ interface CoordinatorState {
   readonly enabled: boolean;
   disposed: boolean;
   readonly slots: Map<string, Slot>;
+  accountingOwnerIdentity: NativeHarnessAccountingIdentity | null;
+  accountingCache: {
+    readonly checkpoint: NativeHarnessAccountingCheckpoint;
+    readonly projection: NativeHarnessAccountingProjection;
+  } | null;
+  accountingUnavailableReason: string | null;
   admissionInProgress: boolean;
   revalidationInProgress: boolean;
   activeOperations: number;
@@ -1105,6 +1223,166 @@ function normalizePolicy(value: unknown): NativeHarnessDelegationLimits {
     maxDurationMs,
     cleanupGraceMs,
   });
+}
+
+const ACCOUNTING_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+function isCanonicalStorageRoot(value: unknown): value is string {
+  return typeof value === "string"
+    && value.length >= 2
+    && value.length <= 4096
+    && value.startsWith("/")
+    && !value.endsWith("/")
+    && !/[\x00-\x1f\x7f]/.test(value)
+    && !value.includes("//")
+    && !value.includes("/./")
+    && !value.includes("/../");
+}
+
+function normalizedLimitsText(limits: NativeHarnessDelegationLimits): string {
+  // Fixed six-field order; the same normalized value is passed to the
+  // association leaf and compared exactly against the stored owner limits.
+  return JSON.stringify({
+    maxRetainedOperations: limits.maxRetainedOperations,
+    maxConcurrent: limits.maxConcurrent,
+    perRunUsd: limits.perRunUsd,
+    lifetimeUsd: limits.lifetimeUsd,
+    maxDurationMs: limits.maxDurationMs,
+    cleanupGraceMs: limits.cleanupGraceMs,
+  });
+}
+
+function sameAccountingLimits(
+  stored: NativeHarnessDelegationLimits,
+  current: NativeHarnessDelegationLimits,
+): boolean {
+  return stored.maxRetainedOperations === current.maxRetainedOperations
+    && stored.maxConcurrent === current.maxConcurrent
+    && stored.perRunUsd === current.perRunUsd
+    && stored.lifetimeUsd === current.lifetimeUsd
+    && stored.maxDurationMs === current.maxDurationMs
+    && stored.cleanupGraceMs === current.cleanupGraceMs;
+}
+
+function readAccountingPort(
+  value: unknown,
+  limits: NativeHarnessDelegationLimits,
+): AccountingRuntime | null {
+  if (value === undefined) return null;
+  const fields = readStrictFields(value, ["storageRoot", "associate"], ["storageRoot", "associate"]);
+  if (fields === null) {
+    throw new NativeHarnessDelegationError(
+      "Delegation accounting must be a plain own-data object with storageRoot and associate.",
+    );
+  }
+  const storageRoot = fields.get("storageRoot");
+  if (!isCanonicalStorageRoot(storageRoot)) {
+    throw new NativeHarnessDelegationError(
+      "Delegation accounting storageRoot must be a canonical absolute non-root path.",
+    );
+  }
+  const associate = fields.get("associate");
+  if (typeof associate !== "function") {
+    throw new NativeHarnessDelegationError("Delegation accounting associate must be a function.");
+  }
+  return Object.freeze({
+    storageRoot,
+    limitsText: normalizedLimitsText(limits),
+    receiver: value as NativeHarnessDelegationAccountingPort,
+    associate: associate as NativeHarnessDelegationAccountingPort["associate"],
+  });
+}
+
+function associationSourceSha256(association: NativeHarnessAssociation): string {
+  // Fixed key order; values come only from the original capture-owned association.
+  return sha256Hex(JSON.stringify({
+    observationId: association.observationId,
+    generation: association.generation,
+    sessionId: association.sessionId,
+    workspaceRoot: association.workspaceRoot,
+    toolCallId: association.toolCallId,
+    toolName: association.toolName,
+  }));
+}
+
+function readAccountingIdentity(value: unknown): NativeHarnessAccountingIdentity | null {
+  const fields = readStrictFields(value, ["ownerId", "selectorSha256"], ["ownerId", "selectorSha256"]);
+  if (fields === null) return null;
+  const ownerId = fields.get("ownerId");
+  const selectorSha256 = fields.get("selectorSha256");
+  if (typeof ownerId !== "string" || !ACCOUNTING_UUID_PATTERN.test(ownerId)) return null;
+  if (!isHex64(selectorSha256)) return null;
+  return Object.freeze({ ownerId, selectorSha256 });
+}
+
+const ACCOUNTING_PREPARED_KEYS = [
+  "preparedRelativeRoot",
+  "storeRelativeRoot",
+  "inputManifestSha256",
+  "sourceDescriptorSha256",
+] as const;
+
+function readAccountingPrepared(
+  value: unknown,
+): { readonly ok: true; readonly prepared: NativeHarnessAccountingPrepared } | { readonly ok: false; readonly reason: string } {
+  const fields = readStrictFields(value, ACCOUNTING_PREPARED_KEYS, ACCOUNTING_PREPARED_KEYS);
+  if (fields === null) {
+    return { ok: false, reason: "trusted prepare returned missing or malformed accountingPrepared facts" };
+  }
+  for (const key of ["preparedRelativeRoot", "storeRelativeRoot"] as const) {
+    const text = fields.get(key);
+    if (typeof text !== "string"
+      || text.length === 0
+      || text.length > 4096
+      || /[\x00-\x1f\x7f]/.test(text)
+      || text.startsWith("/")
+      || text.split("/").some((part) => part === ".." || part === ".")) {
+      return { ok: false, reason: `trusted prepare accountingPrepared.${key} is not a relative path` };
+    }
+  }
+  const inputManifestSha256 = fields.get("inputManifestSha256");
+  const sourceDescriptorSha256 = fields.get("sourceDescriptorSha256");
+  if (!isHex64(inputManifestSha256) || !isHex64(sourceDescriptorSha256)) {
+    return { ok: false, reason: "trusted prepare accountingPrepared hashes must be 64 lowercase hexadecimal characters" };
+  }
+  return {
+    ok: true,
+    prepared: Object.freeze({
+      preparedRelativeRoot: fields.get("preparedRelativeRoot") as string,
+      storeRelativeRoot: fields.get("storeRelativeRoot") as string,
+      inputManifestSha256,
+      sourceDescriptorSha256,
+    }),
+  };
+}
+
+function observeAccountingCheckpoint(
+  slot: Slot,
+  checkpoint: NativeHarnessAccountingCheckpoint,
+): boolean {
+  const state = slotState(slot);
+  if (state === null) return false;
+  const expected = state.accountingOwnerIdentity;
+  if (expected === null) return false;
+  if (checkpoint.ownerId !== expected.ownerId || checkpoint.selectorSha256 !== expected.selectorSha256) {
+    return false;
+  }
+  if (!sameAccountingLimits(checkpoint.limits, state.limits)) return false;
+  let projection: NativeHarnessAccountingProjection;
+  try {
+    projection = projectNativeHarnessAccounting(checkpoint);
+  } catch {
+    return false;
+  }
+  const accounting = slot.accounting;
+  if (accounting.checkpoint === null || checkpoint.revision >= accounting.checkpoint.revision) {
+    accounting.checkpoint = checkpoint;
+  }
+  if (state.accountingCache === null || checkpoint.revision > state.accountingCache.checkpoint.revision) {
+    state.accountingCache = Object.freeze({ checkpoint, projection });
+  }
+  state.accountingUnavailableReason = null;
+  return true;
 }
 
 function deferred<T>(): {
@@ -7796,8 +8074,19 @@ function makeGuardedRunner(slot: Slot): Runner {
   });
 }
 
-function readPreparedBackend(raw: unknown): { readonly ok: true; readonly backend: BackendPort } | { readonly ok: false; readonly reason: string } {
-  const fields = readStrictFields(raw, ["ok", "backend", "reason"], ["ok"]);
+type PreparedBackendOutcome =
+  | {
+      readonly ok: true;
+      readonly backend: BackendPort;
+      readonly accountingPrepared: NativeHarnessAccountingPrepared | null;
+    }
+  | { readonly ok: false; readonly reason: string };
+
+function readPreparedBackend(raw: unknown, durable: boolean): PreparedBackendOutcome {
+  const allowed = durable
+    ? ["ok", "backend", "reason", "accountingPrepared"]
+    : ["ok", "backend", "reason"];
+  const fields = readStrictFields(raw, allowed, ["ok"]);
   if (fields === null) return { ok: false, reason: "trusted prepare returned an unreadable result" };
   if (fields.get("ok") !== true) {
     const reason = fields.get("reason");
@@ -7815,6 +8104,12 @@ function readPreparedBackend(raw: unknown): { readonly ok: true; readonly backen
   if (create === null || execute === null || cancel === null) {
     return { ok: false, reason: "trusted prepare backend is missing create, execute or cancel" };
   }
+  let accountingPrepared: NativeHarnessAccountingPrepared | null = null;
+  if (durable) {
+    const prepared = readAccountingPrepared(fields.get("accountingPrepared"));
+    if (!prepared.ok) return { ok: false, reason: prepared.reason };
+    accountingPrepared = prepared.prepared;
+  }
   return {
     ok: true,
     backend: {
@@ -7824,15 +8119,24 @@ function readPreparedBackend(raw: unknown): { readonly ok: true; readonly backen
       cancel: cancel as BackendPort["cancel"],
       get: get as BackendPort["get"] | null,
     },
+    accountingPrepared,
   };
 }
 
 type PrepareOutcome =
-  | { readonly kind: "backend"; readonly backend: BackendPort }
+  | {
+      readonly kind: "backend";
+      readonly backend: BackendPort;
+      readonly accountingPrepared: NativeHarnessAccountingPrepared | null;
+    }
   | { readonly kind: "failed"; readonly reason: string }
   | { readonly kind: "expired" };
 
-async function invokePrepare(slot: Slot, context: NativeContext | null): Promise<PrepareOutcome> {
+async function invokePrepare(
+  slot: Slot,
+  context: NativeContext | null,
+  accountingFacts: NativeHarnessPrepareAccounting | null,
+): Promise<PrepareOutcome> {
   const state = slotState(slot);
   if (state === null) return { kind: "failed", reason: "delegation state is unavailable" };
   if (context === null) return { kind: "failed", reason: "the gated main context is unavailable" };
@@ -7854,6 +8158,7 @@ async function invokePrepare(slot: Slot, context: NativeContext | null): Promise
     signal: slot.signal,
     runner: makeGuardedRunner(slot),
     guard,
+    ...(accountingFacts === null ? {} : { accounting: accountingFacts }),
   });
   slot.prepareOpen = true;
   let raw: unknown;
@@ -7889,9 +8194,13 @@ async function invokePrepare(slot: Slot, context: NativeContext | null): Promise
   if (slot.guardCalls === 0) {
     return { kind: "failed", reason: "trusted prepare did not call the authority guard" };
   }
-  const backend = readPreparedBackend(value);
+  const backend = readPreparedBackend(value, accountingFacts !== null);
   return backend.ok
-    ? { kind: "backend", backend: backend.backend }
+    ? {
+        kind: "backend",
+        backend: backend.backend,
+        accountingPrepared: backend.accountingPrepared,
+      }
     : { kind: "failed", reason: backend.reason };
 }
 
@@ -7970,21 +8279,500 @@ function settleLifetime(slot: Slot, knownObserved: boolean, observedUsd: number,
   }
 }
 
-function finishSlot(
+function accountingErrorCode(error: unknown): string | null {
+  if (error === null || typeof error !== "object") return null;
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(error, "code");
+  } catch {
+    return null;
+  }
+  return descriptor !== undefined && "value" in descriptor && typeof descriptor.value === "string"
+    ? descriptor.value
+    : null;
+}
+
+type AccountingCommitFailure = {
+  readonly ok: false;
+  readonly reason: string;
+  readonly ambiguous: boolean;
+  readonly code: string | null;
+};
+
+type AccountingCommitOutcome =
+  | { readonly ok: true; readonly checkpoint: NativeHarnessAccountingCheckpoint }
+  | AccountingCommitFailure;
+
+function accountingCommitFailure(error: unknown): AccountingCommitFailure {
+  const code = accountingErrorCode(error);
+  return {
+    ok: false,
+    reason: `durable accounting commit failed: ${boundedReason(error, "unreadable accounting failure")}`,
+    // Only A2a1 `ambiguous` (or an unreadable foreign failure) may have written.
+    ambiguous: code === null || code === "ambiguous",
+    code,
+  };
+}
+
+function markAccountingUnavailable(slot: Slot, reason: string): void {
+  const state = slotState(slot);
+  if (state !== null) state.accountingUnavailableReason = reason;
+  slot.accounting.unavailableReason = reason;
+  slot.accounting.phase = "unavailable";
+}
+
+/**
+ * One bounded CAS commit on the exact current handle revision. The original
+ * commit promise stays attached after a grace expiry; no retry is attempted.
+ */
+async function commitAccounting(
+  slot: Slot,
+  kind: AccountingPendingKind,
+  transition: Record<string, unknown>,
+): Promise<AccountingCommitOutcome> {
+  const state = slotState(slot);
+  const accounting = slot.accounting;
+  if (state === null || state.accounting === null
+    || accounting.handle === null || accounting.checkpoint === null) {
+    const reason = "durable accounting is unavailable for this admission";
+    markAccountingUnavailable(slot, reason);
+    return {
+      ok: false,
+      reason,
+      ambiguous: false,
+      code: "unavailable",
+    };
+  }
+  const expectedRevision = accounting.checkpoint.revision;
+  let promise: Promise<NativeHarnessAccountingCheckpoint>;
+  try {
+    promise = accounting.handle.commit(
+      expectedRevision,
+      JSON.stringify(transition),
+    ) as Promise<NativeHarnessAccountingCheckpoint>;
+  } catch (error) {
+    const failure = accountingCommitFailure(error);
+    markAccountingUnavailable(slot, failure.reason);
+    return failure;
+  }
+  if (!consumeNativePromise(promise)) {
+    const reason = "durable accounting commit did not return a native Promise";
+    markAccountingUnavailable(slot, reason);
+    return {
+      ok: false,
+      reason,
+      ambiguous: true,
+      code: null,
+    };
+  }
+  void promise.catch(() => undefined);
+  accounting.pending = promise;
+  accounting.pendingKind = kind;
+  void promise.then(
+    (value) => {
+      if (accounting.pending === promise) {
+        accounting.pending = null;
+        accounting.pendingKind = null;
+      }
+      if (!observeAccountingCheckpoint(slot, value)) {
+        markAccountingUnavailable(
+          slot,
+          "accounting acknowledgement did not match the fixed owner, limits and projection",
+        );
+      }
+    },
+    () => {
+      if (accounting.pending === promise) {
+        accounting.pending = null;
+        accounting.pendingKind = null;
+      }
+    },
+  );
+  const waited = await awaitWithCleanup(slot, promise);
+  if (waited.kind === "expired") {
+    const reason = `durable accounting ${kind} did not settle within the cleanup grace window`;
+    markAccountingUnavailable(slot, reason);
+    return { ok: false, reason, ambiguous: true, code: null };
+  }
+  if (waited.kind === "error") {
+    const failure = accountingCommitFailure(waited.error);
+    markAccountingUnavailable(slot, failure.reason);
+    return failure;
+  }
+  if (waited.value.revision !== expectedRevision + 1) {
+    const reason = "accounting commit returned an unexpected revision";
+    markAccountingUnavailable(slot, reason);
+    return { ok: false, reason, ambiguous: true, code: null };
+  }
+  if (!observeAccountingCheckpoint(slot, waited.value)) {
+    const reason = "accounting commit returned facts outside the fixed owner and limits";
+    markAccountingUnavailable(slot, reason);
+    return { ok: false, reason, ambiguous: true, code: null };
+  }
+  return { ok: true, checkpoint: waited.value };
+}
+
+function reserveTransition(slot: Slot): Record<string, unknown> {
+  const state = slotState(slot);
+  if (state === null) return {};
+  return {
+    schema: NATIVE_HARNESS_ACCOUNTING_TRANSITION_SCHEMA,
+    action: "reserve",
+    admissionId: slot.accounting.admissionId,
+    sourceAssociationSha256: slot.accounting.sourceAssociationSha256,
+    admittedAt: slot.admittedAt,
+    deadlineAt: slot.deadlineAt,
+    allocatedUsd: state.limits.perRunUsd,
+  };
+}
+
+function bindPreparedTransition(
+  slot: Slot,
+  prepared: NativeHarnessAccountingPrepared,
+): Record<string, unknown> {
+  return {
+    schema: NATIVE_HARNESS_ACCOUNTING_TRANSITION_SCHEMA,
+    action: "bindPrepared",
+    admissionId: slot.accounting.admissionId,
+    prepared: { ...prepared },
+  };
+}
+
+function bindRunTransition(slot: Slot, runId: string): Record<string, unknown> {
+  return {
+    schema: NATIVE_HARNESS_ACCOUNTING_TRANSITION_SCHEMA,
+    action: "bindRun",
+    admissionId: slot.accounting.admissionId,
+    runId,
+  };
+}
+
+function blockBudgetTransition(slot: Slot): Record<string, unknown> {
+  return {
+    schema: NATIVE_HARNESS_ACCOUNTING_TRANSITION_SCHEMA,
+    action: "blockBudget",
+    admissionId: slot.accounting.admissionId,
+  };
+}
+
+function settleTransition(
+  slot: Slot,
+  facts: AccountingFixedFacts,
+): Record<string, unknown> {
+  const mode: NativeHarnessAccountingSettlementMode = facts.noDispatch
+    ? "no-dispatch"
+    : facts.known
+      ? "known"
+      : "unknown";
+  return {
+    schema: NATIVE_HARNESS_ACCOUNTING_TRANSITION_SCHEMA,
+    action: "settle",
+    admissionId: slot.accounting.admissionId,
+    mode,
+    observedUsd: mode === "unknown" ? facts.observedUsd : (facts.observedUsd ?? 0),
+    concurrencyHeld: mode === "unknown" ? facts.concurrencyHeld : false,
+  };
+}
+
+function closeAccountingHandle(slot: Slot): void {
+  const accounting = slot.accounting;
+  if (accounting.handle === null) return;
+  const handle = accounting.handle;
+  if (accounting.pending !== null) {
+    // The in-flight write owns the handle until it really settles.
+    void accounting.pending.then(
+      () => {
+        try {
+          handle.close();
+        } catch {
+          // Already closed.
+        }
+      },
+      () => {
+        try {
+          handle.close();
+        } catch {
+          // Already closed.
+        }
+      },
+    );
+    return;
+  }
+  try {
+    handle.close();
+  } catch {
+    // Already closed.
+  }
+}
+
+/**
+ * After an already-published unknown/unconfirmed terminal wire, observe only
+ * the original in-flight promise and close the handle when it really settles.
+ * Never start a new reserve/link/block/settle write and never release local
+ * occupancy from late evidence.
+ */
+function armLateAccountingCompletion(slot: Slot): void {
+  const accounting = slot.accounting;
+  if (accounting.lateSettlementArmed || accounting.pending === null) return;
+  accounting.lateSettlementArmed = true;
+  const pending = accounting.pending;
+  void pending.then(
+    (value) => {
+      // The original write may have succeeded after the grace window. Mirror
+      // the real checkpoint but do not publish, refund or start another write.
+      observeAccountingCheckpoint(slot, value);
+      closeAccountingHandle(slot);
+    },
+    () => {
+      closeAccountingHandle(slot);
+    },
+  );
+}
+
+function factsForAccounting(
   slot: Slot,
   args: {
-    readonly outcome: NativeHarnessOutcome;
-    readonly reason: string | null;
-    readonly authorityFresh: boolean;
-    readonly executionState: NativeHarnessExecutionState;
-    readonly termination: NativeHarnessTermination;
-    readonly backendStatus: NativeHarnessBackendStatus | null;
-    readonly knownObservedCost: boolean;
     readonly noDispatch: boolean;
+    readonly knownObservedCost: boolean;
+    readonly backendStatus: NativeHarnessBackendStatus | null;
+    readonly executionState: NativeHarnessExecutionState;
     readonly releaseConcurrency: boolean;
-    readonly finishedAt?: number;
-    readonly extraLimitations?: readonly string[];
   },
+): AccountingFixedFacts {
+  // Read actual prepare/cleanup facts before the finalization latch clears the
+  // preparation gate for later effect prevention.
+  const prepareOpen = slot.prepareOpen;
+  const noDispatch = args.noDispatch
+    && args.executionState === "not-started"
+    && slot.runId === null
+    && !slot.createStarted
+    && !slot.executionStarted
+    && !prepareOpen
+    && slot.accounting.pending === null;
+  const known = args.knownObservedCost
+    && !noDispatch
+    && slot.runId !== null
+    && slot.accounting.runConfirmed
+    && slot.executionSettled
+    && slot.workerPromises.size === 0
+    && slot.workerCount > 0
+    && slot.workerAllKnownCompleted
+    && !slot.workerUnknownUsage
+    && !slot.cancelRequested
+    && args.backendStatus === "completed";
+  const observedUsd = noDispatch
+    ? 0
+    : slot.observedAny
+      ? money(slot.observedCostUsd)
+      : null;
+  let concurrencyHeld = false;
+  if (!noDispatch && !known) {
+    concurrencyHeld = true;
+    if (slot.runId === null) {
+      // An in-flight preparation or a create that may have taken effect is
+      // never proof that cleanup settled. A thrown create stays held.
+      concurrencyHeld = slot.createStarted ? true : prepareOpen;
+    } else if (!slot.executionStarted) {
+      concurrencyHeld = !(slot.cancelSettled && slot.cancelState !== "request-failed");
+    } else {
+      concurrencyHeld = !(slot.executionSettled && slot.workerPromises.size === 0);
+    }
+    // The caller's own execution/cleanup classification is authoritative when
+    // it says the wait expired or local occupancy must remain conservative.
+    if (args.executionState === "pending-unknown" || !args.releaseConcurrency) {
+      concurrencyHeld = true;
+    }
+  }
+  return Object.freeze({ noDispatch, known, observedUsd, concurrencyHeld, canSettle: true });
+}
+
+async function attemptAccountingSettlement(
+  slot: Slot,
+  facts: AccountingFixedFacts,
+): Promise<boolean> {
+  const state = slotState(slot);
+  const accounting = slot.accounting;
+  if (state === null || accounting.reserveRevision === null || accounting.handle === null) {
+    return false;
+  }
+  if (accounting.settleStarted) return accounting.settleConfirmed;
+  accounting.settleStarted = true;
+  if (state.budgetBlocked
+    && !accounting.blockCommitted
+    && state.accountingCache?.projection.budgetBlocked !== true) {
+    const blocked = await commitAccounting(slot, "blockBudget", blockBudgetTransition(slot));
+    if (!blocked.ok) {
+      accounting.phase = "unavailable";
+      accounting.unavailableReason = blocked.reason;
+      return false;
+    }
+    accounting.blockCommitted = true;
+  }
+  const settled = await commitAccounting(slot, "settle", settleTransition(slot, facts));
+  if (!settled.ok) {
+    accounting.phase = "unavailable";
+    accounting.unavailableReason = settled.reason;
+    return false;
+  }
+  accounting.settleConfirmed = true;
+  accounting.phase = "reserved";
+  return true;
+}
+
+function finishSlotDurable(
+  slot: Slot,
+  args: SlotFinishArgs,
+): Promise<void> {
+  const state = slotState(slot);
+  if (state === null) return Promise.resolve();
+  const accounting = slot.accounting;
+  if (accounting.finalization !== null) return accounting.finalization;
+  // Snapshot the original cleanup facts before mutating any effect gate.
+  const facts = factsForAccounting(slot, args);
+  // One synchronous latch promise is installed before every callback-rich
+  // clock/native read below. A reentrant finish returns this exact promise.
+  const completion = deferred<void>();
+  accounting.finalization = completion.promise;
+  accounting.finalFacts = facts;
+  accounting.finalizing = true;
+  slot.dispatchClosed = true;
+  slot.prepareOpen = false;
+
+  void (async (): Promise<void> => {
+    let settlementUnavailable = false;
+    try {
+      if (accounting.pending !== null) {
+        const waited = await awaitWithCleanup(slot, accounting.pending);
+        if (waited.kind === "expired") {
+          settlementUnavailable = true;
+          accounting.phase = "unavailable";
+          accounting.unavailableReason = "durable accounting write did not settle within the cleanup grace window";
+        }
+      }
+      if (!settlementUnavailable && accounting.reserveRevision !== null) {
+        const confirmed = await attemptAccountingSettlement(slot, facts);
+        if (!confirmed) settlementUnavailable = true;
+      }
+      const finishedAt = readClock(state.now) ?? slot.admittedAt;
+      // Settlement facts are fixed; authority/clock facts are read fresh again.
+      const finalGate = authorityGate(slot, "effect");
+      if (slot.state !== "running" || !accounting.finalizing) return;
+      if (accounting.identity !== null
+        && state.accountingOwnerIdentity !== null
+        && (accounting.identity.ownerId !== state.accountingOwnerIdentity.ownerId
+          || accounting.identity.selectorSha256 !== state.accountingOwnerIdentity.selectorSha256)) {
+        settlementUnavailable = true;
+        accounting.unavailableReason = "durable accounting owner identity changed before publication";
+      }
+      const unresolved = settlementUnavailable
+        || (accounting.reserveRevision !== null && !accounting.settleConfirmed);
+      if (unresolved) {
+        const unresolvedReason = accounting.unavailableReason ?? "durable accounting settlement is unconfirmed";
+        state.accountingUnavailableReason = unresolvedReason;
+        const retainedLimitations = [
+          ...(args.extraLimitations ?? []),
+          "Durable accounting settlement was not confirmed; local concurrency and allocation conservatively remain retained.",
+        ];
+        publishSlotResult(slot, {
+          outcome: "unknown",
+          reason: unresolvedReason,
+          authorityFresh: false,
+          executionState: "pending-unknown",
+          termination: terminationFor(slot, finalGate, slot.backendStatus),
+          backendStatus: slot.backendStatus,
+          knownObservedCost: false,
+          noDispatch: false,
+          releaseConcurrency: false,
+          finishedAt,
+          extraLimitations: retainedLimitations,
+        });
+        return;
+      }
+      const backendStatus = slot.backendStatus;
+      const outcomeAtGate = outcomeFor(slot, backendStatus, finalGate);
+      const outcome = finalGate === null && args.outcome === "refused"
+        ? "refused"
+        : finalGate === null && args.outcome === "unknown"
+          ? "unknown"
+          : outcomeAtGate;
+      const release = accounting.reserveRevision === null
+        ? args.releaseConcurrency
+        : facts.noDispatch || facts.known || !facts.concurrencyHeld;
+      publishSlotResult(slot, {
+        outcome,
+        reason: finalGate ?? args.reason ?? (backendStatus === "completed"
+          ? "the Harness2 backend reported completion; task acceptance was not evaluated"
+          : `backend status ${backendStatus ?? "unknown"}`),
+        authorityFresh: finalGate === null
+          && args.executionState === "settled"
+          && args.outcome !== "unknown",
+        executionState: args.executionState,
+        termination: terminationFor(slot, finalGate, backendStatus),
+        backendStatus,
+        knownObservedCost: facts.known,
+        noDispatch: facts.noDispatch,
+        releaseConcurrency: release,
+        finishedAt,
+        ...(args.extraLimitations === undefined ? {} : { extraLimitations: args.extraLimitations }),
+      });
+    } catch (error) {
+      const reason = `durable accounting finalization failed: ${boundedReason(error, "unreadable failure")}`;
+      markAccountingUnavailable(slot, reason);
+      if (slot.state === "running") {
+        publishSlotResult(slot, {
+          outcome: "unknown",
+          reason,
+          authorityFresh: false,
+          executionState: "pending-unknown",
+          termination: terminationFor(slot, null, slot.backendStatus),
+          backendStatus: slot.backendStatus,
+          knownObservedCost: false,
+          noDispatch: false,
+          releaseConcurrency: false,
+          finishedAt: readClock(state.now) ?? slot.admittedAt,
+          ...(args.extraLimitations === undefined ? {} : { extraLimitations: args.extraLimitations }),
+        });
+      }
+    } finally {
+      accounting.finalizing = false;
+      if (accounting.pending !== null) armLateAccountingCompletion(slot);
+      else closeAccountingHandle(slot);
+      completion.resolve();
+    }
+  })();
+  return completion.promise;
+}
+
+interface SlotFinishArgs {
+  readonly outcome: NativeHarnessOutcome;
+  readonly reason: string | null;
+  readonly authorityFresh: boolean;
+  readonly executionState: NativeHarnessExecutionState;
+  readonly termination: NativeHarnessTermination;
+  readonly backendStatus: NativeHarnessBackendStatus | null;
+  readonly knownObservedCost: boolean;
+  readonly noDispatch: boolean;
+  readonly releaseConcurrency: boolean;
+  readonly finishedAt?: number;
+  readonly extraLimitations?: readonly string[];
+}
+
+function finishSlot(
+  slot: Slot,
+  args: SlotFinishArgs,
+): void | Promise<void> {
+  const state = slotState(slot);
+  if (state === null) return;
+  if (state.accounting === null) {
+    publishSlotResult(slot, args);
+    return;
+  }
+  return finishSlotDurable(slot, args);
+}
+
+function publishSlotResult(
+  slot: Slot,
+  args: SlotFinishArgs,
 ): void {
   if (slot.state !== "running") return;
   const state = slotState(slot);
@@ -8035,8 +8823,16 @@ function finishSlot(
     reason: args.reason === null ? null : boundedReason(args.reason, "delegation incomplete"),
   });
 
-  settleLifetime(slot, args.knownObservedCost, observedUsd ?? 0, args.noDispatch);
+  if (state.accounting === null) {
+    settleLifetime(slot, args.knownObservedCost, observedUsd ?? 0, args.noDispatch);
+  }
   slot.state = "settled";
+  if (state.accounting !== null
+    && slot.accounting.reserveRevision === null
+    && slot.accounting.phase === "associating") {
+    // A pre-reserve refusal is terminal and no association/open is in flight.
+    slot.accounting.phase = "idle";
+  }
   slot.response = result;
   slot.finalOutcome = args.outcome;
   slot.finalAuthorityFresh = args.authorityFresh;
@@ -8092,7 +8888,7 @@ async function finishCancelledWithoutExecution(slot: Slot): Promise<void> {
   const state = slotState(slot);
   if (state === null) return;
   if (slot.cancelSettled) {
-    finishSlot(slot, {
+    await finishSlot(slot, {
       outcome: cancelledWithoutExecutionOutcome(slot),
       reason: cancelledWithoutExecutionReason(slot),
       authorityFresh: false,
@@ -8108,7 +8904,7 @@ async function finishCancelledWithoutExecution(slot: Slot): Promise<void> {
   if (slot.cancelPromise !== null) {
     const waited = await awaitWithCleanup(slot, slot.cancelPromise);
     if (waited.kind === "expired") {
-      finishSlot(slot, {
+      await finishSlot(slot, {
         outcome: cancelledWithoutExecutionOutcome(slot),
         reason: "the cancellation request did not resolve within the cleanup grace window",
         authorityFresh: false,
@@ -8121,7 +8917,7 @@ async function finishCancelledWithoutExecution(slot: Slot): Promise<void> {
       });
       return;
     }
-    finishSlot(slot, {
+    await finishSlot(slot, {
       outcome: cancelledWithoutExecutionOutcome(slot),
       reason: slot.cancelError ?? cancelledWithoutExecutionReason(slot),
       authorityFresh: false,
@@ -8135,7 +8931,7 @@ async function finishCancelledWithoutExecution(slot: Slot): Promise<void> {
     return;
   }
   if (slot.cancelState === "request-failed") {
-    finishSlot(slot, {
+    await finishSlot(slot, {
       outcome: cancelledWithoutExecutionOutcome(slot),
       reason: slot.cancelError ?? "the backend cancellation request failed",
       authorityFresh: false,
@@ -8149,7 +8945,7 @@ async function finishCancelledWithoutExecution(slot: Slot): Promise<void> {
     return;
   }
   // No runId or backend, so there is no cancellation target and no worker.
-  finishSlot(slot, {
+  await finishSlot(slot, {
     outcome: cancelledWithoutExecutionOutcome(slot),
     reason: "delegation was cancelled before backend run creation",
     authorityFresh: false,
@@ -8195,6 +8991,191 @@ async function awaitExecution(
   return { kind: "settled", execution: first };
 }
 
+async function reserveDurableAdmission(
+  slot: Slot,
+  state: CoordinatorState,
+  context: NativeContext,
+): Promise<{ readonly kind: "ready" } | { readonly kind: "finished" }> {
+  const runtime = state.accounting;
+  if (runtime === null) return { kind: "ready" };
+  const refuse = async (
+    reason: string,
+    noDispatch: boolean,
+    releaseConcurrency: boolean,
+    outcome: NativeHarnessOutcome = "refused",
+  ): Promise<{ readonly kind: "finished" }> => {
+    await finishSlot(slot, {
+      outcome,
+      reason,
+      authorityFresh: false,
+      executionState: noDispatch ? "not-started" : "pending-unknown",
+      termination: terminationFor(slot, null, null),
+      backendStatus: null,
+      knownObservedCost: false,
+      noDispatch,
+      releaseConcurrency,
+    });
+    return { kind: "finished" };
+  };
+  if (!Number.isSafeInteger(slot.admittedAt) || !Number.isSafeInteger(slot.deadlineAt)) {
+    return refuse(
+      "durable accounting requires safe-integer admittedAt and deadlineAt facts; no rounding was applied",
+      true,
+      true,
+    );
+  }
+
+  let rawAssociation: unknown;
+  try {
+    rawAssociation = Reflect.apply(runtime.associate, runtime.receiver, [
+      context,
+      slot.signal,
+      slot.deadlineAt,
+      runtime.limitsText,
+    ]);
+  } catch (error) {
+    return refuse(`trusted accounting association threw: ${boundedReason(error, "unreadable failure")}`, true, true);
+  }
+  if (!consumeNativePromise(rawAssociation)) {
+    return refuse("trusted accounting association did not return a native Promise", true, true);
+  }
+  const associationPromise = rawAssociation as Promise<unknown>;
+  void associationPromise.catch(() => undefined);
+  const associated = await awaitWithCleanup(slot, associationPromise);
+  if (associated.kind === "expired") {
+    return refuse("trusted accounting association did not settle within the cleanup grace window", true, true);
+  }
+  if (associated.kind === "error") {
+    return refuse(
+      `trusted accounting association rejected: ${boundedReason(associated.error, "unreadable failure")}`,
+      true,
+      true,
+    );
+  }
+  const identity = readAccountingIdentity(associated.value);
+  if (identity === null) {
+    return refuse("trusted accounting association returned no exact owner identity", true, true);
+  }
+  if (state.accountingOwnerIdentity === null) {
+    state.accountingOwnerIdentity = identity;
+  } else if (state.accountingOwnerIdentity.ownerId !== identity.ownerId
+    || state.accountingOwnerIdentity.selectorSha256 !== identity.selectorSha256) {
+    return refuse("trusted accounting association returned a different owner identity", true, true);
+  }
+  slot.accounting.identity = identity;
+  slot.accounting.phase = "associating";
+
+  const afterAssociation = authorityGate(slot, "effect");
+  if (afterAssociation !== null) return refuse(afterAssociation, true, true);
+
+  let rawOpen: unknown;
+  try {
+    rawOpen = openNativeHarnessAccountingOwner({
+      storageRoot: runtime.storageRoot,
+      selectorSha256: identity.selectorSha256,
+      ownerId: identity.ownerId,
+    });
+  } catch (error) {
+    const reason = `durable accounting owner open threw: ${boundedReason(error, "unreadable failure")}`;
+    markAccountingUnavailable(slot, reason);
+    return refuse(reason, true, true);
+  }
+  if (!consumeNativePromise(rawOpen)) {
+    const reason = "durable accounting owner open did not return a native Promise";
+    markAccountingUnavailable(slot, reason);
+    return refuse(reason, true, true);
+  }
+  const openPromise = rawOpen as Promise<NativeHarnessAccountingHandle>;
+  void openPromise.catch(() => undefined);
+  const opened = await awaitWithCleanup(slot, openPromise);
+  if (opened.kind === "expired") {
+    // A late handle owns no reservation and must close without another effect.
+    void openPromise.then(
+      (handle) => {
+        try {
+          handle.close();
+        } catch {
+          // Already closed.
+        }
+      },
+      () => undefined,
+    );
+    const reason = "durable accounting owner open did not settle within the cleanup grace window";
+    markAccountingUnavailable(slot, reason);
+    return refuse(reason, true, true);
+  }
+  if (opened.kind === "error") {
+    const reason = `durable accounting owner open was refused: ${boundedReason(opened.error, "unreadable failure")}`;
+    markAccountingUnavailable(slot, reason);
+    return refuse(reason, true, true);
+  }
+  const handle = opened.value;
+  slot.accounting.handle = handle;
+  const checkpoint = handle.snapshot();
+  if (checkpoint.ownerId !== identity.ownerId || checkpoint.selectorSha256 !== identity.selectorSha256) {
+    closeAccountingHandle(slot);
+    const reason = "durable accounting owner identity changed before reserve";
+    markAccountingUnavailable(slot, reason);
+    return refuse(reason, true, true);
+  }
+  if (!sameAccountingLimits(checkpoint.limits, state.limits)) {
+    closeAccountingHandle(slot);
+    const reason = "stored durable accounting limits differ from this coordinator's normalized limits";
+    markAccountingUnavailable(slot, reason);
+    return refuse(reason, true, true);
+  }
+  let projection: NativeHarnessAccountingProjection;
+  try {
+    projection = projectNativeHarnessAccounting(checkpoint);
+  } catch (error) {
+    closeAccountingHandle(slot);
+    const reason = `durable accounting checkpoint is unreadable: ${boundedReason(error, "unreadable failure")}`;
+    markAccountingUnavailable(slot, reason);
+    return refuse(reason, true, true);
+  }
+  if (!observeAccountingCheckpoint(slot, checkpoint)) {
+    closeAccountingHandle(slot);
+    const reason = "durable accounting checkpoint did not match the fixed owner and limits";
+    markAccountingUnavailable(slot, reason);
+    return refuse(reason, true, true);
+  }
+  if (state.budgetBlocked || projection.budgetBlocked) {
+    closeAccountingHandle(slot);
+    return refuse("the durable accounting budget is blocked", true, true);
+  }
+  if (projection.retainedOperations >= state.limits.maxRetainedOperations) {
+    closeAccountingHandle(slot);
+    return refuse("the durable accounting retained-operation limit is exhausted", true, true);
+  }
+  if (projection.activeOperations >= state.limits.maxConcurrent) {
+    closeAccountingHandle(slot);
+    return refuse("the durable accounting concurrency is already retained", true, true);
+  }
+  if (projection.accountedUsd + state.limits.perRunUsd > state.limits.lifetimeUsd + USD_EPSILON) {
+    closeAccountingHandle(slot);
+    return refuse("the durable accounting lifetime budget is exhausted or reserved", true, true);
+  }
+
+  const beforeReserve = authorityGate(slot, "effect");
+  if (beforeReserve !== null) {
+    closeAccountingHandle(slot);
+    return refuse(beforeReserve, true, true);
+  }
+
+  const reserved = await commitAccounting(slot, "reserve", reserveTransition(slot));
+  if (!reserved.ok) {
+    if (reserved.ambiguous) {
+      slot.accounting.phase = "unavailable";
+      return refuse(reserved.reason, false, false, "unknown");
+    }
+    closeAccountingHandle(slot);
+    return refuse(reserved.reason, true, true);
+  }
+  slot.accounting.reserveRevision = reserved.checkpoint.revision;
+  slot.accounting.phase = "reserved";
+  return { kind: "ready" };
+}
+
 async function runSlot(slot: Slot): Promise<void> {
   const state = slotState(slot);
   if (state === null) return;
@@ -8204,7 +9185,7 @@ async function runSlot(slot: Slot): Promise<void> {
       prepareContext = context;
     });
     if (beforePrepare !== null) {
-      finishSlot(slot, {
+      await finishSlot(slot, {
         outcome: "refused",
         reason: beforePrepare,
         authorityFresh: false,
@@ -8218,9 +9199,83 @@ async function runSlot(slot: Slot): Promise<void> {
       return;
     }
 
-    const prepared = await invokePrepare(slot, prepareContext);
+    let prepareAccounting: NativeHarnessPrepareAccounting | null = null;
+    if (state.accounting !== null) {
+      if (prepareContext === null) {
+        await finishSlot(slot, {
+          outcome: "refused",
+          reason: "the gated main context is unavailable",
+          authorityFresh: false,
+          executionState: "not-started",
+          termination: terminationFor(slot, null, null),
+          backendStatus: null,
+          knownObservedCost: false,
+          noDispatch: true,
+          releaseConcurrency: true,
+        });
+        return;
+      }
+      const reserved = await reserveDurableAdmission(slot, state, prepareContext);
+      if (reserved.kind === "finished") return;
+      const identity = slot.accounting.identity;
+      const reserveRevision = slot.accounting.reserveRevision;
+      if (identity === null || reserveRevision === null) {
+        await finishSlot(slot, {
+          outcome: "unknown",
+          reason: "durable accounting reserve facts are unavailable before preparation",
+          authorityFresh: false,
+          executionState: "not-started",
+          termination: terminationFor(slot, null, null),
+          backendStatus: null,
+          knownObservedCost: false,
+          noDispatch: false,
+          releaseConcurrency: false,
+        });
+        return;
+      }
+      prepareAccounting = Object.freeze({
+        ownerId: identity.ownerId,
+        admissionId: slot.accounting.admissionId,
+        reserveRevision,
+        sourceAssociationSha256: slot.accounting.sourceAssociationSha256,
+        admittedAt: slot.admittedAt,
+      });
+      const afterReserve = authorityGate(slot, "effect", (context) => {
+        prepareContext = context;
+      });
+      if (afterReserve !== null) {
+        await finishSlot(slot, {
+          outcome: "refused",
+          reason: afterReserve,
+          authorityFresh: false,
+          executionState: "not-started",
+          termination: terminationFor(slot, afterReserve, null),
+          backendStatus: null,
+          knownObservedCost: false,
+          noDispatch: true,
+          releaseConcurrency: true,
+        });
+        return;
+      }
+      if (prepareContext === null) {
+        await finishSlot(slot, {
+          outcome: "refused",
+          reason: "the post-reserve main context is unavailable",
+          authorityFresh: false,
+          executionState: "not-started",
+          termination: terminationFor(slot, null, null),
+          backendStatus: null,
+          knownObservedCost: false,
+          noDispatch: true,
+          releaseConcurrency: true,
+        });
+        return;
+      }
+    }
+
+    const prepared = await invokePrepare(slot, prepareContext, prepareAccounting);
     if (prepared.kind === "expired") {
-      finishSlot(slot, {
+      await finishSlot(slot, {
         outcome: "unknown",
         reason: "trusted preparation did not settle within the cleanup grace window; no run was created",
         authorityFresh: false,
@@ -8234,7 +9289,7 @@ async function runSlot(slot: Slot): Promise<void> {
       return;
     }
     if (prepared.kind === "failed") {
-      finishSlot(slot, {
+      await finishSlot(slot, {
         outcome: "refused",
         reason: prepared.reason,
         authorityFresh: false,
@@ -8253,20 +9308,93 @@ async function runSlot(slot: Slot): Promise<void> {
       await finishCancelledWithoutExecution(slot);
       return;
     }
-    const afterPrepare = authorityGate(slot, "effect");
-    if (afterPrepare !== null) {
-      finishSlot(slot, {
-        outcome: "refused",
-        reason: afterPrepare,
-        authorityFresh: false,
-        executionState: "not-started",
-        termination: terminationFor(slot, afterPrepare, null),
-        backendStatus: null,
-        knownObservedCost: false,
-        noDispatch: true,
-        releaseConcurrency: true,
-      });
-      return;
+
+    if (state.accounting === null) {
+      const afterPrepare = authorityGate(slot, "effect");
+      if (afterPrepare !== null) {
+        await finishSlot(slot, {
+          outcome: "refused",
+          reason: afterPrepare,
+          authorityFresh: false,
+          executionState: "not-started",
+          termination: terminationFor(slot, afterPrepare, null),
+          backendStatus: null,
+          knownObservedCost: false,
+          noDispatch: true,
+          releaseConcurrency: true,
+        });
+        return;
+      }
+    } else {
+      const accountingPrepared = prepared.accountingPrepared;
+      if (accountingPrepared === null) {
+        await finishSlot(slot, {
+          outcome: "refused",
+          reason: "trusted prepare returned no durable accountingPrepared facts",
+          authorityFresh: false,
+          executionState: "not-started",
+          termination: terminationFor(slot, null, null),
+          backendStatus: null,
+          knownObservedCost: false,
+          noDispatch: true,
+          releaseConcurrency: true,
+        });
+        return;
+      }
+      const beforeBind = authorityGate(slot, "effect");
+      if (beforeBind !== null) {
+        await finishSlot(slot, {
+          outcome: "refused",
+          reason: beforeBind,
+          authorityFresh: false,
+          executionState: "not-started",
+          termination: terminationFor(slot, beforeBind, null),
+          backendStatus: null,
+          knownObservedCost: false,
+          noDispatch: true,
+          releaseConcurrency: true,
+        });
+        return;
+      }
+      const bound = await commitAccounting(
+        slot,
+        "bindPrepared",
+        bindPreparedTransition(slot, accountingPrepared),
+      );
+      if (!bound.ok) {
+        await finishSlot(slot, {
+          outcome: "unknown",
+          reason: bound.reason,
+          authorityFresh: false,
+          executionState: "not-started",
+          termination: terminationFor(slot, null, null),
+          backendStatus: null,
+          knownObservedCost: false,
+          noDispatch: !bound.ambiguous,
+          releaseConcurrency: !bound.ambiguous,
+        });
+        return;
+      }
+      slot.accounting.preparedConfirmed = true;
+      if (slot.cancelRequested) {
+        await finishCancelledWithoutExecution(slot);
+        return;
+      }
+      const afterBind = authorityGate(slot, "effect");
+      if (afterBind !== null) {
+        await finishSlot(slot, {
+          outcome: "refused",
+          reason: afterBind,
+          authorityFresh: false,
+          executionState: "not-started",
+          termination: terminationFor(slot, afterBind, null),
+          backendStatus: null,
+          knownObservedCost: false,
+          noDispatch: true,
+          releaseConcurrency: true,
+        });
+        return;
+      }
     }
 
     slot.backendEffectStarted = true;
@@ -8286,7 +9414,7 @@ async function runSlot(slot: Slot): Promise<void> {
         },
         () => undefined,
       );
-      finishSlot(slot, {
+      await finishSlot(slot, {
         outcome: "unknown",
         reason: "backend run creation did not settle within the cleanup grace window",
         authorityFresh: false,
@@ -8301,7 +9429,7 @@ async function runSlot(slot: Slot): Promise<void> {
     }
     if (created.kind === "error") {
       slot.createSettled = true;
-      finishSlot(slot, {
+      await finishSlot(slot, {
         outcome: slot.cancelReason === "deadline-expired" ? "timed-out" : slot.cancelRequested ? "cancelled" : "unknown",
         reason: `backend run creation failed: ${boundedReason(created.error, "unreadable failure")}`,
         authorityFresh: false,
@@ -8317,7 +9445,7 @@ async function runSlot(slot: Slot): Promise<void> {
     slot.createSettled = true;
     const runId = readBackendRunId(created.value);
     if (runId === null) {
-      finishSlot(slot, {
+      await finishSlot(slot, {
         outcome: slot.cancelRequested ? "cancelled" : "unknown",
         reason: "backend run creation returned no valid bounded runId",
         authorityFresh: false,
@@ -8331,6 +9459,31 @@ async function runSlot(slot: Slot): Promise<void> {
       return;
     }
     slot.runId = runId;
+
+    // A cancellation requested before create had no actual target. As soon as
+    // the original Slot retains a real runId, dispatch the original cancel
+    // before any durable link await so the request is not delayed.
+    if (slot.cancelRequested) requestBackendCancel(slot);
+
+    if (state.accounting !== null) {
+      const linked = await commitAccounting(slot, "bindRun", bindRunTransition(slot, runId));
+      if (!linked.ok) {
+        if (slot.cancelState === "none") requestBackendCancel(slot);
+        await finishSlot(slot, {
+          outcome: "unknown",
+          reason: linked.reason,
+          authorityFresh: false,
+          executionState: "not-started",
+          termination: terminationFor(slot, null, null),
+          backendStatus: null,
+          knownObservedCost: false,
+          noDispatch: false,
+          releaseConcurrency: false,
+        });
+        return;
+      }
+      slot.accounting.runConfirmed = true;
+    }
 
     if (slot.cancelRequested) {
       requestBackendCancel(slot);
@@ -8364,7 +9517,7 @@ async function runSlot(slot: Slot): Promise<void> {
           slot.lateSettlementObserved = true;
         },
       );
-      finishSlot(slot, {
+      await finishSlot(slot, {
         outcome: "unknown",
         reason: "backend execution or worker cleanup did not settle within the cleanup grace window",
         authorityFresh: false,
@@ -8389,17 +9542,38 @@ async function runSlot(slot: Slot): Promise<void> {
     slot.executionSettled = true;
     slot.executionError = executionError;
 
-    // All callback facts, including the finish clock, are read before the
-    // final fresh/pure gate. Nothing invokes a host callback between that gate
-    // and result publication.
     const finishedAt = readClock(state.now) ?? slot.admittedAt;
+    if (state.accounting !== null) {
+      const knownObservedCost = slot.backendStatus === "completed"
+        && slot.workerCount > 0
+        && slot.workerAllKnownCompleted
+        && !slot.workerUnknownUsage
+        && !slot.cancelRequested
+        && slot.executionSettled
+        && slot.workerPromises.size === 0;
+      await finishSlot(slot, {
+        outcome: outcomeFor(slot, slot.backendStatus, null),
+        reason: executionError ?? (slot.backendStatus === "completed"
+          ? "the Harness2 backend reported completion; task acceptance was not evaluated"
+          : `backend status ${slot.backendStatus ?? "unknown"}`),
+        authorityFresh: false,
+        executionState: "settled",
+        termination: terminationFor(slot, null, slot.backendStatus),
+        backendStatus: slot.backendStatus,
+        knownObservedCost,
+        noDispatch: false,
+        releaseConcurrency: true,
+        finishedAt,
+      });
+      return;
+    }
+
+    // Legacy path: all callback facts, including the finish clock, are read
+    // before the final fresh/pure gate. Nothing invokes a host callback
+    // between that gate and result publication.
     const finalGate = authorityGate(slot, "effect");
     const backendStatus = slot.backendStatus;
     const authorityFresh = finalGate === null;
-    // Native freshness is an authority fact, not a usage fact. Execution and
-    // every accepted worker have settled here; when the backend completed with
-    // fully known worker usage and no cancellation, the observed subtotal is
-    // known even if the final native gate rejects (for example navigation).
     const knownObservedCost = backendStatus === "completed"
       && slot.workerCount > 0
       && slot.workerAllKnownCompleted
@@ -8407,16 +9581,14 @@ async function runSlot(slot: Slot): Promise<void> {
       && !slot.cancelRequested
       && slot.executionSettled
       && slot.workerPromises.size === 0;
-    const outcome = outcomeFor(slot, backendStatus, finalGate);
-    const termination = terminationFor(slot, finalGate, backendStatus);
-    finishSlot(slot, {
-      outcome,
+    await finishSlot(slot, {
+      outcome: outcomeFor(slot, backendStatus, finalGate),
       reason: finalGate ?? executionError ?? (backendStatus === "completed"
         ? "the Harness2 backend reported completion; task acceptance was not evaluated"
         : `backend status ${backendStatus ?? "unknown"}`),
       authorityFresh,
       executionState: "settled",
-      termination,
+      termination: terminationFor(slot, finalGate, backendStatus),
       backendStatus,
       knownObservedCost,
       noDispatch: false,
@@ -8424,7 +9596,7 @@ async function runSlot(slot: Slot): Promise<void> {
       finishedAt,
     });
   } catch (error) {
-    finishSlot(slot, {
+    await finishSlot(slot, {
       outcome: "unknown",
       reason: `delegation failed unexpectedly: ${boundedReason(error, "unreadable failure")}`,
       authorityFresh: false,
@@ -8505,6 +9677,49 @@ function createSlot(
     finalExecutionState: "not-started",
     finalTermination: "none",
     finalCost: null,
+    accounting: state.accounting === null
+      ? {
+          admissionId: "",
+          identity: null,
+          handle: null,
+          checkpoint: null,
+          reserveRevision: null,
+          sourceAssociationSha256: "",
+          preparedConfirmed: false,
+          runConfirmed: false,
+          phase: "idle",
+          pending: null,
+          pendingKind: null,
+          settleStarted: false,
+          settleConfirmed: false,
+          blockCommitted: false,
+          finalizing: false,
+          finalization: null,
+          finalFacts: null,
+          lateSettlementArmed: false,
+          unavailableReason: null,
+        }
+      : {
+          admissionId: randomUUID(),
+          identity: null,
+          handle: null,
+          checkpoint: null,
+          reserveRevision: null,
+          sourceAssociationSha256: associationSourceSha256(association),
+          preparedConfirmed: false,
+          runConfirmed: false,
+          phase: "idle",
+          pending: null,
+          pendingKind: null,
+          settleStarted: false,
+          settleConfirmed: false,
+          blockCommitted: false,
+          finalizing: false,
+          finalization: null,
+          finalFacts: null,
+          lateSettlementArmed: false,
+          unavailableReason: null,
+        },
     output: {
       registration: null,
       registrationFailure: null,
@@ -8599,6 +9814,51 @@ function buildSnapshot(state: CoordinatorState): NativeHarnessDelegationSnapshot
       }),
     }));
   }
+  let accountingView: NativeHarnessSnapshotAccounting | undefined;
+  let lifetime: NativeHarnessDelegationSnapshot["lifetime"] = {
+    limitUsd: state.limits.lifetimeUsd,
+    accountedUsd: state.lifetimeAccountedUsd,
+    observedUsd: state.lifetimeObservedUsd,
+    unknownUsd: state.lifetimeUnknownUsd,
+    overspendUsd: state.lifetimeOverspendUsd,
+    budgetBlocked: state.budgetBlocked,
+  };
+  if (state.accounting !== null) {
+    const cache = state.accountingCache;
+    let pending = false;
+    for (const slot of state.slots.values()) {
+      if (slot.state !== "running") continue;
+      if (slot.accounting.pending !== null
+        || slot.accounting.finalizing
+        || slot.accounting.phase === "associating") {
+        pending = true;
+        break;
+      }
+    }
+    const observation = pending
+      ? "pending"
+      : state.accountingUnavailableReason !== null
+        ? "unavailable"
+        : cache === null
+          ? "unloaded"
+          : "observed";
+    accountingView = Object.freeze({
+      observation,
+      revision: cache === null ? null : cache.checkpoint.revision,
+      lastCheckpoint: cache === null ? null : cache.projection,
+      reason: state.accountingUnavailableReason,
+    });
+    // Lifetime fields mirror the last real checkpoint projection. Unloaded or
+    // stale zeros are explicitly not claimed as persistent totals.
+    lifetime = {
+      limitUsd: state.limits.lifetimeUsd,
+      accountedUsd: cache === null ? 0 : cache.projection.accountedUsd,
+      observedUsd: cache === null ? 0 : cache.projection.observedUsd,
+      unknownUsd: cache === null ? 0 : cache.projection.unknownUsd,
+      overspendUsd: cache === null ? 0 : cache.projection.overspendUsd,
+      budgetBlocked: cache === null ? state.budgetBlocked : cache.projection.budgetBlocked,
+    };
+  }
   return deepFreeze({
     schema: NATIVE_HARNESS_DELEGATION_SNAPSHOT_SCHEMA,
     enabled: state.enabled,
@@ -8606,6 +9866,7 @@ function buildSnapshot(state: CoordinatorState): NativeHarnessDelegationSnapshot
     limits: state.limits,
     retainedOperations: state.slots.size,
     activeOperations: state.activeOperations,
+    ...(accountingView === undefined ? {} : { accounting: accountingView }),
     output: {
       retainedCaptures: state.outputRetained,
       retainedBytes: state.outputBytes,
@@ -8615,14 +9876,7 @@ function buildSnapshot(state: CoordinatorState): NativeHarnessDelegationSnapshot
       maxBytes: NATIVE_HARNESS_MAX_OUTPUT_BYTES,
       reservationBytes: NATIVE_HARNESS_OUTPUT_RESERVATION_BYTES,
     },
-    lifetime: {
-      limitUsd: state.limits.lifetimeUsd,
-      accountedUsd: state.lifetimeAccountedUsd,
-      observedUsd: state.lifetimeObservedUsd,
-      unknownUsd: state.lifetimeUnknownUsd,
-      overspendUsd: state.lifetimeOverspendUsd,
-      budgetBlocked: state.budgetBlocked,
-    },
+    lifetime,
     operations,
   });
 }
@@ -8676,7 +9930,7 @@ function admitNew(
   capture: Extract<NativeCaptureResult, { ok: true }>,
   admittedAt: number,
 ): Promise<NativeHarnessDelegationResult> {
-  state.lifetimeAccountedUsd += state.limits.perRunUsd;
+  if (state.accounting === null) state.lifetimeAccountedUsd += state.limits.perRunUsd;
   state.activeOperations += 1;
   const slot = createSlot(
     state,
@@ -8702,6 +9956,12 @@ function canAdmit(state: CoordinatorState): string | null {
     return "the bounded delegation concurrency is already reserved";
   }
   if (state.budgetBlocked) return "a prior observed cost overspend stopped further delegation dispatch";
+  if (state.accounting !== null) {
+    // Persistent active/balance/retained facts are checked only after a fresh
+    // exact-open for each new admission. The cache is last-observation
+    // metadata, never a permit or refusal authority.
+    return null;
+  }
   if (state.lifetimeAccountedUsd + state.limits.perRunUsd > state.limits.lifetimeUsd + USD_EPSILON) {
     return "the lifetime delegation budget is exhausted or reserved";
   }
@@ -8713,7 +9973,7 @@ export function createNativeHarnessDelegation(
 ): NativeHarnessDelegationCoordinator {
   const fields = readStrictFields(
     options,
-    ["native", "policy", "getContext", "prepare", "runner", "now", "enabled", "output"],
+    ["native", "policy", "getContext", "prepare", "runner", "now", "enabled", "output", "accounting"],
     ["native", "getContext", "prepare", "runner"],
     "output",
   );
@@ -8752,6 +10012,7 @@ export function createNativeHarnessDelegation(
     throw new NativeHarnessDelegationError("Delegation enabled must be a boolean when present.");
   }
   const limits = normalizePolicy(fields.get("policy"));
+  const accounting = readAccountingPort(fields.get("accounting"), limits);
   const state: CoordinatorState = {
     native: {
       receiver: nativeValue as NativeEntryControls,
@@ -8760,6 +10021,7 @@ export function createNativeHarnessDelegation(
       registerCallResultExpectation: registerCallResultExpectation as NativeCallPort["registerCallResultExpectation"],
     },
     output: readOutputPort(fields.get("output")),
+    accounting,
     limits,
     getContext: getContext as () => NativeContext,
     prepare: prepare as CoordinatorState["prepare"],
@@ -8771,6 +10033,9 @@ export function createNativeHarnessDelegation(
     enabled: enabledValue === true,
     disposed: false,
     slots: new Map(),
+    accountingOwnerIdentity: null,
+    accountingCache: null,
+    accountingUnavailableReason: null,
     admissionInProgress: false,
     revalidationInProgress: false,
     activeOperations: 0,

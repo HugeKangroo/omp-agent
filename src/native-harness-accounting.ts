@@ -17,9 +17,11 @@ import {
 /**
  * Fixed accounting-owner checkpoint for the existing native coordinator.
  *
- * This module is storage, codec, CAS and projection only. The current
- * coordinator does not use it yet; A2b owns live wiring. It is not a second
- * budget allocator, execution ledger, recovery authority or session registry.
+ * This module is storage, codec, CAS and projection only. Direct construction
+ * of the coordinator with its optional accounting port now uses it; the actual
+ * instanced entry, session-association wrapper and backend/Controller
+ * new-origin creation are not wired yet. It is not a second budget allocator,
+ * execution ledger, recovery authority or session registry.
  * No identifier accepted or stored here grants authority. The trusted private
  * storage root is a host precondition; this leaf does not discover it.
  */
