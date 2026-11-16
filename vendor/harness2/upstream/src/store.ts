@@ -180,6 +180,52 @@ function parse<T>(raw: string, path: string, validate: (value: unknown) => void)
   try { const value: unknown = JSON.parse(raw); validate(value); return value as T; }
   catch (error) { throw new StoreCorruptionError(`Corrupt store file ${path}: ${(error as Error).message}. No fallback was applied.`); }
 }
+
+const HISTORY_TEXT_MAX_BYTES = 256 * 1024;
+const HISTORY_EVENTS_MAX_ROWS = 4096;
+
+/**
+ * Pure readonly history decoder for one already-read run.json text.
+ * It performs no filesystem I/O, lock acquisition, recovery or write. The
+ * original vendor `parse`/`validateRun` schema check is used unchanged; the
+ * expected run ID must match the record and the text is capped before parsing.
+ * A BOM, torn/partial JSON or any other corruption is rejected rather than
+ * stripped, repaired or replaced from a backup.
+ */
+export function decodeRunHistoryText(raw: string, expectedRunId: string): RunRecord {
+  if (typeof raw !== "string") throw new StoreCorruptionError("Corrupt run history: expected UTF-8 text.");
+  try { validId(expectedRunId); }
+  catch { throw new StoreCorruptionError("Corrupt run history: invalid expected run ID."); }
+  if (Buffer.byteLength(raw, "utf8") > HISTORY_TEXT_MAX_BYTES) {
+    throw new RangeError(`Run history text exceeds the ${HISTORY_TEXT_MAX_BYTES}-byte readonly profile.`);
+  }
+  return parse<RunRecord>(raw, "run.json", value => validateRun(value, expectedRunId));
+}
+
+/**
+ * Pure readonly decoder for one already-read events.jsonl text. The original
+ * vendor `parse`/`validateEvent` schema check is used unchanged. Empty text is
+ * an actually empty log; a missing final LF, a row/byte limit breach, a BOM, a
+ * corrupt row or a mismatched run ID is rejected. No fallback is applied.
+ */
+export function decodeRunEventsText(raw: string, expectedRunId: string): RunEvent[] {
+  if (typeof raw !== "string") throw new StoreCorruptionError("Corrupt event history: expected UTF-8 text.");
+  try { validId(expectedRunId); }
+  catch { throw new StoreCorruptionError("Corrupt event history: invalid expected run ID."); }
+  if (Buffer.byteLength(raw, "utf8") > HISTORY_TEXT_MAX_BYTES) {
+    throw new RangeError(`Event history text exceeds the ${HISTORY_TEXT_MAX_BYTES}-byte readonly profile.`);
+  }
+  if (raw === "") return [];
+  if (!raw.endsWith("\n")) {
+    throw new StoreCorruptionError("Incomplete event log: events.jsonl does not end with LF. No fallback was applied.");
+  }
+  const lines = raw.slice(0, -1).split("\n");
+  if (lines.length > HISTORY_EVENTS_MAX_ROWS) {
+    throw new RangeError(`Event history rows exceed the ${HISTORY_EVENTS_MAX_ROWS}-row readonly profile.`);
+  }
+  return lines.map((line, index) =>
+    parse<RunEvent>(line, `events.jsonl:${index + 1}`, value => validateEvent(value, expectedRunId)));
+}
 async function serialized<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const previous = queues.get(key) ?? Promise.resolve();
   const pending = previous.catch(() => {}).then(fn);

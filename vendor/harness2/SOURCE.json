@@ -12,7 +12,7 @@
     "distributionPath": "relative to the omp-agent package root",
     "upstreamPath": "relative to the upstream repository root"
   },
-  "sourceId": "d07cab99cc3e3527a0802b45e40d4e50f0f68c372fbf5d9e69d615a4f8257169",
+  "sourceId": "074cabe55a52d95e7de26d795ff1a347cfd3c427b1736bbeb2d6dfb79a99c63a",
   "sourceIdAlgorithm": "sha256 over UTF-8 canonical JSON with object keys sorted recursively, arrays in stored order, and no insignificant whitespace, of {schemaVersion, upstreamRepository, baseCommit, files:[{distributionPath, bundledSha256}]}; files are every distributed content file except vendor/harness2/SOURCE.json, sorted by distributionPath; SOURCE.json is excluded to avoid self-referential metadata hashing.",
   "license": {
     "upstreamLicensePath": "LICENSE",
@@ -37,10 +37,10 @@
       "upstreamPath": null,
       "kind": "wrapper",
       "originalSha256": null,
-      "bundledSha256": "209892a75a07526e9a70fc7f9278a6b3e03c6de34ef19cf83a193d466feea2ab",
-      "bytes": 942,
+      "bundledSha256": "f67f9a042a0036d5f6ecde4cc825da59718cd3a6be8ac39d6e1eed7c014d4732",
+      "bytes": 1076,
       "modified": false,
-      "note": "Authored host-only library entry. Re-exports HarnessController, the actual OmpRpcRunner, the credential-free capability probe and the minimal public types; no OMP extension, CLI, bin, or HTTP entry, and importing it starts no process."
+      "note": "Authored host-only library entry. Re-exports HarnessController, the actual OmpRpcRunner, the credential-free capability probe, the pure bounded run/events history decoders and the minimal public types; no OMP extension, CLI, bin, or HTTP entry, and importing it starts no process."
     },
     {
       "distributionPath": "vendor/harness2/upstream/LICENSE",
@@ -267,10 +267,10 @@
       "upstreamPath": "src/store.ts",
       "kind": "upstream-source",
       "originalSha256": "d3cc63d6a8a5dd10e073987927febac1fa69f076b9beeba9e08c2e198df472c8",
-      "bundledSha256": "d3cc63d6a8a5dd10e073987927febac1fa69f076b9beeba9e08c2e198df472c8",
-      "bytes": 26486,
-      "modified": false,
-      "note": "Copied byte-for-byte from the upstream snapshot; no modifications."
+      "bundledSha256": "bca4014f84cbd8f2a3d9786e9f70d66848f4baa9bf653902bd3379403c3171ef",
+      "bytes": 28945,
+      "modified": true,
+      "note": "Upstream store with two added pure readonly text decoders, decodeRunHistoryText and decodeRunEventsText. They reuse the original parse/validateRun/validateEvent schema checks, enforce a 256 KiB text and 4096 event-row readonly profile with RangeError profile limits and StoreCorruptionError for torn/corrupt/mismatched text, and perform no I/O, lock, write, recovery or fallback. Existing read/write/controller behavior is unchanged."
     },
     {
       "distributionPath": "vendor/harness2/upstream/src/surface.ts",

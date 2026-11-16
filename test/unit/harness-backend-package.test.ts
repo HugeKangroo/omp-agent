@@ -27,7 +27,7 @@ const VENDOR_ROOT = path.join(REPO_ROOT, "vendor/harness2");
 const SOURCE_MANIFEST = path.join(VENDOR_ROOT, "SOURCE.json");
 const UPSTREAM_REPOSITORY = "https://github.com/HugeKangroo/omp-harness2";
 const UPSTREAM_BASE_COMMIT = "6d5cd6386c8a085d0070cfb660ddbc5c7f76b92e";
-const EXPECTED_SOURCE_ID = "d07cab99cc3e3527a0802b45e40d4e50f0f68c372fbf5d9e69d615a4f8257169";
+const EXPECTED_SOURCE_ID = "074cabe55a52d95e7de26d795ff1a347cfd3c427b1736bbeb2d6dfb79a99c63a";
 const UPSTREAM_MODULES = [
   "adaptation.ts",
   "approval-channel.ts",
@@ -67,11 +67,13 @@ const EXPECTED_MODIFIED_FILES = [
   "vendor/harness2/upstream/src/controller.ts",
   "vendor/harness2/upstream/src/evolution.ts",
   "vendor/harness2/upstream/src/runner.ts",
+  "vendor/harness2/upstream/src/store.ts",
 ].sort();
 const EXPECTED_EDITED_ORIGINALS: Record<string, string> = {
   "vendor/harness2/upstream/src/controller.ts": "711967e2e61220953e00412dbfcf3dac623202f0cd01d9e1fcfd002113582d92",
   "vendor/harness2/upstream/src/evolution.ts": "706d229570950eb074844472ada15237477ed9d86ffb8b4443f9601861f16985",
   "vendor/harness2/upstream/src/runner.ts": "589cde36411bcb71ea06a2c628b4fa28dbbc36f44d1431043452e98d9f829f24",
+  "vendor/harness2/upstream/src/store.ts": "d3cc63d6a8a5dd10e073987927febac1fa69f076b9beeba9e08c2e198df472c8",
 };
 
 type SourceFileKind = "upstream-source" | "license" | "wrapper" | "provenance";
@@ -360,7 +362,13 @@ describe("G5-1 vendored Harness² source capsule", () => {
     const extractedIndex = path.join(artifact.packageRoot, "vendor/harness2/index.ts");
     expect(realpathSync(extractedIndex).startsWith(`${realPackageRoot}${path.sep}`)).toBe(true);
     const vendored = await import(pathToFileURL(extractedIndex).href) as Record<string, unknown>;
-    expect(Object.keys(vendored)).toEqual(["HarnessController", "OmpRpcRunner", "probeRpcCapabilities"]);
+    expect(Object.keys(vendored)).toEqual([
+      "HarnessController",
+      "OmpRpcRunner",
+      "decodeRunEventsText",
+      "decodeRunHistoryText",
+      "probeRpcCapabilities",
+    ]);
     expect(typeof vendored.HarnessController).toBe("function");
     expect(typeof vendored.OmpRpcRunner).toBe("function");
     expect(typeof vendored.probeRpcCapabilities).toBe("function");
