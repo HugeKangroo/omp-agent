@@ -3636,17 +3636,27 @@ async function handoffChild(
   childId: string,
   task: string,
 ): Promise<ChildFixture> {
+  return await handoffChildPrompt(root, call, childId, HANDOFF_TASK_PREFIX + task);
+}
+
+async function handoffChildPrompt(
+  root: RootFixture,
+  call: string,
+  childId: string,
+  prompt: string,
+  contextPrompt = prompt,
+): Promise<ChildFixture> {
   const child = await startChild(root, call, childId, {
     activeTools: ["read", "agent_snapshot"],
   });
   const body = root.children[0]!.definition.body;
   await child.host.emit("before_agent_start", {
     reason: "prompt",
-    prompt: HANDOFF_TASK_PREFIX + task,
+    prompt,
     systemPrompt: childPrompt(body),
   });
   await child.host.emit("context", {
-    messages: [{ role: "user", content: HANDOFF_TASK_PREFIX + task }],
+    messages: [{ role: "user", content: contextPrompt }],
   });
   return child;
 }
@@ -4412,6 +4422,173 @@ describe("actual instanced handoff composition", () => {
       expect(refused.isError).toBe(true);
       expect(statusRecord(base.root, "task-child-drift").refusalCode).toBe("child-model");
       driftChild.entry.dispose();
+    } finally {
+      await base.cleanup();
+    }
+  }, 20_000);
+
+  test("raw CRLF/CR handoff tasks with outer whitespace render to the exact normalized prompt and context", async () => {
+    const base = await handoffBase();
+    try {
+      const crlfTask = `OMP_HANDOFF_REF_V1 ${base.offerId}\r\nKeep  interior spaces.\r\n\r\nKeep blank line.\r\n `;
+      const crlfPrompt = `${HANDOFF_TASK_PREFIX}OMP_HANDOFF_REF_V1 ${base.offerId}\nKeep  interior spaces.\n\nKeep blank line.`;
+      await admitHandoffTask(base.root, "task-render-crlf", crlfTask);
+      const crlfChild = await handoffChildPrompt(
+        base.root,
+        "task-render-crlf",
+        "ChildRenderCrlf",
+        crlfPrompt,
+      );
+      expect(statusRecord(base.root, "task-render-crlf")).toMatchObject({
+        phase: "bound",
+        refusalCode: null,
+      });
+      const crlfCheck = snapshotDetails(await snapshotCall(crlfChild, "snapshot-render-crlf", {
+        action: "check",
+        offerId: base.offerId,
+      }));
+      expect(crlfCheck.outcome).toBe("pass");
+      expect(typeof crlfCheck.receiptId).toBe("string");
+
+      const crOffer = await publishHandoffOffer(base.root, "handoff-offer-render-cr", base.captureId);
+      const crTask = `OMP_HANDOFF_REF_V1 ${crOffer}\rKeep  interior spaces.\r\rKeep blank line.\r `;
+      const crPrompt = `${HANDOFF_TASK_PREFIX}OMP_HANDOFF_REF_V1 ${crOffer}\nKeep  interior spaces.\n\nKeep blank line.`;
+      await admitHandoffTask(base.root, "task-render-cr", crTask);
+      const crChild = await handoffChildPrompt(
+        base.root,
+        "task-render-cr",
+        "ChildRenderCr",
+        crPrompt,
+      );
+      const crCheck = snapshotDetails(await snapshotCall(crChild, "snapshot-render-cr", {
+        action: "check",
+        offerId: crOffer,
+      }));
+      expect(crCheck.outcome).toBe("pass");
+      expect(typeof crCheck.receiptId).toBe("string");
+    } finally {
+      await base.cleanup();
+    }
+  }, 20_000);
+
+  test("interior Markdown spacing survives rendering while an interior-space or one-character mutation refuses", async () => {
+    const base = await handoffBase();
+    try {
+      const rawTask = `OMP_HANDOFF_REF_V1 ${base.offerId}\r\nKeep  two spaces.\r\n\r\nKeep blank line.\r\n`;
+      const expected = `${HANDOFF_TASK_PREFIX}OMP_HANDOFF_REF_V1 ${base.offerId}\nKeep  two spaces.\n\nKeep blank line.`;
+      await admitHandoffTask(base.root, "task-render-interior", rawTask);
+      const correct = await handoffChildPrompt(
+        base.root,
+        "task-render-interior",
+        "ChildRenderInterior",
+        expected,
+      );
+      const correctCheck = snapshotDetails(await snapshotCall(correct, "snapshot-render-interior", {
+        action: "check",
+        offerId: base.offerId,
+      }));
+      expect(correctCheck.outcome).toBe("pass");
+
+      const promptOffer = await publishHandoffOffer(
+        base.root,
+        "handoff-offer-render-prompt-mutation",
+        base.captureId,
+      );
+      const promptTask = `OMP_HANDOFF_REF_V1 ${promptOffer}\r\nKeep  two spaces.\r\n\r\nKeep blank line.\r\n`;
+      await admitHandoffTask(base.root, "task-render-prompt-mutation", promptTask);
+      const promptChild = await startChild(
+        base.root,
+        "task-render-prompt-mutation",
+        "ChildRenderPromptMutation",
+        { activeTools: ["read", "agent_snapshot"] },
+      );
+      await promptChild.host.emit("before_agent_start", {
+        reason: "prompt",
+        prompt: `${HANDOFF_TASK_PREFIX}OMP_HANDOFF_REF_V1 ${promptOffer}\nKeep two spaces.\n\nKeep blank line.`,
+        systemPrompt: childPrompt(base.alphaBody),
+      });
+      const promptRow = statusRecord(base.root, "task-render-prompt-mutation");
+      expect(promptRow.phase).toBe("refused");
+      expect(promptRow.refusalCode).toBe("handoff-task-prompt");
+      expect(isBlocked(await promptChild.host.emit("tool_call", {
+        toolCallId: "snapshot-render-prompt-mutation",
+        toolName: "agent_snapshot",
+        input: { action: "check", offerId: promptOffer },
+      }))).toBe(true);
+
+      const contextOffer = await publishHandoffOffer(
+        base.root,
+        "handoff-offer-render-context-mutation",
+        base.captureId,
+      );
+      const contextTask = `OMP_HANDOFF_REF_V1 ${contextOffer}\r\nKeep  two spaces.\r\n\r\nKeep blank line.\r\n`;
+      await admitHandoffTask(base.root, "task-render-context-mutation", contextTask);
+      const contextChild = await startChild(
+        base.root,
+        "task-render-context-mutation",
+        "ChildRenderContextMutation",
+        { activeTools: ["read", "agent_snapshot"] },
+      );
+      await contextChild.host.emit("before_agent_start", {
+        reason: "prompt",
+        prompt: `${HANDOFF_TASK_PREFIX}OMP_HANDOFF_REF_V1 ${contextOffer}\nKeep  two spaces.\n\nKeep blank line.`,
+        systemPrompt: childPrompt(base.alphaBody),
+      });
+      await contextChild.host.emit("context", {
+        messages: [{
+          role: "user",
+          content: `${HANDOFF_TASK_PREFIX}OMP_HANDOFF_REF_V1 ${contextOffer}\nKeep  two spaces.\n\nKeep blank line`,
+        }],
+      });
+      const contextRow = statusRecord(base.root, "task-render-context-mutation");
+      expect(contextRow.phase).toBe("refused");
+      expect(contextRow.refusalCode).toBe("handoff-task-context");
+      expect(isBlocked(await contextChild.host.emit("tool_call", {
+        toolCallId: "snapshot-render-context-mutation",
+        toolName: "agent_snapshot",
+        input: { action: "check", offerId: contextOffer },
+      }))).toBe(true);
+    } finally {
+      await base.cleanup();
+    }
+  }, 20_000);
+
+  test("a normalized parent task result input remains a digest conflict and cannot adopt", async () => {
+    const base = await handoffBase();
+    try {
+      const rawTask = `OMP_HANDOFF_REF_V1 ${base.offerId}\r\nCheck  digest.\r\n\r\nKeep blank line.\r\n`;
+      const expected = `${HANDOFF_TASK_PREFIX}OMP_HANDOFF_REF_V1 ${base.offerId}\nCheck  digest.\n\nKeep blank line.`;
+      await admitHandoffTask(base.root, "task-render-result-digest", rawTask);
+      const child = await handoffChildPrompt(
+        base.root,
+        "task-render-result-digest",
+        "ChildRenderResultDigest",
+        expected,
+      );
+      const receipt = snapshotDetails(await snapshotCall(child, "snapshot-render-result-digest", {
+        action: "check",
+        offerId: base.offerId,
+      }));
+      expect(receipt.outcome).toBe("pass");
+
+      const normalizedTask = rawTask.trim().replace(/\r\n?/g, "\n");
+      expect(normalizedTask).not.toBe(rawTask);
+      await base.root.host.emit("tool_result", handoffTaskResult(
+        "task-render-result-digest",
+        "ChildRenderResultDigest",
+        "alpha",
+        normalizedTask,
+        "PASS result",
+      ));
+      const row = statusRecord(base.root, "task-render-result-digest");
+      expect(row.refusalCode).toBe("handoff-task-result-input");
+      const adopt = await handoffCall(base.root, "handoff-adopt-render-normalized-input", {
+        action: "adopt",
+        receiptId: receipt.receiptId,
+        captureId: base.captureId,
+        consumerParentToolCallId: "task-render-result-digest",
+      });
+      expect(adopt.isError).toBe(true);
     } finally {
       await base.cleanup();
     }

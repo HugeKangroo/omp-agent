@@ -1923,11 +1923,13 @@ type HandoffTaskReference =
   | { readonly kind: "invalid"; readonly reason: string };
 
 /**
- * The reference is accepted only as the exact first line. No scanning of later
- * text, systemPrompt or model-controlled context is allowed.
+ * The reference is accepted only as the exact first line, with LF, CRLF or CR
+ * terminating it. No scanning of later text, systemPrompt or model-controlled
+ * context is allowed, and leading whitespace never hides or discovers one.
  */
 function readHandoffTaskReference(task: string): HandoffTaskReference {
-  const firstLine = task.split("\n", 1)[0] ?? "";
+  const separator = task.search(/[\r\n]/);
+  const firstLine = separator === -1 ? task : task.slice(0, separator);
   if (!firstLine.startsWith(HANDOFF_REF_PREFIX)) return { kind: "none" };
   if (!firstLine.startsWith(`${HANDOFF_REF_PREFIX} `)) {
     return { kind: "invalid", reason: `the first task line must be exactly ${HANDOFF_REF_PREFIX} <offerId>.` };
@@ -3021,12 +3023,22 @@ function taskMessageText(content: unknown): string | null {
 }
 
 /**
- * Minimal fixed-host context check: exactly one user message carries the
- * complete accepted task text. Provider date/workspace wrappers are not part
- * of this context shape and are never stripped or guessed.
+ * The fixed OMP 18.20.2 assignment renderer trims the assignment and normalizes
+ * CRLF/CR to LF before inserting it after the fixed child prompt. Derive that
+ * exact expected rendering from the retained original task; observed prompt and
+ * context text is compared without trimming or wrapper removal and without
+ * joining unrelated messages.
  */
-function verifyHandoffTaskMessage(messages: readonly unknown[], task: string): boolean {
-  const expected = HANDOFF_TASK_PREFIX + task;
+function expectedHandoffChildPrompt(task: string): string {
+  return HANDOFF_TASK_PREFIX + task.trim().replace(/\r\n?/g, "\n");
+}
+
+/**
+ * Minimal fixed-host context check: exactly one user message carries the
+ * derived child prompt. Provider date/workspace wrappers are not part of this
+ * context shape and are never stripped or guessed.
+ */
+function verifyHandoffTaskMessage(messages: readonly unknown[], expected: string): boolean {
   let matches = 0;
   for (const message of messages) {
     if (!isRecord(message) || message.role !== "user") continue;
@@ -4996,9 +5008,10 @@ function onChildBeforeAgentStart(
     }
     if (record.handoffOffer !== null && record.task !== null) {
       const actualPrompt = isRecord(event) ? event.prompt : undefined;
-      if (typeof actualPrompt !== "string" || actualPrompt !== HANDOFF_TASK_PREFIX + record.task) {
+      const expectedPrompt = expectedHandoffChildPrompt(record.task);
+      if (typeof actualPrompt !== "string" || actualPrompt !== expectedPrompt) {
         record.handoffPromptGate = "refused";
-        markRefused(root, record, "handoff-task-prompt", "The actual before_agent_start prompt was not the accepted prefix plus the complete original task.");
+        markRefused(root, record, "handoff-task-prompt", "The actual before_agent_start prompt was not the fixed child prefix plus the fixed-host rendering of the complete original task.");
         abortNow(context);
         return undefined;
       }
@@ -5075,9 +5088,9 @@ function onChildContext(
       return undefined;
     }
     if (record.handoffOffer !== null && record.task !== null) {
-      if (!verifyHandoffTaskMessage(messages, record.task)) {
+      if (!verifyHandoffTaskMessage(messages, expectedHandoffChildPrompt(record.task))) {
         record.handoffContextGate = "refused";
-        markRefused(root, record, "handoff-task-context", "The native context did not contain exactly one exact user task message for the complete original task.");
+        markRefused(root, record, "handoff-task-context", "The native context did not contain exactly one exact user task message for the fixed-host rendering of the complete original task.");
         abortNow(context);
         return undefined;
       }
