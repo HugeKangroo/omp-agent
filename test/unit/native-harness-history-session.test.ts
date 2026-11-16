@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import {
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -44,6 +45,19 @@ type Entry = Record<string, unknown> & {
   value?: never;
 };
 
+type DiskShape =
+  | "title-auto"
+  | "title-user"
+  | "title-minimal"
+  | "title-malformed"
+  | "title-version"
+  | "title-source"
+  | "title-duplicate"
+  | "title-after-header"
+  | "title-missing-header"
+  | "arbitrary-prefix"
+  | "extra-session-header";
+
 interface FixtureOptions {
   readonly append?: "native" | "noop" | "throw" | "rewrite-prefix" | "navigate";
   readonly ensure?:
@@ -67,6 +81,7 @@ interface FixtureOptions {
   readonly reportSourceCallId?: string;
   readonly candidateSessionId?: string;
   readonly ensureOnDiskTimeoutMs?: number;
+  readonly diskShape?: DiskShape;
 }
 
 interface HostState {
@@ -83,6 +98,7 @@ interface HostState {
   resolveEnsure: (() => void) | null;
   rejectEnsure: ((error: unknown) => void) | null;
   openCalls: number;
+  closeCalls: number;
   openReached: Promise<void>;
   releaseOpen: () => void;
 }
@@ -98,6 +114,7 @@ interface Fixture {
   readonly state: HostState;
   readonly session: NativeHarnessHistorySession;
   readonly candidate: NativeHarnessHistorySourceCandidate;
+  appendEntry(customType: string, data?: unknown): void;
   context(): unknown;
   dispose(): void;
 }
@@ -121,6 +138,17 @@ function sha256(value: string | Uint8Array): string {
 
 function jsonLine(value: unknown): string {
   return `${JSON.stringify(value)}\n`;
+}
+
+/** Mirrors the fixed host title slot: JSON body padded to 255 bytes plus LF. */
+function fixedTitleLine(title: string, source?: "auto" | "user"): string {
+  const record: Record<string, unknown> = { type: "title", v: 1, title };
+  if (source !== undefined) record.source = source;
+  record.updatedAt = "2026-01-01T00:00:00.000Z";
+  record.pad = "";
+  const unpadded = Buffer.byteLength(JSON.stringify(record), "utf8");
+  record.pad = " ".repeat(Math.max(0, 255 - unpadded));
+  return `${JSON.stringify(record)}\n`;
 }
 
 function sourceDetails(runId = RUN_ID): Record<string, unknown> {
@@ -513,6 +541,7 @@ function makeFixture(options: FixtureOptions = {}): Fixture {
     resolveEnsure: null,
     rejectEnsure: null,
     openCalls: 0,
+    closeCalls: 0,
     openReached,
     releaseOpen: () => {
       releaseOpenResolve?.();
@@ -543,7 +572,62 @@ function makeFixture(options: FixtureOptions = {}): Fixture {
         });
       }
     }
-    const body = [header, ...branch].map(jsonLine).join("");
+    const headerLine = jsonLine(header);
+    const branchText = branch.map(jsonLine).join("");
+    let body = headerLine + branchText;
+    switch (options.diskShape) {
+      case undefined:
+        break;
+      case "title-auto":
+        body = fixedTitleLine("Fixture session", "auto") + headerLine + branchText;
+        break;
+      case "title-user":
+        body = fixedTitleLine("会话 ✓ タイトル", "user") + headerLine + branchText;
+        break;
+      case "title-minimal":
+        body = jsonLine({
+          type: "title",
+          v: 1,
+          title: "minimal",
+          updatedAt: "whenever",
+          pad: "x",
+        }) + headerLine + branchText;
+        break;
+      case "title-malformed":
+        body = jsonLine({ type: "title", v: 1, title: "x", updatedAt: "whenever" }) + headerLine + branchText;
+        break;
+      case "title-version":
+        body = jsonLine({ type: "title", v: 2, title: "x", updatedAt: "whenever", pad: "" }) + headerLine + branchText;
+        break;
+      case "title-source":
+        body = jsonLine({
+          type: "title",
+          v: 1,
+          title: "x",
+          source: "system",
+          updatedAt: "whenever",
+          pad: "",
+        }) + headerLine + branchText;
+        break;
+      case "title-duplicate":
+        body = fixedTitleLine("first", "auto") + headerLine + fixedTitleLine("second", "user") + branchText;
+        break;
+      case "title-after-header":
+        body = headerLine + fixedTitleLine("late", "auto") + branchText;
+        break;
+      case "title-missing-header":
+        body = fixedTitleLine("only", "auto") + branchText;
+        break;
+      case "arbitrary-prefix":
+        body = jsonLine({ type: "note", v: 1 }) + headerLine + branchText;
+        break;
+      case "extra-session-header":
+        body = fixedTitleLine("x", "auto")
+          + headerLine
+          + jsonLine({ type: "session", id: state.sessionId, parentId: null })
+          + branchText;
+        break;
+    }
     if (options.ensure === "bom") {
       writeFileSync(state.sessionFile, `\uFEFF${body}`, "utf8");
       return;
@@ -603,7 +687,15 @@ function makeFixture(options: FixtureOptions = {}): Fixture {
         openReachedResolve?.();
         await openRelease;
       }
-      return nodeFileIo.open(target, flags);
+      const handle = await nodeFileIo.open(target, flags);
+      return {
+        stat: (statOptions) => handle.stat(statOptions),
+        read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
+        close: async () => {
+          state.closeCalls += 1;
+          await handle.close();
+        },
+      };
     },
   };
   const session = createNativeHarnessHistorySession({
@@ -644,6 +736,7 @@ function makeFixture(options: FixtureOptions = {}): Fixture {
     state,
     session,
     candidate,
+    appendEntry,
     context() {
       return {
         cwd: mainWorkspace,
@@ -663,6 +756,41 @@ function locatorEntryId(session: NativeHarnessHistorySession, context: unknown):
   const listed = session.list(context, { limit: 16 });
   expect(listed.rows.length).toBe(1);
   return listed.rows[0]!.entryId;
+}
+
+interface ScopedHostProbe {
+  readonly context: Record<string, unknown>;
+  branchReads(): number;
+}
+
+/**
+ * Synthetic host capability fixture: Object.create(baseCtx) with only ui owned;
+ * agent, cwd and sessionManager are inherited. getBranch is observational.
+ */
+function scopedHostProbe(fixture: Fixture, onBranchRead?: (count: number) => void): ScopedHostProbe {
+  const base = fixture.context() as {
+    readonly agent: unknown;
+    readonly cwd: string;
+    readonly sessionManager: Record<string, unknown>;
+  };
+  let reads = 0;
+  const manager: Record<string, unknown> = Object.create(base.sessionManager);
+  Object.defineProperty(manager, "getBranch", {
+    value: () => {
+      reads += 1;
+      onBranchRead?.(reads);
+      return (base.sessionManager.getBranch as () => Entry[])();
+    },
+    enumerable: true,
+    configurable: true,
+  });
+  const context: Record<string, unknown> = Object.create({
+    agent: base.agent,
+    cwd: base.cwd,
+    sessionManager: manager,
+  });
+  context.ui = { setWidget: () => undefined };
+  return { context, branchReads: () => reads };
 }
 
 function secondCandidate(fixture: Fixture): NativeHarnessHistorySourceCandidate {
@@ -1229,5 +1357,316 @@ describe("native harness history session leaf", () => {
     expect(inspected.inspection?.query.storageRoot).toBe(fixture.storageRoot);
     expect(inspected.inspection?.query.storeRelativePath).toBe(`${HARNESS_NAME}/store/runs/${RUN_ID}`);
     expect(fixture.session.status().schema).toBe(NATIVE_HARNESS_HISTORY_SESSION_SCHEMA);
+  });
+
+  test("scoped host context with inherited capabilities publishes, lists and inspects one disk-confirmed locator", async () => {
+    const seen: unknown[] = [];
+    const fixture = makeFixture({
+      ownerCurrent: (context) => {
+        seen.push(context);
+        return true;
+      },
+    });
+    const base = fixture.context() as Record<string, unknown>;
+    const scoped = Object.create(base) as Record<string, unknown>;
+    scoped.ui = { setWidget: () => undefined };
+    expect(Object.getPrototypeOf(scoped)).toBe(base);
+    expect(Object.prototype.hasOwnProperty.call(scoped, "agent")).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(scoped, "cwd")).toBe(false);
+    expect(Object.prototype.hasOwnProperty.call(scoped, "sessionManager")).toBe(false);
+
+    const published = await fixture.session.publishTerminal(scoped, {}, [fixture.candidate]);
+    expect(published.state).toBe("published");
+    expect(published.publications[0]?.outcome).toBe("disk-confirmed");
+    expect(published.publications[0]?.durability).toBe("observed-only");
+    expect(fixture.state.appendCalls).toBe(1);
+    expect(fixture.state.ensureCalls).toBe(1);
+    expect(fixture.state.openCalls).toBe(1);
+    expect(fixture.state.closeCalls).toBe(1);
+    expect(seen.length).toBeGreaterThan(0);
+    expect(seen.every((value) => value === scoped)).toBe(true);
+    const entryId = published.publications[0]!.entryId!;
+    const digest = published.publications[0]!.locatorSha256!;
+
+    const listed = fixture.session.list(scoped, { limit: 16 });
+    expect(listed.state).toBe("complete");
+    expect(listed.rows).toHaveLength(1);
+    expect(listed.rows[0]?.entryId).toBe(entryId);
+    expect(listed.rows[0]?.locatorSha256).toBe(digest);
+    expect(listed.rows[0]?.labelCompatibility).toBe("match");
+
+    const inspected = await fixture.session.inspect(
+      scoped,
+      { entryId, locatorSha256: digest },
+      new AbortController().signal,
+    );
+    expect(inspected.state).toBe("observed");
+    expect(inspected.current).toBe(true);
+    expect(inspected.evidence.source).toBe("match");
+    expect(inspected.evidence.report).toBe("match");
+    expect(inspected.labels.originSession).toBe("match");
+    expect(inspected.labels.workspace).toBe("match");
+    expect(inspected.inspection?.processObservation.inspected).toBe(false);
+    expect(inspected.inspection?.eligibility.resumeAvailable).toBe(false);
+    expect(inspected.inspection?.query.storageRoot).toBe(fixture.storageRoot);
+    expect(fixture.state.appendCalls).toBe(1);
+    expect(fixture.session.status().diskConfirmed).toBe(1);
+    expect(seen.every((value) => value === scoped)).toBe(true);
+  });
+
+  test("throwing host capability getters refuse within bounds and start no append, ensure or file I/O", async () => {
+    const fixture = makeFixture();
+    const base = fixture.context() as Record<string, unknown>;
+    const cwdFailure = Object.create(base) as Record<string, unknown>;
+    cwdFailure.ui = {};
+    Object.defineProperty(base, "cwd", {
+      configurable: true,
+      get() {
+        throw new Error("host context getter");
+      },
+    });
+    const published = await fixture.session.publishTerminal(cwdFailure, {}, [fixture.candidate]);
+    expect(published.state).toBe("unavailable");
+    expect(fixture.state.appendCalls).toBe(0);
+    expect(fixture.state.ensureCalls).toBe(0);
+    expect(fixture.state.openCalls).toBe(0);
+    expect(fixture.session.status().attempts).toBe(0);
+    const listed = fixture.session.list(cwdFailure);
+    expect(listed.state).toBe("unavailable");
+    const inspected = await fixture.session.inspect(
+      cwdFailure,
+      { entryId: "entry", locatorSha256: "e".repeat(64) },
+      new AbortController().signal,
+    );
+    expect(inspected.state).toBe("unavailable");
+    expect(inspected.current).toBe(false);
+    expect(fixture.state.openCalls).toBe(0);
+
+    const second = makeFixture();
+    const managerBase = second.context() as Record<string, unknown>;
+    const managerFailure = Object.create(managerBase) as Record<string, unknown>;
+    managerFailure.ui = {};
+    Object.defineProperty(managerBase, "sessionManager", {
+      configurable: true,
+      get() {
+        throw new Error("host manager getter");
+      },
+    });
+    const managerResult = await second.session.publishTerminal(managerFailure, {}, [second.candidate]);
+    expect(managerResult.state).toBe("unavailable");
+    expect(second.state.appendCalls).toBe(0);
+    expect(second.state.ensureCalls).toBe(0);
+    expect(second.state.openCalls).toBe(0);
+  });
+
+  test("list never returns current rows when the owner callback disposes after the session read", () => {
+    const fixture = makeFixture();
+    const probe = scopedHostProbe(fixture);
+    let sessionRef: NativeHarnessHistorySession | undefined;
+    const session = createNativeHarnessHistorySession({
+      storageRoot: fixture.storageRoot,
+      isOwnerCurrent: (context) => {
+        if (context === probe.context && probe.branchReads() >= 1) sessionRef?.dispose();
+        return true;
+      },
+      fileIo: nodeFileIo,
+      now: () => 1_000,
+    });
+    sessionRef = session;
+    const listed = session.list(probe.context, { limit: 16 });
+    expect(listed.state).toBe("unavailable");
+    expect(listed.rows).toHaveLength(0);
+    expect(listed.reasons[0]?.code).toBe("disposed");
+    expect(probe.branchReads()).toBe(1);
+  });
+
+  test("inspect starts no storage-root I/O when the owner is lost after the host read", async () => {
+    const fixture = makeFixture();
+    const published = await fixture.session.publishTerminal(fixture.context(), {}, [fixture.candidate]);
+    const entryId = published.publications[0]!.entryId!;
+    const digest = published.publications[0]!.locatorSha256!;
+    const probe = scopedHostProbe(fixture);
+    let ioCalls = 0;
+    const countingIo: NativeFileIo = {
+      ...nodeFileIo,
+      realpath: async (target) => {
+        ioCalls += 1;
+        return nodeFileIo.realpath(target);
+      },
+      lstat: async (target, statOptions) => {
+        ioCalls += 1;
+        return nodeFileIo.lstat(target, statOptions);
+      },
+      open: async (target, flags) => {
+        ioCalls += 1;
+        return nodeFileIo.open(target, flags);
+      },
+    };
+    let sessionRef: NativeHarnessHistorySession | undefined;
+    const session = createNativeHarnessHistorySession({
+      storageRoot: fixture.storageRoot,
+      isOwnerCurrent: (context) => {
+        if (context === probe.context && probe.branchReads() >= 1) sessionRef?.dispose();
+        return true;
+      },
+      fileIo: countingIo,
+      now: () => 1_000,
+    });
+    sessionRef = session;
+    const inspected = await session.inspect(
+      probe.context,
+      { entryId, locatorSha256: digest },
+      new AbortController().signal,
+    );
+    expect(inspected.state).toBe("invalidated");
+    expect(inspected.current).toBe(false);
+    expect(inspected.inspection).toBeNull();
+    expect(inspected.reasons.some((problem) => problem.code === "invalidated")).toBe(true);
+    expect(ioCalls).toBe(0);
+  });
+
+  test("inspect never returns current after disposal on the final owner recheck", async () => {
+    const fixture = makeFixture();
+    const published = await fixture.session.publishTerminal(fixture.context(), {}, [fixture.candidate]);
+    const entryId = published.publications[0]!.entryId!;
+    const digest = published.publications[0]!.locatorSha256!;
+    const probe = scopedHostProbe(fixture);
+    let opens = 0;
+    const countingIo: NativeFileIo = {
+      ...nodeFileIo,
+      open: async (target, flags) => {
+        opens += 1;
+        return nodeFileIo.open(target, flags);
+      },
+    };
+    let sessionRef: NativeHarnessHistorySession | undefined;
+    const session = createNativeHarnessHistorySession({
+      storageRoot: fixture.storageRoot,
+      isOwnerCurrent: (context) => {
+        if (context === probe.context && probe.branchReads() >= 2) sessionRef?.dispose();
+        return true;
+      },
+      fileIo: countingIo,
+      now: () => 1_000,
+    });
+    sessionRef = session;
+    const inspected = await session.inspect(
+      probe.context,
+      { entryId, locatorSha256: digest },
+      new AbortController().signal,
+    );
+    expect(inspected.state).toBe("invalidated");
+    expect(inspected.current).toBe(false);
+    expect(inspected.inspection).toBeNull();
+    expect(inspected.evidence.source).toBe("match");
+    expect(inspected.reasons.some((problem) => problem.code === "invalidated")).toBe(true);
+    expect(opens).toBeGreaterThan(0);
+  });
+
+  test("publication never latches disk-confirmed when the final host read disposes the leaf", async () => {
+    const fixture = makeFixture();
+    let opens = 0;
+    let closes = 0;
+    let postOpenReads = 0;
+    let sessionRef: NativeHarnessHistorySession | undefined;
+    const probe = scopedHostProbe(fixture, () => {
+      if (opens > 0) {
+        postOpenReads += 1;
+        if (postOpenReads === 3) sessionRef?.dispose();
+      }
+    });
+    const io: NativeFileIo = {
+      ...nodeFileIo,
+      open: async (target, flags) => {
+        opens += 1;
+        const handle = await nodeFileIo.open(target, flags);
+        return {
+          stat: (statOptions) => handle.stat(statOptions),
+          read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
+          close: async () => {
+            closes += 1;
+            await handle.close();
+          },
+        };
+      },
+    };
+    const session = createNativeHarnessHistorySession({
+      storageRoot: fixture.storageRoot,
+      appendEntry: fixture.appendEntry,
+      isOwnerCurrent: () => true,
+      fileIo: io,
+      now: () => 1_000,
+    });
+    sessionRef = session;
+    const published = await session.publishTerminal(probe.context, {}, [fixture.candidate]);
+    expect(published.publications[0]?.outcome).toBe("visible");
+    expect(published.publications[0]?.durability).toBe("unknown");
+    expect(published.publications[0]?.reasons[0]?.code).toBe("persistence-unavailable");
+    expect(session.status().diskConfirmed).toBe(0);
+    expect(fixture.state.appendCalls).toBe(1);
+    expect(fixture.state.ensureCalls).toBe(1);
+    expect(opens).toBe(1);
+    expect(closes).toBe(1);
+  });
+
+  test("real native title-slot prefixes and a non-256 minimal title stay metadata-only", async () => {
+    for (const diskShape of ["title-auto", "title-user", "title-minimal"] as const) {
+      const fixture = makeFixture({ diskShape });
+      const published = await fixture.session.publishTerminal(fixture.context(), {}, [fixture.candidate]);
+      expect(published.publications[0]?.outcome).toBe("disk-confirmed");
+      expect(published.publications[0]?.durability).toBe("observed-only");
+      expect(fixture.session.status().diskConfirmed).toBe(1);
+      const listed = fixture.session.list(fixture.context(), { limit: 16 });
+      expect(listed.state).toBe("complete");
+      expect(listed.rows).toHaveLength(1);
+      expect(listed.rows[0]?.entryId).toBe(published.publications[0]!.entryId!);
+      const firstLine = readFileSync(fixture.state.sessionFile, "utf8").split("\n")[0]!;
+      expect(JSON.parse(firstLine).type).toBe("title");
+    }
+
+    const real = makeFixture({ diskShape: "title-auto" });
+    const realPublished = await real.session.publishTerminal(real.context(), {}, [real.candidate]);
+    expect(realPublished.publications[0]?.outcome).toBe("disk-confirmed");
+    const realFirstLine = readFileSync(real.state.sessionFile, "utf8").split("\n")[0]!;
+    expect(Buffer.byteLength(`${realFirstLine}\n`, "utf8")).toBe(256);
+    expect(realFirstLine).toContain('"source":"auto"');
+
+    const unicode = makeFixture({ diskShape: "title-user" });
+    const unicodePublished = await unicode.session.publishTerminal(unicode.context(), {}, [unicode.candidate]);
+    expect(unicodePublished.publications[0]?.outcome).toBe("disk-confirmed");
+    const unicodeFirstLine = readFileSync(unicode.state.sessionFile, "utf8").split("\n")[0]!;
+    expect(Buffer.byteLength(`${unicodeFirstLine}\n`, "utf8")).toBe(256);
+    expect(unicodeFirstLine).toContain("会话 ✓ タイトル");
+    expect(unicodeFirstLine).toContain('"source":"user"');
+
+    const minimal = makeFixture({ diskShape: "title-minimal" });
+    const minimalPublished = await minimal.session.publishTerminal(minimal.context(), {}, [minimal.candidate]);
+    expect(minimalPublished.publications[0]?.outcome).toBe("disk-confirmed");
+    const minimalFirstLine = readFileSync(minimal.state.sessionFile, "utf8").split("\n")[0]!;
+    expect(Buffer.byteLength(`${minimalFirstLine}\n`, "utf8")).toBeLessThan(256);
+    expect(minimalFirstLine).toContain('"pad":"x"');
+  });
+
+  test("malformed, misplaced, duplicate or foreign session prefixes never become disk-confirmed", async () => {
+    const shapes = [
+      "title-malformed",
+      "title-version",
+      "title-source",
+      "title-duplicate",
+      "title-after-header",
+      "title-missing-header",
+      "arbitrary-prefix",
+      "extra-session-header",
+    ] as const;
+    for (const diskShape of shapes) {
+      const fixture = makeFixture({ diskShape });
+      const result = await fixture.session.publishTerminal(fixture.context(), {}, [fixture.candidate]);
+      expect(result.publications[0]?.outcome).toBe("visible");
+      expect(result.publications[0]?.durability).toBe("unknown");
+      expect(result.publications[0]?.reasons[0]?.code).toBe("disk-unavailable");
+      expect(fixture.session.status().diskConfirmed).toBe(0);
+      expect(fixture.state.appendCalls).toBe(1);
+      expect(fixture.state.ensureCalls).toBe(1);
+    }
   });
 });

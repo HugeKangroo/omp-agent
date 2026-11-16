@@ -321,6 +321,30 @@ function asRecord(value: unknown, detail: string): Record<string, unknown> {
   return value;
 }
 
+/**
+ * Trusted host capability context only. The actual host composes its handler
+ * context with Object.create(baseCtx), so agent/cwd/sessionManager may live on
+ * the inherited chain. This structural read stays confined to that context and
+ * its agent; persisted JSON, candidates and selectors keep the strict plain
+ * record checks above.
+ */
+function capabilityRecord(value: unknown, detail: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) fail("shape", detail);
+  return value as Record<string, unknown>;
+}
+
+function capabilityField(value: unknown, key: string, detail: string): unknown {
+  return capabilityRecord(value, detail)[key];
+}
+
+function capabilityTextField(value: unknown, key: string, max: number, detail: string): string {
+  const raw = capabilityField(value, key, detail);
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > max || CONTROL_PATTERN.test(raw)) {
+    fail("field", detail);
+  }
+  return raw;
+}
+
 function field(value: unknown, key: string, detail: string): unknown {
   const record = asRecord(value, detail);
   const descriptor = Object.getOwnPropertyDescriptor(record, key);
@@ -512,23 +536,23 @@ type ContextRead<T> =
 
 function readSessionBase(context: unknown): ContextRead<SessionBase> {
   try {
-    const record = asRecord(context, "The actual main context is unavailable.");
-    const agent = field(record, "agent", "The actual main agent kind is unavailable.");
-    if (asRecord(agent, "The actual main agent kind is unavailable").kind !== "main") {
+    const record = capabilityRecord(context, "The actual main context is unavailable.");
+    const agent = capabilityField(record, "agent", "The actual main agent kind is unavailable.");
+    if (capabilityField(agent, "kind", "The actual main agent kind is unavailable") !== "main") {
       return {
         ok: false,
         code: "not-main",
         reason: reason("not-main", "Only the actual main session may publish or query native history."),
       };
     }
-    const contextCwd = textField(
+    const contextCwd = capabilityTextField(
       record,
       "cwd",
       NATIVE_HARNESS_HISTORY_SESSION_LIMITS.pathChars,
       "The actual context workspace is unavailable.",
     );
     if (!isCanonicalAbsolutePath(contextCwd)) fail("cwd", "The actual context workspace is not canonical.");
-    const manager = field(record, "sessionManager", "The actual session manager is unavailable.");
+    const manager = capabilityField(record, "sessionManager", "The actual session manager is unavailable.");
     if (typeof manager !== "object" || manager === null) fail("manager", "The actual session manager is unavailable.");
     const sessionIdRaw = managerCall(manager, "getSessionId");
     if (!boundedLabel(sessionIdRaw)) fail("session", "The actual session id is unavailable.");
@@ -1569,6 +1593,15 @@ interface SessionDiskFile {
   readonly byId: ReadonlyMap<string, SessionDiskEntry>;
 }
 
+function isSessionTitleSlot(value: Record<string, unknown>): boolean {
+  if (value.type !== "title" || value.v !== 1) return false;
+  if (typeof value.title !== "string" || typeof value.updatedAt !== "string" || typeof value.pad !== "string") {
+    return false;
+  }
+  const source = value.source;
+  return source === undefined || source === "auto" || source === "user";
+}
+
 function parseSessionFile(text: string, sessionId: string, recordedCwd: string): SessionDiskFile | null {
   if (Buffer.byteLength(text, "utf8") > NATIVE_HARNESS_HISTORY_SESSION_LIMITS.sessionFileBytes) return null;
   if (text.includes("\0")) return null;
@@ -1577,6 +1610,7 @@ function parseSessionFile(text: string, sessionId: string, recordedCwd: string):
   if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
   if (lines.length === 0) return null;
   let header: Record<string, unknown> | null = null;
+  let bodyStart = 0;
   const entries: SessionDiskEntry[] = [];
   const byId = new Map<string, SessionDiskEntry>();
   for (let index = 0; index < lines.length; index += 1) {
@@ -1589,13 +1623,37 @@ function parseSessionFile(text: string, sessionId: string, recordedCwd: string):
       return null;
     }
     if (index === 0) {
-      if (!isPlainRecord(parsed) || parsed.type !== "session") return null;
-      header = parsed;
+      if (!isPlainRecord(parsed)) return null;
+      if (parsed.type === "session") {
+        header = parsed;
+        bodyStart = 1;
+        continue;
+      }
+      // The actual fixed host may write one title metadata slot as the first
+      // physical line. It is optional, may appear at most once and is never
+      // branch evidence; its serialized byte size and padding are not parser
+      // requirements.
+      if (!isSessionTitleSlot(parsed)) return null;
+      const next = lines[1];
+      if (next === undefined || next.length === 0) return null;
+      let headerParsed: unknown;
+      try {
+        headerParsed = JSON.parse(next);
+      } catch {
+        return null;
+      }
+      if (!isPlainRecord(headerParsed) || headerParsed.type !== "session") return null;
+      header = headerParsed;
+      bodyStart = 2;
+      index = 1;
       continue;
     }
     if (!isPlainRecord(parsed) || typeof parsed.id !== "string" || parsed.id.length === 0) return null;
     if (parsed.parentId !== null && typeof parsed.parentId !== "string") return null;
     if (typeof parsed.type !== "string") return null;
+    // Exactly one session header is allowed; no later title slot or foreign
+    // header may masquerade as an entry, even with id/parentId present.
+    if (parsed.type === "session" || parsed.type === "title") return null;
     if (byId.has(parsed.id)) return null;
     const entry: SessionDiskEntry = {
       id: parsed.id,
@@ -1606,7 +1664,7 @@ function parseSessionFile(text: string, sessionId: string, recordedCwd: string):
     entries.push(entry);
     byId.set(entry.id, entry);
   }
-  if (header === null) return null;
+  if (header === null || bodyStart === 0) return null;
   if (header.id !== sessionId) return null;
   if (header.cwd !== recordedCwd) return null;
   return { header, entries, byId };
@@ -1892,11 +1950,15 @@ export function createNativeHarnessHistorySession(
 
   function ownerCurrent(context: unknown): boolean {
     if (disposed) return false;
+    let current: boolean;
     try {
-      return options.isOwnerCurrent(context) === true;
+      current = options.isOwnerCurrent(context) === true;
     } catch {
       return false;
     }
+    // The host callback may reenter this leaf and dispose it. A leaf disposed
+    // during the callback is never current regardless of the returned flag.
+    return current && !disposed;
   }
 
   function rememberAttempt(key: string, latch: AttemptLatch): void {
@@ -2269,7 +2331,12 @@ export function createNativeHarnessHistorySession(
         }
         const selected = scanLocators(freshEntries).find((locator) => locator.entry.id === appended.id);
         if (selected === undefined || selected.sha256 !== resolved.locatorSha256) return false;
-        return resolvePublication(fresh.value, freshEntries, candidate).locatorSha256 === resolved.locatorSha256;
+        if (resolvePublication(fresh.value, freshEntries, candidate).locatorSha256 !== resolved.locatorSha256) {
+          return false;
+        }
+        // Manager callbacks in the fresh read may have reentered and disposed
+        // or replaced the owner; the disk guard must not stay current.
+        return !disposed && ownerCurrent(context);
       } catch {
         return false;
       }
@@ -2343,6 +2410,22 @@ export function createNativeHarnessHistorySession(
     const finalResolved = resolvePublication(afterDisk.value, finalEntries, candidate);
     if (finalResolved.locatorSha256 !== resolved.locatorSha256) {
       const problem = reason("disk-unavailable", "The source or report changed after disk readback.");
+      const latch = attempts.get(attemptKey);
+      if (latch !== undefined) setLatch(attemptKey, { ...latch, reason: problem });
+      lastReason = problem;
+      return {
+        publication: publishRow( "visible", appended.id, resolved.locatorSha256, [problem]),
+        stop: true,
+      };
+    }
+    // Last host reads and branch projections above may have reentered and
+    // disposed the leaf or replaced the owner. Never latch disk confirmation
+    // after that loss.
+    if (disposed || !ownerCurrent(context)) {
+      const problem = reason(
+        "persistence-unavailable",
+        "The history session was disposed or the owner changed before the final disk confirmation.",
+      );
       const latch = attempts.get(attemptKey);
       if (latch !== undefined) setLatch(attemptKey, { ...latch, reason: problem });
       lastReason = problem;
@@ -2713,6 +2796,21 @@ export function createNativeHarnessHistorySession(
       }
       const pageRows = rows.slice(offset, offset + limit);
       const nextOffset = offset + pageRows.length < rows.length ? offset + pageRows.length : null;
+      // Manager reads and branch projections above may have reentered and
+      // disposed the leaf or replaced the owner; never return current rows then.
+      if (disposed || !ownerCurrent(context)) {
+        return deepFreeze({
+          schema: NATIVE_HARNESS_HISTORY_SESSION_SCHEMA,
+          state: "unavailable" as const,
+          rows: [],
+          page: { offset: 0, limit: 0, total: 0, returned: 0, nextOffset: null },
+          reasons: boundedReasons([
+            disposed
+              ? reason("disposed", "The history session is disposed.")
+              : reason("owner-changed", "The owning native root is not current."),
+          ]),
+        });
+      }
       return deepFreeze({
         schema: NATIVE_HARNESS_HISTORY_SESSION_SCHEMA,
         state: invalid ? "incomplete" : "complete",
@@ -2950,6 +3048,25 @@ export function createNativeHarnessHistorySession(
           current: false,
           inspection: null,
           reasons: boundedReasons([...problems, orderProblem]),
+        });
+      }
+      // Host reads and branch projections above may have reentered and
+      // disposed the leaf or replaced the owner; start no storage-root I/O then.
+      if (disposed || !ownerCurrent(context)) {
+        return deepFreeze({
+          schema: NATIVE_HARNESS_HISTORY_SESSION_SCHEMA,
+          state: "invalidated" as const,
+          selector: { entryId, locatorSha256 },
+          locator,
+          labels,
+          evidence: { source: evidenceSource, report: evidenceReport },
+          declaration,
+          current: false,
+          inspection: null,
+          reasons: boundedReasons([
+            ...problems,
+            reason("invalidated", "The history session or owning root changed before the storage-root query."),
+          ]),
         });
       }
       const rootBefore = await pinDirectory(storageRoot, io);
@@ -3222,6 +3339,26 @@ export function createNativeHarnessHistorySession(
             ]),
           });
         }
+      }
+      // The final session read and all branch projections above may have
+      // reentered and disposed the leaf or replaced the owner; never mark that
+      // result current.
+      if (disposed || !ownerCurrent(context)) {
+        return deepFreeze({
+          schema: NATIVE_HARNESS_HISTORY_SESSION_SCHEMA,
+          state: "invalidated" as const,
+          selector: { entryId, locatorSha256 },
+          locator,
+          labels,
+          evidence: { source: evidenceSource, report: evidenceReport },
+          declaration,
+          current: false,
+          inspection: null,
+          reasons: boundedReasons([
+            ...problems,
+            reason("invalidated", "The history session or owning root changed before the inspection result."),
+          ]),
+        });
       }
       const result: NativeHarnessHistorySessionInspection = {
         schema: NATIVE_HARNESS_HISTORY_SESSION_SCHEMA,
