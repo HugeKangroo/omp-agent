@@ -87,7 +87,7 @@ type RecoverySourceFailureCode =
   | "readback-failed"
   | "too-large";
 
-class NativeHarnessRecoverySourceError extends Error {
+export class NativeHarnessRecoverySourceError extends Error {
   override name = "NativeHarnessRecoverySourceError";
 
   constructor(
@@ -281,7 +281,7 @@ function readRelativePath(value: unknown, label: string): string {
   }
 }
 
-interface RecoveryBackendProfile {
+export interface RecoveryBackendProfile {
   readonly model: string;
   readonly improverModel: string;
   readonly ompCommand: string;
@@ -295,9 +295,43 @@ interface RecoveryBackendProfile {
   };
 }
 
-interface RecoveryBackendBuild {
+export interface RecoveryBackendBuild {
   readonly sourceId: string;
   readonly sourceIntegrity: "build-label-only";
+}
+
+/** Trusted host path expectations for the pure recovery-source decoder. */
+export interface NativeHarnessRecoverySourceTextExpectation {
+  readonly storageRoot: string;
+  readonly sourceRoot: string;
+  readonly preparedRelativeRoot: string;
+}
+
+/**
+ * Pure decoded shape of one already-read `recovery-source.json` document.
+ * `sha256` hashes the exact caller-supplied UTF-8 bytes; reordered but
+ * semantically equal JSON is not normalized back into the original digest.
+ * These facts are a decode of caller-supplied text, never proof that an actual
+ * file exists, a completion handle, lease authority or resume permission.
+ */
+export interface NativeHarnessRecoverySourceDocument {
+  readonly schema: typeof NATIVE_HARNESS_RECOVERY_SOURCE_SCHEMA;
+  readonly profile: typeof NATIVE_HARNESS_RECOVERY_SOURCE_PROFILE;
+  readonly accounting: NativeHarnessPrepareAccounting;
+  readonly association: NativeHarnessAssociation;
+  readonly budget: NativeHarnessAdmittedBudget;
+  readonly workspace: {
+    readonly sourceRoot: string;
+    readonly preparedRelativeRoot: string;
+    readonly workspaceRelativeRoot: string;
+    readonly storeRelativeRoot: string;
+  };
+  readonly inputs: readonly NativeHarnessWorkspaceManifestEntry[];
+  readonly inputManifestSha256: string;
+  readonly backendProfile: RecoveryBackendProfile;
+  readonly backendBuild: RecoveryBackendBuild;
+  readonly bytes: number;
+  readonly sha256: string;
 }
 
 export interface NativeHarnessRecoverySourceInput {
@@ -1332,6 +1366,198 @@ function readSourceFacts(value: unknown): NativeHarnessRecoverySourceFacts {
     bytes,
     sha256,
   });
+}
+
+function readSourceDocument(
+  raw: unknown,
+  expectedValue: unknown,
+): NativeHarnessRecoverySourceDocument {
+  const expectedFields = readStrictFields(
+    expectedValue,
+    ["storageRoot", "sourceRoot", "preparedRelativeRoot"],
+    "source expectation",
+  );
+  const storageRoot = readString(
+    expectedFields.get("storageRoot"),
+    "expectation.storageRoot",
+    MAX_PATH_CHARS,
+    true,
+  );
+  const expectedSourceRoot = readString(
+    expectedFields.get("sourceRoot"),
+    "expectation.sourceRoot",
+    MAX_PATH_CHARS,
+    true,
+  );
+  const expectedPreparedRelativeRoot = readRelativePath(
+    expectedFields.get("preparedRelativeRoot"),
+    "expectation.preparedRelativeRoot",
+  );
+  if (
+    isContained(storageRoot, expectedSourceRoot)
+    || isContained(expectedSourceRoot, storageRoot)
+  ) {
+    fail("invalid-input", "expectation.storageRoot and expectation.sourceRoot must be disjoint.");
+  }
+  const expectedPreparedRoot = path.join(storageRoot, expectedPreparedRelativeRoot);
+  if (path.dirname(expectedPreparedRoot) !== storageRoot) {
+    fail("invalid-input", "expectation.preparedRelativeRoot must be a direct child of storageRoot.");
+  }
+  if (!path.basename(expectedPreparedRoot).startsWith(OWNED_PREFIX)) {
+    fail("invalid-input", `expectation.preparedRelativeRoot must use the ${OWNED_PREFIX} owned prefix.`);
+  }
+  readString(expectedPreparedRoot, "expectation.preparedRoot", MAX_PATH_CHARS, true);
+
+  if (typeof raw !== "string") {
+    fail("invalid-input", "recovery source document must be UTF-8 text.");
+  }
+  if (raw.length > NATIVE_HARNESS_RECOVERY_SOURCE_MAX_BYTES) {
+    fail("too-large", `recovery source document exceeds ${NATIVE_HARNESS_RECOVERY_SOURCE_MAX_BYTES} characters.`);
+  }
+  const encoded = Buffer.from(raw, "utf8");
+  if (encoded.length > NATIVE_HARNESS_RECOVERY_SOURCE_MAX_BYTES) {
+    fail("too-large", `recovery source document exceeds ${NATIVE_HARNESS_RECOVERY_SOURCE_MAX_BYTES} bytes.`);
+  }
+  if (raw.length === 0 || raw.startsWith("\uFEFF") || !raw.endsWith("\n")) {
+    fail("invalid-input", "recovery source document must be newline-terminated UTF-8 without BOM.");
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(raw);
+  } catch (error) {
+    fail("invalid-input", "recovery source document is not valid JSON. No fallback was applied.", error);
+  }
+  const fields = readStrictFields(
+    value,
+    [
+      "schema",
+      "profile",
+      "accounting",
+      "association",
+      "budget",
+      "workspace",
+      "inputs",
+      "inputManifestSha256",
+      "backendProfile",
+      "backendBuild",
+    ],
+    "recovery source document",
+  );
+  if (fields.get("schema") !== NATIVE_HARNESS_RECOVERY_SOURCE_SCHEMA) {
+    fail("invalid-input", "recovery source schema is not the fixed v1 schema.");
+  }
+  if (fields.get("profile") !== NATIVE_HARNESS_RECOVERY_SOURCE_PROFILE) {
+    fail("invalid-input", "recovery source profile is not the fixed native profile.");
+  }
+  const workspaceFields = readStrictFields(
+    fields.get("workspace"),
+    ["sourceRoot", "preparedRelativeRoot", "workspaceRelativeRoot", "storeRelativeRoot"],
+    "recovery source workspace",
+  );
+  const sourceRoot = readString(
+    workspaceFields.get("sourceRoot"),
+    "workspace.sourceRoot",
+    MAX_PATH_CHARS,
+    true,
+  );
+  if (sourceRoot !== expectedSourceRoot) {
+    fail("identity-changed", "recovery source workspace.sourceRoot does not match the host expectation.");
+  }
+  if (
+    isContained(sourceRoot, storageRoot)
+    || isContained(storageRoot, sourceRoot)
+  ) {
+    fail("invalid-input", "recovery source workspace.sourceRoot and storage root must be disjoint.");
+  }
+  const preparedRelativeRoot = readRelativePath(
+    workspaceFields.get("preparedRelativeRoot"),
+    "workspace.preparedRelativeRoot",
+  );
+  const workspaceRelativeRoot = readRelativePath(
+    workspaceFields.get("workspaceRelativeRoot"),
+    "workspace.workspaceRelativeRoot",
+  );
+  const storeRelativeRoot = readRelativePath(
+    workspaceFields.get("storeRelativeRoot"),
+    "workspace.storeRelativeRoot",
+  );
+  if (preparedRelativeRoot !== expectedPreparedRelativeRoot) {
+    fail("identity-changed", "recovery source preparedRelativeRoot does not match the host expectation.");
+  }
+  if (workspaceRelativeRoot !== `${preparedRelativeRoot}/workspace`) {
+    fail("invalid-input", "workspace.workspaceRelativeRoot must be preparedRelativeRoot/workspace.");
+  }
+  if (storeRelativeRoot !== `${preparedRelativeRoot}/store`) {
+    fail("invalid-input", "workspace.storeRelativeRoot must be preparedRelativeRoot/store.");
+  }
+  readString(
+    path.join(storageRoot, preparedRelativeRoot),
+    "workspace.preparedRoot",
+    MAX_PATH_CHARS,
+    true,
+  );
+  readString(
+    path.join(storageRoot, workspaceRelativeRoot),
+    "workspace.workspaceRoot",
+    MAX_PATH_CHARS,
+    true,
+  );
+  readString(
+    path.join(storageRoot, storeRelativeRoot),
+    "workspace.storeRoot",
+    MAX_PATH_CHARS,
+    true,
+  );
+  const association = readAssociation(fields.get("association"), sourceRoot);
+  const accounting = readAccounting(fields.get("accounting"));
+  if (associationDigest(association) !== accounting.sourceAssociationSha256) {
+    fail("invalid-input", "accounting.sourceAssociationSha256 does not match the document association.");
+  }
+  const budget = readBudget(fields.get("budget"), accounting.admittedAt);
+  const inputManifestSha256 = readHex64(
+    fields.get("inputManifestSha256"),
+    "recovery source inputManifestSha256",
+  );
+  const inputs = readManifest(fields.get("inputs"), inputManifestSha256);
+  const backendProfile = readBackendProfile(fields.get("backendProfile"));
+  const backendBuild = readBackendBuild(fields.get("backendBuild"));
+  return deepFreeze({
+    schema: NATIVE_HARNESS_RECOVERY_SOURCE_SCHEMA,
+    profile: NATIVE_HARNESS_RECOVERY_SOURCE_PROFILE,
+    accounting,
+    association,
+    budget,
+    workspace: {
+      sourceRoot,
+      preparedRelativeRoot,
+      workspaceRelativeRoot,
+      storeRelativeRoot,
+    },
+    inputs,
+    inputManifestSha256,
+    backendProfile,
+    backendBuild,
+    bytes: encoded.length,
+    sha256: sha256Hex(encoded),
+  });
+}
+
+/**
+ * Pure bounded decoder for one already-read `recovery-source.json` text.
+ * It reuses the writer's fixed field/value readers, verifies the exact
+ * schema/profile, confined relative layout, manifest triples, association
+ * digest and the host path expectations. It performs no filesystem, process,
+ * signal, write, controller or network effect, never constructs a prepared
+ * source or completion handle and never calls the writer/verifier. The
+ * returned SHA-256 hashes the exact supplied bytes; reordered raw JSON is not
+ * normalized or re-signed. Host path expectations are caller-supplied values,
+ * not proof that those directories or files exist.
+ */
+export function decodeNativeHarnessRecoverySourceText(
+  raw: string,
+  expected: NativeHarnessRecoverySourceTextExpectation,
+): NativeHarnessRecoverySourceDocument {
+  return readSourceDocument(raw, expected);
 }
 
 function buildSeedText(

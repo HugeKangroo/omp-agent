@@ -24,8 +24,11 @@ import {
   NATIVE_HARNESS_RECOVERY_SOURCE_PROFILE,
   NATIVE_HARNESS_RECOVERY_SOURCE_SCHEMA,
   NATIVE_HARNESS_RECOVERY_SEED_SCHEMA,
+  NativeHarnessRecoverySourceError,
+  decodeNativeHarnessRecoverySourceText,
   prepareNativeHarnessRecoverySource,
   verifyNativeHarnessRecoverySource,
+  type NativeHarnessRecoverySourceTextExpectation,
   type PreparedRecoverySource,
   type SourceInput,
 } from "../../src/native-harness-recovery-source.ts";
@@ -846,5 +849,122 @@ describe("native harness recovery source", () => {
       freshSignal(),
     ));
     expect(multibyteFailure.message).toContain(String(NATIVE_HARNESS_RECOVERY_SOURCE_MAX_BYTES));
+  });
+});
+
+describe("native harness recovery source pure document decoder", () => {
+  async function fixture(): Promise<{
+    readonly raw: string;
+    readonly expected: NativeHarnessRecoverySourceTextExpectation;
+    readonly prepared: PreparedRecoverySource;
+    readonly fixture: WorkspaceFixture;
+  }> {
+    const workspace = await makeRealWorkspace([{ relativePath: "hello.txt", content: "hello\n" }]);
+    const prepared = await prepare(makeInput(workspace.descriptor));
+    const storageRoot = path.dirname(workspace.descriptor.preparedRoot);
+    return {
+      raw: await readFile(sourceFileOf(workspace.descriptor), "utf8"),
+      expected: {
+        storageRoot,
+        sourceRoot: workspace.descriptor.sourceRoot,
+        preparedRelativeRoot: path.relative(storageRoot, workspace.descriptor.preparedRoot),
+      },
+      prepared,
+      fixture: workspace,
+    };
+  }
+
+  function failure(
+    raw: string,
+    expected: NativeHarnessRecoverySourceTextExpectation,
+  ): NativeHarnessRecoverySourceError {
+    try {
+      decodeNativeHarnessRecoverySourceText(raw, expected);
+    } catch (error) {
+      expect(error).toBeInstanceOf(NativeHarnessRecoverySourceError);
+      return error as NativeHarnessRecoverySourceError;
+    }
+    throw new Error("expected the pure source decoder to refuse");
+  }
+
+  test("decodes the writer's exact bytes without pinning or creating a source handle", async () => {
+    const f = await fixture();
+    const document = decodeNativeHarnessRecoverySourceText(f.raw, f.expected);
+    expect(document.sha256).toBe(f.prepared.source.sha256);
+    expect(document.sha256).toBe(sha256Hex(Buffer.from(f.raw, "utf8")));
+    expect(document.bytes).toBe(Buffer.byteLength(f.raw, "utf8"));
+    expect(document.schema).toBe(NATIVE_HARNESS_RECOVERY_SOURCE_SCHEMA);
+    expect(document.profile).toBe(NATIVE_HARNESS_RECOVERY_SOURCE_PROFILE);
+    expect(document.accounting).toEqual(JSON.parse(f.raw).accounting);
+    expect(document.workspace).toEqual({
+      sourceRoot: f.fixture.descriptor.sourceRoot,
+      preparedRelativeRoot: f.expected.preparedRelativeRoot,
+      workspaceRelativeRoot: `${f.expected.preparedRelativeRoot}/workspace`,
+      storeRelativeRoot: `${f.expected.preparedRelativeRoot}/store`,
+    });
+    expect(document.inputs).toEqual(f.fixture.descriptor.inputManifest);
+    expect(document.inputManifestSha256).toBe(f.fixture.descriptor.manifestSha256);
+    expect(Object.isFrozen(document)).toBe(true);
+    expect(Object.isFrozen(document.accounting)).toBe(true);
+    expect("text" in document).toBe(false);
+    expect("pins" in document).toBe(false);
+  });
+
+  test("preserves the exact raw SHA for reordered JSON instead of re-normalizing it", async () => {
+    const f = await fixture();
+    const parsed = JSON.parse(f.raw) as Record<string, unknown>;
+    const reordered = `${JSON.stringify(Object.fromEntries(
+      Object.entries(parsed).sort(([left], [right]) => left.localeCompare(right)),
+    ))}\n`;
+    expect(reordered).not.toBe(f.raw);
+    const document = decodeNativeHarnessRecoverySourceText(reordered, f.expected);
+    expect(document.sha256).toBe(sha256Hex(Buffer.from(reordered, "utf8")));
+    expect(document.sha256).not.toBe(f.prepared.source.sha256);
+    expect(document.inputManifestSha256).toBe(f.fixture.descriptor.manifestSha256);
+  });
+
+  test("refuses combined prepared/workspace roots above the writer's path ceiling", async () => {
+    const f = await fixture();
+    const parsed = JSON.parse(f.raw) as Record<string, any>;
+    parsed.workspace.preparedRelativeRoot = "omp-harness-a";
+    parsed.workspace.workspaceRelativeRoot = "omp-harness-a/workspace";
+    parsed.workspace.storeRelativeRoot = "omp-harness-a/store";
+    const raw = `${JSON.stringify(parsed)}\n`;
+    const preparedFailure = failure(raw, {
+      storageRoot: `/${"a".repeat(4_089)}`,
+      sourceRoot: f.expected.sourceRoot,
+      preparedRelativeRoot: "omp-harness-a",
+    });
+    expect(preparedFailure.code).toBe("invalid-input");
+    expect(preparedFailure.message).toContain("expectation.preparedRoot");
+
+    const workspaceFailure = failure(raw, {
+      storageRoot: `/${"a".repeat(4_079)}`,
+      sourceRoot: f.expected.sourceRoot,
+      preparedRelativeRoot: "omp-harness-a",
+    });
+    expect(workspaceFailure.code).toBe("invalid-input");
+    expect(workspaceFailure.message).toContain("workspace.workspaceRoot");
+  });
+
+  test("refuses manifest, expectation, BOM, newline and size mutations", async () => {
+    const f = await fixture();
+    const manifestTamper = JSON.parse(f.raw) as Record<string, any>;
+    manifestTamper.inputs[0].sha256 = "0".repeat(64);
+    const manifestFailure = failure(`${JSON.stringify(manifestTamper)}\n`, f.expected);
+    expect(manifestFailure.code).toBe("invalid-input");
+    expect(manifestFailure.message).toContain("manifest");
+
+    const wrongRoot = failure(f.raw, { ...f.expected, sourceRoot: `${f.expected.sourceRoot}-other` });
+    expect(wrongRoot.code).toBe("identity-changed");
+    const wrongPrepared = failure(f.raw, { ...f.expected, preparedRelativeRoot: "omp-harness-other" });
+    expect(wrongPrepared.code).toBe("identity-changed");
+
+    const bom = failure(`\uFEFF${f.raw}`, f.expected);
+    expect(bom.code).toBe("invalid-input");
+    const noLf = failure(f.raw.slice(0, -1), f.expected);
+    expect(noLf.code).toBe("invalid-input");
+    const oversized = failure(`${"x".repeat(NATIVE_HARNESS_RECOVERY_SOURCE_MAX_BYTES)}y\n`, f.expected);
+    expect(oversized.code).toBe("too-large");
   });
 });
