@@ -114,6 +114,27 @@ import {
   type NativeHarnessResolvedRoot,
   type NativeHarnessRootResolution,
 } from "./native-harness-entry.ts";
+import { NATIVE_HARNESS_COMPLETION_SOURCE_ID } from "./native-harness-completion.ts";
+import {
+  createNativeHarnessHistorySession,
+  type NativeHarnessHistoryListPage,
+  type NativeHarnessHistoryListResult,
+  type NativeHarnessHistorySelector,
+  type NativeHarnessHistorySession,
+  type NativeHarnessHistorySessionStatus,
+  type NativeHarnessHistorySourceCandidate,
+} from "./native-harness-history-session.ts";
+import {
+  buildNativeHarnessHistoryHostInspection,
+  createNativeHarnessHistoryEntry,
+  NATIVE_HARNESS_HISTORY_TOOL,
+  unavailableNativeHarnessHistoryHostInspection,
+  unavailableNativeHarnessHistoryList,
+  type NativeHarnessHistoryEntry,
+  type NativeHarnessHistoryHostInspection,
+  type NativeHarnessHistoryRootLabels,
+  type NativeHarnessHistoryRootResolution,
+} from "./native-harness-history-entry.ts";
 import {
   createNativeSnapshotEntry,
   MAX_SNAPSHOT_OPERATIONS,
@@ -220,6 +241,8 @@ export interface InstancedOmpApi extends DefinedOmpApi {
   readonly events?: {
     on?(event: string, handler: (data: unknown) => void): void;
   } | null;
+  /** Optional actual host custom-entry transport; absent keeps local history unavailable. */
+  appendEntry?<T = unknown>(customType: string, data?: T): void;
 }
 
 interface InstancedEventBus {
@@ -265,6 +288,8 @@ export interface InstancedHarnessConfig {
   readonly backend: NativeHarnessBackendHostConfig;
   /** Lowering-only delegation policy. It cannot widen the 2A limits. */
   readonly policy?: NativeHarnessDelegationPolicy;
+  /** Explicit host opt-in: true only registers readonly native history. */
+  readonly history?: boolean;
 }
 
 export type InstancedHarnessBackendFactory = (
@@ -487,6 +512,16 @@ export interface InstancedNativeEntryControls {
     signal: AbortSignal,
     context: NativeContext,
   ): Promise<NativeHarnessOutputSelection>;
+  /** Host-only readonly history list; no model tool selection or active work required. */
+  harnessHistoryList?(context: NativeContext, page?: NativeHarnessHistoryListPage): NativeHarnessHistoryListResult;
+  /** Host-only readonly history inspect with the actual host abort signal. */
+  harnessHistoryInspect?(
+    context: NativeContext,
+    selector: NativeHarnessHistorySelector,
+    signal: AbortSignal,
+  ): Promise<NativeHarnessHistoryHostInspection>;
+  /** Pure/no-IO publication status for a passive observer; null when no root history. */
+  harnessHistoryStatus?(): NativeHarnessHistorySessionStatus | null;
   getStatus(): InstancedEntryStatus;
   dispose(): void;
 }
@@ -643,6 +678,16 @@ interface HarnessRootState {
   readonly mainModel: DefinitionModelRef;
 }
 
+interface HistoryRootState {
+  readonly session: NativeHarnessHistorySession;
+  readonly labels: NativeHarnessHistoryRootLabels;
+  readonly mainTools: readonly string[];
+  readonly mainModel: DefinitionModelRef;
+  readonly roleTools: readonly string[];
+  readonly effectiveTools: readonly string[];
+  readonly admittedEpoch: number;
+}
+
 interface RootState {
   readonly token: symbol;
   readonly id: number;
@@ -671,6 +716,7 @@ interface RootState {
   handoffCoordinator: NativeHandoffCoordinator | null;
   handoffStore: NativeHandoffStore | null;
   harness: HarnessRootState | null;
+  history: HistoryRootState | null;
   handoffPreflights: Map<string, HandoffPreflight>;
   offerReservations: Map<string, HandoffOfferReservation>;
   retainedBytes: number;
@@ -702,6 +748,8 @@ interface FactoryContext {
   readonly diagnostic: ((event: InstancedDiagnostic) => void) | undefined;
   readonly harnessConfig: InstancedHarnessConfig | null;
   readonly harnessBackendFactory: InstancedHarnessBackendFactory;
+  readonly appendEntry: ((customType: string, data?: unknown) => void) | undefined;
+  historyEnabled: boolean;
   statusCommandRegistered: boolean;
   eventBusSubscribed: boolean;
   rootToken: symbol | null;
@@ -1031,9 +1079,13 @@ function copyHarnessBackendConfig(value: unknown): NativeHarnessBackendHostConfi
 
 function readHarnessConfig(value: unknown): InstancedHarnessConfig | null {
   if (value === undefined) return null;
-  const fields = readOwnDataFields(value, ["backend", "policy"], ["backend"]);
+  const fields = readOwnDataFields(value, ["backend", "policy", "history"], ["backend"]);
   if (fields === null) {
-    throw new Error("harness options must be an exact own-data object with backend and an optional policy.");
+    throw new Error("harness options must be an exact own-data object with backend, an optional policy and an optional history boolean.");
+  }
+  const rawHistory = fields.get("history");
+  if (rawHistory !== undefined && typeof rawHistory !== "boolean") {
+    throw new Error("harness.history must be an explicit boolean.");
   }
   const backend = copyHarnessBackendConfig(fields.get("backend"));
   const rawPolicy = fields.get("policy");
@@ -1057,6 +1109,7 @@ function readHarnessConfig(value: unknown): InstancedHarnessConfig | null {
   return deepFreeze({
     backend,
     ...(policy === undefined ? {} : { policy }),
+    ...(rawHistory === undefined ? {} : { history: rawHistory }),
   });
 }
 
@@ -1404,6 +1457,16 @@ function closeHarnessRoot(root: RootState): void {
   }
 }
 
+function closeHistoryRoot(root: RootState): void {
+  const history = root.history;
+  if (history === null) return;
+  try {
+    history.session.dispose();
+  } catch {
+    // History disposal is local and must not break root cleanup.
+  }
+}
+
 function failRoot(factory: FactoryContext, root: RootState, code: string, message: string): void {
   if (root.phase === "closed" || root.phase === "failed") return;
   root.open = false;
@@ -1417,6 +1480,7 @@ function failRoot(factory: FactoryContext, root: RootState, code: string, messag
   for (const record of root.records) closeRecord(record, "the instance root failed");
   closeHandoffRoot(root, "the instance root failed");
   closeHarnessRoot(root);
+  closeHistoryRoot(root);
   diagnose(factory, "root-failed", `${code}: ${message}`);
 }
 
@@ -1432,6 +1496,7 @@ function closeRoot(factory: FactoryContext, root: RootState, reason: string): vo
   for (const record of root.records) closeRecord(record, reason);
   closeHandoffRoot(root, reason);
   closeHarnessRoot(root);
+  closeHistoryRoot(root);
   diagnose(factory, "root-closed", reason);
 }
 
@@ -1776,6 +1841,7 @@ function claimRoot(factory: FactoryContext, context: NativeContext): RootState |
     handoffCoordinator: null,
     handoffStore: null,
     harness: null,
+    history: null,
     handoffPreflights: new Map(),
     offerReservations: new Map(),
     retainedBytes: 0,
@@ -1956,6 +2022,7 @@ async function startRoot(
     if (!harnessStartupCurrent(factory, root, startupEpoch)) {
       throw new Error("The root was invalidated while the Harness capability was being admitted.");
     }
+    admitHistoryRoot(factory, root, context, activeTools, currentModel, startupEpoch);
 
     const selectionMap = new Map<string, SelectedDefinition>();
     for (const selection of selections) selectionMap.set(selection.name, selection);
@@ -2971,6 +3038,172 @@ function admitHarnessRoot(
   }
 }
 
+const HISTORY_CONFIGURATION_PROJECTION_SCHEMA =
+  "omp-agent.native-harness-history-config.v1" as const;
+const CONFIGURED_LOWERING_KEYS = [
+  "maxRetainedOperations",
+  "maxConcurrent",
+  "perRunUsd",
+  "lifetimeUsd",
+  "maxDurationMs",
+  "cleanupGraceMs",
+] as const;
+
+function readAppendEntry(
+  pi: InstancedOmpApi,
+): ((customType: string, data?: unknown) => void) | undefined {
+  let value: unknown;
+  try {
+    value = pi.appendEntry;
+  } catch {
+    return undefined;
+  }
+  if (typeof value !== "function") return undefined;
+  return (customType, data) => {
+    Reflect.apply(value, pi, [customType, data]);
+  };
+}
+
+/**
+ * Explicitly versioned, secret-free configured-policy projection. It is a
+ * correlation label only: no auth/raw host configuration is included and it
+ * is not an effective-budget or runtime-integrity claim.
+ */
+function historyConfigurationSha256(
+  config: InstancedHarnessConfig,
+  backendSourceId: string | null,
+): string | null {
+  try {
+    const policy = config.policy;
+    const configured: Record<string, number | null> = {};
+    for (const key of CONFIGURED_LOWERING_KEYS) {
+      const value = policy?.[key];
+      configured[key] = typeof value === "number" && Number.isFinite(value) ? value : null;
+    }
+    return sha256Hex(JSON.stringify({
+      schema: HISTORY_CONFIGURATION_PROJECTION_SCHEMA,
+      model: config.backend.model,
+      ompCommand: config.backend.ompCommand,
+      inputFiles: [...config.backend.inputFiles],
+      configuredLowering: configured,
+      profile: {
+        backendSourceId,
+        sourceIntegrity: "build-label-only",
+      },
+    }));
+  } catch {
+    return null;
+  }
+}
+
+function historyStartupCurrent(
+  factory: FactoryContext,
+  root: RootState,
+  startupEpoch: number,
+): boolean {
+  return !factory.disposed
+    && moduleRoot === root
+    && root.factoryId === factory.id
+    && factory.rootToken !== null
+    && root.token === factory.rootToken
+    && root.open
+    && root.phase === "starting"
+    && root.epoch === startupEpoch;
+}
+
+function historyOwnerCurrent(
+  factory: FactoryContext,
+  root: RootState,
+  history: HistoryRootState,
+  context: unknown,
+): boolean {
+  if (factory.disposed) return false;
+  if (moduleRoot !== root || root.factoryId !== factory.id) return false;
+  if (factory.rootToken === null || root.token !== factory.rootToken) return false;
+  if (root.history !== history) return false;
+  if (!root.open || root.phase !== "ready") return false;
+  if (root.epoch !== history.admittedEpoch) return false;
+  let facts: HostFacts;
+  try {
+    facts = readHostFacts(context as NativeContext);
+  } catch {
+    return false;
+  }
+  if (!matchesOwnerIdentity(root, facts)) return false;
+  // Host getters above can reenter. Finish with the same original pure
+  // identity/state checks only, never a second host observation.
+  return !factory.disposed
+    && moduleRoot === root
+    && root.factoryId === factory.id
+    && factory.rootToken !== null
+    && root.token === factory.rootToken
+    && root.history === history
+    && root.open
+    && root.phase === "ready"
+    && root.epoch === history.admittedEpoch;
+}
+
+/**
+ * Initializes the optional history session once after existing startup
+ * admission. History-only roots never call the backend factory: labels come
+ * from the already frozen host config and the admitted D1 binding.
+ */
+function admitHistoryRoot(
+  factory: FactoryContext,
+  root: RootState,
+  context: NativeContext,
+  activeTools: readonly string[],
+  currentModel: InstancedModel,
+  startupEpoch: number,
+): void {
+  const config = factory.harnessConfig;
+  if (config === null || config.history !== true || !factory.historyEnabled || root.history !== null) return;
+  try {
+    const main = factory.definitionEntry.controller.getStatus();
+    if (main.phase !== "bound"
+      || main.sessionId !== root.sessionId
+      || main.workspaceRoot !== root.workspaceRoot) {
+      return;
+    }
+    const definitionVersion = main.version;
+    const backendSourceId = NATIVE_HARNESS_COMPLETION_SOURCE_ID;
+    const labels = deepFreeze({
+      definitionVersion,
+      backendSourceId,
+      configurationSha256: historyConfigurationSha256(config, backendSourceId),
+    });
+    let historyRef: HistoryRootState | null = null;
+    const session = createNativeHarnessHistorySession({
+      storageRoot: config.backend.storageRoot,
+      ...(factory.appendEntry === undefined ? {} : { appendEntry: factory.appendEntry }),
+      isOwnerCurrent(actualContext: unknown): boolean {
+        return historyRef !== null && historyOwnerCurrent(factory, root, historyRef, actualContext);
+      },
+    });
+    const state: HistoryRootState = {
+      session,
+      labels,
+      mainTools: Object.freeze([...activeTools]),
+      mainModel: Object.freeze({ provider: currentModel.provider, id: currentModel.id }),
+      roleTools: Object.freeze([...main.roleTools]),
+      effectiveTools: Object.freeze([...main.effectiveTools]),
+      admittedEpoch: root.epoch,
+    };
+    historyRef = state;
+    if (!historyStartupCurrent(factory, root, startupEpoch)) {
+      session.dispose();
+      return;
+    }
+    root.history = state;
+    if (!historyStartupCurrent(factory, root, startupEpoch)) {
+      root.history = null;
+      session.dispose();
+    }
+  } catch (error) {
+    diagnose(factory, "history-admission", boundedMessage(`Native history is unavailable: ${errorMessage(error)}`));
+  }
+}
+
 /**
  * Tracks only the promise currently admitted for a call id. Rejected parallel
  * calls and same-id changed-task/signal refusals return a different promise and
@@ -3175,6 +3408,263 @@ function resolveMainHarnessRoot(
       },
     },
   };
+}
+
+function historyRootBase(
+  factory: FactoryContext,
+  context: NativeContext,
+): { readonly root: RootState; readonly history: HistoryRootState } | { readonly reason: string } {
+  if (factory.disposed) return { reason: "the instanced native entry was disposed" };
+  const root = moduleRoot;
+  if (root === null
+    || root.factoryId !== factory.id
+    || !ownsRoot(factory, root)
+    || !root.open
+    || root.phase !== "ready") {
+    return { reason: "the owning main history root is not open and ready" };
+  }
+  const history = root.history;
+  if (history === null) {
+    return { reason: "the native history capability is not enabled for this main root" };
+  }
+  let facts: HostFacts;
+  try {
+    facts = readHostFacts(context);
+  } catch {
+    return { reason: "the actual main history context is unreadable" };
+  }
+  if (!matchesOwnerIdentity(root, facts)) {
+    return { reason: "the actual history context is not the owning main root" };
+  }
+  return { root, history };
+}
+
+/**
+ * Host-only query gate. It never requires an active Work, source call or
+ * model tool selection, but the actual owning main root and D1 binding must
+ * still be current.
+ */
+function resolveHistoryHostRoot(
+  factory: FactoryContext,
+  context: NativeContext,
+  pi: DefinedOmpApi,
+): { readonly ok: true; readonly root: RootState; readonly history: HistoryRootState } | { readonly ok: false; readonly reason: string } {
+  const base = historyRootBase(factory, context);
+  if ("reason" in base) return { ok: false, reason: base.reason };
+  const { root, history } = base;
+  if (!refreshRoot(factory, root, pi, context)) {
+    return { ok: false, reason: root.failure ?? "the fresh main D1/root gate refused the history query" };
+  }
+  if (root.history !== history || !root.open || root.phase !== "ready") {
+    return { ok: false, reason: "the root history capability was invalidated during resolution" };
+  }
+  if (!historyRootStillCurrent(factory, root, history)) {
+    return { ok: false, reason: "the root history capability changed during resolution" };
+  }
+  return { ok: true, root, history };
+}
+
+function historyRootStillCurrent(
+  factory: FactoryContext,
+  root: RootState,
+  history: HistoryRootState,
+): boolean {
+  return !factory.disposed
+    && moduleRoot === root
+    && root.factoryId === factory.id
+    && factory.rootToken !== null
+    && root.token === factory.rootToken
+    && root.history === history
+    && root.open
+    && root.phase === "ready"
+    && root.epoch === history.admittedEpoch;
+}
+
+/**
+ * Post-await view check: same actual root, D1 binding, session and workspace,
+ * without widening host query authority to the model tool selection.
+ */
+function historyViewCurrent(
+  factory: FactoryContext,
+  root: RootState,
+  history: HistoryRootState,
+  context: NativeContext,
+): boolean {
+  if (!historyRootStillCurrent(factory, root, history)) return false;
+  let facts: HostFacts;
+  try {
+    facts = readHostFacts(context);
+  } catch {
+    return false;
+  }
+  if (!matchesOwnerIdentity(root, facts)) return false;
+  let allowed = false;
+  try {
+    allowed = factory.definitionEntry.controller.allowsObservation({
+      agentKind: facts.agentKind,
+      sessionId: facts.sessionId!,
+      workspaceRoot: facts.workspaceRoot!,
+      hasUI: (context as InstancedNativeContext).hasUI === true,
+      hasPendingMessages: null,
+    });
+  } catch {
+    allowed = false;
+  }
+  return allowed && historyRootStillCurrent(factory, root, history);
+}
+
+function historyToolSelected(main: ReturnType<DefinedControls["controller"]["getStatus"]>): boolean {
+  return main.phase === "bound"
+    && main.roleTools.includes(NATIVE_HARNESS_HISTORY_TOOL)
+    && main.effectiveTools.includes(NATIVE_HARNESS_HISTORY_TOOL);
+}
+
+/**
+ * Model-only history gate. Child, foreign, unselected, disposed and late
+ * changed contexts are refused before the leaf performs any query I/O.
+ */
+function resolveMainHistoryRoot(
+  factory: FactoryContext,
+  context: NativeContext,
+  pi: DefinedOmpApi,
+): NativeHarnessHistoryRootResolution {
+  const base = historyRootBase(factory, context);
+  if ("reason" in base) return { ok: false, reason: base.reason };
+  const { root, history } = base;
+  if (!refreshRoot(factory, root, pi, context)) {
+    return { ok: false, reason: root.failure ?? "the fresh main D1/root gate refused the history query" };
+  }
+  if (root.history !== history || !root.open || root.phase !== "ready") {
+    return { ok: false, reason: "the root history capability was invalidated during resolution" };
+  }
+  let main: ReturnType<DefinedControls["controller"]["getStatus"]>;
+  try {
+    main = factory.definitionEntry.controller.getStatus();
+  } catch {
+    return { ok: false, reason: "the D1 main binding status is unavailable" };
+  }
+  if (!historyToolSelected(main)) {
+    return {
+      ok: false,
+      reason: "agent_harness_history is not explicitly selected by the current D1 main binding",
+    };
+  }
+  if (!sameSet(main.roleTools, history.roleTools) || !sameSet(main.effectiveTools, history.effectiveTools)) {
+    return { ok: false, reason: "the D1 main history tool sets changed since admission" };
+  }
+  const tools = readActiveTools(pi);
+  if (tools === null) return { ok: false, reason: "the actual main active tools are unavailable" };
+  if (!tools.includes(NATIVE_HARNESS_HISTORY_TOOL)) {
+    return { ok: false, reason: "agent_harness_history is no longer in the actual main active tool set" };
+  }
+  if (!sameSet(tools, history.mainTools)) {
+    return { ok: false, reason: "the actual main tool set changed since the history root was admitted" };
+  }
+  const model = readCurrentModel(context);
+  if (!sameModel(model, history.mainModel)) {
+    return { ok: false, reason: "the actual main model changed since the history root was admitted" };
+  }
+  const finalTools = readActiveTools(pi);
+  if (finalTools === null || !sameSet(finalTools, history.mainTools) || !finalTools.includes(NATIVE_HARNESS_HISTORY_TOOL)) {
+    return { ok: false, reason: "the actual main tool set changed during the history query" };
+  }
+  let finalMain: ReturnType<DefinedControls["controller"]["getStatus"]>;
+  try {
+    finalMain = factory.definitionEntry.controller.getStatus();
+  } catch {
+    return { ok: false, reason: "the D1 main binding status is unavailable" };
+  }
+  if (!historyToolSelected(finalMain)
+    || !sameSet(finalMain.roleTools, history.roleTools)
+    || !sameSet(finalMain.effectiveTools, history.effectiveTools)) {
+    return { ok: false, reason: "the D1 main history selection changed during the query" };
+  }
+  if (!historyRootStillCurrent(factory, root, history)) {
+    return { ok: false, reason: "the root history capability changed during resolution" };
+  }
+  return {
+    ok: true,
+    root: {
+      session: history.session,
+      labels: history.labels,
+      revalidate(actualContext: NativeContext): string | null {
+        const again = resolveMainHistoryRoot(factory, actualContext, pi);
+        if (!again.ok) return again.reason;
+        if (again.root.session !== history.session) return "the root history session changed";
+        return null;
+      },
+    },
+  };
+}
+
+/**
+ * Synchronously joins existing retained coordinator operations to exactly one
+ * backend diagnostic per runId. Missing/ambiguous joins are omitted rather
+ * than guessed; no capture, reread, execution or store scan occurs.
+ */
+function collectHistoryCandidates(
+  root: RootState,
+  history: HistoryRootState,
+): readonly NativeHarnessHistorySourceCandidate[] {
+  const harness = root.harness;
+  if (harness === null) return [];
+  let operations: readonly unknown[];
+  let diagnostics: readonly unknown[];
+  try {
+    const snapshot = harness.coordinator.inspect();
+    operations = Array.isArray(snapshot.operations) ? snapshot.operations.slice(0, 16) : [];
+    const inspected = harness.backend.inspect();
+    diagnostics = Array.isArray(inspected) ? inspected : [];
+  } catch {
+    return [];
+  }
+  const byRun = new Map<string, Record<string, unknown>[]>();
+  for (const diagnostic of diagnostics) {
+    if (!isRecord(diagnostic) || typeof diagnostic.runId !== "string") continue;
+    const group = byRun.get(diagnostic.runId) ?? [];
+    group.push(diagnostic);
+    byRun.set(diagnostic.runId, group);
+  }
+  const candidates: NativeHarnessHistorySourceCandidate[] = [];
+  for (const operation of operations) {
+    if (!isRecord(operation) || typeof operation.runId !== "string") continue;
+    const association = operation.association;
+    if (!isRecord(association)
+      || association.toolName !== NATIVE_HARNESS_TOOL
+      || typeof association.observationId !== "string"
+      || typeof association.generation !== "number"
+      || typeof association.sessionId !== "string"
+      || typeof association.workspaceRoot !== "string"
+      || typeof association.toolCallId !== "string") {
+      continue;
+    }
+    const matched = byRun.get(operation.runId);
+    if (matched === undefined || matched.length !== 1) continue;
+    const diagnostic = matched[0]!;
+    if (typeof diagnostic.preparedRoot !== "string" || typeof diagnostic.storeRoot !== "string") continue;
+    candidates.push({
+      association: {
+        observationId: association.observationId,
+        generation: association.generation,
+        sessionId: association.sessionId,
+        workspaceRoot: association.workspaceRoot,
+        toolCallId: association.toolCallId,
+        toolName: NATIVE_HARNESS_TOOL as typeof NATIVE_HARNESS_TOOL,
+      },
+      runId: operation.runId,
+      backend: {
+        preparedRoot: diagnostic.preparedRoot,
+        storeRoot: diagnostic.storeRoot,
+        inputManifestSha256: typeof diagnostic.inputManifestSha256 === "string"
+          ? diagnostic.inputManifestSha256
+          : null,
+      },
+      definitionVersion: history.labels.definitionVersion,
+      backendSourceId: history.labels.backendSourceId,
+      configurationSha256: history.labels.configurationSha256,
+    });
+  }
+  return candidates;
 }
 
 interface HarnessReportOrigin {
@@ -6299,6 +6789,9 @@ export function createInstancedNativeEntry(
   const limits = normalizeLimits(options.limits);
   const harnessConfig = readHarnessConfig(options.harness);
   const harnessBackendFactory = readHarnessBackendFactory(options.harnessBackendFactory);
+  const historyConfigured = harnessConfig?.history === true;
+  let historyEnabled = historyConfigured;
+  const appendEntry = historyConfigured ? readAppendEntry(pi) : undefined;
   const startupTimeoutMs = clampTimeout(options.startupTimeoutMs, DEFAULT_STARTUP_TIMEOUT_MS, MAX_STARTUP_TIMEOUT_MS);
   const d1TimeoutMs = Math.max(1, Math.floor(startupTimeoutMs / 2));
   const admissionTimeoutMs = clampTimeout(options.admissionTimeoutMs, DEFAULT_ADMISSION_TIMEOUT_MS, MAX_ADMISSION_TIMEOUT_MS);
@@ -6390,7 +6883,18 @@ export function createInstancedNativeEntry(
   let snapshotEntry: NativeSnapshotEntry | null = null;
   let harnessEntry: NativeHarnessEntry | null = null;
   let harnessResultEntry: NativeHarnessResultEntry | null = null;
+  let harnessHistoryEntry: NativeHarnessHistoryEntry | null = null;
   let toolRegistrationFailure: string | null = null;
+  if (historyConfigured) {
+    harnessHistoryEntry = createNativeHarnessHistoryEntry({
+      resolveRoot(context: NativeContext) {
+        if (toolFactory === null) {
+          return { ok: false, reason: "the native history entry is not initialized" };
+        }
+        return resolveMainHistoryRoot(toolFactory, context, pi);
+      },
+    });
+  }
   if (harnessConfig !== null) {
     harnessEntry = createNativeHarnessEntry({
       resolveRoot(context: NativeContext) {
@@ -6454,6 +6958,18 @@ export function createInstancedNativeEntry(
   } catch (error) {
     toolRegistrationFailure = boundedMessage(`Native handoff tool registration failed: ${errorMessage(error)}`);
   }
+  // Optional history registration is isolated: a throw here may leave the
+  // supplied tool retained by the host, so the same adapter is disposed and
+  // permanently disabled instead of invalidating unrelated tools/roots.
+  if (harnessHistoryEntry !== null) {
+    try {
+      pi.registerTool(harnessHistoryEntry.tool as unknown as NativeTool);
+    } catch {
+      harnessHistoryEntry.dispose();
+      harnessHistoryEntry = null;
+      historyEnabled = false;
+    }
+  }
   const d1Options: DefinedNativeEntryOptions = {
     ...(options.mainDefinitionPath === undefined ? {} : { definitionPath: options.mainDefinitionPath }),
     ...(options.nativePorts === undefined ? {} : {
@@ -6503,6 +7019,8 @@ export function createInstancedNativeEntry(
     diagnostic: options.diagnostic,
     harnessConfig,
     harnessBackendFactory,
+    appendEntry,
+    historyEnabled,
     statusCommandRegistered: false,
     eventBusSubscribed: false,
     rootToken: null,
@@ -6782,6 +7300,36 @@ export function createInstancedNativeEntry(
   pi.on("agent_end", (_event, context) => onWorkEnding(context, "agent_end"));
   pi.on("session_stop", (_event, context) => onWorkEnding(context, "session_stop"));
 
+  if (historyEnabled) {
+    // Registered after the existing native/D1/instanced cleanup hooks above.
+    // Public agent_end is fire-and-forget relative to this extension hook, so
+    // the promise is awaited here and the pure status control is the observer
+    // surface; terminal completion alone never claims disk persistence.
+    pi.on("agent_end", async (event, context) => {
+      try {
+        if (factory.disposed) return;
+        const root = moduleRoot;
+        if (root === null || root.factoryId !== factory.id) return;
+        const history = root.history;
+        if (history === null) return;
+        if (!isRecord(event) || event.willContinue === true || event.awaitingAsyncWork === true) return;
+        let facts: HostFacts;
+        try {
+          facts = readHostFacts(context);
+        } catch {
+          return;
+        }
+        if (!matchesOwnerIdentity(root, facts)) return;
+        if (!root.open || root.phase !== "ready" || root.history !== history) return;
+        const candidates = collectHistoryCandidates(root, history);
+        if (candidates.length === 0) return;
+        await history.session.publishTerminal(context, event, candidates);
+      } catch {
+        // Optional history publication never blocks ordinary work.
+      }
+    });
+  }
+
   for (const eventName of ["session_switch", "session_branch", "session_tree", "session_clear"] as const) {
     pi.on(eventName, (_event, context) => {
       try {
@@ -6900,6 +7448,43 @@ export function createInstancedNativeEntry(
         return captureHarnessOutput(toolFactory, pi, sourceToolCallId, signal, context);
       },
     }),
+    ...(historyEnabled ? {
+      harnessHistoryList(
+        context: NativeContext,
+        page?: NativeHarnessHistoryListPage,
+      ): NativeHarnessHistoryListResult {
+        const resolved = resolveHistoryHostRoot(factory, context, pi);
+        if (!resolved.ok) return unavailableNativeHarnessHistoryList(resolved.reason);
+        const result = resolved.history.session.list(context, page);
+        if (!historyViewCurrent(factory, resolved.root, resolved.history, context)) {
+          return unavailableNativeHarnessHistoryList("the history root changed during the list query");
+        }
+        return result;
+      },
+      async harnessHistoryInspect(
+        context: NativeContext,
+        selector: NativeHarnessHistorySelector,
+        signal: AbortSignal,
+      ): Promise<NativeHarnessHistoryHostInspection> {
+        const resolved = resolveHistoryHostRoot(factory, context, pi);
+        if (!resolved.ok) return unavailableNativeHarnessHistoryHostInspection(resolved.reason);
+        let leaf;
+        try {
+          leaf = await resolved.history.session.inspect(context, selector, signal);
+        } catch {
+          return unavailableNativeHarnessHistoryHostInspection("the history inspection failed");
+        }
+        if (!historyViewCurrent(factory, resolved.root, resolved.history, context)) {
+          return unavailableNativeHarnessHistoryHostInspection("the history root changed during the inspection");
+        }
+        return buildNativeHarnessHistoryHostInspection(leaf, resolved.history.labels);
+      },
+      harnessHistoryStatus(): NativeHarnessHistorySessionStatus | null {
+        const root = moduleRoot;
+        if (root === null || root.factoryId !== factory.id || root.history === null) return null;
+        return root.history.session.status();
+      },
+    } : {}),
     getStatus() {
       try {
         return buildStatus(factory);
@@ -6929,6 +7514,7 @@ export function createInstancedNativeEntry(
       snapshotEntry?.dispose();
       harnessEntry?.dispose();
       harnessResultEntry?.dispose();
+      harnessHistoryEntry?.dispose();
       definitionEntry.dispose();
     },
   };

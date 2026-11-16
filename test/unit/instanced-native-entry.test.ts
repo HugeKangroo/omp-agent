@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -50,6 +51,7 @@ import {
   type NativeHarnessBackendHostConfig,
 } from "../../src/native-harness-backend.ts";
 import { NATIVE_HARNESS_RESULT_TOOL } from "../../src/native-harness-checks.ts";
+import { NATIVE_HARNESS_HISTORY_TOOL } from "../../src/native-harness-history-entry.ts";
 import type { NativeHarnessOutputCapture } from "../../src/native-harness-output.ts";
 import type { NativeContext, NativeToolResult } from "../../src/native-entry.ts";
 import { clearPublishedTaskOwner, publishTaskOwner } from "../../src/task-entry-port.ts";
@@ -230,8 +232,108 @@ interface HostOptions {
   readonly activeTools?: readonly string[];
   readonly hasUI?: boolean;
   readonly bus?: TestBus;
+  readonly session?: TestSession;
   /** Synthetic host registrar behavior for both fixed status commands. */
   readonly commandRegistration?: "ok" | "missing" | "throws";
+}
+
+interface SessionEntry {
+  id: string;
+  parentId: string | null;
+  type: string;
+  message?: Record<string, unknown>;
+  customType?: string;
+  data?: unknown;
+}
+
+/** Real temp JSONL session facade for the bounded history reader. */
+class TestSession {
+  readonly dir: string;
+  readonly file: string;
+  readonly sessionId: string;
+  readonly cwd: string;
+  readonly recordedCwd: string;
+  readonly branch: SessionEntry[];
+  leafId: string | null;
+  appendCalls = 0;
+  ensureCalls = 0;
+  private sequence = 0;
+
+  constructor(
+    root: string,
+    workspace: string,
+    options: { readonly sessionId?: string; readonly noopEnsure?: boolean } = {},
+  ) {
+    this.dir = path.join(root, "sessions");
+    this.sessionId = options.sessionId ?? "session-root";
+    this.cwd = workspace;
+    this.recordedCwd = workspace;
+    this.file = path.join(this.dir, `2026-01-01_${this.sessionId}.jsonl`);
+    mkdirSync(this.dir, { recursive: true, mode: 0o700 });
+    this.branch = [{ id: "base-1", parentId: null, type: "custom", customType: "fixture-base", data: {} }];
+    this.leafId = "base-1";
+    this.noopEnsure = options.noopEnsure === true;
+    this.write();
+  }
+
+  private readonly noopEnsure: boolean;
+
+  readonly manager = {
+    getSessionId: () => this.sessionId,
+    getCwd: () => this.cwd,
+    getRecordedCwd: () => this.recordedCwd,
+    getSessionDir: () => this.dir,
+    getSessionFile: () => this.file,
+    getLeafId: () => this.leafId,
+    getBranch: () => this.branch.slice(),
+    ensureOnDisk: (): void => {
+      this.ensureCalls += 1;
+      if (!this.noopEnsure) this.write();
+    },
+  };
+
+  private nextId(): string {
+    this.sequence += 1;
+    return `entry-${this.sequence}`;
+  }
+
+  appendEntry(customType: string, data?: unknown): void {
+    this.appendCalls += 1;
+    const id = this.nextId();
+    this.branch.push({ id, parentId: this.leafId, type: "custom", customType, data });
+    this.leafId = id;
+  }
+
+  observeToolResult(event: Record<string, unknown>): void {
+    if (typeof event.toolCallId !== "string" || typeof event.toolName !== "string") return;
+    const id = this.nextId();
+    this.branch.push({
+      id,
+      parentId: this.leafId,
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+        content: event.content ?? [],
+        ...(event.details === undefined ? {} : { details: event.details }),
+        isError: event.isError === true,
+      },
+    });
+    this.leafId = id;
+  }
+
+  write(): void {
+    const header = {
+      type: "session",
+      version: 3,
+      id: this.sessionId,
+      timestamp: "2026-01-01T00:00:00.000Z",
+      cwd: this.recordedCwd,
+    };
+    const body = [header, ...this.branch].map((entry) => `${JSON.stringify(entry)}\n`).join("");
+    writeFileSync(this.file, body, "utf8");
+  }
 }
 
 interface TestBus {
@@ -259,6 +361,7 @@ class Host {
   readonly toolRegistrations: RegisteredTool[] = [];
   readonly commands = new Map<string, CommandHandler>();
   readonly bus: TestBus;
+  readonly session: TestSession | null;
   readonly flags = new Map<string, string | boolean | undefined>();
   readonly flagRegistrations: { name: string; options: unknown }[] = [];
   readonly notifications: string[] = [];
@@ -293,6 +396,7 @@ class Host {
     this.hasUI = options.hasUI ?? true;
     this.commandRegistration = options.commandRegistration ?? "ok";
     this.bus = options.bus ?? createTestBus();
+    this.session = options.session ?? null;
     this.models = new Map(options.models ?? [
       ["fixture/main", MAIN_MODEL],
       ["fixture/child", CHILD_MODEL],
@@ -300,9 +404,11 @@ class Host {
     ]);
     const host = this;
     this.context = {
-      get cwd() {
-        return host.cwd;
-      },
+      ...(host.session === null ? {
+        get cwd() {
+          return host.cwd;
+        },
+      } : { cwd: host.cwd }),
       agent: {
         get kind() {
           return host.agentKind === "unknown" ? undefined : host.agentKind;
@@ -324,14 +430,14 @@ class Host {
       get model() {
         return host.currentModel;
       },
-      sessionManager: {
+      sessionManager: host.session === null ? {
         getSessionId() {
           return host.sessionId;
         },
         getCwd() {
           return host.cwd;
         },
-      },
+      } : host.session.manager,
       models: {
         current() {
           return host.currentModel;
@@ -386,6 +492,11 @@ class Host {
         return true;
       },
       events: host.bus,
+      ...(host.session === null ? {} : {
+        appendEntry(customType: string, data?: unknown) {
+          host.session!.appendEntry(customType, data);
+        },
+      }),
     } as InstancedOmpApi;
   }
 
@@ -404,6 +515,9 @@ class Host {
       if (type === "before_agent_start" && isRecord(result) && Array.isArray(result.systemPrompt)) {
         current = { ...current, systemPrompt: result.systemPrompt };
       }
+    }
+    if (type === "tool_result" && this.session !== null) {
+      this.session.observeToolResult({ ...current, type });
     }
     return last;
   }
@@ -764,10 +878,17 @@ interface ActualHarnessCaptureFixture {
   readonly sourceRoot: string;
   readonly storageRoot: string;
   readonly backendConfigs: NativeHarnessBackendHostConfig[];
+  readonly session: TestSession | null;
 }
 
 async function startActualHarnessCapture(
-  options: { readonly candidateText?: string; readonly mainTools?: readonly string[] } = {},
+  options: {
+    readonly candidateText?: string;
+    readonly mainTools?: readonly string[];
+    readonly history?: boolean;
+    readonly session?: TestSession;
+    readonly noopEnsure?: boolean;
+  } = {},
 ): Promise<ActualHarnessCaptureFixture> {
   const mainTools = options.mainTools ?? HARNESS_MAIN_TOOLS;
   const dir = await realpath(await mkdtemp(path.join(tmpdir(), "omp-a22c-")));
@@ -779,6 +900,9 @@ async function startActualHarnessCapture(
   await writeFile(path.join(sourceRoot, "a.txt"), "alpha\n", { mode: 0o600 });
   const runner = actualHarnessRunner(options.candidateText);
   const backendConfigs: NativeHarnessBackendHostConfig[] = [];
+  const session = options.history === true
+    ? options.session ?? new TestSession(dir, sourceRoot, { noopEnsure: options.noopEnsure === true })
+    : options.session ?? null;
   const harness: InstancedHarnessConfig = {
     backend: {
       model: "fixture/main",
@@ -786,6 +910,7 @@ async function startActualHarnessCapture(
       storageRoot,
       inputFiles: ["a.txt"],
     },
+    ...(options.history === undefined ? {} : { history: options.history }),
   };
   const root = await startRoot({
     workspace: sourceRoot,
@@ -793,12 +918,13 @@ async function startActualHarnessCapture(
     hostActiveTools: mainTools,
     children: [childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1", { workspace: sourceRoot })],
     harness,
+    ...(session === null ? {} : { session }),
     harnessBackendFactory(config) {
       backendConfigs.push(config);
       return createNativeHarnessBackend(config, { deterministicRunner: runner.runner });
     },
   });
-  return { root, runner, sourceRoot, storageRoot, backendConfigs };
+  return { root, runner, sourceRoot, storageRoot, backendConfigs, session };
 }
 
 interface ActualHarnessExecution {
@@ -1016,6 +1142,12 @@ function resultPayload(wire: NativeToolResult): Record<string, any> {
   return JSON.parse(wire.content[0]?.text ?? "") as Record<string, any>;
 }
 
+function historyPayload(wire: NativeToolResult): Record<string, any> {
+  expect(wire.content).toHaveLength(1);
+  expect(wire.content[0]?.type).toBe("text");
+  return wire.details as Record<string, any>;
+}
+
 async function resultPreflight(
   root: RootFixture,
   toolCallId: string,
@@ -1099,6 +1231,7 @@ interface RootOptions {
   readonly workspace?: string;
   readonly harness?: InstancedHarnessConfig;
   readonly harnessBackendFactory?: InstancedHarnessBackendFactory;
+  readonly session?: TestSession;
 }
 
 async function startRoot(options: RootOptions = {}): Promise<RootFixture> {
@@ -1125,6 +1258,7 @@ async function startRoot(options: RootOptions = {}): Promise<RootFixture> {
     sessionId: "session-root",
     activeTools: options.hostActiveTools ?? (options.mainTools ?? ["read", "task"]),
     ...(options.commandRegistration === undefined ? {} : { commandRegistration: options.commandRegistration }),
+    ...(options.session === undefined ? {} : { session: options.session }),
   });
   const entry = createInstancedNativeEntry(host.pi, {
     mainDefinitionPath: main.definition.canonicalPath,
@@ -7246,4 +7380,201 @@ describe("actual instanced Harness host-only output capture", () => {
     expect(root.entry.harnessInspect).toBeUndefined();
     expect(root.entry.getStatus().phase).toBe("ready");
   });
+});
+
+describe("actual instanced Harness history composition", () => {
+  const HISTORY_MAIN_TOOLS = ["read", NATIVE_HARNESS_HISTORY_TOOL] as const;
+
+  test("absent or false history preserves registration; true registers before D1 and creates no history-only backend", async () => {
+    let factoryCalls = 0;
+    const backendFactory: InstancedHarnessBackendFactory = (config) => {
+      factoryCalls += 1;
+      return createFakeHarness().host;
+    };
+    const absent = await startRoot();
+    expect(absent.host.tools.has(NATIVE_HARNESS_HISTORY_TOOL)).toBe(false);
+    expect(absent.entry.harnessHistoryList).toBeUndefined();
+    expect(absent.entry.harnessHistoryStatus).toBeUndefined();
+    absent.entry.dispose();
+
+    const disabled = await startRoot({
+      harness: { backend: harnessBackendConfig(), history: false },
+      harnessBackendFactory: backendFactory,
+    });
+    expect(disabled.host.tools.has(NATIVE_HARNESS_HISTORY_TOOL)).toBe(false);
+    expect(disabled.entry.harnessHistoryStatus).toBeUndefined();
+    expect(factoryCalls).toBe(0);
+    disabled.entry.dispose();
+
+    const enabled = await startRoot({
+      main: mainSnapshot(WORKSPACE, HISTORY_MAIN_TOOLS),
+      mainTools: HISTORY_MAIN_TOOLS,
+      hostActiveTools: HISTORY_MAIN_TOOLS,
+      harness: { backend: harnessBackendConfig(), history: true },
+      harnessBackendFactory: backendFactory,
+    });
+    expect(enabled.host.tools.get(NATIVE_HARNESS_HISTORY_TOOL)?.approval).toBe("read");
+    expect(enabled.host.tools.get(NATIVE_HARNESS_HISTORY_TOOL)?.defaultInactive).toBe(true);
+    const names = enabled.host.toolRegistrations.map((tool) => tool.name);
+    expect(names.indexOf(NATIVE_HARNESS_HISTORY_TOOL)).toBeGreaterThanOrEqual(0);
+    expect(names.indexOf(NATIVE_HARNESS_HISTORY_TOOL)).toBeLessThan(names.indexOf(AGENT_DEFINITION_TOOL));
+    expect(factoryCalls).toBe(0);
+    expect(enabled.entry.harnessInspect?.(enabled.host.context)?.coordinator).toBeNull();
+    expect(enabled.entry.getStatus().phase).toBe("ready");
+    expect(enabled.entry.harnessHistoryStatus?.()?.append).toBe("unavailable");
+  });
+
+  test("selected history tool lists; unselected, child and foreign contexts are refused without owner invalidation", async () => {
+    const unselected = await startRoot({
+      harness: { backend: harnessBackendConfig(), history: true },
+      harnessBackendFactory: () => createFakeHarness().host,
+    });
+    const unselectedResult = await unselected.host.tools.get(NATIVE_HARNESS_HISTORY_TOOL)!.execute(
+      "history-unselected",
+      { action: "list" },
+      undefined,
+      undefined,
+      unselected.host.context,
+    );
+    expect(unselectedResult.isError).toBe(true);
+    expect(historyPayload(unselectedResult).state).toBe("unavailable");
+    expect(unselected.entry.getStatus().phase).toBe("ready");
+    unselected.entry.dispose();
+
+    const fixture = await startActualHarnessCapture({
+      history: true,
+      mainTools: [...HARNESS_RESULT_MAIN_TOOLS, NATIVE_HARNESS_HISTORY_TOOL],
+    });
+    const session = fixture.session!;
+    const tool = fixture.root.host.tools.get(NATIVE_HARNESS_HISTORY_TOOL)!;
+    const listed = await tool.execute("history-list-1", { action: "list", limit: 16 }, undefined, undefined, fixture.root.host.context);
+    expect(listed.isError).not.toBe(true);
+    const listedPayload = historyPayload(listed);
+    expect(listedPayload.history.state).toBe("complete");
+    expect(listedPayload.history.rows).toEqual([]);
+    expect(listedPayload.recoveredAuthority).toBe(false);
+    expect(listedPayload.resume).toBe(false);
+    expect(listedPayload.processObservation).toBe("unknown/not-inspected");
+
+    const appendCalls = session.appendCalls;
+    const foreign = ownerContext({ agentId: "Other" });
+    const foreignResult = await tool.execute("history-foreign", { action: "list" }, undefined, undefined, foreign);
+    expect(foreignResult.isError).toBe(true);
+    const child = ownerContext({ agentKind: "sub", agentId: "Child", sessionId: "session-child", cwd: fixture.sourceRoot });
+    const childResult = await tool.execute("history-child", { action: "list" }, undefined, undefined, child);
+    expect(childResult.isError).toBe(true);
+    expect(fixture.root.entry.getStatus().phase).toBe("ready");
+    expect(session.appendCalls).toBe(appendCalls);
+    const ownerList = fixture.root.entry.harnessHistoryList?.(fixture.root.host.context, { limit: 16 });
+    expect(ownerList?.state).toBe("complete");
+  }, 30_000);
+
+  test("terminal agent_end publishes one real locator; continuations do not", async () => {
+    const fixture = await startActualHarnessCapture({
+      history: true,
+      mainTools: [...HARNESS_RESULT_MAIN_TOOLS, NATIVE_HARNESS_HISTORY_TOOL],
+    });
+    const session = fixture.session!;
+    await beginWork(fixture.root, "history publication work");
+    const source = await executeActualHarness(fixture.root, "history-source-1", "bounded history task");
+    await observeActualHarness(fixture.root, source);
+    expect(harnessDetails(source.result).outcome).toBe("backend-completed");
+    expect(session.appendCalls).toBe(0);
+    await fixture.root.host.emit("agent_end", { willContinue: true });
+    expect(session.appendCalls).toBe(0);
+    await fixture.root.host.emit("agent_end", { awaitingAsyncWork: true });
+    expect(session.appendCalls).toBe(0);
+
+    await fixture.root.host.emit("agent_end", {});
+    expect(session.appendCalls).toBe(1);
+    await fixture.root.host.emit("agent_end", {});
+    expect(session.appendCalls).toBe(1);
+    expect(fixture.root.entry.harnessHistoryStatus?.()?.diskConfirmed).toBe(1);
+    const status = fixture.root.entry.harnessHistoryStatus?.();
+    expect(status?.diskConfirmed).toBe(1);
+    expect(session.ensureCalls).toBeGreaterThanOrEqual(1);
+
+    const listed = fixture.root.entry.harnessHistoryList?.(fixture.root.host.context, { limit: 16 });
+    expect(listed?.state).toBe("complete");
+    expect(listed?.rows).toHaveLength(1);
+    const row = listed!.rows[0]!;
+    const inspected = await fixture.root.entry.harnessHistoryInspect?.(
+      fixture.root.host.context,
+      { entryId: row.entryId, locatorSha256: row.locatorSha256! },
+      new AbortController().signal,
+    );
+    expect(inspected?.history?.locator?.runId).not.toBeNull();
+    expect(inspected?.versions.definitionVersion).toBe("match");
+    expect(inspected?.versions.backendSourceId).toBe("match");
+    expect(inspected?.versions.configurationSha256).toBe("match");
+    expect(inspected?.recoveredAuthority).toBe(false);
+    expect(inspected?.resume).toBe(false);
+    expect(["observed", "partial"]).toContain(inspected?.state ?? "unavailable");
+
+    fixture.root.entry.dispose();
+    expect(fixture.root.entry.harnessHistoryList?.(fixture.root.host.context, { limit: 16 }).state)
+      .toBe("unavailable");
+    const second = await startRoot({
+      workspace: fixture.sourceRoot,
+      session,
+      main: makeSnapshot({
+        name: "main",
+        body: "MAIN_DEFINITION_BODY",
+        version: "main-v2",
+        tools: HISTORY_MAIN_TOOLS,
+        model: MAIN_MODEL,
+        selectorNull: true,
+        workspace: fixture.sourceRoot,
+      }),
+      mainTools: HISTORY_MAIN_TOOLS,
+      hostActiveTools: HISTORY_MAIN_TOOLS,
+      children: [childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1", { workspace: fixture.sourceRoot })],
+      harness: {
+        backend: {
+          model: "fixture/main",
+          ompCommand: "/usr/bin/fake-omp",
+          storageRoot: fixture.storageRoot,
+          inputFiles: ["a.txt"],
+        },
+        history: true,
+      },
+      harnessBackendFactory: () => {
+        throw new Error("a history-only fresh root must not create a backend");
+      },
+    });
+    const freshList = second.entry.harnessHistoryList?.(second.host.context, { limit: 16 });
+    expect(freshList?.rows).toHaveLength(1);
+    const freshInspect = await second.entry.harnessHistoryInspect?.(
+      second.host.context,
+      { entryId: freshList!.rows[0]!.entryId, locatorSha256: freshList!.rows[0]!.locatorSha256! },
+      new AbortController().signal,
+    );
+    expect(freshInspect?.versions.definitionVersion).toBe("mismatch");
+    expect(freshInspect?.versions.backendSourceId).toBe("match");
+    expect(freshInspect?.versions.configurationSha256).toBe("match");
+    expect(freshInspect?.history?.locator?.runId).toBe(inspected?.history?.locator?.runId);
+    expect(freshInspect?.recoveredAuthority).toBe(false);
+    expect(freshInspect?.resume).toBe(false);
+
+    const foreignList = second.entry.harnessHistoryList?.(ownerContext({ agentId: "Other" }), { limit: 16 });
+    expect(foreignList?.state).toBe("unavailable");
+    expect(second.entry.getStatus().phase).toBe("ready");
+  }, 60_000);
+
+  test("a no-op ensureOnDisk facade stays visible but is not disk-confirmed", async () => {
+    const fixture = await startActualHarnessCapture({
+      history: true,
+      noopEnsure: true,
+      mainTools: [...HARNESS_RESULT_MAIN_TOOLS, NATIVE_HARNESS_HISTORY_TOOL],
+    });
+    await beginWork(fixture.root, "history noop work");
+    const source = await executeActualHarness(fixture.root, "history-noop-source", "bounded noop task");
+    await observeActualHarness(fixture.root, source);
+    await fixture.root.host.emit("agent_end", {});
+    const status = fixture.root.entry.harnessHistoryStatus?.();
+    expect(status?.visible).toBe(1);
+    expect(status?.diskConfirmed).toBe(0);
+    const listed = fixture.root.entry.harnessHistoryList?.(fixture.root.host.context, { limit: 16 });
+    expect(listed?.rows).toHaveLength(1);
+  }, 30_000);
 });
