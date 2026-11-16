@@ -4,13 +4,17 @@ import path from "node:path";
 import {
   HarnessController,
   OmpRpcRunner,
+  decodeRunRecoveryOriginText,
   type OmpProfileAuth,
   type RunConfig,
   type RunRecord,
+  type RunRecoveryOrigin,
+  type RunRecoverySeed,
   type Runner,
   type WorkerRequest,
   type WorkerResult,
 } from "../vendor/harness2/index.ts";
+import type { NativeHarnessAccountingPrepared } from "./native-harness-accounting.ts";
 import type { NativeContext } from "./native-entry.ts";
 import {
   NATIVE_HARNESS_COMPLETION_LIMITATIONS,
@@ -48,10 +52,20 @@ import {
   NATIVE_HARNESS_MAX_DURATION_MS,
   NATIVE_HARNESS_MAX_PER_RUN_USD,
   NATIVE_HARNESS_MAX_TASK_BYTES,
+  type NativeHarnessAssociation,
   type NativeHarnessBackend,
+  type NativeHarnessPrepareAccounting,
   type NativeHarnessPrepareRequest,
   type NativeHarnessPrepareResult,
 } from "./native-harness-delegation.ts";
+import {
+  NATIVE_HARNESS_RECOVERY_SOURCE_FILE,
+  NATIVE_HARNESS_RECOVERY_SOURCE_PROFILE,
+  NATIVE_HARNESS_RECOVERY_SEED_SCHEMA,
+  prepareNativeHarnessRecoverySource,
+  verifyNativeHarnessRecoverySource,
+  type NativeHarnessRecoverySourceFacts,
+} from "./native-harness-recovery-source.ts";
 import {
   NativeHarnessWorkspaceError,
   NATIVE_HARNESS_WORKSPACE_LIMITS,
@@ -87,6 +101,8 @@ const MAX_MODEL_CHARS = 256;
 const MAX_REASON_CHARS = 320;
 const NUMERIC_EPSILON = 1e-9;
 const MODEL_PATTERN = /^([a-z0-9][a-z0-9-]*)\/([^\s,:@]+)$/;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const HEX_64_PATTERN = /^[0-9a-f]{64}$/;
 const EXPECTED_ADAPTATION = Object.freeze({
   capabilities: "fixed" as const,
   reuse: false,
@@ -168,12 +184,27 @@ interface RetainedRecord {
   reason: string | null;
 }
 
+interface DurableBackendState {
+  readonly source: NativeHarnessRecoverySourceFacts;
+  readonly seedText: string;
+  readonly expectedSeed: RunRecoverySeed;
+  readonly accountingPrepared: NativeHarnessAccountingPrepared;
+  readonly accounting: NativeHarnessPrepareAccounting;
+  readonly association: NativeHarnessAssociation;
+  readonly signal: AbortSignal;
+  readonly deadlineAt: number;
+  createAttempted: boolean;
+  origin: RunRecoveryOrigin | null;
+  executionRefusal: string | null;
+}
+
 interface BackendState {
   controller: HarnessController | null;
   descriptor: NativeHarnessWorkspaceDescriptor | null;
   runId: string | null;
   taskSha256: string | null;
   status: string | null;
+  readonly durable: DurableBackendState | null;
   readonly record: RetainedRecord;
   readonly completion: BackendCompletionState;
 }
@@ -214,6 +245,7 @@ interface GateExpectation {
   readonly descriptor: NativeHarnessWorkspaceDescriptor;
   readonly budget: PrepareBudget;
   readonly options: NormalizedTestOptions;
+  readonly durable: DurableBackendState | null;
 }
 
 interface PrepareFacts {
@@ -222,6 +254,8 @@ interface PrepareFacts {
   readonly signal: AbortSignal;
   readonly runner: Runner;
   readonly guard: () => void;
+  readonly association: NativeHarnessAssociation | null;
+  readonly accounting: NativeHarnessPrepareAccounting | null;
 }
 
 type StrictFields = ReadonlyMap<string, unknown>;
@@ -253,6 +287,13 @@ function createCompletionState(): BackendCompletionState {
 const ACTUAL_ABORTED_GETTER = (() => {
   try {
     return Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get ?? null;
+  } catch {
+    return null;
+  }
+})();
+const ACTUAL_PROMISE_THEN = (() => {
+  try {
+    return Promise.prototype.then;
   } catch {
     return null;
   }
@@ -506,22 +547,167 @@ function signalAborted(signal: unknown): boolean | null {
   }
 }
 
+function isThenable(value: unknown): boolean {
+  if ((typeof value !== "object" || value === null) && typeof value !== "function") return false;
+  try {
+    return typeof (value as { then?: unknown }).then === "function";
+  } catch {
+    return true;
+  }
+}
+
+function observeNativePromiseSettlement(value: unknown): boolean {
+  if (ACTUAL_PROMISE_THEN === null) return false;
+  try {
+    // Native then brand-checks the receiver. A real Promise gets two handlers
+    // attached solely to consume a possible rejection; an arbitrary thenable
+    // throws here and is never assimilated or invoked.
+    Reflect.apply(ACTUAL_PROMISE_THEN, value, [() => undefined, () => undefined]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The recovery source leaf and this backend share one synchronous guard
+ * contract. Durable preparation must not hide a Promise or thenable returned
+ * by the host guard: a real Promise rejection is observed and refused, and a
+ * foreign thenable is refused without invoking its `then`.
+ */
+function assertSynchronousGuardResult(result: unknown): void {
+  if (observeNativePromiseSettlement(result)) {
+    throw new Error("preparation guard must be synchronous and must not return a Promise");
+  }
+  if (isThenable(result)) {
+    throw new Error("preparation guard must be synchronous and must not return a Promise or thenable");
+  }
+}
+
+function readBoundedString(value: unknown, label: string, max: number): string {
+  if (
+    typeof value !== "string"
+    || value.length < 1
+    || value.length > max
+    || /[\x00-\x1f\x7f]/.test(value)
+  ) {
+    throw new Error(`${label} must be a bounded nonempty string`);
+  }
+  return value;
+}
+
+function readFullAssociation(value: unknown): NativeHarnessAssociation {
+  const fields = readStrictFields(
+    value,
+    ["observationId", "generation", "sessionId", "workspaceRoot", "toolCallId", "toolName"],
+    ["observationId", "generation", "sessionId", "workspaceRoot", "toolCallId", "toolName"],
+  );
+  if (fields === null) throw new Error("durable prepare association must contain all six exact fields");
+  const generation = fields.get("generation");
+  if (
+    typeof generation !== "number"
+    || !Number.isSafeInteger(generation)
+    || generation < 1
+  ) {
+    throw new Error("association.generation must be a positive safe integer");
+  }
+  const toolName = fields.get("toolName");
+  if (toolName !== "agent_harness") throw new Error("association.toolName must be agent_harness");
+  return deepFreeze({
+    observationId: readBoundedString(fields.get("observationId"), "association.observationId", 1024),
+    generation,
+    sessionId: readBoundedString(fields.get("sessionId"), "association.sessionId", 1024),
+    workspaceRoot: readAbsolutePath(fields.get("workspaceRoot"), "association.workspaceRoot"),
+    toolCallId: readBoundedString(fields.get("toolCallId"), "association.toolCallId", 256),
+    toolName: "agent_harness" as const,
+  });
+}
+
+function readPrepareAccounting(value: unknown): NativeHarnessPrepareAccounting {
+  const fields = readStrictFields(
+    value,
+    ["ownerId", "admissionId", "reserveRevision", "sourceAssociationSha256", "admittedAt"],
+    ["ownerId", "admissionId", "reserveRevision", "sourceAssociationSha256", "admittedAt"],
+  );
+  if (fields === null) {
+    throw new Error("durable prepare accounting must contain all five exact fields");
+  }
+  const ownerId = fields.get("ownerId");
+  const admissionId = fields.get("admissionId");
+  const reserveRevision = fields.get("reserveRevision");
+  const sourceAssociationSha256 = fields.get("sourceAssociationSha256");
+  const admittedAt = fields.get("admittedAt");
+  if (typeof ownerId !== "string" || !UUID_PATTERN.test(ownerId)) {
+    throw new Error("accounting.ownerId must be a lowercase UUID");
+  }
+  if (typeof admissionId !== "string" || !UUID_PATTERN.test(admissionId)) {
+    throw new Error("accounting.admissionId must be a lowercase UUID");
+  }
+  if (
+    typeof reserveRevision !== "number"
+    || !Number.isSafeInteger(reserveRevision)
+    || reserveRevision < 1
+  ) {
+    throw new Error("accounting.reserveRevision must be a positive safe integer");
+  }
+  if (typeof sourceAssociationSha256 !== "string" || !HEX_64_PATTERN.test(sourceAssociationSha256)) {
+    throw new Error("accounting.sourceAssociationSha256 must be 64 lowercase hexadecimal characters");
+  }
+  if (
+    typeof admittedAt !== "number"
+    || !Number.isSafeInteger(admittedAt)
+    || admittedAt < 1
+  ) {
+    throw new Error("accounting.admittedAt must be a positive safe integer");
+  }
+  return deepFreeze({ ownerId, admissionId, reserveRevision, sourceAssociationSha256, admittedAt });
+}
+
 function readPrepareFacts(value: unknown): PrepareFacts {
   const fields = readStrictFields(
     value,
-    ["association", "budget", "signal", "runner", "guard"],
+    ["association", "budget", "signal", "runner", "guard", "accounting"],
     ["association", "budget", "signal", "runner", "guard"],
   );
   if (fields === null) throw new Error("prepare request must be an exact plain object");
   const association = fields.get("association");
-  const associationFields = readStrictFields(
-    association,
-    ["observationId", "generation", "sessionId", "workspaceRoot", "toolCallId", "toolName"],
-    ["workspaceRoot"],
-  );
-  if (associationFields === null) throw new Error("prepare association is unreadable");
-  const workspaceRoot = readAbsolutePath(associationFields.get("workspaceRoot"), "association.workspaceRoot");
+  const accounting = fields.has("accounting") ? readPrepareAccounting(fields.get("accounting")) : null;
+  let associationFacts: NativeHarnessAssociation | null = null;
+  let workspaceRoot: string;
+  if (accounting === null) {
+    const associationFields = readStrictFields(
+      association,
+      ["observationId", "generation", "sessionId", "workspaceRoot", "toolCallId", "toolName"],
+      ["workspaceRoot"],
+    );
+    if (associationFields === null) throw new Error("prepare association is unreadable");
+    workspaceRoot = readAbsolutePath(associationFields.get("workspaceRoot"), "association.workspaceRoot");
+  } else {
+    associationFacts = readFullAssociation(association);
+    workspaceRoot = associationFacts.workspaceRoot;
+    const associationSha256 = sha256Hex(JSON.stringify({
+      observationId: associationFacts.observationId,
+      generation: associationFacts.generation,
+      sessionId: associationFacts.sessionId,
+      workspaceRoot: associationFacts.workspaceRoot,
+      toolCallId: associationFacts.toolCallId,
+      toolName: associationFacts.toolName,
+    }));
+    if (associationSha256 !== accounting.sourceAssociationSha256) {
+      throw new Error("accounting.sourceAssociationSha256 does not match the owned association");
+    }
+  }
   const budget = readBudget(fields.get("budget"));
+  if (accounting !== null) {
+    if (
+      budget.maxCostUsd > 1
+      || budget.maxDurationMs > 300_000
+      || !Number.isSafeInteger(accounting.admittedAt + budget.maxDurationMs)
+      || accounting.admittedAt + budget.maxDurationMs !== budget.deadlineAt
+    ) {
+      throw new Error("durable prepare budget must match accounting.admittedAt and the fixed admission bounds");
+    }
+  }
   const signal = fields.get("signal");
   const aborted = signalAborted(signal);
   if (aborted === null) throw new Error("prepare signal is not a readable host AbortSignal");
@@ -534,6 +720,8 @@ function readPrepareFacts(value: unknown): PrepareFacts {
     signal: signal as AbortSignal,
     runner,
     guard: guard as () => void,
+    association: associationFacts,
+    accounting,
   };
 }
 
@@ -675,6 +863,141 @@ async function realDirectoryExact(target: string, label: string): Promise<string
   return resolved;
 }
 
+const ORIGIN_FIELDS = [
+  "schema",
+  "nonce",
+  "runId",
+  "createdAt",
+  "recordIdentitySha256",
+  "seed",
+] as const;
+const ORIGIN_SEED_FIELDS = [
+  "schema",
+  "profile",
+  "accountingOwnerId",
+  "admissionId",
+  "accountingOwnerRevision",
+  "sourceAssociationSha256",
+  "sourceDescriptorSha256",
+  "inputManifestSha256",
+  "admittedAt",
+  "deadlineAt",
+  "allocatedCostUsd",
+] as const;
+
+function boundedOriginString(value: unknown, label: string, max = 1024): string {
+  if (typeof value !== "string" || value.length > max) {
+    throw new Error(`recovery origin ${label} is unreadable`);
+  }
+  return value;
+}
+
+/**
+ * Validate the four seed numbers before JSON serialization. A non-number can
+ * carry a toJSON hook; NaN/Infinity serialize to null; an unsafe integer may
+ * round. The vendor decoder still owns the full admission ranges.
+ */
+function boundedOriginNumber(value: unknown, label: string, integer: boolean): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`recovery origin seed ${label} is not a finite number`);
+  }
+  if (integer && !Number.isSafeInteger(value)) {
+    throw new Error(`recovery origin seed ${label} is not a safe integer`);
+  }
+  return value;
+}
+
+/**
+ * Explicit bounded own-data projection of the actual record's origin. The
+ * vendor decoder then checks the fixed shape and run ID. It does not by itself
+ * prove the surrounding record identity; the Store get/create already did.
+ */
+function originFromRecord(record: RunRecord, runId: string): RunRecoveryOrigin {
+  const originValue = readOwnData(record, "recoveryOrigin");
+  if (!originValue.present || !originValue.readable) {
+    throw new Error("actual run record has no readable recovery origin");
+  }
+  const fields = readStrictFields(originValue.value, ORIGIN_FIELDS, ORIGIN_FIELDS);
+  if (fields === null) throw new Error("actual run recovery origin is malformed");
+  const seedFields = readStrictFields(fields.get("seed"), ORIGIN_SEED_FIELDS, ORIGIN_SEED_FIELDS);
+  if (seedFields === null) throw new Error("actual run recovery seed is malformed");
+  const projection = {
+    schema: boundedOriginString(fields.get("schema"), "schema", 64),
+    nonce: boundedOriginString(fields.get("nonce"), "nonce", 64),
+    runId: boundedOriginString(fields.get("runId"), "runId", 64),
+    createdAt: boundedOriginString(fields.get("createdAt"), "createdAt", 64),
+    recordIdentitySha256: boundedOriginString(fields.get("recordIdentitySha256"), "recordIdentity", 64),
+    seed: {
+      schema: boundedOriginString(seedFields.get("schema"), "seed schema", 64),
+      profile: boundedOriginString(seedFields.get("profile"), "seed profile", 64),
+      accountingOwnerId: boundedOriginString(seedFields.get("accountingOwnerId"), "seed owner", 64),
+      admissionId: boundedOriginString(seedFields.get("admissionId"), "seed admission", 64),
+      accountingOwnerRevision: boundedOriginNumber(
+        seedFields.get("accountingOwnerRevision"),
+        "accountingOwnerRevision",
+        true,
+      ),
+      sourceAssociationSha256: boundedOriginString(seedFields.get("sourceAssociationSha256"), "seed association", 64),
+      sourceDescriptorSha256: boundedOriginString(seedFields.get("sourceDescriptorSha256"), "seed descriptor", 64),
+      inputManifestSha256: boundedOriginString(seedFields.get("inputManifestSha256"), "seed manifest", 64),
+      admittedAt: boundedOriginNumber(seedFields.get("admittedAt"), "admittedAt", true),
+      deadlineAt: boundedOriginNumber(seedFields.get("deadlineAt"), "deadlineAt", true),
+      allocatedCostUsd: boundedOriginNumber(seedFields.get("allocatedCostUsd"), "allocatedCostUsd", false),
+    },
+  };
+  const decoded = decodeRunRecoveryOriginText(JSON.stringify(projection), runId);
+  const recordCreatedAt = readOwnData(record, "createdAt").value;
+  if (decoded.createdAt !== recordCreatedAt) {
+    throw new Error("recovery origin createdAt does not match the actual initial record");
+  }
+  return decoded;
+}
+
+function sameOriginSeed(left: RunRecoverySeed, right: RunRecoverySeed): boolean {
+  return ORIGIN_SEED_FIELDS.every((key) => left[key] === right[key]);
+}
+
+function sameRecoveryOrigin(left: RunRecoveryOrigin, right: RunRecoveryOrigin): boolean {
+  return left.schema === right.schema
+    && left.nonce === right.nonce
+    && left.runId === right.runId
+    && left.createdAt === right.createdAt
+    && left.recordIdentitySha256 === right.recordIdentitySha256
+    && sameOriginSeed(left.seed, right.seed);
+}
+
+function durableDeadlineExpired(durable: DurableBackendState, current: number): boolean {
+  return Math.floor(durable.deadlineAt - current) < 1;
+}
+
+function assertDurableSignal(durable: DurableBackendState): void {
+  const aborted = signalAborted(durable.signal);
+  if (aborted === null) throw new Error("durable backend original signal is unreadable");
+  if (aborted) throw new Error("durable backend original signal is aborted");
+}
+
+function durableLocalGuard(
+  state: BackendState,
+  durable: DurableBackendState,
+  now: () => number,
+  workerSignal?: unknown,
+): () => void {
+  return () => {
+    if (state.durable !== durable) throw new Error("durable backend state is not this preparation");
+    // The clock is a host callback and may synchronously abort a signal. Read
+    // it first, then perform the final actual signal observations.
+    if (durableDeadlineExpired(durable, readNow(now))) {
+      throw new Error("the admitted delegation deadline expired");
+    }
+    assertDurableSignal(durable);
+    if (workerSignal !== undefined) {
+      const workerAborted = signalAborted(workerSignal);
+      if (workerAborted === null) throw new Error("durable worker signal is unreadable");
+      if (workerAborted) throw new Error("durable worker signal is aborted");
+    }
+  };
+}
+
 /** The final leaf may be absent because OmpRpcRunner creates artifactDir after this gate. */
 async function assertConfinedDirectoryAllowMissingLeaf(
   root: string,
@@ -794,6 +1117,14 @@ async function verifyRunRecord(
   const snapshotReal = await realDirectoryExact(snapshot.root, "base snapshot root");
   if (snapshotReal !== path.resolve(snapshot.root) || !isContained(runRoot, snapshotReal)) {
     throw new Error("base snapshot root is outside the private run store");
+  }
+  if (expected.durable !== null) {
+    const sealed = expected.durable.origin;
+    if (sealed === null) throw new Error("durable run has no accepted initial recovery origin");
+    const observed = originFromRecord(record, runId);
+    if (!sameRecoveryOrigin(sealed, observed)) {
+      throw new Error("actual run recovery origin or seed changed after creation");
+    }
   }
   return record;
 }
@@ -1184,6 +1515,24 @@ function createBaseInputGateRunner(
         }));
         record = await verifyRunRecord(controller, request.runId, expected);
       }
+      if (expected.durable !== null) {
+        const durable = expected.durable;
+        if (durable.executionRefusal !== null) {
+          throw new Error("durable run execution was refused after creation");
+        }
+        if (expected.state.runId === null || expected.state.runId !== request.runId) {
+          throw new Error("durable worker request does not name the actual created run");
+        }
+        const workerAborted = signalAborted(request.signal);
+        if (workerAborted === null) throw new Error("durable worker signal is missing or unreadable");
+        if (workerAborted) throw new Error("durable worker signal is aborted");
+        const guard = durableLocalGuard(expected.state, durable, expected.options.now ?? Date.now, request.signal);
+        await verifyNativeHarnessRecoverySource(durable.source, guard, request.signal as AbortSignal);
+        // Re-read the pure request/path checks after the asynchronous source
+        // observation. The final record reread below follows the snapshot read.
+        assertWorkerRequest(request, expected);
+        await verifyRequestPaths(request, expected);
+      }
       const hostManifest = assertManifestPaths(record, expected);
       const checkedInputs: NativeHarnessCheckedBaseInput[] = [];
       await verifySnapshotFiles(record, expected, hostManifest, checkedInputs);
@@ -1204,6 +1553,18 @@ function createBaseInputGateRunner(
         finalRecord,
         checkedInputs,
       );
+      if (expected.durable !== null) {
+        // Fresh final gate after every asynchronous source/path/record check
+        // and the synchronous witness copy. No earlier gate is carried across
+        // this I/O. The underlying coordinator still performs its own final
+        // native/currentness/budget gate.
+        durableLocalGuard(
+          expected.state,
+          expected.durable,
+          expected.options.now ?? Date.now,
+          request.signal,
+        )();
+      }
       let result: WorkerResult;
       try {
         result = await underlying.run(request);
@@ -1610,6 +1971,89 @@ function makeBackend(
   const backend = {
     async create(task: string): Promise<unknown> {
       const boundedTask = readTask(task);
+      const durable = state.durable;
+      if (durable !== null) {
+        // Install the one-attempt latch synchronously, before any clock
+        // callback or await. A pending, fulfilled or rejected attempt never
+        // permits a second Controller.create.
+        if (durable.createAttempted) {
+          throw new Error("durable backend run creation was already attempted");
+        }
+        durable.createAttempted = true;
+        assertDurableSignal(durable);
+        if (durableDeadlineExpired(durable, readNow(now))) {
+          throw new Error("the admitted delegation deadline expired before backend run creation");
+        }
+        const verifyGuard = durableLocalGuard(state, durable, now);
+        await verifyNativeHarnessRecoverySource(durable.source, verifyGuard, durable.signal);
+        // New source I/O consumes the original window. Re-read the actual
+        // clock and signal, then narrow the inner config by what remains.
+        const current = readNow(now);
+        assertDurableSignal(durable);
+        const remaining = Math.floor(durable.deadlineAt - current);
+        if (!Number.isFinite(remaining) || remaining < 1) {
+          throw new Error("the admitted delegation deadline expired during backend run creation");
+        }
+        const maxDurationMs = Math.min(
+          remaining,
+          Math.floor(budget.maxDurationMs),
+          NATIVE_HARNESS_MAX_DURATION_MS,
+        );
+        if (maxDurationMs < 1) throw new Error("the admitted delegation duration is exhausted");
+        const controller = requireController();
+        const config: Partial<RunConfig> & { model: string } = {
+          mode: "product",
+          strategy: "auto",
+          model: host.model,
+          improverModel: host.model,
+          maxCostUsd: budget.maxCostUsd,
+          maxDurationMs,
+          stageTimeoutMs: maxDurationMs,
+          domain: NATIVE_HARNESS_BACKEND_DOMAIN,
+          ompCommand: host.ompCommand,
+          ...(host.auth === undefined ? {} : { auth: host.auth }),
+          adaptation: EXPECTED_ADAPTATION,
+        };
+        const created = await controller.create(boundedTask, config, {
+          recoverySeedText: durable.seedText,
+        });
+        const createdId = readOwnData(created, "id").value;
+        if (typeof createdId !== "string" || !UUID_PATTERN.test(createdId)) {
+          throw new Error("actual Harness2 create returned no canonical run ID");
+        }
+        // Preserve the known created association before any pure origin check.
+        // No later abort, clock change or origin mismatch discards this ID.
+        state.runId = createdId;
+        state.taskSha256 = sha256Hex(boundedTask);
+        // Read the initial status as own data, never through a getter. A
+        // malformed or unreadable status is a noncritical diagnostic: the
+        // known ID is retained and execution becomes sticky-refused.
+        const statusValue = readOwnData(created, "status");
+        if (!statusValue.readable || statusValue.value !== "queued") {
+          state.status = "unknown";
+          state.record.backendStatus = "unknown";
+          durable.executionRefusal = "created run initial status is unreadable or malformed";
+        } else {
+          state.status = "queued";
+          state.record.backendStatus = "queued";
+        }
+        state.record.runId = createdId;
+        state.record.retainedForInspection = true;
+        try {
+          const origin = originFromRecord(created, createdId);
+          if (!sameOriginSeed(origin.seed, durable.expectedSeed)) {
+            throw new Error("actual initial recovery origin seed does not match the prepared source");
+          }
+          durable.origin = origin;
+        } catch (error) {
+          if (durable.executionRefusal === null) {
+            durable.executionRefusal = boundedReason(
+              `created run recovery origin did not match the prepared source: ${boundedReason(error)}`,
+            );
+          }
+        }
+        return { runId: createdId };
+      }
       const current = readNow(now);
       const remaining = Math.floor(budget.deadlineAt - current);
       if (!Number.isFinite(remaining) || remaining < 1) {
@@ -1646,6 +2090,17 @@ function makeBackend(
     },
     async execute(runId: string): Promise<unknown> {
       const controller = requireCreated(runId);
+      if (state.durable !== null) {
+        if (state.durable.executionRefusal !== null) {
+          throw new Error(state.durable.executionRefusal);
+        }
+        // The clock callback may synchronously abort. Read it before the final
+        // actual signal observation so an abort during the callback is seen.
+        if (durableDeadlineExpired(state.durable, readNow(now))) {
+          throw new Error("the admitted delegation deadline expired before backend execution");
+        }
+        assertDurableSignal(state.durable);
+      }
       const record = await controller.execute(runId);
       state.status = record.status;
       state.record.backendStatus = record.status;
@@ -1715,10 +2170,35 @@ export function createNativeHarnessBackend(
       return failed("the admitted delegation deadline has expired before preparation");
     }
 
+    // Durable preparation validates every host guard return synchronously,
+    // then re-reads the actual signal after the guard (and after any deadline
+    // clock callback) before the next effect. Legacy preparation invokes the
+    // original guard exactly as before. This wrapper is local and is never
+    // captured after preparation returns.
+    const checkedGuard = (
+      deadlineMessage: string | null = null,
+      abortedMessage = "preparation was aborted before the next effect",
+    ): void => {
+      if (request.accounting === null) {
+        request.guard();
+        return;
+      }
+      assertSynchronousGuardResult(request.guard());
+      if (
+        deadlineMessage !== null
+        && Math.floor(request.budget.deadlineAt - readNow(now)) < 1
+      ) {
+        throw new Error(deadlineMessage);
+      }
+      const aborted = signalAborted(request.signal);
+      if (aborted === null) throw new Error("preparation signal is unreadable");
+      if (aborted) throw new Error(abortedMessage);
+    };
+
     // This guard opens only for preparation. It is never captured by the
     // backend or consulted after this function returns.
     try {
-      request.guard();
+      checkedGuard();
     } catch (error) {
       return failed(`prepared authority was rejected: ${boundedReason(error)}`);
     }
@@ -1731,7 +2211,7 @@ export function createNativeHarnessBackend(
           storageRoot: host.storageRoot,
           inputFiles: host.inputFiles,
         },
-        request.guard,
+        checkedGuard,
         request.signal,
       );
     } catch (error) {
@@ -1764,14 +2244,90 @@ export function createNativeHarnessBackend(
       return failed(reason);
     }
 
-    // Final synchronous preparation authority read. No await follows before
-    // the Controller is constructed.
-    try {
-      request.guard();
-    } catch (error) {
-      const reason = `prepared authority was rejected after the private workspace was created: ${boundedReason(error)}`;
-      retain(records, recordFromDescriptor(descriptor, true, reason));
-      return failed(reason);
+    let durable: DurableBackendState | null = null;
+    if (request.accounting !== null && request.association !== null) {
+      try {
+        const prepareGuard = (): void => {
+          checkedGuard(
+            "the admitted delegation deadline expired before recovery source creation",
+            "preparation was aborted before recovery source creation",
+          );
+        };
+        prepareGuard();
+        const canonicalStorageRoot = await realDirectoryExact(host.storageRoot, "host storage root");
+        prepareGuard();
+        const prepared = await prepareNativeHarnessRecoverySource(
+          {
+            storageRoot: canonicalStorageRoot,
+            descriptor,
+            association: request.association,
+            accounting: request.accounting,
+            budget: request.budget,
+            backendProfile: {
+              model: host.model,
+              improverModel: host.model,
+              ompCommand: host.ompCommand,
+              mode: "product",
+              strategy: "auto",
+              domain: NATIVE_HARNESS_BACKEND_DOMAIN,
+              adaptation: EXPECTED_ADAPTATION,
+            },
+            backendBuild: {
+              sourceId: NATIVE_HARNESS_COMPLETION_SOURCE_ID,
+              sourceIntegrity: NATIVE_HARNESS_COMPLETION_SOURCE_INTEGRITY,
+            },
+          },
+          prepareGuard,
+          request.signal,
+        );
+        // Final synchronous preparation authority read. checkedGuard validates
+        // the guard return, then the deadline clock callback, then the actual
+        // signal. No await follows before the original Controller is
+        // constructed.
+        checkedGuard(
+          "the admitted delegation deadline expired during recovery source creation",
+          "preparation was aborted after recovery source creation",
+        );
+        durable = {
+          source: prepared.source,
+          seedText: prepared.seedText,
+          expectedSeed: Object.freeze({
+            schema: NATIVE_HARNESS_RECOVERY_SEED_SCHEMA,
+            profile: NATIVE_HARNESS_RECOVERY_SOURCE_PROFILE,
+            accountingOwnerId: request.accounting.ownerId,
+            admissionId: request.accounting.admissionId,
+            accountingOwnerRevision: request.accounting.reserveRevision,
+            sourceAssociationSha256: request.accounting.sourceAssociationSha256,
+            sourceDescriptorSha256: prepared.source.sha256,
+            inputManifestSha256: descriptor.manifestSha256,
+            admittedAt: request.accounting.admittedAt,
+            deadlineAt: request.budget.deadlineAt,
+            allocatedCostUsd: request.budget.maxCostUsd,
+          }),
+          accountingPrepared: prepared.accountingPrepared,
+          accounting: request.accounting,
+          association: request.association,
+          signal: request.signal,
+          deadlineAt: request.budget.deadlineAt,
+          createAttempted: false,
+          origin: null,
+          executionRefusal: null,
+        };
+      } catch (error) {
+        const reason = `recovery source preparation failed: ${boundedReason(error)}`;
+        retain(records, recordFromDescriptor(descriptor, true, reason));
+        return failed(reason);
+      }
+    } else {
+      // Legacy preparation retains its exact final authority read: no source
+      // effect, seed, origin or new accounting field is produced.
+      try {
+        checkedGuard();
+      } catch (error) {
+        const reason = `prepared authority was rejected after the private workspace was created: ${boundedReason(error)}`;
+        retain(records, recordFromDescriptor(descriptor, true, reason));
+        return failed(reason);
+      }
     }
 
     const record = recordFromDescriptor(descriptor, false, null);
@@ -1782,6 +2338,7 @@ export function createNativeHarnessBackend(
       runId: null,
       taskSha256: null,
       status: null,
+      durable,
       record,
       completion: createCompletionState(),
     };
@@ -1791,6 +2348,7 @@ export function createNativeHarnessBackend(
       descriptor,
       budget: request.budget,
       options,
+      durable,
     };
     try {
       const gateRunner = createBaseInputGateRunner(request.runner, expected);
@@ -1811,6 +2369,7 @@ export function createNativeHarnessBackend(
       return {
         ok: true,
         backend: makeBackend(state, host, request.budget, now),
+        ...(durable === null ? {} : { accountingPrepared: durable.accountingPrepared }),
       };
     } catch (error) {
       const reason = `actual Harness2 backend construction failed: ${boundedReason(error)}`;

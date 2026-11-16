@@ -4,6 +4,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   realpath,
   rm,
@@ -30,7 +31,8 @@ import {
   type NativeHarnessPrepareResult,
 } from "../../src/native-harness-delegation.ts";
 import type { NativeContext } from "../../src/native-entry.ts";
-import type { Runner, WorkerRequest, WorkerResult } from "../../vendor/harness2/index.ts";
+import { NATIVE_HARNESS_RECOVERY_SOURCE_FILE } from "../../src/native-harness-recovery-source.ts";
+import { HarnessController, type Runner, type WorkerRequest, type WorkerResult } from "../../vendor/harness2/index.ts";
 
 const PLAN_RESPONSE = JSON.stringify({
   decision: "direct",
@@ -146,6 +148,152 @@ function prepareRequest(f: Fixture, runner: Runner, overrides: RequestOverrides 
     runner: overrides.runner ?? runner,
     guard: overrides.guard ?? (() => undefined),
   });
+}
+
+const DURABLE_OWNER_ID = "11111111-1111-4111-8111-111111111111";
+const DURABLE_ADMISSION_ID = "22222222-2222-4222-8222-222222222222";
+
+function durableAssociation(f: Fixture): {
+  readonly observationId: string;
+  readonly generation: number;
+  readonly sessionId: string;
+  readonly workspaceRoot: string;
+  readonly toolCallId: string;
+  readonly toolName: "agent_harness";
+} {
+  return {
+    observationId: "durable-observation",
+    generation: 1,
+    sessionId: "durable-session",
+    workspaceRoot: f.sourceRoot,
+    toolCallId: "durable-call",
+    toolName: "agent_harness" as const,
+  };
+}
+
+function associationDigest(association: ReturnType<typeof durableAssociation>): string {
+  return createHash("sha256").update(JSON.stringify({
+    observationId: association.observationId,
+    generation: association.generation,
+    sessionId: association.sessionId,
+    workspaceRoot: association.workspaceRoot,
+    toolCallId: association.toolCallId,
+    toolName: association.toolName,
+  })).digest("hex");
+}
+
+function durableRequest(
+  f: Fixture,
+  runner: Runner,
+  options: {
+    readonly admittedAt?: number;
+    readonly maxDurationMs?: number;
+    readonly signal?: AbortSignal;
+    readonly guard?: () => void;
+  } = {},
+): NativeHarnessPrepareRequest {
+  const association = durableAssociation(f);
+  const admittedAt = options.admittedAt ?? Date.now() - 1_000;
+  const maxDurationMs = options.maxDurationMs ?? 120_000;
+  return Object.freeze({
+    association: Object.freeze(association),
+    accounting: Object.freeze({
+      ownerId: DURABLE_OWNER_ID,
+      admissionId: DURABLE_ADMISSION_ID,
+      reserveRevision: 1,
+      sourceAssociationSha256: associationDigest(association),
+      admittedAt,
+    }),
+    budget: Object.freeze({
+      maxCostUsd: 1,
+      deadlineAt: admittedAt + maxDurationMs,
+      maxDurationMs,
+    }),
+    signal: options.signal ?? new AbortController().signal,
+    runner,
+    guard: options.guard ?? (() => undefined),
+  });
+}
+
+async function preparedRootOf(
+  factory: ReturnType<typeof createNativeHarnessBackend>,
+): Promise<string> {
+  const root = factory.inspect().at(-1)?.preparedRoot;
+  if (root === null || root === undefined) throw new Error("no prepared root was retained");
+  return root;
+}
+
+async function withCreateSpy<T>(
+  transform: (record: Awaited<ReturnType<HarnessController["create"]>>) => unknown,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const original = HarnessController.prototype.create;
+  const patched = async function (
+    this: HarnessController,
+    ...args: Parameters<HarnessController["create"]>
+  ): Promise<Awaited<ReturnType<HarnessController["create"]>>> {
+    const record = await original.apply(this, args);
+    return transform(record) as Awaited<ReturnType<HarnessController["create"]>>;
+  };
+  HarnessController.prototype.create = patched;
+  try {
+    return await fn();
+  } finally {
+    HarnessController.prototype.create = original;
+  }
+}
+
+async function withGetSpy<T>(
+  transform: (record: NonNullable<Awaited<ReturnType<HarnessController["get"]>>>) => unknown,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const original = HarnessController.prototype.get;
+  const patched = async function (
+    this: HarnessController,
+    id: string,
+  ): Promise<Awaited<ReturnType<HarnessController["get"]>>> {
+    const record = await original.call(this, id);
+    return record === undefined
+      ? undefined
+      : transform(record) as Awaited<ReturnType<HarnessController["get"]>>;
+  };
+  HarnessController.prototype.get = patched;
+  try {
+    return await fn();
+  } finally {
+    HarnessController.prototype.get = original;
+  }
+}
+
+async function withControllerDispatchCounters<T>(
+  fn: () => Promise<T>,
+): Promise<{ readonly value: T; readonly createCalls: number; readonly executeCalls: number }> {
+  const originalCreate = HarnessController.prototype.create;
+  const originalExecute = HarnessController.prototype.execute;
+  let createCalls = 0;
+  let executeCalls = 0;
+  const patchedCreate = async function (
+    this: HarnessController,
+    ...args: Parameters<HarnessController["create"]>
+  ): Promise<Awaited<ReturnType<HarnessController["create"]>>> {
+    createCalls += 1;
+    return originalCreate.apply(this, args);
+  };
+  const patchedExecute = async function (
+    this: HarnessController,
+    ...args: Parameters<HarnessController["execute"]>
+  ): Promise<Awaited<ReturnType<HarnessController["execute"]>>> {
+    executeCalls += 1;
+    return originalExecute.apply(this, args);
+  };
+  HarnessController.prototype.create = patchedCreate;
+  HarnessController.prototype.execute = patchedExecute;
+  try {
+    return { value: await fn(), createCalls, executeCalls };
+  } finally {
+    HarnessController.prototype.create = originalCreate;
+    HarnessController.prototype.execute = originalExecute;
+  }
 }
 
 function deferred<T>(): {
@@ -1177,5 +1325,574 @@ describe("G5-3A1 host-only actual backend completion", () => {
     expect(matchesNativeHarnessBackendCompletion(backend, hostile)).toBe(false);
     expect(matchesNativeHarnessBackendCompletion(backend, { ...completion })).toBe(false);
     expect(accesses).toBe(0);
+  });
+});
+
+describe("R2-A2b2c durable backend source and initial origin wiring", () => {
+  test("legacy preparation writes no recovery source, result field or record origin", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend, result } = await prepareBackend(factory, f, prepareRequest(f, det.runner));
+    expect("accountingPrepared" in result).toBe(false);
+    const preparedRoot = await preparedRootOf(factory);
+    expect(await exists(path.join(preparedRoot, NATIVE_HARNESS_RECOVERY_SOURCE_FILE))).toBe(false);
+    const runId = await requiredRunId(backend);
+    const record = await readRecord(factory.inspect().at(-1)!.storeRoot!, runId);
+    expect(record.recoveryOrigin).toBeUndefined();
+  });
+
+  test("malformed or mismatched durable accounting rejects without legacy fallback", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const base = durableRequest(f, det.runner);
+    const missing = { ...base, accounting: undefined } as unknown as NativeHarnessPrepareRequest;
+    const missingResult = await factory.prepare(missing, contextFor(f));
+    expect(missingResult.ok).toBe(false);
+    expect(factory.inspect().length).toBe(0);
+    const mismatched = {
+      ...base,
+      accounting: { ...base.accounting!, sourceAssociationSha256: "0".repeat(64) },
+    } as NativeHarnessPrepareRequest;
+    const mismatchedResult = await factory.prepare(mismatched, contextFor(f));
+    expect(mismatchedResult.ok).toBe(false);
+    if (!mismatchedResult.ok) expect(mismatchedResult.reason).toContain("sourceAssociationSha256");
+    expect(factory.inspect().length).toBe(0);
+  });
+
+  test("durable prepare writes exact source and binds the initial origin through completion", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const admittedAt = Date.now() - 1_000;
+    const request = durableRequest(f, det.runner, { admittedAt, maxDurationMs: 120_000 });
+    const factory = createNativeHarnessBackend(f.host, {
+      deterministicRunner: det.runner,
+      now: () => admittedAt + 1_000,
+    });
+    const { backend, result } = await prepareBackend(factory, f, request);
+    if (!result.ok || result.accountingPrepared === undefined) {
+      throw new Error("durable prepare returned no accountingPrepared facts");
+    }
+    const preparedRoot = await preparedRootOf(factory);
+    const raw = await readFile(path.join(preparedRoot, NATIVE_HARNESS_RECOVERY_SOURCE_FILE), "utf8");
+    const document = JSON.parse(raw) as Record<string, any>;
+    expect(createHash("sha256").update(raw).digest("hex")).toBe(result.accountingPrepared.sourceDescriptorSha256);
+    expect(document.accounting.reserveRevision).toBe(1);
+    expect(document.budget.deadlineAt).toBe(request.budget.deadlineAt);
+    expect(document.budget.maxDurationMs).toBe(120_000);
+    expect(document.inputManifestSha256).toBe(result.accountingPrepared.inputManifestSha256);
+    const diagnostic = factory.inspect().at(-1)!;
+    expect(result.accountingPrepared.inputManifestSha256).toBe(diagnostic.inputManifestSha256!);
+
+    const runId = await requiredRunId(backend, "durable bounded task");
+    const record = await readRecord(diagnostic.storeRoot!, runId);
+    expect(record.task).toBe("durable bounded task");
+    expect(record.recoveryOrigin.runId).toBe(runId);
+    expect(record.recoveryOrigin.createdAt).toBe(record.createdAt);
+    expect(record.recoveryOrigin.seed).toMatchObject({
+      accountingOwnerId: DURABLE_OWNER_ID,
+      admissionId: DURABLE_ADMISSION_ID,
+      accountingOwnerRevision: 1,
+      sourceAssociationSha256: request.accounting!.sourceAssociationSha256,
+      sourceDescriptorSha256: result.accountingPrepared.sourceDescriptorSha256,
+      inputManifestSha256: result.accountingPrepared.inputManifestSha256,
+      admittedAt,
+      deadlineAt: request.budget.deadlineAt,
+      allocatedCostUsd: 1,
+    });
+    const executed = await backend.execute(runId) as { status?: unknown };
+    expect(executed.status).toBe("completed");
+    expect(readNativeHarnessBackendCompletion(backend).ok).toBe(true);
+  });
+
+  test("durable create is one attempt across reentrant and post-success calls", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    let backend!: NativeHarnessBackend;
+    let armed = false;
+    let reentrant: Promise<void> | null = null;
+    let reentrantError: unknown = null;
+    const factory = createNativeHarnessBackend(f.host, {
+      deterministicRunner: det.runner,
+      now: () => {
+        if (armed && reentrant === null) {
+          reentrant = backend.create("reentrant task").then(
+            () => undefined,
+            (error: unknown) => { reentrantError = error; },
+          ) as Promise<void>;
+        }
+        return Date.now();
+      },
+    });
+    const prepared = await prepareBackend(factory, f, durableRequest(f, det.runner));
+    backend = prepared.backend;
+    armed = true;
+    const runId = await requiredRunId(backend);
+    await reentrant!;
+    expect(reentrantError).toBeInstanceOf(Error);
+    await expect(backend.create("second task")).rejects.toThrow(/already attempted/);
+    const storeRoot = factory.inspect().at(-1)!.storeRoot!;
+    expect(await readdir(path.join(storeRoot, "runs"))).toEqual([runId]);
+  });
+
+  test("changed source bytes block create and every worker dispatch", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, durableRequest(f, det.runner));
+    const preparedRoot = await preparedRootOf(factory);
+    const sourcePath = path.join(preparedRoot, NATIVE_HARNESS_RECOVERY_SOURCE_FILE);
+    await writeFile(sourcePath, `${await readFile(sourcePath, "utf8")} `, { mode: 0o600 });
+    await expect(backend.create("bounded task")).rejects.toThrow();
+    expect(await exists(path.join(factory.inspect().at(-1)!.storeRoot!, "runs"))).toBe(false);
+
+    const second = await fixture();
+    const secondDet = deterministicRunner();
+    const secondFactory = createNativeHarnessBackend(second.host, { deterministicRunner: secondDet.runner });
+    const secondPrepare = await prepareBackend(secondFactory, second, durableRequest(second, secondDet.runner));
+    const runId = await requiredRunId(secondPrepare.backend);
+    const secondRoot = await preparedRootOf(secondFactory);
+    await writeFile(
+      path.join(secondRoot, NATIVE_HARNESS_RECOVERY_SOURCE_FILE),
+      `${await readFile(path.join(secondRoot, NATIVE_HARNESS_RECOVERY_SOURCE_FILE), "utf8")} `,
+      { mode: 0o600 },
+    );
+    try {
+      await secondPrepare.backend.execute(runId);
+    } catch {
+      // The Controller may settle the run as failed; dispatch is the assertion.
+    }
+    expect(secondDet.requests.length).toBe(0);
+  });
+
+  test("a different valid-shaped origin seed blocks the worker before the runner", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, durableRequest(f, det.runner));
+    const runId = await requiredRunId(backend);
+    await withGetSpy((record) => {
+      const clone = structuredClone(record);
+      if (clone.recoveryOrigin !== undefined) clone.recoveryOrigin.seed.accountingOwnerRevision += 1;
+      return clone;
+    }, async () => {
+      try {
+        await backend.execute(runId);
+      } catch {
+        // The origin gate refuses dispatch; the Controller may settle failure.
+      }
+    });
+    expect(det.requests.length).toBe(0);
+    expect(await backend.get!(runId)).not.toBeNull();
+  });
+
+  test("abort immediately after fulfilled create keeps the known ID and blocks execute", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const abort = new AbortController();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, durableRequest(f, det.runner, { signal: abort.signal }));
+    let runId = "";
+    await withCreateSpy((record) => {
+      abort.abort();
+      return record;
+    }, async () => {
+      runId = await requiredRunId(backend);
+    });
+    expect(typeof runId).toBe("string");
+    expect(await backend.get!(runId)).not.toBeNull();
+    await expect(backend.execute(runId)).rejects.toThrow(/aborted/);
+    expect(det.requests.length).toBe(0);
+    const cancelled = await backend.cancel(runId) as { requested?: unknown };
+    expect(cancelled.requested).toBe(true);
+  });
+
+  test("origin mismatch after fulfilled create keeps the ID, refuses execution and stays sticky", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, durableRequest(f, det.runner));
+    let runId = "";
+    await withCreateSpy((record) => {
+      const clone = structuredClone(record);
+      if (clone.recoveryOrigin !== undefined) clone.recoveryOrigin.seed.admissionId = "33333333-3333-4333-8333-333333333333";
+      return clone;
+    }, async () => {
+      runId = await requiredRunId(backend);
+    });
+    expect(await backend.get!(runId)).not.toBeNull();
+    await expect(backend.execute(runId)).rejects.toThrow(/recovery origin/);
+    expect(await backend.get!(runId)).not.toBeNull();
+    await expect(backend.execute(runId)).rejects.toThrow(/recovery origin/);
+    expect(det.requests.length).toBe(0);
+    const cancelled = await backend.cancel(runId) as { requested?: unknown };
+    expect(cancelled.requested).toBe(true);
+  });
+
+  test("a fulfilled create clone with a seed toJSON sentinel is refused without serialization", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, durableRequest(f, det.runner));
+    let sentinelCalls = 0;
+    let runId = "";
+    await withCreateSpy((record) => {
+      const clone = structuredClone(record) as Record<string, any>;
+      clone.recoveryOrigin.seed.accountingOwnerRevision = {
+        toJSON() {
+          sentinelCalls += 1;
+          return 1;
+        },
+      };
+      return clone;
+    }, async () => {
+      runId = await requiredRunId(backend);
+    });
+    expect(sentinelCalls).toBe(0);
+    expect(runId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    const diagnostic = factory.inspect().at(-1)!;
+    expect(diagnostic.runId).toBe(runId);
+    const stored = await readRecord(diagnostic.storeRoot!, runId);
+    expect(stored.status).toBe("queued");
+    expect(stored.recoveryOrigin.seed.accountingOwnerRevision).toBe(1);
+    await expect(backend.execute(runId)).rejects.toThrow(/recovery origin/);
+    await expect(backend.execute(runId)).rejects.toThrow(/recovery origin/);
+    const observed = await backend.get!(runId) as { readonly status?: unknown } | null;
+    expect(observed?.status).toBe("queued");
+    const cancelled = await backend.cancel(runId) as { readonly requested?: unknown };
+    expect(cancelled.requested).toBe(true);
+    await expect(backend.create("second task")).rejects.toThrow(/already attempted/);
+    expect(readNativeHarnessBackendCompletion(backend).ok).toBe(false);
+    expect(det.requests).toHaveLength(0);
+  });
+
+  test("unreadable initial created status keeps the known ID but refuses execution", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, durableRequest(f, det.runner));
+    let statusGetterCalls = 0;
+    let runId = "";
+    await withCreateSpy((record) => {
+      const clone = structuredClone(record) as Record<string, any>;
+      Object.defineProperty(clone, "status", {
+        enumerable: true,
+        configurable: true,
+        get() {
+          statusGetterCalls += 1;
+          throw new Error("status getter must not be invoked");
+        },
+      });
+      return clone;
+    }, async () => {
+      runId = await requiredRunId(backend);
+    });
+    expect(statusGetterCalls).toBe(0);
+    const diagnostic = factory.inspect().at(-1)!;
+    expect(diagnostic.runId).toBe(runId);
+    expect(diagnostic.backendStatus).toBe("unknown");
+    const stored = await readRecord(diagnostic.storeRoot!, runId);
+    expect(stored.status).toBe("queued");
+    await expect(backend.execute(runId)).rejects.toThrow(/status/);
+    await expect(backend.execute(runId)).rejects.toThrow(/status/);
+    const observed = await backend.get!(runId) as { readonly status?: unknown } | null;
+    expect(observed?.status).toBe("queued");
+    const cancelled = await backend.cancel(runId) as { readonly requested?: unknown };
+    expect(cancelled.requested).toBe(true);
+    expect(readNativeHarnessBackendCompletion(backend).ok).toBe(false);
+    expect(det.requests).toHaveLength(0);
+  });
+
+  test("a durable guard that returns a rejected Promise is observed and refused", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    let clockCalls = 0;
+    let armed = false;
+    const factory = createNativeHarnessBackend(f.host, {
+      deterministicRunner: det.runner,
+      now: () => {
+        clockCalls += 1;
+        // The second backend clock read follows private workspace preparation
+        // and precedes the first durable guard check.
+        if (clockCalls === 2) armed = true;
+        return Date.now();
+      },
+    });
+    let guardCalls = 0;
+    const guard = () => {
+      guardCalls += 1;
+      return armed
+        ? Promise.reject(new Error("durable guard returned a Promise"))
+        : undefined;
+    };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    let result: NativeHarnessPrepareResult | null = null;
+    try {
+      result = await factory.prepare(durableRequest(f, det.runner, { guard }), contextFor(f));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+    expect(guardCalls).toBeGreaterThan(0);
+    expect(result?.ok).toBe(false);
+    if (result !== null && !result.ok) expect(result.reason).toMatch(/synchronous/);
+    expect(unhandled).toHaveLength(0);
+    const diagnostics = factory.inspect();
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]!.retainedForInspection).toBe(true);
+    expect(diagnostics[0]!.reason).toMatch(/synchronous/);
+    expect(det.requests).toHaveLength(0);
+  });
+
+  test("a durable guard that returns a foreign thenable is refused without invoking it", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    let clockCalls = 0;
+    let armed = false;
+    const factory = createNativeHarnessBackend(f.host, {
+      deterministicRunner: det.runner,
+      now: () => {
+        clockCalls += 1;
+        if (clockCalls === 2) armed = true;
+        return Date.now();
+      },
+    });
+    let guardCalls = 0;
+    let foreignThenCalls = 0;
+    const guard = () => {
+      guardCalls += 1;
+      if (armed) {
+        return {
+          then() {
+            foreignThenCalls += 1;
+            throw new Error("foreign then must not run");
+          },
+        };
+      }
+      return undefined;
+    };
+    const result = await factory.prepare(durableRequest(f, det.runner, { guard }), contextFor(f));
+    expect(guardCalls).toBeGreaterThan(0);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/synchronous/);
+    expect(foreignThenCalls).toBe(0);
+    const diagnostics = factory.inspect();
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]!.reason).toMatch(/synchronous/);
+    expect(det.requests).toHaveLength(0);
+  });
+
+  test("an initial durable guard returning a rejected Promise is observed and refused before workspace", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    let guardCalls = 0;
+    const guard = (): Promise<never> => {
+      guardCalls += 1;
+      return Promise.reject(new Error("initial durable guard returned a Promise"));
+    };
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => {
+      unhandled.push(reason);
+    };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const checked = await withControllerDispatchCounters(async () => {
+        const prepared = await factory.prepare(durableRequest(f, det.runner, { guard }), contextFor(f));
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+        return prepared;
+      });
+      expect(guardCalls).toBe(1);
+      expect(checked.value.ok).toBe(false);
+      if (!checked.value.ok) expect(checked.value.reason).toMatch(/synchronous/);
+      expect(unhandled).toHaveLength(0);
+      expect(checked.createCalls).toBe(0);
+      expect(checked.executeCalls).toBe(0);
+      expect(factory.inspect()).toHaveLength(0);
+      expect(det.requests).toHaveLength(0);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  test("a workspace durable guard returning a foreign thenable after the initial void is refused without invoking it", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    let guardCalls = 0;
+    let foreignThenCalls = 0;
+    const guard = () => {
+      guardCalls += 1;
+      if (guardCalls === 1) return undefined;
+      return {
+        then() {
+          foreignThenCalls += 1;
+          throw new Error("foreign then must not run");
+        },
+      };
+    };
+    const checked = await withControllerDispatchCounters(async () => {
+      const prepared = await factory.prepare(durableRequest(f, det.runner, { guard }), contextFor(f));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      return prepared;
+    });
+    expect(guardCalls).toBe(2);
+    expect(checked.value.ok).toBe(false);
+    if (!checked.value.ok) expect(checked.value.reason).toMatch(/preparation guard/);
+    expect(foreignThenCalls).toBe(0);
+    expect(checked.createCalls).toBe(0);
+    expect(checked.executeCalls).toBe(0);
+    expect(factory.inspect()).toHaveLength(0);
+    expect(det.requests).toHaveLength(0);
+  });
+
+  test("a clock abort during the first source guard is observed before the next effect", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const abort = new AbortController();
+    let clockCalls = 0;
+    let guardCalls = 0;
+    let guardCallsAtAbort = 0;
+    const guard = (): void => {
+      guardCalls += 1;
+    };
+    const factory = createNativeHarnessBackend(f.host, {
+      deterministicRunner: det.runner,
+      now: () => {
+        clockCalls += 1;
+        if (clockCalls === 3) {
+          guardCallsAtAbort = guardCalls;
+          abort.abort();
+        }
+        return Date.now();
+      },
+    });
+    const result = await factory.prepare(durableRequest(f, det.runner, {
+      signal: abort.signal,
+      guard,
+    }), contextFor(f));
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    expect(clockCalls).toBe(3);
+    expect(guardCallsAtAbort).toBeGreaterThan(1);
+    expect(guardCalls).toBe(guardCallsAtAbort);
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toMatch(/aborted/);
+    const diagnostics = factory.inspect();
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]!.retainedForInspection).toBe(true);
+    expect(det.requests).toHaveLength(0);
+  });
+
+  test("abort inside the execute clock callback is observed before Controller.execute", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const abort = new AbortController();
+    let abortOnNow = false;
+    const factory = createNativeHarnessBackend(f.host, {
+      deterministicRunner: det.runner,
+      now: () => {
+        if (abortOnNow) abort.abort();
+        return Date.now();
+      },
+    });
+    const { backend } = await prepareBackend(factory, f, durableRequest(f, det.runner, { signal: abort.signal }));
+    const runId = await requiredRunId(backend);
+    let executeCalls = 0;
+    const originalExecute = HarnessController.prototype.execute;
+    const patchedExecute = async function (
+      this: HarnessController,
+      ...args: Parameters<HarnessController["execute"]>
+    ): Promise<Awaited<ReturnType<HarnessController["execute"]>>> {
+      executeCalls += 1;
+      return originalExecute.apply(this, args);
+    };
+    HarnessController.prototype.execute = patchedExecute;
+    try {
+      abortOnNow = true;
+      await expect(backend.execute(runId)).rejects.toThrow(/aborted/);
+    } finally {
+      HarnessController.prototype.execute = originalExecute;
+    }
+    expect(executeCalls).toBe(0);
+    expect(det.requests.length).toBe(0);
+  });
+
+  test("abort inside the worker final-gate clock callback blocks underlying dispatch", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const abort = new AbortController();
+    let abortOnNow = false;
+    const factory = createNativeHarnessBackend(f.host, {
+      deterministicRunner: det.runner,
+      now: () => {
+        if (abortOnNow) {
+          abortOnNow = false;
+          abort.abort();
+        }
+        return Date.now();
+      },
+    });
+    const { backend } = await prepareBackend(factory, f, durableRequest(f, det.runner, { signal: abort.signal }));
+    const runId = await requiredRunId(backend);
+    let getCalls = 0;
+    await withGetSpy((record) => {
+      getCalls += 1;
+      // The second backend get is the final record reread. Arm the next clock
+      // callback, which is the fresh gate immediately before underlying.run.
+      if (getCalls === 2) abortOnNow = true;
+      return record;
+    }, async () => {
+      try {
+        await backend.execute(runId);
+      } catch {
+        // The final gate refuses dispatch; Controller accounting may settle.
+      }
+    });
+    expect(getCalls).toBeGreaterThanOrEqual(2);
+    expect(det.requests.length).toBe(0);
+  });
+
+  test("closed prepare guard is not reused and source I/O consumes the original window", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const admittedAt = Date.now() - 1_000;
+    let guardCalls = 0;
+    let closed = false;
+    const guard = (): void => {
+      guardCalls += 1;
+      if (closed) throw new Error("prepare guard is closed");
+    };
+    const clock = { now: admittedAt };
+    const factory = createNativeHarnessBackend(f.host, {
+      deterministicRunner: det.runner,
+      now: () => clock.now,
+    });
+    const { backend } = await prepareBackend(factory, f, durableRequest(f, det.runner, {
+      admittedAt,
+      maxDurationMs: 120_000,
+      guard,
+    }));
+    const callsAfterPrepare = guardCalls;
+    expect(callsAfterPrepare).toBeGreaterThan(0);
+    closed = true;
+    clock.now = admittedAt + 100_000;
+    const runId = await requiredRunId(backend);
+    expect(guardCalls).toBe(callsAfterPrepare);
+    const record = await readRecord(factory.inspect().at(-1)!.storeRoot!, runId);
+    expect(record.config.maxDurationMs).toBeLessThanOrEqual(20_000);
+    expect(record.config.stageTimeoutMs).toBeLessThanOrEqual(record.config.maxDurationMs);
+    const executed = await backend.execute(runId) as { status?: unknown };
+    expect(executed.status).toBe("completed");
+    expect(guardCalls).toBe(callsAfterPrepare);
+    const dispatched = det.requests.length;
+    expect(dispatched).toBeGreaterThan(0);
+    clock.now = admittedAt + 120_000;
+    await expect(backend.execute(runId)).rejects.toThrow(/deadline/);
+    expect(det.requests.length).toBe(dispatched);
   });
 });

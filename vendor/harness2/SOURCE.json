@@ -12,7 +12,7 @@
     "distributionPath": "relative to the omp-agent package root",
     "upstreamPath": "relative to the upstream repository root"
   },
-  "sourceId": "f7c8fd263d52abe2a4f0e75a48e7a9f3aebf4f9f27ed3045bf200add0bb567fa",
+  "sourceId": "5415f078b33c22f1360e0e56125a0dc0b0784dd27fe1778ca7d3412a1bb36e50",
   "sourceIdAlgorithm": "sha256 over UTF-8 canonical JSON with object keys sorted recursively, arrays in stored order, and no insignificant whitespace, of {schemaVersion, upstreamRepository, baseCommit, files:[{distributionPath, bundledSha256}]}; files are every distributed content file except vendor/harness2/SOURCE.json, sorted by distributionPath; SOURCE.json is excluded to avoid self-referential metadata hashing.",
   "license": {
     "upstreamLicensePath": "LICENSE",
@@ -107,10 +107,10 @@
       "upstreamPath": "src/controller.ts",
       "kind": "upstream-source",
       "originalSha256": "711967e2e61220953e00412dbfcf3dac623202f0cd01d9e1fcfd002113582d92",
-      "bundledSha256": "3151027dbb8e782347b25d636837fa1c1ef9bbd0d7e1b9bb3d0e5b62cce29f7f",
-      "bytes": 35925,
+      "bundledSha256": "339089bcd5e259a5352283d84fac986d4a8790bef7ad2843e98fa4f0fdc33f32",
+      "bytes": 37557,
       "modified": true,
-      "note": "Strict optional-property adaptation: approval uses an explicit undefined union; undefined evolution execution, worker auth and missing lesson properties are omitted or deleted. Existing default consumers read equivalent values and JSON serialization is unchanged; own-property reflection is observably different and is not promised equivalent for custom consumers."
+      "note": "Strict optional-property adaptation: approval uses an explicit undefined union; undefined evolution execution, worker auth and missing lesson properties are omitted or deleted. Existing default consumers read equivalent values and JSON serialization is unchanged; own-property reflection is observably different and is not promised equivalent for custom consumers. Adds an inline create() third parameter limited to one own-data recoverySeedText string of at most 4096 UTF-8 bytes; it is read once before the first await and forwarded only to createWithRecoveryOrigin, while two-argument creation remains the unchanged unmarked store.create path."
     },
     {
       "distributionPath": "vendor/harness2/upstream/src/conversation.ts",

@@ -4,13 +4,14 @@ import { mkdir, mkdtemp, readFile, rm, stat, unlink, writeFile } from "node:fs/p
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { decodeRunRecoveryOriginText } from "../../vendor/harness2/index.ts";
+import { HarnessController } from "../../vendor/harness2/upstream/src/controller.ts";
 import {
   RunStore,
   StoreConflictError,
   StoreCorruptionError,
   readRegular,
 } from "../../vendor/harness2/upstream/src/store.ts";
-import type { RunRecord, RunRecoveryOrigin, RunRecoverySeed } from "../../vendor/harness2/upstream/src/types.ts";
+import type { RunConfig, RunRecord, RunRecoveryOrigin, RunRecoverySeed } from "../../vendor/harness2/upstream/src/types.ts";
 
 const RUN_ID = "run-recovery-fixture-1";
 const ADMITTED_AT = Date.UTC(2026, 0, 1, 0, 0, 0);
@@ -34,6 +35,27 @@ async function makeStore(): Promise<{ root: string; store: RunStore }> {
   const root = await mkdtemp(path.join(tmpdir(), "omp-recovery-origin-"));
   tempRoots.push(root);
   return { root, store: new RunStore(path.join(root, "runs")) };
+}
+
+const CONTROLLER_OPTIONS: Partial<RunConfig> & { model: string } = {
+  model: "fixture/model",
+  maxCostUsd: 0.5,
+  maxDurationMs: 60_000,
+};
+
+async function makeController(): Promise<{ root: string; controller: HarnessController }> {
+  const base = await mkdtemp(path.join(tmpdir(), "omp-recovery-origin-controller-"));
+  tempRoots.push(base);
+  const workspace = path.join(base, "workspace");
+  const storeRoot = path.join(base, "store");
+  await mkdir(workspace, { recursive: true });
+  return { root: storeRoot, controller: new HarnessController({ workspace, storeRoot }) };
+}
+
+function liveSeed(overrides: Partial<RunRecoverySeed> = {}): { text: string; value: RunRecoverySeed } {
+  const admittedAt = Date.now() - 60_000;
+  const value = seed({ admittedAt, deadlineAt: admittedAt + 300_000, ...overrides });
+  return { text: JSON.stringify(value), value };
 }
 
 function seed(overrides: Partial<RunRecoverySeed> = {}): RunRecoverySeed {
@@ -628,6 +650,165 @@ describe("creation-bound recovery origin storage", () => {
     const fileMode = (await stat(primaryPath(root))).mode & 0o777;
     expect(directoryMode).toBe(0o700);
     expect(fileMode).toBe(0o600);
+  });
+});
+
+describe("controller initial origin passthrough", () => {
+  test("keeps a two-argument create unmarked with the original initial record", async () => {
+    const { root, controller } = await makeController();
+    const task = "controller legacy task";
+    const created = await controller.create(task, CONTROLLER_OPTIONS);
+
+    expect(created.revision).toBe(0);
+    expect(created.schemaVersion).toBe(1);
+    expect(created.task).toBe(task);
+    expect(created.workspace).toBe(controller.workspace);
+    expect(created.status).toBe("queued");
+    expect(created.stages).toEqual({});
+    expect(created.libraryEntries).toEqual([]);
+    expect(created.snapshot).toBeUndefined();
+    expect(created.winner).toBeUndefined();
+    expect(created.evolution).toBeUndefined();
+    expect(created.baseHarness.schemaVersion).toBe(1);
+    expect(created.baseHarness.skills).toEqual([]);
+    expect(created.config).toEqual({
+      mode: "product",
+      strategy: "auto",
+      model: "fixture/model",
+      improverModel: "fixture/model",
+      maxCostUsd: 0.5,
+      maxDurationMs: 60_000,
+      stageTimeoutMs: 60_000,
+      domain: "project",
+      ompCommand: "omp",
+    });
+    expect(Object.hasOwn(created, "recoveryOrigin")).toBe(false);
+
+    const parsed = JSON.parse(await readText(primaryPath(root, created.id))) as Record<string, unknown>;
+    expect(Object.hasOwn(parsed, "recoveryOrigin")).toBe(false);
+    expect(parsed.task).toBe(task);
+    expect(parsed.revision).toBe(0);
+    expect(await controller.list()).toEqual([created]);
+    expect(await controller.get(created.id)).toEqual(created);
+  });
+
+  test("passes one owned seed into the single marked initial record", async () => {
+    const { root, controller } = await makeController();
+    const task = "controller marked task";
+    const live = liveSeed();
+    const created = await controller.create(task, CONTROLLER_OPTIONS, { recoverySeedText: live.text });
+
+    const origin = created.recoveryOrigin;
+    if (origin === undefined) throw new Error("controller creation did not record an origin");
+    expect(created.revision).toBe(0);
+    expect(created.task).toBe(task);
+    expect(origin.runId).toBe(created.id);
+    expect(origin.createdAt).toBe(created.createdAt);
+    expect(origin.seed).toEqual(JSON.parse(live.text) as RunRecoverySeed);
+    expect(origin.seed).toEqual(live.value);
+    expect(origin.recordIdentitySha256).toBe(recordIdentity(created));
+    expect(Object.isFrozen(origin)).toBe(true);
+    expect(Object.isFrozen(origin.seed)).toBe(true);
+
+    const records = await controller.list();
+    expect(records).toHaveLength(1);
+    expect(records[0]?.id).toBe(created.id);
+    expect(records[0]?.recoveryOrigin).toEqual(origin);
+    expect(await controller.store.list()).toHaveLength(1);
+
+    const parsed = JSON.parse(await readText(primaryPath(root, created.id))) as {
+      recoveryOrigin?: RunRecoveryOrigin;
+    };
+    expect(parsed.recoveryOrigin).toEqual(origin);
+    expect(await controller.get(created.id)).toEqual(created);
+  });
+
+  test("rejects invalid creations and seeds without falling back to an unmarked create", async () => {
+    const { controller } = await makeController();
+    const good = liveSeed();
+    const expiredAt = Date.now() - 600_000;
+    const getter = Object.defineProperty({}, "recoverySeedText", { get: () => good.text });
+    const inherited = Object.create({ recoverySeedText: good.text }) as Record<string, unknown>;
+    const cases: Array<[string, unknown]> = [
+      ["array", []],
+      ["null", null],
+      ["string", good.text],
+      ["empty object", {}],
+      ["extra field", { recoverySeedText: good.text, extra: true }],
+      ["missing field", { recoveryText: good.text }],
+      ["non-string field", { recoverySeedText: 1 }],
+      ["undefined field", { recoverySeedText: undefined }],
+      ["accessor field", getter],
+      ["inherited field", inherited],
+      ["oversize ascii", { recoverySeedText: "x".repeat(4097) }],
+      ["oversize multibyte", { recoverySeedText: "\u00e9".repeat(2049) }],
+      ["malformed seed", { recoverySeedText: "not json" }],
+      ["null seed", { recoverySeedText: "null" }],
+      ["wrong schema", { recoverySeedText: seedText((value) => { value.schema = "omp-agent.native-harness-recovery-seed.v2"; }) }],
+      ["wrong profile", { recoverySeedText: seedText((value) => { value.profile = "native-auto-scoped-files.v2"; }) }],
+      ["wrong budget", { recoverySeedText: liveSeed({ allocatedCostUsd: 0.4 }).text }],
+      [
+        "expired window",
+        { recoverySeedText: JSON.stringify(seed({ admittedAt: expiredAt, deadlineAt: expiredAt + 300_000 })) },
+      ],
+    ];
+    for (const [label, creation] of cases) {
+      let error: Error | undefined;
+      try {
+        await controller.create("rejected creation", CONTROLLER_OPTIONS, creation as never);
+      } catch (caught) {
+        if (!(caught instanceof Error)) throw new Error(`${label}: non-Error rejection`);
+        error = caught;
+      }
+      if (error === undefined) throw new Error(`${label}: creation unexpectedly succeeded`);
+      if (label.startsWith("oversize")) expect(error).toBeInstanceOf(RangeError);
+      else expect(error).toBeInstanceOf(Error);
+    }
+    expect(await controller.list()).toHaveLength(0);
+    expect(await controller.store.list()).toHaveLength(0);
+  });
+
+  test("reads the seed once before the first await", async () => {
+    const { controller } = await makeController();
+    const original = liveSeed();
+    const replacement = liveSeed({ inputManifestSha256: SHA("d") });
+    const creation: { recoverySeedText: string } = { recoverySeedText: original.text };
+
+    const pending = controller.create("controller mutation task", CONTROLLER_OPTIONS, creation);
+    creation.recoverySeedText = replacement.text;
+    const created = await pending;
+
+    expect(created.recoveryOrigin?.seed).toEqual(original.value);
+    expect(created.recoveryOrigin?.seed).not.toEqual(replacement.value);
+  });
+
+  test("keeps the controller-created origin through a legal save and rejects identity tampering", async () => {
+    const { controller } = await makeController();
+    const task = "controller save task";
+    const created = await controller.create(task, CONTROLLER_OPTIONS, { recoverySeedText: liveSeed().text });
+    const initial = await controller.store.get(created.id);
+    if (initial === undefined) throw new Error("fixture run missing");
+
+    const progressed = await controller.store.save({ ...initial, status: "running" }, 0);
+    expect(progressed.revision).toBe(1);
+    expect(progressed.status).toBe("running");
+    expect(progressed.createdAt).toBe(initial.createdAt);
+    expect(progressed.task).toBe(task);
+    expect(progressed.config).toEqual(initial.config);
+    expect(progressed.recoveryOrigin).toEqual(initial.recoveryOrigin);
+    expect(JSON.stringify(progressed.recoveryOrigin)).toBe(JSON.stringify(initial.recoveryOrigin));
+
+    const createdAtError = await rejection(controller.store.save({
+      ...structuredClone(progressed),
+      createdAt: new Date(Date.parse(progressed.createdAt) + 1).toISOString(),
+    }, 1));
+    expect(createdAtError.message).toContain("recovery origin createdAt");
+
+    const configError = await rejection(controller.store.save({
+      ...structuredClone(progressed),
+      config: { ...progressed.config, maxCostUsd: 0.4 },
+    }, 1));
+    expect(configError.message).toContain("recovery origin record identity");
   });
 });
 

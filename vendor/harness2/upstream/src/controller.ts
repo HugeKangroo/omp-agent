@@ -32,6 +32,25 @@ const DEFAULTS: Omit<RunConfig, "model" | "improverModel"> = {
   domain: "project", ompCommand: "omp",
 };
 
+interface RecoveryCreation { readonly recoverySeedText: string }
+
+function ownedRecoverySeedText(creation: RecoveryCreation | undefined): string | undefined {
+  if (creation === undefined) return undefined;
+  const value: unknown = creation;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) throw new Error("Recovery creation must be a plain object");
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) throw new Error("Recovery creation must be a plain object");
+  if (Object.getOwnPropertySymbols(value).length !== 0) throw new Error("Recovery creation must not have symbol properties");
+  const names = Object.getOwnPropertyNames(value);
+  if (names.length !== 1 || names[0] !== "recoverySeedText") throw new Error("Recovery creation must have exactly one recoverySeedText field");
+  const descriptor = Object.getOwnPropertyDescriptor(value, "recoverySeedText");
+  if (descriptor === undefined || !("value" in descriptor)) throw new Error("Recovery creation recoverySeedText must be an own data property");
+  const seedText: unknown = descriptor.value;
+  if (typeof seedText !== "string") throw new Error("Recovery creation recoverySeedText must be a string");
+  if (Buffer.byteLength(seedText, "utf8") > 4096) throw new RangeError("Recovery creation recoverySeedText exceeds 4096 UTF-8 bytes");
+  return seedText;
+}
+
 function configOf(value: Partial<RunConfig> & { model: string }): RunConfig {
   const config: RunConfig = { ...DEFAULTS, ...value, strategy: value.strategy ?? (value.mode === "research" ? "legacy" : "auto"), improverModel: value.improverModel ?? value.model,
     stageTimeoutMs: value.stageTimeoutMs ?? Math.min(DEFAULTS.stageTimeoutMs, value.maxDurationMs ?? DEFAULTS.maxDurationMs) };
@@ -76,8 +95,9 @@ export class HarnessController {
     this.runner = options.runner ?? new OmpRpcRunner();
   }
 
-  async create(task: string, options: Partial<RunConfig> & { model: string }): Promise<RunRecord> {
+  async create(task: string, options: Partial<RunConfig> & { model: string }, creation?: RecoveryCreation): Promise<RunRecord> {
     if (!task.trim() || task.length > 50_000 || task.includes("\0")) throw new Error("Task must contain 1–50,000 characters");
+    const recoverySeedText = ownedRecoverySeedText(creation);
     if (options.strategy === "adaptive" && !options.execution) {
       const source = path.join(this.storeRoot, "runtime-policy.json");
       const raw = await readRegular(source);
@@ -89,11 +109,12 @@ export class HarnessController {
     const entries = config.adaptation?.reuse === false ? [] : (await this.library.list(config.domain, config.model)).slice(-12);
     let frontier = config.strategy === "adaptive" && config.adaptation?.capabilities !== "fixed" ? await this.capabilities.search("", config.execution?.tools ?? ["read_file", "list_files", "write_file"]) : [];
     if (config.adaptation?.reuse === false) frontier = (await Promise.all(frontier.map(async ref => ({ref, builtin:(await this.capabilities.inspect(ref)).version.tags.includes("builtin")})))).filter(x=>x.builtin).map(x=>x.ref);
-    return this.store.create({
+    const record: RunRecord = {
       schemaVersion: config.strategy === "adaptive" ? 2 : 1, id: randomUUID(), revision: 0, createdAt: now, updatedAt: now,
       ...(config.strategy === "adaptive" ? { evolution: newEvolution(task, frontier) } : {}),
       workspace: this.workspace, task, config, status: "queued", baseHarness: baseHarness(), libraryEntries: entries, stages: {},
-    });
+    };
+    return recoverySeedText === undefined ? this.store.create(record) : this.store.createWithRecoveryOrigin(record, recoverySeedText);
   }
 
   get(id: string): Promise<RunRecord | undefined> { return this.store.get(id); }

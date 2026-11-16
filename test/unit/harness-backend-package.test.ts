@@ -27,7 +27,7 @@ const VENDOR_ROOT = path.join(REPO_ROOT, "vendor/harness2");
 const SOURCE_MANIFEST = path.join(VENDOR_ROOT, "SOURCE.json");
 const UPSTREAM_REPOSITORY = "https://github.com/HugeKangroo/omp-harness2";
 const UPSTREAM_BASE_COMMIT = "6d5cd6386c8a085d0070cfb660ddbc5c7f76b92e";
-const EXPECTED_SOURCE_ID = "f7c8fd263d52abe2a4f0e75a48e7a9f3aebf4f9f27ed3045bf200add0bb567fa";
+const EXPECTED_SOURCE_ID = "5415f078b33c22f1360e0e56125a0dc0b0784dd27fe1778ca7d3412a1bb36e50";
 const UPSTREAM_MODULES = [
   "adaptation.ts",
   "approval-channel.ts",
