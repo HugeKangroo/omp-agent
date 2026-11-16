@@ -1,13 +1,17 @@
 #!/usr/bin/env bun
 // Bounded local RPC fixture for Runner lifecycle tests. It has no provider,
 // network, tool execution, shell or arbitrary process-launch behavior.
-import { writeFileSync } from "node:fs";
+import { appendFileSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 
 const executable = process.argv[1] ?? "";
 const modeMatch = /harness-lifecycle-worker-([a-z0-9-]+)\.mjs$/.exec(basename(executable));
 const mode = modeMatch ? modeMatch[1] : "normal";
 writeFileSync(`${executable}.started`, String(process.pid), { mode: 0o600 });
+if (mode === "durable") {
+  appendFileSync(`${executable}.started-pids`, `${process.pid}\n`, { mode: 0o600 });
+  setTimeout(() => process.exit(124), 15_000).unref?.();
+}
 
 const args = process.argv.slice(2);
 const modelArgument = args[args.indexOf("--model") + 1] ?? "openai/lifecycle-fixture";
@@ -18,8 +22,28 @@ const modelId = separator > 0 ? modelArgument.slice(separator + 1) : modelArgume
 const send = (frame) => { process.stdout.write(JSON.stringify(frame) + "\n"); };
 const respond = (frame, data = {}) => send({ type: "response", id: frame.id, success: true, command: frame.type, data });
 
+const DURABLE_PLAN = JSON.stringify({
+  decision: "direct",
+  reason: "Bounded durable fixture planning.",
+  criteria: [{ id: "task", description: "Fulfill the requested bounded task.", kind: "requirement" }],
+  routes: [],
+});
+const DURABLE_SELECT = JSON.stringify({
+  assessments: [{
+    candidate: "A",
+    criteria: [{ criterionId: "task", verdict: "met", evidence: "Bounded durable fixture result." }],
+    strengths: [],
+    weaknesses: [],
+  }],
+  winner: "A",
+  reason: "Bounded durable fixture selection.",
+  limitations: ["Bounded fixture execution is not semantic acceptance."],
+});
+const DURABLE_SOLVER = "durable fixture result";
+
 let tools = [];
 let promptSeen = false;
+let lastText = "lifecycle fixture result";
 const handle = (line, rawLine) => {
   const frame = JSON.parse(line);
   if (frame.type === "negotiate_protocol" || frame.type === "set_auto_retry"
@@ -37,16 +61,23 @@ const handle = (line, rawLine) => {
   if (frame.type === "get_session_stats") {
     return send({
       type: "response", id: frame.id, success: true, command: "get_session_stats",
-      data: { cost: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
+      data: mode === "durable"
+        ? { cost: 0.01, tokens: { input: 2, output: 3, cacheRead: 0, cacheWrite: 0 } }
+        : { cost: 0, tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
     });
   }
   if (frame.type === "get_last_assistant_text") {
-    return send({ type: "response", id: frame.id, success: true, command: "get_last_assistant_text", data: { text: "lifecycle fixture result" } });
+    return send({ type: "response", id: frame.id, success: true, command: "get_last_assistant_text", data: { text: lastText } });
   }
   if (frame.type === "prompt") {
     if (promptSeen) return undefined;
     promptSeen = true;
     writeFileSync(`${executable}.prompt`, rawLine, { mode: 0o600 });
+    if (mode === "durable") {
+      if (rawLine.includes("Decide how much exploration")) lastText = DURABLE_PLAN;
+      else if (rawLine.includes("Review every anonymous candidate")) lastText = DURABLE_SELECT;
+      else lastText = DURABLE_SOLVER;
+    }
     if (mode === "approval-delay") send({ type: "extension_ui_request", id: "approval-1", method: "confirm", title: "fixture approval", message: "fixture", options: [] });
     if (mode === "no-complete") return undefined;
     if (mode === "prompt-fail") return send({ type: "prompt_result", id: "h2-prompt", status: "error", error: { message: "synthetic prompt failure" } });

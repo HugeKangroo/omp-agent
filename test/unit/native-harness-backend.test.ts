@@ -32,6 +32,7 @@ import {
 } from "../../src/native-harness-delegation.ts";
 import type { NativeContext } from "../../src/native-entry.ts";
 import { NATIVE_HARNESS_RECOVERY_SOURCE_FILE } from "../../src/native-harness-recovery-source.ts";
+import { nodeFileIo } from "../../src/native-work.ts";
 import { HarnessController, type Runner, type WorkerRequest, type WorkerResult } from "../../vendor/harness2/index.ts";
 
 const PLAN_RESPONSE = JSON.stringify({
@@ -1402,8 +1403,22 @@ describe("R2-A2b2c durable backend source and initial origin wiring", () => {
       allocatedCostUsd: 1,
     });
     const executed = await backend.execute(runId) as { status?: unknown };
-    expect(executed.status).toBe("completed");
-    expect(readNativeHarnessBackendCompletion(backend).ok).toBe(true);
+    // The deterministic Runner ignores the private bridge. Its dispatch stays
+    // an intended/unacknowledged row and no accepted completion is issued.
+    expect(executed.status).toBe("failed");
+    expect(det.requests).toHaveLength(1);
+    const inventory = JSON.parse(await readFile(
+      path.join(diagnostic.storeRoot!, "runs", runId, "dispatch-inventory.json"),
+      "utf8",
+    )) as Record<string, any>;
+    expect(inventory.dispatches).toHaveLength(1);
+    expect(inventory.dispatches[0].state).toBe("intended");
+    expect(inventory.dispatches[0].launch).toBeUndefined();
+    expect(inventory.dispatches[0].process).toBeUndefined();
+    expect(inventory.dispatches[0].prompt).toBeUndefined();
+    expect(inventory.dispatches[0].cleanup).toBeUndefined();
+    expect(inventory.dispatches[0].terminal).toBeUndefined();
+    expect(readNativeHarnessBackendCompletion(backend).ok).toBe(false);
   });
 
   test("durable create is one attempt across reentrant and post-success calls", async () => {
@@ -1485,6 +1500,320 @@ describe("R2-A2b2c durable backend source and initial origin wiring", () => {
     });
     expect(det.requests.length).toBe(0);
     expect(await backend.get!(runId)).not.toBeNull();
+  });
+
+  test("retained request mutation after intent cannot change the owned forwarded payload", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    let retained: WorkerRequest | null = null;
+    let retainedExtensions: WorkerRequest["generatedExtensions"] = undefined;
+    let originalPrompt = "";
+    let originalHarnessCanonical = "";
+    let armed = false;
+    let mutated = false;
+    const factory = createNativeHarnessBackend(f.host, {
+      deterministicRunner: det.runner,
+      mutateWorkerRequest(request) {
+        retained = request;
+        request.generatedExtensions = [];
+        retainedExtensions = request.generatedExtensions;
+        originalPrompt = request.prompt;
+        originalHarnessCanonical = JSON.stringify(request.harness);
+      },
+      now: () => {
+        if (armed && !mutated && retained !== null) {
+          mutated = true;
+          retained.prompt = "mutated retained prompt";
+          retainedExtensions!.push({} as never);
+          try {
+            (retained.harness as { promptAppend: string }).promptAppend = "mutated nested harness";
+          } catch {
+            // A frozen original harness is replaced below to model a changed
+            // retained reference; the owned copy must not follow either.
+          }
+          retained.harness = Object.freeze({
+            ...retained.harness,
+            promptAppend: "replaced retained harness",
+          });
+        }
+        return Date.now();
+      },
+      dispatchInventoryTestOptions: {
+        testAfterPrimaryWrite(event) {
+          if (event.revision >= 1) armed = true;
+        },
+      },
+    });
+    const { backend } = await prepareBackend(factory, f, durableRequest(f, det.runner));
+    const runId = await requiredRunId(backend);
+    try {
+      await backend.execute(runId);
+    } catch {
+      // The deterministic Runner ignores the private bridge; dispatch remains
+      // intended and the Controller may settle the run as failed.
+    }
+    expect(mutated).toBe(true);
+    expect(retained).not.toBeNull();
+    expect(retained!.prompt).toBe("mutated retained prompt");
+    expect(retainedExtensions).toHaveLength(1);
+    expect(det.requests).toHaveLength(1);
+    expect(det.requests[0]!.prompt).toBe(originalPrompt);
+    expect(JSON.stringify(det.requests[0]!.harness)).toBe(originalHarnessCanonical);
+    expect(det.requests[0]!.harness).not.toBe(retained!.harness);
+    expect(det.requests[0]!.generatedExtensions).toEqual([]);
+    expect(det.requests[0]!.generatedExtensions).not.toBe(retainedExtensions);
+    expect(Object.isFrozen(det.requests[0]!.generatedExtensions)).toBe(true);
+    expect(Object.isFrozen(det.requests[0]!)).toBe(true);
+  });
+
+  test("post-copy original model, ompCommand and execution mutation cannot evade host checks", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const retained: { value: WorkerRequest | null } = { value: null };
+    const factory = createNativeHarnessBackend(f.host, {
+      deterministicRunner: det.runner,
+      mutateWorkerRequest(request) {
+        retained.value = request;
+      },
+      beforeBaseInputCheck() {
+        const request = retained.value;
+        if (request === null) throw new Error("worker request was not retained");
+        // These mutations happen after the owned copy and its first gate. They
+        // must not change the payload that is actually checked or forwarded.
+        request.model = "other/model";
+        request.ompCommand = "/usr/bin/other-omp";
+        request.execution = {
+          kind: "omp-native",
+          tools: ["read"],
+          approvalMode: "yolo",
+          approval: {},
+          source: "test",
+        };
+      },
+    });
+    const { backend } = await prepareBackend(factory, f, durableRequest(f, det.runner));
+    const runId = await requiredRunId(backend);
+    try {
+      await backend.execute(runId);
+    } catch {
+      // The deterministic Runner ignores the private bridge; the assertion is
+      // the exact owned payload actually forwarded.
+    }
+    expect(det.requests).toHaveLength(1);
+    expect(det.requests[0]!.model).toBe(f.host.model);
+    expect(det.requests[0]!.ompCommand).toBe(f.host.ompCommand);
+    expect(det.requests[0]!.execution).toBeUndefined();
+    expect(retained.value!.model).toBe("other/model");
+    expect(retained.value!.ompCommand).toBe("/usr/bin/other-omp");
+    expect(retained.value!.execution).toBeDefined();
+  });
+
+  test("held cleanup write settles before close while new retained-port writes refuse", async () => {
+    const f = await fixture();
+    const writeHeld = deferred<void>();
+    const releaseWrite = deferred<void>();
+    let armed = false;
+    let held = false;
+    const fileIo = {
+      ...nodeFileIo,
+      async lstat(target: string, options: { bigint: true }) {
+        const result = await nodeFileIo.lstat(target, options);
+        if (armed && !held) {
+          held = true;
+          writeHeld.resolve(undefined);
+          await releaseWrite.promise;
+        }
+        return result;
+      },
+    };
+    let retainedBridge: {
+      checkpoint(event: unknown, assertPersistable: () => void): Promise<void>;
+    } | null = null;
+    let retainedRunId = "";
+    let retainedStage = "";
+    let assertionCalls = 0;
+    const runner: Runner = {
+      async run(request: WorkerRequest): Promise<WorkerResult> {
+        const bridge = (request as unknown as {
+          nativeHarnessLifecycle?: { checkpoint(event: unknown, assert: () => void): Promise<void> };
+        }).nativeHarnessLifecycle;
+        if (bridge === undefined) throw new Error("private lifecycle bridge is missing");
+        retainedBridge = bridge;
+        retainedRunId = request.runId;
+        retainedStage = request.stage;
+        const cleanup = {
+          type: "cleanupObserved",
+          runId: request.runId,
+          stage: request.stage,
+          spawnAttempted: false,
+          closeSeen: false,
+          closeCode: null,
+          closeSignal: null,
+          groupObservation: "unknown",
+          groupObservedAt: null,
+          hostWorkSettled: true,
+          approvalWorkSettled: true,
+          logFlush: "success",
+        };
+        // Start, but do not await, the already-started cleanup operation. The
+        // file-I/O seam holds it before the inventory write lock, so original
+        // execution can end independently and closeRequested can latch.
+        armed = true;
+        void bridge.checkpoint(cleanup, () => {
+          assertionCalls += 1;
+        }).catch(() => undefined);
+        await mkdir(request.artifactDir, { recursive: true, mode: 0o700 });
+        const eventsPath = path.join(request.artifactDir, "worker-events.jsonl");
+        await writeFile(eventsPath, "{}\n", { mode: 0o600 });
+        return {
+          text: "not a bounded plan response",
+          usage: { inputTokens: 1, outputTokens: 1, costUsd: 0.01 },
+          startedAt: new Date().toISOString(),
+          endedAt: new Date().toISOString(),
+          eventsPath,
+          status: "completed",
+        };
+      },
+    };
+    const factory = createNativeHarnessBackend(f.host, {
+      deterministicRunner: runner,
+      dispatchInventoryTestOptions: { fileIo },
+    });
+    const { backend } = await prepareBackend(factory, f, durableRequest(f, runner));
+    const runId = await requiredRunId(backend);
+    const diagnostic = factory.inspect().at(-1)!;
+    const inventoryPath = path.join(diagnostic.storeRoot!, "runs", runId, "dispatch-inventory.json");
+    const execution = backend.execute(runId);
+    void execution.catch(() => undefined);
+
+    // Probe an unsupported event: before close it refuses on event type, and
+    // after execution end the NEW-entry guard refuses before any storage call.
+    const probe = () => ({ type: "unsupported", runId: retainedRunId, stage: retainedStage });
+    let released = false;
+    const releaseHeld = (): void => {
+      if (released) return;
+      released = true;
+      releaseWrite.resolve(undefined);
+    };
+    try {
+      // Do not outlive an early original settlement while waiting for the
+      // held cleanup write; the finally below releases and observes it anyway.
+      await settle(Promise.race([
+        writeHeld.promise,
+        execution.then(() => undefined, () => undefined),
+      ]), 5000);
+      const until = Date.now() + 2000;
+      let closeObserved = false;
+      while (Date.now() < until) {
+        try {
+          await retainedBridge!.checkpoint(probe(), () => undefined);
+          throw new Error("unsupported event was unexpectedly accepted");
+        } catch (error) {
+          const message = (error as Error).message;
+          if (message.includes("no longer this run's open handle")) {
+            closeObserved = true;
+            break;
+          }
+          if (!message.includes("event type is not supported")) throw error;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 5));
+      }
+      expect(closeObserved).toBe(true);
+      // A valid-looking new terminal entry must also refuse while the already
+      // started cleanup write is still held.
+      await expect((async () => retainedBridge!.checkpoint({
+        type: "resultObserved",
+        runId: retainedRunId,
+        stage: retainedStage,
+        resultSha256: "0".repeat(64),
+        status: "completed",
+        usage: { inputTokens: 1, outputTokens: 1, costUsd: 0.01 },
+        startedAt: new Date(0).toISOString(),
+        endedAt: new Date(1).toISOString(),
+        usageEstimated: false,
+      }, () => undefined))()).rejects.toThrow(/no longer this run's open handle/);
+      const beforeRelease = JSON.parse(await readFile(inventoryPath, "utf8")) as Record<string, any>;
+      expect(beforeRelease.dispatches[0].state).toBe("intended");
+      expect(beforeRelease.dispatches[0].cleanup).toBeUndefined();
+    } finally {
+      // Always drop the held original operation and observe its real promise
+      // before the test ends, even if an assertion above failed.
+      releaseHeld();
+      await settle(execution, 5000).catch(() => undefined);
+    }
+    expect(assertionCalls).toBeGreaterThanOrEqual(1);
+    const afterRelease = JSON.parse(await readFile(inventoryPath, "utf8")) as Record<string, any>;
+    expect(afterRelease.dispatches[0].cleanup).toBeDefined();
+    await expect((async () => retainedBridge!.checkpoint(probe(), () => undefined))())
+      .rejects.toThrow(/no longer this run's open handle/);
+    const afterRefusal = JSON.parse(await readFile(inventoryPath, "utf8")) as Record<string, any>;
+    expect(afterRefusal.revision).toBe(afterRelease.revision);
+  });
+
+  test("durable worker allocation and artifact path mismatch refuse zero worker calls", async () => {
+    const mutations: ReadonlyArray<{
+      readonly name: string;
+      readonly mutate: (request: WorkerRequest) => void;
+    }> = [
+      {
+        name: "allocation",
+        mutate(request) {
+          request.maxCostUsd = 0.5;
+        },
+      },
+      {
+        name: "artifact path",
+        mutate(request) {
+          request.artifactDir = path.join(path.dirname(request.artifactDir), "other-artifacts");
+        },
+      },
+    ];
+    for (const item of mutations) {
+      const f = await fixture();
+      const det = deterministicRunner();
+      let mutate: ((request: WorkerRequest) => void) | null = null;
+      const factory = createNativeHarnessBackend(f.host, {
+        deterministicRunner: det.runner,
+        mutateWorkerRequest(request) {
+          mutate?.(request);
+        },
+      });
+      const { backend } = await prepareBackend(factory, f, durableRequest(f, det.runner));
+      const runId = await requiredRunId(backend);
+      mutate = item.mutate;
+      try {
+        await backend.execute(runId);
+      } catch {
+        // The durable stage/path binding refuses before underlying dispatch.
+      }
+      expect(det.requests, item.name).toHaveLength(0);
+      expect(await backend.get!(runId), item.name).not.toBeNull();
+    }
+  });
+
+  test("dispatch inventory creation failure keeps the known run id, get and cancel usable", async () => {
+    const f = await fixture();
+    const det = deterministicRunner();
+    const factory = createNativeHarnessBackend(f.host, { deterministicRunner: det.runner });
+    const { backend } = await prepareBackend(factory, f, durableRequest(f, det.runner));
+    const diagnostic = factory.inspect().at(-1)!;
+    let runId = "";
+    await withCreateSpy(async (record) => {
+      await mkdir(path.join(diagnostic.storeRoot!, "runs", record.id, "dispatch-inventory.json"), {
+        recursive: true,
+        mode: 0o700,
+      });
+      return record;
+    }, async () => {
+      runId = await requiredRunId(backend);
+    });
+    expect(runId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    await expect(backend.execute(runId)).rejects.toThrow(/inventory creation failed/);
+    expect(det.requests).toHaveLength(0);
+    expect(await backend.get!(runId)).not.toBeNull();
+    const cancelled = await backend.cancel(runId) as { readonly requested?: unknown };
+    expect(cancelled.requested).toBe(true);
+    expect(readNativeHarnessBackendCompletion(backend).ok).toBe(false);
   });
 
   test("abort immediately after fulfilled create keeps the known ID and blocks execute", async () => {
@@ -1887,12 +2216,14 @@ describe("R2-A2b2c durable backend source and initial origin wiring", () => {
     expect(record.config.maxDurationMs).toBeLessThanOrEqual(20_000);
     expect(record.config.stageTimeoutMs).toBeLessThanOrEqual(record.config.maxDurationMs);
     const executed = await backend.execute(runId) as { status?: unknown };
-    expect(executed.status).toBe("completed");
+    // The run was created with a ~20s inner duration at a synthetic clock
+    // already ~99s beyond its real createdAt. The durable dispatch gate must
+    // refuse before the underlying Runner adds a dispatch.
+    expect(executed.status).toBe("failed");
     expect(guardCalls).toBe(callsAfterPrepare);
-    const dispatched = det.requests.length;
-    expect(dispatched).toBeGreaterThan(0);
+    expect(det.requests).toHaveLength(0);
     clock.now = admittedAt + 120_000;
     await expect(backend.execute(runId)).rejects.toThrow(/deadline/);
-    expect(det.requests.length).toBe(dispatched);
+    expect(det.requests).toHaveLength(0);
   });
 });

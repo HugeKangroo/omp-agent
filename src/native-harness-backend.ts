@@ -17,6 +17,19 @@ import {
 import type { NativeHarnessAccountingPrepared } from "./native-harness-accounting.ts";
 import type { NativeContext } from "./native-entry.ts";
 import {
+  createNativeHarnessDispatchInventory,
+  type NativeHarnessDispatchInventoryHandle,
+  type NativeHarnessDispatchInventoryTestOptions,
+  type NativeHarnessDispatchIntent,
+  type NativeHarnessDispatchTerminal,
+} from "./native-harness-dispatch-inventory.ts";
+import type {
+  StageRecord,
+  WorkerLifecycleCleanupObservedEvent,
+  WorkerLifecycleEvent,
+  WorkerLifecycleResultObservedEvent,
+} from "../vendor/harness2/upstream/src/types.ts";
+import {
   NATIVE_HARNESS_COMPLETION_LIMITATIONS,
   NATIVE_HARNESS_COMPLETION_LIMITS,
   NATIVE_HARNESS_COMPLETION_ORIGIN,
@@ -52,6 +65,7 @@ import {
   NATIVE_HARNESS_MAX_DURATION_MS,
   NATIVE_HARNESS_MAX_PER_RUN_USD,
   NATIVE_HARNESS_MAX_TASK_BYTES,
+  canonicalWorkerResultSha256,
   type NativeHarnessAssociation,
   type NativeHarnessBackend,
   type NativeHarnessPrepareAccounting,
@@ -159,6 +173,8 @@ export interface NativeHarnessBackendTestOptions {
   }) => void | Promise<void>;
   /** Mutates the Controller-built worker request before any gate check. */
   readonly mutateWorkerRequest?: (request: WorkerRequest) => void;
+  /** Test-only inventory read/write observation seams; production omits this. */
+  readonly dispatchInventoryTestOptions?: NativeHarnessDispatchInventoryTestOptions;
 }
 
 interface NormalizedTestOptions {
@@ -169,6 +185,7 @@ interface NormalizedTestOptions {
     readonly snapshotRoot: string;
   }) => void | Promise<void>) | null;
   readonly mutateWorkerRequest: ((request: WorkerRequest) => void) | null;
+  readonly dispatchInventoryTestOptions: NativeHarnessDispatchInventoryTestOptions | null;
 }
 
 interface RetainedRecord {
@@ -196,6 +213,25 @@ interface DurableBackendState {
   createAttempted: boolean;
   origin: RunRecoveryOrigin | null;
   executionRefusal: string | null;
+  inventory: NativeHarnessDispatchInventoryHandle | null;
+  inventoryClosed: boolean;
+  closeRequested: boolean;
+  readonly inventoryPending: Set<Promise<unknown>>;
+  completionRows: readonly { readonly state: string; readonly ordinal: number }[] | null;
+}
+
+/** Plugin-private request bridge; consumed by this plugin's coordinator, never a model input. */
+export const NATIVE_HARNESS_LIFECYCLE_FIELD = "nativeHarnessLifecycle" as const;
+
+export interface NativeHarnessLifecycleBridge {
+  readonly innerDeadlineAt: number;
+  readonly assertAdvanceCurrent: () => void;
+  readonly checkpoint: (event: WorkerLifecycleEvent, assertPersistable: () => void) => Promise<void>;
+}
+
+interface DurableDispatchAcknowledgement {
+  cleanup: WorkerLifecycleCleanupObservedEvent | null;
+  terminal: WorkerLifecycleResultObservedEvent | null;
 }
 
 interface BackendState {
@@ -497,11 +533,12 @@ function readTestOptions(value: unknown): NormalizedTestOptions {
       now: null,
       beforeBaseInputCheck: null,
       mutateWorkerRequest: null,
+      dispatchInventoryTestOptions: null,
     };
   }
   const fields = readStrictFields(
     value,
-    ["deterministicRunner", "now", "beforeBaseInputCheck", "mutateWorkerRequest"],
+    ["deterministicRunner", "now", "beforeBaseInputCheck", "mutateWorkerRequest", "dispatchInventoryTestOptions"],
     [],
   );
   if (fields === null) throw new Error("test options must be an exact plain object");
@@ -521,6 +558,9 @@ function readTestOptions(value: unknown): NormalizedTestOptions {
     mutateWorkerRequest: mutateValue === undefined
       ? null
       : mutateValue as (request: WorkerRequest) => void,
+    dispatchInventoryTestOptions: fields.get("dispatchInventoryTestOptions") === undefined
+      ? null
+      : fields.get("dispatchInventoryTestOptions") as NativeHarnessDispatchInventoryTestOptions,
   };
 }
 
@@ -964,6 +1004,22 @@ function sameRecoveryOrigin(left: RunRecoveryOrigin, right: RunRecoveryOrigin): 
     && left.createdAt === right.createdAt
     && left.recordIdentitySha256 === right.recordIdentitySha256
     && sameOriginSeed(left.seed, right.seed);
+}
+
+/** Same sorted-key recursive encoding as the original Runner's result digest. */
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const source = value as Record<string, unknown>;
+    return `{${Object.keys(source).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(source[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) as string;
+}
+
+function readOwnValue(value: unknown, key: string): unknown {
+  const own = readOwnData(value, key);
+  if (!own.present || !own.readable) throw new Error(`actual dispatch fact ${key} is unreadable`);
+  return own.value;
 }
 
 function durableDeadlineExpired(durable: DurableBackendState, current: number): boolean {
@@ -1494,6 +1550,472 @@ function settleCompletionWitness(
   }
 }
 
+interface FrozenDispatchTuple {
+  readonly stage: string;
+  readonly attempt: number;
+  readonly cwd: string;
+  readonly artifactDir: string;
+  readonly runRevision: number;
+  readonly stageAllocatedCostUsd: number;
+  readonly parentStage: unknown;
+  readonly parentArtifactHash: unknown;
+}
+
+function sameDispatchTuple(record: RunRecord, tuple: FrozenDispatchTuple, request: WorkerRequest): void {
+  if (readOwnValue(record, "revision") !== tuple.runRevision) {
+    throw new Error("durable dispatch run revision changed after inventory association");
+  }
+  const stages = readOwnValue(record, "stages");
+  const stage = readOwnValue(stages, tuple.stage);
+  if (readOwnValue(stage, "id") !== tuple.stage
+    || readOwnValue(stage, "status") !== "running"
+    || readOwnValue(stage, "attempt") !== tuple.attempt
+    || readOwnValue(stage, "cwd") !== tuple.cwd
+    || readOwnValue(stage, "reservedCostUsd") !== tuple.stageAllocatedCostUsd
+    || (readOwnData(stage, "parentStage").value ?? null) !== tuple.parentStage
+    || (readOwnData(stage, "parentArtifactHash").value ?? null) !== tuple.parentArtifactHash) {
+    throw new Error("durable dispatch stage facts changed after inventory association");
+  }
+  if (request.cwd !== tuple.cwd
+    || path.resolve(request.artifactDir) !== tuple.artifactDir
+    || request.maxCostUsd !== tuple.stageAllocatedCostUsd) {
+    throw new Error("durable worker request facts changed after inventory association");
+  }
+}
+
+function assertSameDigestInputs(
+  request: WorkerRequest,
+  facts: {
+    readonly role: unknown;
+    readonly model: unknown;
+    readonly prompt: unknown;
+    readonly harnessCanonical: string;
+    readonly timeoutMs: unknown;
+    readonly maxCostUsd: unknown;
+  },
+): void {
+  if (readOwnValue(request, "role") !== facts.role
+    || readOwnValue(request, "model") !== facts.model
+    || readOwnValue(request, "prompt") !== facts.prompt
+    || readOwnValue(request, "timeoutMs") !== facts.timeoutMs
+    || readOwnValue(request, "maxCostUsd") !== facts.maxCostUsd
+    || canonicalJson(readOwnValue(request, "harness")) !== facts.harnessCanonical) {
+    throw new Error("durable worker request digest inputs changed after inventory association");
+  }
+}
+
+const MAX_OWNED_REQUEST_FIELDS = 128;
+const MAX_OWNED_HARNESS_DEPTH = 8;
+const MAX_OWNED_HARNESS_NODES = 4096;
+
+function copyBoundedOwnedValue(value: unknown, state: { nodes: number }, depth = 0): unknown {
+  state.nodes += 1;
+  if (state.nodes > MAX_OWNED_HARNESS_NODES || depth > MAX_OWNED_HARNESS_DEPTH) {
+    throw new Error("durable worker harness exceeds the bounded owned copy");
+  }
+  if (Array.isArray(value)) {
+    if (value.length > 256) throw new Error("durable worker harness array exceeds the bounded owned copy");
+    const items: unknown[] = [];
+    for (let index = 0; index < value.length; index += 1) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+      if (descriptor === undefined || !("value" in descriptor)) {
+        throw new Error("durable worker harness array contains an accessor or hole");
+      }
+      items.push(copyBoundedOwnedValue(descriptor.value, state, depth + 1));
+    }
+    return Object.freeze(items);
+  }
+  if (value !== null && typeof value === "object") {
+    if (Object.getOwnPropertySymbols(value).length !== 0) {
+      throw new Error("durable worker harness contains symbol properties");
+    }
+    const keys = Object.getOwnPropertyNames(value);
+    if (keys.length > 64) throw new Error("durable worker harness object exceeds the bounded owned copy");
+    const copy: Record<string, unknown> = {};
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !("value" in descriptor)) {
+        throw new Error("durable worker harness contains an accessor property");
+      }
+      copy[key] = copyBoundedOwnedValue(descriptor.value, state, depth + 1);
+    }
+    return Object.freeze(copy);
+  }
+  return value;
+}
+
+/**
+ * Owns the exact payload the durable gate later dispatches. The original
+ * Controller request can be mutated by a host clock before the coordinator's
+ * shallow copy; allocating this copy before any later callback makes the
+ * digest and the forwarded bytes the same owned values. The nested harness,
+ * bounded auth data and an admitted empty generated-extension list are
+ * deep-copied without invoking accessors and frozen; signal, host handlers and
+ * other actual host references stay by reference.
+ */
+function copyOwnedDispatchRequest(request: WorkerRequest): WorkerRequest {
+  if (!isRecord(request)) throw new Error("durable worker request is not an object");
+  const prototype = Object.getPrototypeOf(request);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new Error("durable worker request uses an unsupported prototype");
+  }
+  const keys = Reflect.ownKeys(request);
+  if (keys.length > MAX_OWNED_REQUEST_FIELDS || keys.some((key) => typeof key !== "string")) {
+    throw new Error("durable worker request contains unsupported or excessive fields");
+  }
+  const copy: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+  for (const key of keys as string[]) {
+    const descriptor = Object.getOwnPropertyDescriptor(request, key);
+    if (descriptor === undefined || !("value" in descriptor)) {
+      throw new Error("durable worker request contains an accessor property");
+    }
+    Object.defineProperty(copy, key, {
+      value: descriptor.value,
+      enumerable: true,
+      writable: true,
+      configurable: true,
+    });
+  }
+  const ownedHarness = copyBoundedOwnedValue(readOwnValue(request, "harness"), { nodes: 0 });
+  Object.defineProperty(copy, "harness", {
+    value: ownedHarness,
+    enumerable: true,
+    writable: false,
+    configurable: false,
+  });
+  const authDescriptor = Object.getOwnPropertyDescriptor(copy, "auth");
+  if (authDescriptor !== undefined) {
+    // Auth is bounded own data (kind/agentDir). Keep the same values and
+    // optional presence while preventing later retained-object mutation;
+    // signal and host handler references remain the actual originals.
+    Object.defineProperty(copy, "auth", {
+      value: copyBoundedOwnedValue(authDescriptor.value, { nodes: 0 }),
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
+  }
+  const extensionDescriptor = Object.getOwnPropertyDescriptor(copy, "generatedExtensions");
+  if (extensionDescriptor !== undefined) {
+    // Only the admitted empty list is owned; absent/undefined presence is
+    // preserved and an originally invalid or nonempty value is left for the
+    // existing host gate to refuse before dispatch.
+    const extensions = extensionDescriptor.value;
+    Object.defineProperty(copy, "generatedExtensions", {
+      value: Array.isArray(extensions) && extensions.length === 0
+        ? copyBoundedOwnedValue(extensions, { nodes: 0 })
+        : extensions,
+      enumerable: true,
+      writable: false,
+      configurable: false,
+    });
+  }
+  return copy as unknown as WorkerRequest;
+}
+
+async function createDurableDispatchBridge(
+  expected: GateExpectation,
+  request: WorkerRequest,
+  checkedRecord: RunRecord,
+  finalRecord: RunRecord,
+  checkedInputs: readonly NativeHarnessCheckedBaseInput[],
+  controller: HarnessController,
+): Promise<{ readonly bridge: NativeHarnessLifecycleBridge; readonly acknowledgement: DurableDispatchAcknowledgement }> {
+  const durable = expected.durable;
+  if (durable === null) throw new Error("durable dispatch binding requires durable preparation");
+  const durableState = expected.state;
+  const now = expected.options.now ?? Date.now;
+  const inventory = durable.inventory;
+  if (inventory === null || durable.inventoryClosed) {
+    throw new Error("durable dispatch inventory is unavailable");
+  }
+  if (durable.origin === null) throw new Error("durable run has no accepted initial recovery origin");
+  if (durable.executionRefusal !== null) {
+    throw new Error("durable run execution was refused after creation");
+  }
+  if (durableState.runId === null || durableState.runId !== request.runId) {
+    throw new Error("durable worker request does not name the actual created run");
+  }
+
+  const stages = readOwnValue(finalRecord, "stages");
+  const stageRecord = readOwnValue(stages, request.stage) as StageRecord;
+  const stageId = readOwnValue(stageRecord, "id");
+  const stageStatus = readOwnValue(stageRecord, "status");
+  const attempt = readOwnValue(stageRecord, "attempt");
+  const stageCwd = readOwnValue(stageRecord, "cwd");
+  const reservedCostUsd = readOwnValue(stageRecord, "reservedCostUsd");
+  if (stageId !== request.stage
+    || stageStatus !== "running"
+    || typeof stageCwd !== "string"
+    || stageCwd !== request.cwd
+    || !isPositiveSafeInteger(attempt)) {
+    throw new Error("actual durable StageRecord does not match the worker dispatch");
+  }
+  if (typeof reservedCostUsd !== "number"
+    || !Number.isFinite(reservedCostUsd)
+    || reservedCostUsd <= 0
+    || reservedCostUsd !== request.maxCostUsd) {
+    throw new Error("actual StageRecord reservation does not match the worker allocation");
+  }
+  const artifactDir = path.resolve(request.artifactDir);
+  if (artifactDir !== path.join(path.dirname(path.resolve(stageCwd)), "artifacts")) {
+    throw new Error("worker artifactDir is not the constrained sibling of the actual stage attempt");
+  }
+  const runRevision = readOwnValue(finalRecord, "revision");
+  if (!Number.isSafeInteger(runRevision) || (runRevision as number) < 0) {
+    throw new Error("actual RunRecord revision is unreadable");
+  }
+  const runCreatedAt = readOwnValue(finalRecord, "createdAt");
+  const runConfig = readOwnValue(finalRecord, "config");
+  const maxDurationMs = readOwnValue(runConfig, "maxDurationMs");
+  if (typeof maxDurationMs !== "number" || !Number.isFinite(maxDurationMs) || maxDurationMs <= 0) {
+    throw new Error("actual RunRecord duration facts are unreadable");
+  }
+  if (typeof runCreatedAt !== "string") throw new Error("actual RunRecord createdAt is unreadable");
+  const innerDeadlineAt = Date.parse(runCreatedAt) + maxDurationMs;
+  if (!Number.isSafeInteger(innerDeadlineAt) || innerDeadlineAt < 1) {
+    throw new Error("actual inner execution deadline is unreadable");
+  }
+  const executionDeadlineAt = Math.min(innerDeadlineAt, durable.deadlineAt);
+  const checkedSnapshot = readOwnValue(checkedRecord, "snapshot");
+  const checkedBase = copyWitnessBase({
+    snapshotId: readOwnValue(checkedSnapshot, "id"),
+    root: readOwnValue(checkedSnapshot, "root"),
+    sourceRoot: readOwnValue(checkedSnapshot, "sourceRoot"),
+    createdAt: readOwnValue(checkedSnapshot, "createdAt"),
+    checked: checkedInputs,
+    inputs: expected.descriptor.inputManifest,
+    manifestSha256: expected.descriptor.manifestSha256,
+  });
+  if (checkedBase === null) {
+    throw new Error("actually checked base snapshot facts could not be copied");
+  }
+  if (!snapshotMatchesWitnessBase(readOwnValue(finalRecord, "snapshot"), checkedBase)) {
+    throw new Error("final run record snapshot does not match the actually checked base snapshot");
+  }
+  const snapshotSha256 = sha256Hex(canonicalJson(checkedBase));
+  const role = readOwnValue(request, "role");
+  const model = readOwnValue(request, "model");
+  const prompt = readOwnValue(request, "prompt");
+  const timeoutMs = readOwnValue(request, "timeoutMs");
+  const maxCostUsd = readOwnValue(request, "maxCostUsd");
+  if (typeof prompt !== "string" || typeof timeoutMs !== "number" || typeof maxCostUsd !== "number") {
+    throw new Error("durable worker request digest inputs are unreadable");
+  }
+  const harnessCanonical = canonicalJson(readOwnValue(request, "harness"));
+  const parentStage = readOwnData(stageRecord, "parentStage").value ?? null;
+  const parentArtifactHash = readOwnData(stageRecord, "parentArtifactHash").value ?? null;
+  const digestFacts = Object.freeze({ role, model, prompt, harnessCanonical, timeoutMs, maxCostUsd });
+  const intentSha256 = sha256Hex(canonicalJson({
+    runId: request.runId,
+    runRevision,
+    stage: request.stage,
+    role,
+    attempt,
+    cwd: stageCwd,
+    artifactDir,
+    model,
+    maxCostUsd,
+    timeoutMs,
+    promptSha256: sha256Hex(prompt),
+    harnessSha256: sha256Hex(harnessCanonical),
+    parentStage,
+    parentArtifactHash,
+    innerDeadlineAt,
+    outerDeadlineAt: durable.deadlineAt,
+  }));
+  const tuple: FrozenDispatchTuple = Object.freeze({
+    stage: request.stage,
+    attempt: attempt as number,
+    cwd: stageCwd,
+    artifactDir,
+    runRevision: runRevision as number,
+    stageAllocatedCostUsd: reservedCostUsd,
+    parentStage,
+    parentArtifactHash,
+  });
+  const ordinal = inventory.snapshot().dispatches.length + 1;
+  const nonce = randomUUID();
+  const advanceGuard = (): void => {
+    // Callback-rich clocks first. A clock may abort the signal or reenter; all
+    // intrinsic signal reads and pure local facts follow them.
+    const current = readNow(now);
+    if (current >= executionDeadlineAt) {
+      throw new Error("the actual inner or outer execution deadline expired");
+    }
+    if (durableDeadlineExpired(durable, current)) {
+      throw new Error("the admitted delegation deadline expired");
+    }
+    const durableAborted = signalAborted(durable.signal);
+    if (durableAborted === null) throw new Error("durable backend original signal is unreadable");
+    if (durableAborted) throw new Error("durable backend original signal is aborted");
+    const workerAborted = signalAborted(request.signal);
+    if (workerAborted === null) throw new Error("durable worker signal is unreadable");
+    if (workerAborted) throw new Error("durable worker signal is aborted");
+    if (durableState.durable !== durable) throw new Error("durable backend state is not this preparation");
+    if (durable.inventory !== inventory || durable.inventoryClosed) {
+      throw new Error("durable dispatch inventory is no longer this run's open handle");
+    }
+    if (durable.executionRefusal !== null) throw new Error(durable.executionRefusal);
+  };
+
+  advanceGuard();
+  const intent: NativeHarnessDispatchIntent = Object.freeze({
+    ordinal,
+    nonce,
+    stage: request.stage,
+    attempt: attempt as number,
+    runRevision: runRevision as number,
+    cwd: stageCwd,
+    artifactDir,
+    intentSha256,
+    snapshotSha256,
+    innerDeadlineAt,
+    requestTimeoutMs: request.timeoutMs,
+    stageAllocatedCostUsd: reservedCostUsd,
+  });
+  await inventory.intend(intent, advanceGuard);
+  advanceGuard();
+  // Recheck the exact same actual tuple after the inventory effect; never bind
+  // a later attempt or a changed revision to the already appended intent.
+  const reread = await verifyRunRecord(controller, request.runId, expected);
+  sameDispatchTuple(reread, tuple, request);
+  assertSameDigestInputs(request, digestFacts);
+  if (!snapshotMatchesWitnessBase(readOwnValue(reread, "snapshot"), checkedBase)) {
+    throw new Error("post-intent run record snapshot does not match the actually checked base snapshot");
+  }
+  advanceGuard();
+
+  const acknowledgement: DurableDispatchAcknowledgement = { cleanup: null, terminal: null };
+  const checkpoint = (event: WorkerLifecycleEvent, assertPersistable: () => void): Promise<void> => {
+    if (durable.inventory !== inventory || durable.inventoryClosed || durable.closeRequested) {
+      throw new Error("durable dispatch inventory is no longer this run's open handle");
+    }
+    if (event.runId !== request.runId || event.stage !== request.stage) {
+      throw new Error("worker lifecycle event does not match the bound dispatch");
+    }
+    const advance = (): void => {
+      // Original backend binding/currentness first; the Runner-supplied
+      // per-operation assertion is last. Only pure local facts follow it.
+      advanceGuard();
+      assertPersistable();
+      if (durable.inventory !== inventory || durable.inventoryClosed) {
+        throw new Error("durable dispatch inventory is no longer this run's open handle");
+      }
+      if (durable.executionRefusal !== null) throw new Error(durable.executionRefusal);
+    };
+    const cleanup = (): void => {
+      // Already-started cleanup/result persistence is owned by the original
+      // per-operation assertion. closeRequested only closes NEW checkpoints at
+      // execution end; it is not execution authority over this operation.
+      if (durable.inventory !== inventory || durable.inventoryClosed) {
+        throw new Error("durable dispatch inventory is no longer this run's open handle");
+      }
+      assertPersistable();
+      if (durable.inventory !== inventory || durable.inventoryClosed) {
+        throw new Error("durable dispatch inventory is no longer this run's open handle");
+      }
+    };
+    let operation: Promise<unknown>;
+    switch (event.type) {
+      case "preLaunch":
+        operation = inventory.markLaunched(ordinal, nonce, Object.freeze({
+          runtimeRoot: event.runtimeRoot,
+          configSha256: event.configSha256,
+          appendixSha256: event.appendixSha256,
+          effectiveTimeoutMs: event.timeoutMs,
+        }), advance);
+        break;
+      case "processBound":
+        if (event.pid === null || event.pgid === null) {
+          throw new Error("the original Runner reported no actual process identity");
+        }
+        operation = inventory.bindProcess(ordinal, nonce, Object.freeze({
+          pid: event.pid,
+          pgid: event.pgid,
+          identitySha256: event.associationSha256,
+        }), advance);
+        break;
+      case "prePrompt":
+        operation = inventory.markPromptPending(ordinal, nonce, Object.freeze({
+          promptSha256: event.promptSha256,
+          promptBytes: event.promptBytes,
+          effectiveTimeoutMs: event.timeoutMs,
+        }), advance);
+        break;
+      case "cleanupObserved":
+        operation = inventory.markCleanupObserved(ordinal, nonce, Object.freeze({
+          observationKind: "runner-observation" as const,
+          observation: event,
+        }), cleanup);
+        break;
+      case "resultObserved": {
+        const observedAt = Date.parse(event.endedAt);
+        if (!Number.isSafeInteger(observedAt) || observedAt < 0) {
+          throw new Error("worker result endedAt is not a bounded timestamp");
+        }
+        const terminal: NativeHarnessDispatchTerminal = Object.freeze({
+          outcome: event.status === "timed_out" ? "timed-out" : event.status,
+          observationKind: "runner-observation" as const,
+          observedAt,
+          resultSha256: event.resultSha256,
+          usageCostUsd: event.usage.costUsd,
+          usageEstimated: event.usageEstimated,
+        });
+        operation = inventory.finalize(ordinal, nonce, terminal, cleanup);
+        break;
+      }
+      default:
+        throw new Error("worker lifecycle event type is not supported");
+    }
+    const tracked = Promise.resolve(operation).then((value) => {
+      if (event.type === "cleanupObserved") acknowledgement.cleanup = event;
+      else if (event.type === "resultObserved") acknowledgement.terminal = event;
+      return value;
+    });
+    durable.inventoryPending.add(tracked);
+    const forget = (): void => { durable.inventoryPending.delete(tracked); };
+    void tracked.then(forget, forget);
+    return tracked.then(() => undefined);
+  };
+
+  return Object.freeze({
+    bridge: Object.freeze({
+      innerDeadlineAt,
+      assertAdvanceCurrent: () => { advanceGuard(); },
+      checkpoint,
+    }),
+    acknowledgement,
+  });
+}
+
+function durableResultConsistency(
+  acknowledgement: DurableDispatchAcknowledgement,
+  result: WorkerResult,
+): string | null {
+  try {
+    const terminal = acknowledgement.terminal;
+    if (terminal === null) return "durable dispatch has no acknowledged terminal observation";
+    if (acknowledgement.cleanup === null) return "durable dispatch has no acknowledged cleanup observation";
+    const usage = readOwnValue(result, "usage");
+    if (terminal.status !== readOwnValue(result, "status")
+      || terminal.usage.inputTokens !== readOwnValue(usage, "inputTokens")
+      || terminal.usage.outputTokens !== readOwnValue(usage, "outputTokens")
+      || terminal.usage.costUsd !== readOwnValue(usage, "costUsd")
+      || terminal.startedAt !== readOwnValue(result, "startedAt")
+      || terminal.endedAt !== readOwnValue(result, "endedAt")
+      || terminal.usageEstimated !== (readOwnData(result, "usageEstimated").value === true)) {
+      return "durable terminal fields do not match the returned WorkerResult";
+    }
+    if (terminal.resultSha256 !== canonicalWorkerResultSha256(result)) {
+      return "durable terminal digest does not match the returned WorkerResult";
+    }
+    return null;
+  } catch {
+    return "returned WorkerResult or durable terminal observation is unreadable";
+  }
+}
+
 function createBaseInputGateRunner(
   underlying: Runner,
   expected: GateExpectation,
@@ -1503,35 +2025,52 @@ function createBaseInputGateRunner(
       const controller = expected.state.controller;
       if (controller === null) throw new Error("actual Harness2 controller is unavailable");
       expected.options.mutateWorkerRequest?.(request);
-      assertWorkerRequest(request, expected);
-      await verifyRequestPaths(request, expected);
-      let record = await verifyRunRecord(controller, request.runId, expected);
+      // Own the exact durable dispatch payload immediately after the
+      // synchronous test seam and before any await. Every gate, path/record
+      // read, snapshot, digest and forwarded call uses this same object; a
+      // retained original cannot change model/ompCommand/execution/prompt/
+      // harness after this point. Legacy requests keep their original object.
+      const dispatchRequest = expected.durable === null
+        ? request
+        : copyOwnedDispatchRequest(request);
+      assertWorkerRequest(dispatchRequest, expected);
+      await verifyRequestPaths(dispatchRequest, expected);
+      let record = await verifyRunRecord(controller, dispatchRequest.runId, expected);
       if (expected.options.beforeBaseInputCheck !== null) {
         const snapshotRoot = record.snapshot?.root;
         if (snapshotRoot === undefined) throw new Error("actual Harness2 base snapshot is missing");
         await expected.options.beforeBaseInputCheck(Object.freeze({
-          runId: request.runId,
+          runId: dispatchRequest.runId,
           snapshotRoot,
         }));
-        record = await verifyRunRecord(controller, request.runId, expected);
+        record = await verifyRunRecord(controller, dispatchRequest.runId, expected);
       }
       if (expected.durable !== null) {
         const durable = expected.durable;
         if (durable.executionRefusal !== null) {
           throw new Error("durable run execution was refused after creation");
         }
-        if (expected.state.runId === null || expected.state.runId !== request.runId) {
+        if (expected.state.runId === null || expected.state.runId !== dispatchRequest.runId) {
           throw new Error("durable worker request does not name the actual created run");
         }
-        const workerAborted = signalAborted(request.signal);
+        const workerAborted = signalAborted(dispatchRequest.signal);
         if (workerAborted === null) throw new Error("durable worker signal is missing or unreadable");
         if (workerAborted) throw new Error("durable worker signal is aborted");
-        const guard = durableLocalGuard(expected.state, durable, expected.options.now ?? Date.now, request.signal);
-        await verifyNativeHarnessRecoverySource(durable.source, guard, request.signal as AbortSignal);
+        const guard = durableLocalGuard(
+          expected.state,
+          durable,
+          expected.options.now ?? Date.now,
+          dispatchRequest.signal,
+        );
+        await verifyNativeHarnessRecoverySource(
+          durable.source,
+          guard,
+          dispatchRequest.signal as AbortSignal,
+        );
         // Re-read the pure request/path checks after the asynchronous source
         // observation. The final record reread below follows the snapshot read.
-        assertWorkerRequest(request, expected);
-        await verifyRequestPaths(request, expected);
+        assertWorkerRequest(dispatchRequest, expected);
+        await verifyRequestPaths(dispatchRequest, expected);
       }
       const hostManifest = assertManifestPaths(record, expected);
       const checkedInputs: NativeHarnessCheckedBaseInput[] = [];
@@ -1541,18 +2080,19 @@ function createBaseInputGateRunner(
       // observation. A refusal here stops only worker dispatch; the Controller
       // may still settle its own private run record. No provider dispatch or
       // original-source write follows a refused gate.
-      const finalRecord = await verifyRunRecord(controller, request.runId, expected);
+      const finalRecord = await verifyRunRecord(controller, dispatchRequest.runId, expected);
       // The later reread is not byte-checked. Its snapshot must match the facts
       // actually checked above before the dispatch witness can support output.
       // A mismatch makes completion origin unavailable; it never refuses the
       // existing worker call or changes Controller accounting.
       const witnessIndex = reserveCompletionWitness(
         expected,
-        request,
+        dispatchRequest,
         checkedRecord,
         finalRecord,
         checkedInputs,
       );
+      let durableDispatch: DurableDispatchAcknowledgement | null = null;
       if (expected.durable !== null) {
         // Fresh final gate after every asynchronous source/path/record check
         // and the synchronous witness copy. No earlier gate is carried across
@@ -1562,15 +2102,47 @@ function createBaseInputGateRunner(
           expected.state,
           expected.durable,
           expected.options.now ?? Date.now,
-          request.signal,
+          dispatchRequest.signal,
         )();
+        if (
+          Object.getOwnPropertyDescriptor(dispatchRequest, "lifecycle") !== undefined
+          || Object.getOwnPropertyDescriptor(dispatchRequest, NATIVE_HARNESS_LIFECYCLE_FIELD) !== undefined
+        ) {
+          throw new Error("durable worker request already contains an ambiguous lifecycle bridge");
+        }
+        const binding = await createDurableDispatchBridge(
+          expected,
+          dispatchRequest,
+          checkedRecord,
+          finalRecord,
+          checkedInputs,
+          controller,
+        );
+        durableDispatch = binding.acknowledgement;
+        Object.defineProperty(dispatchRequest, NATIVE_HARNESS_LIFECYCLE_FIELD, {
+          value: binding.bridge,
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+        // The owned top-level fields and nested harness are frozen before the
+        // actual Runner invocation. The coordinator still copies the request
+        // and may only narrow timeoutMs/signal on its own copy.
+        Object.freeze(dispatchRequest);
       }
       let result: WorkerResult;
       try {
-        result = await underlying.run(request);
+        result = await underlying.run(dispatchRequest);
       } catch (error) {
         settleCompletionWitness(expected, witnessIndex, null, true);
         throw error;
+      }
+      if (durableDispatch !== null) {
+        const problem = durableResultConsistency(durableDispatch, result);
+        if (problem !== null) {
+          settleCompletionWitness(expected, witnessIndex, null, true);
+          throw new Error(problem);
+        }
       }
       settleCompletionWitness(expected, witnessIndex, result, false);
       return result;
@@ -1958,6 +2530,7 @@ function makeBackend(
   host: NativeHarnessBackendHostConfig,
   budget: PrepareBudget,
   now: () => number,
+  testOptions: NormalizedTestOptions,
 ): NativeHarnessBackend & { inspect(): NativeHarnessBackendDiagnostic } {
   const requireController = (): HarnessController => {
     if (state.controller === null) throw new Error("actual Harness2 controller is unavailable");
@@ -2052,6 +2625,24 @@ function makeBackend(
             );
           }
         }
+        if (durable.origin !== null && durable.executionRefusal === null) {
+          let handle: NativeHarnessDispatchInventoryHandle | null = null;
+          try {
+            const guard = durableLocalGuard(state, durable, now);
+            guard();
+            handle = await createNativeHarnessDispatchInventory(
+              { storeRoot: controller.store.root, runId: createdId },
+              testOptions.dispatchInventoryTestOptions ?? undefined,
+            );
+            guard();
+            durable.inventory = handle;
+          } catch (error) {
+            if (handle !== null && durable.inventory !== handle) handle.close();
+            durable.executionRefusal = boundedReason(
+              `durable dispatch inventory creation failed: ${boundedReason(error)}`,
+            );
+          }
+        }
         return { runId: createdId };
       }
       const current = readNow(now);
@@ -2101,14 +2692,53 @@ function makeBackend(
         }
         assertDurableSignal(state.durable);
       }
-      const record = await controller.execute(runId);
+      let record: RunRecord;
+      try {
+        record = await controller.execute(runId);
+      } finally {
+        const durable = state.durable;
+        if (durable !== null && durable.inventory !== null && !durable.inventoryClosed) {
+          // No new lifecycle write may start once original execution ended.
+          // Already-started operations may settle before the close.
+          durable.closeRequested = true;
+          // Runner rejection is not proof that its checkpoint work settled.
+          // Keep each original operation and close only after actual settlement.
+          while (durable.inventoryPending.size > 0) {
+            await Promise.allSettled([...durable.inventoryPending]);
+          }
+          durable.completionRows = durable.inventory.snapshot().dispatches.map((row) => ({
+            state: row.state,
+            ordinal: row.ordinal,
+          }));
+          durable.inventory.close();
+          durable.inventoryClosed = true;
+        }
+      }
       state.status = record.status;
       state.record.backendStatus = record.status;
       state.record.retainedForInspection = true;
-      // Observe this fulfilled execute before returning the existing status.
-      // A projection failure never changes the result or hides the
-      // Controller's settled accounting.
-      observeNativeHarnessCompletion(state, record, host);
+      // A completed durable run is accepted only when every bound dispatch has
+      // its own acknowledged terminal. Passing a port is not consumption; a
+      // Runner that ignored the bridge leaves intended rows and no witness.
+      const durable = state.durable;
+      if (durable !== null && record.status === "completed") {
+        const rows = durable.completionRows;
+        const unresolved = rows?.find((row) => row.state !== "terminal");
+        if (rows === null || rows.length === 0 || unresolved !== undefined) {
+          failCompletion(
+            state.completion,
+            rows === null
+              ? "durable dispatch inventory is unavailable for completion"
+              : rows.length === 0
+                ? "durable run completed without a bound dispatch"
+                : `durable dispatch ${unresolved!.ordinal} lifecycle is ${unresolved!.state}`,
+          );
+        } else {
+          observeNativeHarnessCompletion(state, record, host);
+        }
+      } else {
+        observeNativeHarnessCompletion(state, record, host);
+      }
       return { status: record.status };
     },
     async cancel(runId: string): Promise<unknown> {
@@ -2312,6 +2942,11 @@ export function createNativeHarnessBackend(
           createAttempted: false,
           origin: null,
           executionRefusal: null,
+          inventory: null,
+          inventoryClosed: false,
+          closeRequested: false,
+          inventoryPending: new Set(),
+          completionRows: null,
         };
       } catch (error) {
         const reason = `recovery source preparation failed: ${boundedReason(error)}`;
@@ -2368,7 +3003,7 @@ export function createNativeHarnessBackend(
     try {
       return {
         ok: true,
-        backend: makeBackend(state, host, request.budget, now),
+        backend: makeBackend(state, host, request.budget, now, options),
         ...(durable === null ? {} : { accountingPrepared: durable.accountingPrepared }),
       };
     } catch (error) {

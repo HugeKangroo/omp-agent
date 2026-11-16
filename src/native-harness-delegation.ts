@@ -97,6 +97,12 @@ import type {
   WorkerRequest,
   WorkerResult,
 } from "../vendor/harness2/index.ts";
+import type {
+  Usage,
+  WorkerLifecycleCleanupObservedEvent,
+  WorkerLifecycleEvent,
+  WorkerLifecycleResultObservedEvent,
+} from "../vendor/harness2/upstream/src/types.ts";
 
 /**
  * Host-only, default-off, one-shot Harness2 delegation coordinator.
@@ -809,6 +815,10 @@ interface Slot {
   workerCount: number;
   workerAllKnownCompleted: boolean;
   workerUnknownUsage: boolean;
+  /** Bounded count of opt-in Runner dispatches whose lifecycle evidence is unresolved. */
+  lifecycleUnknown: number;
+  lifecycleConflict: string | null;
+  lifecycleDispatches: number;
   observedCostUsd: number;
   observedAny: boolean;
   runnerAccountedUsd: number;
@@ -1017,6 +1027,16 @@ function consumeNativePromise(value: unknown): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+/** Observe a possible thenable without invoking its `then`. */
+function isThenable(value: unknown): boolean {
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return false;
+  try {
+    return typeof (value as { readonly then?: unknown }).then === "function";
+  } catch {
+    return true;
   }
 }
 
@@ -1565,10 +1585,17 @@ function readMainContext(state: CoordinatorState): { readonly ok: true; readonly
  * Fresh host reads, then a fresh native prepared check, then its pure check
  * last. No authority callback runs after the pure gate before a caller effect.
  */
+interface WorkerAuthorityContext {
+  readonly innerDeadlineAt: number;
+  readonly signal: AbortSignal;
+  readonly assertBackendCurrent: () => void;
+}
+
 function authorityGate(
   slot: Slot,
   mode: "effect" | "replay",
   contextSink?: (context: NativeContext) => void,
+  worker?: WorkerAuthorityContext,
 ): string | null {
   const state = slotState(slot);
   if (state === null) return "the delegation coordinator state is unavailable";
@@ -1578,9 +1605,19 @@ function authorityGate(
     if (slot.state !== "running") return "the delegation operation is already settled";
     if (slot.cancelRequested) return `the delegation operation was cancelled (${slot.cancelReason ?? "requested"})`;
   }
+  if (worker !== undefined) {
+    try {
+      worker.assertBackendCurrent();
+    } catch (error) {
+      return `original backend execution binding refused: ${boundedReason(error, "unreadable failure")}`;
+    }
+  }
   const firstTime = readClock(state.now);
   if (firstTime === null) return "the delegation clock is unavailable";
   if (firstTime >= slot.deadlineAt) return "the original delegation deadline expired";
+  if (worker !== undefined && firstTime >= worker.innerDeadlineAt) {
+    return "the original inner execution deadline expired";
+  }
   const firstSignal = readActualAbortSignal(slot.invocationSignal);
   if (!firstSignal.ok) return firstSignal.reason;
   if (firstSignal.aborted) return "the original invocation signal was aborted";
@@ -1610,6 +1647,9 @@ function authorityGate(
   const secondTime = readClock(state.now);
   if (secondTime === null) return "the delegation clock is unavailable";
   if (secondTime >= slot.deadlineAt) return "the original delegation deadline expired";
+  if (worker !== undefined && secondTime >= worker.innerDeadlineAt) {
+    return "the original inner execution deadline expired";
+  }
   // The clock is a host callback and may have reentered disposal/cancellation.
   // This local gate has no callbacks and runs after all callback facts.
   if (state.disposed) return "the delegation coordinator was disposed";
@@ -1633,7 +1673,23 @@ function authorityGate(
   } catch (error) {
     return `native call pure revalidation threw: ${boundedReason(error, "unreadable failure")}`;
   }
-  if (raw === null) return null;
+  if (raw === null) {
+    if (worker === undefined) return null;
+    // The original prepared revalidation was the last callback. Only pure
+    // local state and the intrinsic signal getter may run after it.
+    if (state.disposed) return "the delegation coordinator was disposed";
+    if (!state.enabled) return "the delegation coordinator is disabled";
+    if (slot.state !== "running") return "the delegation operation is already settled";
+    if (!slot.executionStarted) return "worker execution has not started";
+    if (slot.dispatchClosed) return "worker dispatch is closed";
+    if (slot.cancelRequested) {
+      return `the delegation operation was cancelled (${slot.cancelReason ?? "requested"})`;
+    }
+    const workerSignal = readActualAbortSignal(worker.signal);
+    if (!workerSignal.ok) return workerSignal.reason;
+    if (workerSignal.aborted) return "the combined worker signal was aborted";
+    return null;
+  }
   if (typeof raw === "string") return boundedReason(raw, "native call pure revalidation refused");
   if (consumeNativePromise(raw)) return "native call pure revalidation returned a promise";
   return "native call pure revalidation returned an invalid result";
@@ -7964,6 +8020,420 @@ function recordDispatchResult(
   }
 }
 
+const NATIVE_HARNESS_LIFECYCLE_FIELD = "nativeHarnessLifecycle";
+
+interface NativeHarnessLifecycleBridge {
+  readonly innerDeadlineAt: number;
+  readonly assertAdvanceCurrent: () => void;
+  readonly checkpoint: (event: WorkerLifecycleEvent, assertPersistable: () => void) => Promise<void>;
+}
+
+interface DispatchLifecycle {
+  readonly bridge: NativeHarnessLifecycleBridge;
+  readonly events: string[];
+  launchSeen: boolean;
+  processSeen: boolean;
+  promptSeen: boolean;
+  cleanup: WorkerLifecycleCleanupObservedEvent | null;
+  result: WorkerLifecycleResultObservedEvent | null;
+  conflict: string | null;
+  active: boolean;
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const source = value as Record<string, unknown>;
+    return `{${Object.keys(source).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(source[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) as string;
+}
+
+/** The original Runner's exact final-result digest encoding over an owned copy. */
+export function canonicalWorkerResultSha256(value: unknown): string {
+  const owned = readOwnedWorkerResult(value);
+  if (owned === null) throw new Error("WorkerResult is not a bounded owned result");
+  return owned.digest;
+}
+
+function ownDataValue(value: unknown, key: string): unknown {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("host lifecycle bridge must be an object");
+  }
+  const descriptor = Object.getOwnPropertyDescriptor(value, key);
+  if (descriptor === undefined || !("value" in descriptor)) {
+    throw new Error(`host lifecycle bridge requires own data property ${key}`);
+  }
+  return descriptor.value;
+}
+
+function readNativeHarnessLifecycle(request: Record<string, unknown>): {
+  readonly bridge: NativeHarnessLifecycleBridge;
+  readonly invokeCurrent: () => void;
+  readonly invokeCheckpoint: (event: WorkerLifecycleEvent, assertPersistable: () => void) => Promise<void>;
+} | null {
+  const descriptor = Object.getOwnPropertyDescriptor(request, NATIVE_HARNESS_LIFECYCLE_FIELD);
+  if (descriptor === undefined) return null;
+  if (!("value" in descriptor)) throw new Error("host lifecycle bridge must be an own data property");
+  if (Object.getOwnPropertyDescriptor(request, "lifecycle") !== undefined) {
+    throw new Error("durable worker request contains both a private bridge and a public lifecycle port");
+  }
+  const value = descriptor.value;
+  if (typeof value !== "object" || value === null || Array.isArray(value) || !Object.isFrozen(value)) {
+    throw new Error("host lifecycle bridge must be a frozen host object");
+  }
+  const names = Object.getOwnPropertyNames(value).sort();
+  const expected = ["assertAdvanceCurrent", "checkpoint", "innerDeadlineAt"];
+  if (names.length !== expected.length || names.some((name, index) => name !== expected[index])) {
+    throw new Error("host lifecycle bridge must contain exactly innerDeadlineAt, assertAdvanceCurrent and checkpoint");
+  }
+  const innerDeadlineAt = ownDataValue(value, "innerDeadlineAt");
+  const current = ownDataValue(value, "assertAdvanceCurrent");
+  const checkpoint = ownDataValue(value, "checkpoint");
+  if (!Number.isSafeInteger(innerDeadlineAt) || (innerDeadlineAt as number) < 1) {
+    throw new Error("host lifecycle bridge innerDeadlineAt is not a positive safe integer");
+  }
+  if (typeof current !== "function" || typeof checkpoint !== "function") {
+    throw new Error("host lifecycle bridge callbacks must be functions");
+  }
+  if (Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new Error("host lifecycle bridge must not contain symbol properties");
+  }
+  const bridge: NativeHarnessLifecycleBridge = Object.freeze({
+    innerDeadlineAt: innerDeadlineAt as number,
+    assertAdvanceCurrent: () => {
+      const returned: unknown = Reflect.apply(current, value, []);
+      if (consumeNativePromise(returned)) {
+        throw new Error("host lifecycle assertAdvanceCurrent must be synchronous and must not return a Promise");
+      }
+      if (isThenable(returned)) {
+        throw new Error("host lifecycle assertAdvanceCurrent must be synchronous and must not return a thenable");
+      }
+      if (returned !== undefined) {
+        throw new Error("host lifecycle assertAdvanceCurrent must return void");
+      }
+    },
+    checkpoint: (event: WorkerLifecycleEvent, assertPersistable: () => void) =>
+      Reflect.apply(checkpoint, value, [event, assertPersistable]) as Promise<void>,
+  });
+  delete request[NATIVE_HARNESS_LIFECYCLE_FIELD];
+  return {
+    bridge,
+    invokeCurrent: bridge.assertAdvanceCurrent,
+    invokeCheckpoint: bridge.checkpoint,
+  };
+}
+
+function readOwnedLifecycleEvent(value: unknown): WorkerLifecycleEvent {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("worker lifecycle event must be an object");
+  }
+  if (Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new Error("worker lifecycle event must not contain symbol properties");
+  }
+  const descriptors = new Map<string, PropertyDescriptor>();
+  for (const key of Object.getOwnPropertyNames(value)) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key);
+    if (descriptor === undefined || !("value" in descriptor)) {
+      throw new Error("worker lifecycle event must contain only own data properties");
+    }
+    descriptors.set(key, descriptor);
+  }
+  const read = (key: string): unknown => {
+    const descriptor = descriptors.get(key);
+    if (descriptor === undefined) throw new Error(`worker lifecycle event is missing ${key}`);
+    return descriptor.value;
+  };
+  const exact = (keys: readonly string[]): void => {
+    if (descriptors.size !== keys.length || keys.some((key) => !descriptors.has(key))) {
+      throw new Error("worker lifecycle event has missing or unsupported fields");
+    }
+  };
+  const type = read("type");
+  const runId = read("runId");
+  const stage = read("stage");
+  if (typeof type !== "string" || typeof runId !== "string" || typeof stage !== "string") {
+    throw new Error("worker lifecycle event type/runId/stage is unreadable");
+  }
+  const common = ["type", "runId", "stage"];
+  if (type === "preLaunch") {
+    exact([...common, "runtimeRoot", "timeoutMs", "configSha256", "appendixSha256"]);
+    const runtimeRoot = read("runtimeRoot");
+    const timeoutMs = read("timeoutMs");
+    const configSha256 = read("configSha256");
+    const appendixSha256 = read("appendixSha256");
+    if (typeof runtimeRoot !== "string" || typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0
+      || typeof configSha256 !== "string" || typeof appendixSha256 !== "string") {
+      throw new Error("worker lifecycle preLaunch fields are unreadable");
+    }
+    return Object.freeze({ type, runId, stage: stage as never, runtimeRoot, timeoutMs, configSha256, appendixSha256 });
+  }
+  if (type === "processBound") {
+    exact([...common, "pid", "pgid", "associationSha256"]);
+    const pid = read("pid");
+    const pgid = read("pgid");
+    const associationSha256 = read("associationSha256");
+    if ((pid !== null && (!Number.isSafeInteger(pid) || (pid as number) < 1))
+      || (pgid !== null && (!Number.isSafeInteger(pgid) || (pgid as number) < 1))
+      || typeof associationSha256 !== "string") {
+      throw new Error("worker lifecycle processBound fields are unreadable");
+    }
+    return Object.freeze({ type, runId, stage: stage as never, pid: pid as number | null, pgid: pgid as number | null, associationSha256 });
+  }
+  if (type === "prePrompt") {
+    exact([...common, "promptSha256", "promptBytes", "timeoutMs"]);
+    const promptSha256 = read("promptSha256");
+    const promptBytes = read("promptBytes");
+    const timeoutMs = read("timeoutMs");
+    if (typeof promptSha256 !== "string" || !Number.isSafeInteger(promptBytes) || (promptBytes as number) < 1
+      || typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new Error("worker lifecycle prePrompt fields are unreadable");
+    }
+    return Object.freeze({ type, runId, stage: stage as never, promptSha256, promptBytes: promptBytes as number, timeoutMs });
+  }
+  if (type === "cleanupObserved") {
+    exact([...common, "spawnAttempted", "closeSeen", "closeCode", "closeSignal", "groupObservation",
+      "groupObservedAt", "hostWorkSettled", "approvalWorkSettled", "logFlush"]);
+    const spawnAttempted = read("spawnAttempted");
+    const closeSeen = read("closeSeen");
+    const closeCode = read("closeCode");
+    const closeSignal = read("closeSignal");
+    const groupObservation = read("groupObservation");
+    const groupObservedAt = read("groupObservedAt");
+    const hostWorkSettled = read("hostWorkSettled");
+    const approvalWorkSettled = read("approvalWorkSettled");
+    const logFlush = read("logFlush");
+    if (typeof spawnAttempted !== "boolean" || typeof closeSeen !== "boolean"
+      || (closeCode !== null && (!Number.isSafeInteger(closeCode) || (closeCode as number) < 0))
+      || (closeSignal !== null && typeof closeSignal !== "string")
+      || (groupObservation !== "not-observed" && groupObservation !== "present" && groupObservation !== "unknown")
+      || (groupObservedAt !== null && typeof groupObservedAt !== "string")
+      || typeof hostWorkSettled !== "boolean" || typeof approvalWorkSettled !== "boolean"
+      || (logFlush !== "success" && logFlush !== "failure")) {
+      throw new Error("worker lifecycle cleanupObserved fields are unreadable");
+    }
+    return Object.freeze({
+      type,
+      runId,
+      stage: stage as never,
+      spawnAttempted,
+      closeSeen,
+      closeCode: closeCode as number | null,
+      closeSignal: closeSignal as string | null,
+      groupObservation: groupObservation as WorkerLifecycleCleanupObservedEvent["groupObservation"],
+      groupObservedAt: groupObservedAt as string | null,
+      hostWorkSettled,
+      approvalWorkSettled,
+      logFlush: logFlush as WorkerLifecycleCleanupObservedEvent["logFlush"],
+    });
+  }
+  if (type === "resultObserved") {
+    exact([...common, "resultSha256", "status", "usage", "startedAt", "endedAt", "usageEstimated"]);
+    const resultSha256 = read("resultSha256");
+    const status = read("status");
+    const usageValue = read("usage");
+    const startedAt = read("startedAt");
+    const endedAt = read("endedAt");
+    const usageEstimated = read("usageEstimated");
+    if (typeof resultSha256 !== "string"
+      || (status !== "completed" && status !== "failed" && status !== "cancelled" && status !== "timed_out")
+      || typeof startedAt !== "string" || typeof endedAt !== "string" || typeof usageEstimated !== "boolean"
+      || typeof usageValue !== "object" || usageValue === null || Array.isArray(usageValue)
+      || Object.getOwnPropertySymbols(usageValue).length !== 0) {
+      throw new Error("worker lifecycle resultObserved fields are unreadable");
+    }
+    const usageKeys = ["inputTokens", "outputTokens", "costUsd"] as const;
+    if (Object.getOwnPropertyNames(usageValue).length !== usageKeys.length) {
+      throw new Error("worker lifecycle result usage has unsupported fields");
+    }
+    const usage: Record<string, number> = {};
+    for (const key of usageKeys) {
+      const descriptor = Object.getOwnPropertyDescriptor(usageValue, key);
+      if (descriptor === undefined || !("value" in descriptor)
+        || typeof descriptor.value !== "number" || !Number.isFinite(descriptor.value) || descriptor.value < 0) {
+        throw new Error("worker lifecycle result usage is unreadable");
+      }
+      usage[key] = descriptor.value;
+    }
+    return Object.freeze({
+      type,
+      runId,
+      stage: stage as never,
+      resultSha256,
+      status: status as WorkerLifecycleResultObservedEvent["status"],
+      usage: Object.freeze({ inputTokens: usage.inputTokens!, outputTokens: usage.outputTokens!, costUsd: usage.costUsd! }),
+      startedAt,
+      endedAt,
+      usageEstimated,
+    });
+  }
+  throw new Error("worker lifecycle event type is not supported");
+}
+
+function validateLifecycleEvent(
+  lifecycle: DispatchLifecycle,
+  event: WorkerLifecycleEvent,
+  runId: string,
+  stage: string,
+): void {
+  if (event === null || typeof event !== "object" || Array.isArray(event)) {
+    throw new Error("worker lifecycle event must be an object");
+  }
+  if (event.runId !== runId || event.stage !== stage) {
+    throw new Error("worker lifecycle event does not match this dispatch");
+  }
+  if (lifecycle.active) throw new Error("worker lifecycle checkpoint overlap refused");
+  if (lifecycle.conflict !== null) throw new Error(lifecycle.conflict);
+  const type = event.type;
+  if (type === "preLaunch") {
+    if (lifecycle.launchSeen || lifecycle.processSeen || lifecycle.promptSeen
+      || lifecycle.cleanup !== null || lifecycle.result !== null) {
+      throw new Error("worker lifecycle preLaunch is out of order or duplicated");
+    }
+  } else if (type === "processBound") {
+    if (!lifecycle.launchSeen || lifecycle.processSeen || lifecycle.promptSeen
+      || lifecycle.cleanup !== null || lifecycle.result !== null) {
+      throw new Error("worker lifecycle processBound is out of order or duplicated");
+    }
+  } else if (type === "prePrompt") {
+    if (!lifecycle.processSeen || lifecycle.promptSeen || lifecycle.cleanup !== null || lifecycle.result !== null) {
+      throw new Error("worker lifecycle prePrompt is out of order or duplicated");
+    }
+  } else if (type === "cleanupObserved") {
+    if (lifecycle.cleanup !== null || lifecycle.result !== null) {
+      throw new Error("worker lifecycle cleanup observation is duplicated or out of order");
+    }
+    if (event.spawnAttempted && !lifecycle.launchSeen) {
+      throw new Error("worker lifecycle cleanup claims a spawn without an acknowledged launch");
+    }
+  } else if (type === "resultObserved") {
+    if (lifecycle.cleanup === null || lifecycle.result !== null) {
+      throw new Error("worker lifecycle result observation requires one prior cleanup receipt");
+    }
+  } else {
+    throw new Error("worker lifecycle event type is not supported");
+  }
+}
+
+function lifecycleCleanupProblem(
+  lifecycle: DispatchLifecycle,
+  event: WorkerLifecycleCleanupObservedEvent,
+): string | null {
+  if (!event.hostWorkSettled || !event.approvalWorkSettled || event.logFlush !== "success") {
+    return "worker lifecycle cleanup witness is incomplete";
+  }
+  if (event.spawnAttempted) {
+    if (!lifecycle.processSeen) return "worker lifecycle cleanup lacks an actual process-bound fact";
+    if (!event.closeSeen) return "worker lifecycle cleanup did not observe the original child close";
+    if (event.groupObservation !== "not-observed" || event.groupObservedAt === null) {
+      return "worker lifecycle cleanup did not observe original process-group absence";
+    }
+  } else if (lifecycle.processSeen) {
+    return "worker lifecycle cleanup contradicts the recorded process-bound fact";
+  }
+  return null;
+}
+
+interface OwnedWorkerResult {
+  readonly copy: WorkerResult;
+  readonly digest: string;
+}
+
+function readOwnedWorkerResult(value: unknown): OwnedWorkerResult | null {
+  try {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+    if (Object.getOwnPropertySymbols(value).length !== 0) return null;
+    const allowed = new Set(["text", "usage", "startedAt", "endedAt", "eventsPath", "status", "error", "usageEstimated"]);
+    const keys = Object.getOwnPropertyNames(value);
+    if (keys.some((key) => !allowed.has(key))) return null;
+    const records = new Map<string, PropertyDescriptor>();
+    for (const key of keys) {
+      const descriptor = Object.getOwnPropertyDescriptor(value, key);
+      if (descriptor === undefined || !("value" in descriptor)) return null;
+      records.set(key, descriptor);
+    }
+    const required = (key: string): unknown => records.get(key)?.value;
+    const text = required("text");
+    const eventsPath = required("eventsPath");
+    const status = required("status");
+    const startedAt = required("startedAt");
+    const endedAt = required("endedAt");
+    const usageValue = required("usage");
+    if (typeof text !== "string" || Buffer.byteLength(text, "utf8") > 1_048_576 || typeof eventsPath !== "string"
+      || eventsPath.length < 1 || eventsPath.length > 4096 || /[\x00-\x1f\x7f]/.test(eventsPath)
+      || (status !== "completed" && status !== "failed" && status !== "cancelled" && status !== "timed_out")
+      || typeof startedAt !== "string" || startedAt.length > 64 || !Number.isSafeInteger(Date.parse(startedAt))
+      || typeof endedAt !== "string" || endedAt.length > 64 || !Number.isSafeInteger(Date.parse(endedAt))
+      || typeof usageValue !== "object" || usageValue === null || Array.isArray(usageValue)
+      || Object.getOwnPropertySymbols(usageValue).length !== 0) return null;
+    const usageKeys = Object.getOwnPropertyNames(usageValue);
+    if (usageKeys.some((key) => key !== "inputTokens" && key !== "outputTokens" && key !== "costUsd")) return null;
+    const usageRecords = new Map<string, PropertyDescriptor>();
+    for (const key of usageKeys) {
+      const descriptor = Object.getOwnPropertyDescriptor(usageValue, key);
+      if (descriptor === undefined || !("value" in descriptor)) return null;
+      usageRecords.set(key, descriptor);
+    }
+    const input = usageRecords.get("inputTokens")?.value;
+    const output = usageRecords.get("outputTokens")?.value;
+    const cost = usageRecords.get("costUsd")?.value;
+    if (typeof input !== "number" || !Number.isFinite(input) || input < 0
+      || typeof output !== "number" || !Number.isFinite(output) || output < 0
+      || typeof cost !== "number" || !Number.isFinite(cost) || cost < 0) return null;
+    let error: string | undefined;
+    if (records.has("error")) {
+      const raw = records.get("error")!.value;
+      if (typeof raw !== "string" || Buffer.byteLength(raw, "utf8") > 262_144) return null;
+      error = raw;
+    }
+    let usageEstimated: boolean | undefined;
+    if (records.has("usageEstimated")) {
+      const raw = records.get("usageEstimated")!.value;
+      if (typeof raw !== "boolean") return null;
+      usageEstimated = raw;
+    }
+    const usage: Usage = Object.freeze({ inputTokens: input, outputTokens: output, costUsd: cost });
+    const copy: WorkerResult = Object.freeze({
+      text,
+      usage,
+      startedAt,
+      endedAt,
+      eventsPath,
+      status,
+      ...(error === undefined ? {} : { error }),
+      ...(usageEstimated === undefined ? {} : { usageEstimated }),
+    });
+    return Object.freeze({ copy, digest: sha256Hex(canonicalJson(copy)) });
+  } catch {
+    return null;
+  }
+}
+
+function lifecycleResultProblem(
+  lifecycle: DispatchLifecycle,
+  owned: OwnedWorkerResult,
+): string | null {
+  if (lifecycle.conflict !== null) return lifecycle.conflict;
+  if (lifecycle.cleanup === null) return "worker lifecycle has no acknowledged cleanup observation";
+  const observed = lifecycle.result;
+  if (observed === null) return "worker lifecycle has no acknowledged result observation";
+  const result = owned.copy;
+  const resultEstimated = result.usageEstimated === true;
+  if (observed.status !== result.status
+    || observed.usage.inputTokens !== result.usage.inputTokens
+    || observed.usage.outputTokens !== result.usage.outputTokens
+    || observed.usage.costUsd !== result.usage.costUsd
+    || observed.startedAt !== result.startedAt
+    || observed.endedAt !== result.endedAt
+    || observed.usageEstimated !== resultEstimated) {
+    return "worker lifecycle result fields do not match the returned WorkerResult";
+  }
+  if (observed.resultSha256 !== owned.digest) {
+    return "worker lifecycle result digest does not match the returned WorkerResult";
+  }
+  return null;
+}
+
 function dispatchWorker(slot: Slot, requestValue: WorkerRequest): Promise<WorkerResult> {
   const state = slotState(slot);
   if (state === null) return Promise.reject(new NativeHarnessDelegationError("delegation state is unavailable"));
@@ -7983,6 +8453,12 @@ function dispatchWorker(slot: Slot, requestValue: WorkerRequest): Promise<Worker
   const request = read.request;
   if (request.runId !== slot.runId) {
     return Promise.reject(new NativeHarnessDelegationError("worker request runId is not the actual created run"));
+  }
+  let privateLifecycle: ReturnType<typeof readNativeHarnessLifecycle>;
+  try {
+    privateLifecycle = readNativeHarnessLifecycle(request);
+  } catch (error) {
+    return Promise.reject(new NativeHarnessDelegationError(boundedReason(error, "host lifecycle bridge is unreadable")));
   }
   const requestedUsd = request.maxCostUsd;
   if (typeof requestedUsd !== "number" || !Number.isFinite(requestedUsd) || requestedUsd <= 0) {
@@ -8011,7 +8487,13 @@ function dispatchWorker(slot: Slot, requestValue: WorkerRequest): Promise<Worker
 
   // Reserve the dispatch locally before the final pure gate; release on refusal.
   slot.runnerInflightUsd += requestedUsd;
-  const gate = authorityGate(slot, "effect");
+  const gate = privateLifecycle === null
+    ? authorityGate(slot, "effect")
+    : authorityGate(slot, "effect", undefined, {
+        innerDeadlineAt: privateLifecycle.bridge.innerDeadlineAt,
+        signal: combined.signal,
+        assertBackendCurrent: privateLifecycle.bridge.assertAdvanceCurrent,
+      });
   if (gate !== null) {
     slot.runnerInflightUsd = Math.max(0, slot.runnerInflightUsd - requestedUsd);
     combined.cleanup();
@@ -8039,15 +8521,123 @@ function dispatchWorker(slot: Slot, requestValue: WorkerRequest): Promise<Worker
   slot.workerDispatches += 1;
   slot.workerCount += 1;
 
+  let dispatchLifecycle: DispatchLifecycle | null = null;
+  if (privateLifecycle !== null) {
+    const lifecycle: DispatchLifecycle = {
+      bridge: privateLifecycle.bridge,
+      events: [],
+      launchSeen: false,
+      processSeen: false,
+      promptSeen: false,
+      cleanup: null,
+      result: null,
+      conflict: null,
+      active: false,
+    };
+    const port = Object.freeze({
+      cleanupGraceMs: state.limits.cleanupGraceMs,
+      assertAdvanceCurrent: (): void => {
+        const problem = authorityGate(slot, "effect", undefined, {
+          innerDeadlineAt: privateLifecycle!.bridge.innerDeadlineAt,
+          signal: combined.signal,
+          assertBackendCurrent: privateLifecycle!.bridge.assertAdvanceCurrent,
+        });
+        if (problem !== null) throw new NativeHarnessDelegationError(problem);
+      },
+      checkpoint: async (event: WorkerLifecycleEvent, assertPersistable: () => void): Promise<void> => {
+        if (slot.state !== "running" || slot.accounting.finalizing) {
+          const failure = new Error("worker lifecycle checkpoint was offered after original finalization");
+          lifecycle.conflict ??= failure.message;
+          throw failure;
+        }
+        let active = false;
+        try {
+          const ownedEvent = readOwnedLifecycleEvent(event);
+          validateLifecycleEvent(lifecycle, ownedEvent, slot.runId!, request.stage as string);
+          active = true;
+          lifecycle.active = true;
+          // The same finite owned event is persisted and retained; a caller
+          // mutation during the await cannot change the acknowledged facts.
+          await privateLifecycle!.invokeCheckpoint(ownedEvent, assertPersistable);
+          if (ownedEvent.type === "preLaunch") lifecycle.launchSeen = true;
+          else if (ownedEvent.type === "processBound") lifecycle.processSeen = true;
+          else if (ownedEvent.type === "prePrompt") lifecycle.promptSeen = true;
+          else if (ownedEvent.type === "cleanupObserved") {
+            lifecycle.cleanup = ownedEvent;
+            lifecycle.conflict ??= lifecycleCleanupProblem(lifecycle, ownedEvent);
+          } else if (ownedEvent.type === "resultObserved") {
+            lifecycle.result = ownedEvent;
+          }
+          lifecycle.events.push(ownedEvent.type);
+        } catch (error) {
+          // Every entry/copy/ordering/persistence refusal is sticky. A Runner
+          // may catch one failure and later offer valid-looking events; it may
+          // not recover this dispatch's unknown accounting.
+          lifecycle.conflict ??= boundedReason(error, "worker lifecycle checkpoint failed");
+          throw error;
+        } finally {
+          if (active) lifecycle.active = false;
+        }
+      },
+    });
+    // Begin the bounded cleanup-unknown latch synchronously before the actual
+    // opt-in Runner invocation. Passing a port is never proof of consumption.
+    slot.lifecycleDispatches += 1;
+    slot.lifecycleUnknown += 1;
+    dispatchLifecycle = lifecycle;
+    request.lifecycle = port;
+  }
+
   let tracked: Promise<WorkerResult> | null = null;
   let settledBeforeTracking = false;
   const promise = (async (): Promise<WorkerResult> => {
+    // Locally reserved/started workers must still account normally after
+    // dispatchClosed; that flag only prevents new dispatches. Only an opt-in
+    // lifecycle dispatch that completes after actual terminal publication is
+    // observation-only.
+    const lateAfterSettlement = (): boolean =>
+      dispatchLifecycle !== null
+      && (slot.state !== "running" || slot.accounting.finalizing);
     try {
       const result = await Reflect.apply(state.runner.run, state.runner.receiver, [request as unknown as WorkerRequest]);
-      recordDispatchResult(slot, requestedUsd, readWorkerFacts(result));
-      return result;
+      let ownedResult: OwnedWorkerResult | null = null;
+      if (lateAfterSettlement()) {
+        // Late fulfillment is observation only: no refund, release, latch
+        // clearing or accounting mutation after the original publication.
+        slot.lateSettlementObserved = true;
+        return result;
+      }
+      let accountingResult: unknown = result;
+      if (dispatchLifecycle !== null) {
+        const owned = readOwnedWorkerResult(result);
+        const problem = owned === null
+          ? "returned WorkerResult is not a bounded owned result"
+          : lifecycleResultProblem(dispatchLifecycle, owned);
+        if (problem !== null) {
+          slot.lifecycleConflict ??= problem;
+          slot.workerUnknownUsage = true;
+          slot.workerAllKnownCompleted = false;
+          // Do not return an ordinary completed/failed-known result after a
+          // sink/digest/scalar failure. The catch path retains the full
+          // requested allocation exactly once for this dispatch.
+          throw new NativeHarnessDelegationError(problem);
+        }
+        ownedResult = owned;
+        if (lateAfterSettlement()) {
+          slot.lateSettlementObserved = true;
+          return owned!.copy;
+        }
+        slot.lifecycleUnknown = Math.max(0, slot.lifecycleUnknown - 1);
+        accountingResult = owned!.copy;
+      }
+      recordDispatchResult(slot, requestedUsd, readWorkerFacts(accountingResult));
+      return ownedResult?.copy ?? result;
     } catch (error) {
-      recordDispatchResult(slot, requestedUsd, null);
+      if (!lateAfterSettlement()) {
+        recordDispatchResult(slot, requestedUsd, null);
+      } else {
+        slot.lateSettlementObserved = true;
+      }
       throw error;
     } finally {
       combined.cleanup();
@@ -8215,6 +8805,7 @@ function outcomeFor(
     if (slot.cancelRequested) return "cancelled";
     return "incomplete";
   }
+  if (slot.lifecycleUnknown > 0) return "unknown";
   if (backendStatus === "completed") return "backend-completed";
   if (backendStatus === "failed") return "backend-failed";
   if (backendStatus === "cancelled") return "backend-cancelled";
@@ -8558,6 +9149,7 @@ function factsForAccounting(
     && slot.workerCount > 0
     && slot.workerAllKnownCompleted
     && !slot.workerUnknownUsage
+    && slot.lifecycleUnknown === 0
     && !slot.cancelRequested
     && args.backendStatus === "completed";
   const observedUsd = noDispatch
@@ -8798,6 +9390,9 @@ function publishSlotResult(
   }
   if (slot.cancelRequested) {
     extra.push("Cancellation resolution is only a request; process-group exit and OS isolation are not proven.");
+  }
+  if (slot.lifecycleUnknown > 0) {
+    extra.push("Original Runner lifecycle persistence or result acknowledgement is unresolved; completion is not accepted and local concurrency/usage remain retained.");
   }
   const result: NativeHarnessDelegationResult = deepFreeze({
     schema: NATIVE_HARNESS_DELEGATION_SCHEMA,
@@ -9548,21 +10143,24 @@ async function runSlot(slot: Slot): Promise<void> {
         && slot.workerCount > 0
         && slot.workerAllKnownCompleted
         && !slot.workerUnknownUsage
+        && slot.lifecycleUnknown === 0
         && !slot.cancelRequested
         && slot.executionSettled
         && slot.workerPromises.size === 0;
       await finishSlot(slot, {
         outcome: outcomeFor(slot, slot.backendStatus, null),
-        reason: executionError ?? (slot.backendStatus === "completed"
-          ? "the Harness2 backend reported completion; task acceptance was not evaluated"
-          : `backend status ${slot.backendStatus ?? "unknown"}`),
+        reason: executionError ?? (slot.lifecycleUnknown > 0
+          ? `original Runner lifecycle acknowledgement is unresolved: ${slot.lifecycleConflict ?? "missing or failed sink evidence"}`
+          : slot.backendStatus === "completed"
+            ? "the Harness2 backend reported completion; task acceptance was not evaluated"
+            : `backend status ${slot.backendStatus ?? "unknown"}`),
         authorityFresh: false,
-        executionState: "settled",
+        executionState: slot.lifecycleUnknown > 0 ? "pending-unknown" : "settled",
         termination: terminationFor(slot, null, slot.backendStatus),
         backendStatus: slot.backendStatus,
         knownObservedCost,
         noDispatch: false,
-        releaseConcurrency: true,
+        releaseConcurrency: slot.lifecycleUnknown === 0,
         finishedAt,
       });
       return;
@@ -9578,6 +10176,7 @@ async function runSlot(slot: Slot): Promise<void> {
       && slot.workerCount > 0
       && slot.workerAllKnownCompleted
       && !slot.workerUnknownUsage
+      && slot.lifecycleUnknown === 0
       && !slot.cancelRequested
       && slot.executionSettled
       && slot.workerPromises.size === 0;
@@ -9665,6 +10264,9 @@ function createSlot(
     workerCount: 0,
     workerAllKnownCompleted: true,
     workerUnknownUsage: false,
+    lifecycleUnknown: 0,
+    lifecycleConflict: null,
+    lifecycleDispatches: 0,
     observedCostUsd: 0,
     observedAny: false,
     runnerAccountedUsd: 0,

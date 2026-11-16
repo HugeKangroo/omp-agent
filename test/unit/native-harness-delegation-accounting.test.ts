@@ -336,6 +336,19 @@ function completed(costUsd: number): WorkerResult {
   };
 }
 
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const source = value as Record<string, unknown>;
+    return `{${Object.keys(source).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(source[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) as string;
+}
+
+function canonicalResultSha256(result: WorkerResult): string {
+  return createHash("sha256").update(canonicalJson(result)).digest("hex");
+}
+
 function deferred<T>(): {
   readonly promise: Promise<T>;
   resolve(value: T): void;
@@ -1540,4 +1553,528 @@ describe("native harness delegation durable accounting", () => {
     });
     expect(be.calls).toEqual({ create: 0, execute: 0, cancel: [] });
   });
+
+  function syntheticLifecycleBridge(): Record<string, unknown> {
+    // Clearly synthetic event-shaped protocol input: no OS or actual-worker
+    // evidence is claimed by this unit fixture.
+    return Object.freeze({
+      innerDeadlineAt: CLOCK + 100_000,
+      assertAdvanceCurrent(): void {},
+      async checkpoint(_event: unknown, assertPersistable: () => void): Promise<void> {
+        assertPersistable();
+      },
+    });
+  }
+
+  async function bridgeInvocation(
+    ignorePort: boolean,
+  ): Promise<{
+    readonly result: Awaited<ReturnType<ReturnType<typeof createNativeHarnessDelegation>["invoke"]>>;
+    readonly checkpoint: NativeHarnessAccountingCheckpoint;
+  }> {
+    const root = await makeRoot(ignorePort ? "ignored-port" : "mismatched-ack");
+    const owner = identity(ignorePort ? "ip" : "ma");
+    await createOwner(root, owner, limitsFor());
+    const be = scriptedBackend({
+      create: () => ({ runId: randomUUID() }),
+      execute: async (runId, runner) => {
+        const request = workerRequest(runId) as WorkerRequest & Record<string, unknown>;
+        request.nativeHarnessLifecycle = syntheticLifecycleBridge();
+        // The opt-in Runner decides whether to consume the translated port.
+        // The ignored case returns an ordinary completed result without it.
+        await runner!.run(request);
+        return { status: "completed" };
+      },
+    });
+    const syntheticRunner: Runner = {
+      async run(request: WorkerRequest): Promise<WorkerResult> {
+        const lifecycle = request.lifecycle as unknown as {
+          checkpoint(event: unknown, assert: () => void): Promise<void>;
+        };
+        if (!ignorePort) {
+          const pass = (): void => {};
+          await lifecycle.checkpoint(Object.freeze({
+            type: "cleanupObserved",
+            runId: request.runId,
+            stage: "baseline",
+            spawnAttempted: false,
+            closeSeen: false,
+            closeCode: null,
+            closeSignal: null,
+            groupObservation: "unknown",
+            groupObservedAt: null,
+            hostWorkSettled: true,
+            approvalWorkSettled: true,
+            logFlush: "success",
+          }), pass);
+          await lifecycle.checkpoint(Object.freeze({
+            type: "resultObserved",
+            runId: request.runId,
+            stage: "baseline",
+            resultSha256: "0".repeat(64),
+            status: "completed",
+            usage: { inputTokens: 10, outputTokens: 5, costUsd: 0.5 },
+            startedAt: "2026-11-17T00:00:00.000Z",
+            endedAt: "2026-11-17T00:00:01.000Z",
+            usageEstimated: false,
+          }), pass);
+        }
+        return completed(0.1);
+      },
+    };
+    const h = harness({
+      root,
+      owner,
+      runner: syntheticRunner,
+      prepare: async (request) => {
+        be.setRunner(request.runner);
+        return { ok: true, backend: be.backend, accountingPrepared: preparedFor(1) };
+      },
+    });
+    const result = await invoke(h.coordinator, `call-${ignorePort ? "ignored" : "mismatch"}`);
+    return { result, checkpoint: await readCheckpoint(root, owner) };
+  }
+
+  test("an ignored opt-in port remains intended/unknown with the full reservation", async () => {
+    const { result, checkpoint } = await bridgeInvocation(true);
+    expect(result.outcome).toBe("unknown");
+    expect(result.cost.observedUsd).toBeNull();
+    expect(result.cost.unknownUsd).toBe(1);
+    expect(checkpoint.admissions[0]!.settlement).toEqual({
+      revision: checkpoint.admissions[0]!.settlement!.revision,
+      mode: "unknown",
+      observedUsd: null,
+      concurrencyHeld: true,
+    });
+  }, 10_000);
+
+  test("a mismatched acknowledged result scalar/digest keeps unknown occupancy", async () => {
+    const { result, checkpoint } = await bridgeInvocation(false);
+    expect(result.outcome).toBe("unknown");
+    expect(result.cost.observedUsd).toBeNull();
+    expect(result.cost.unknownUsd).toBe(1);
+    expect(checkpoint.admissions[0]!.settlement?.mode).toBe("unknown");
+    expect(checkpoint.admissions[0]!.settlement?.concurrencyHeld).toBe(true);
+  }, 10_000);
+
+  interface TrackedBridge {
+    readonly bridge: Record<string, unknown>;
+    readonly calls: unknown[];
+  }
+
+  function trackedLifecycleBridge(
+    onCheckpoint?: (event: Record<string, unknown>, assertPersistable: () => void) => void | Promise<void>,
+  ): TrackedBridge {
+    const calls: unknown[] = [];
+    const bridge = Object.freeze({
+      innerDeadlineAt: CLOCK + 100_000,
+      assertAdvanceCurrent(): void {},
+      async checkpoint(event: unknown, assertPersistable: () => void): Promise<void> {
+        calls.push(event);
+        if (onCheckpoint === undefined) assertPersistable();
+        else await onCheckpoint(event as Record<string, unknown>, assertPersistable);
+      },
+    });
+    return { bridge, calls };
+  }
+
+  interface LifecycleSetupOptions {
+    readonly policy?: Partial<NativeHarnessDelegationLimits>;
+    readonly now?: () => number;
+    readonly runner?: Runner;
+    readonly execute?: (
+      runId: string,
+      guarded: Runner,
+      request: WorkerRequest & Record<string, unknown>,
+    ) => Promise<unknown>;
+  }
+
+  async function setupLifecycleDispatch(
+    label: string,
+    bridge: Record<string, unknown>,
+    options: LifecycleSetupOptions = {},
+  ): Promise<{
+    readonly root: string;
+    readonly owner: NativeHarnessAccountingIdentity;
+    readonly coordinator: ReturnType<typeof createNativeHarnessDelegation>;
+    readonly requests: WorkerRequest[];
+    readonly start: (callId?: string) => ReturnType<ReturnType<typeof createNativeHarnessDelegation>["invoke"]>;
+  }> {
+    const root = await makeRoot(label);
+    const owner = identity(label);
+    await createOwner(root, owner, limitsFor(options.policy));
+    const requests: WorkerRequest[] = [];
+    const be = scriptedBackend({
+      create: () => ({ runId: randomUUID() }),
+      execute: async (runId, guarded) => {
+        const request = workerRequest(runId) as WorkerRequest & Record<string, unknown>;
+        request.nativeHarnessLifecycle = bridge;
+        requests.push(request);
+        if (options.execute !== undefined) return options.execute(runId, guarded!, request);
+        await guarded!.run(request);
+        return { status: "completed" };
+      },
+    });
+    const h = harness({
+      root,
+      owner,
+      ...(options.policy === undefined ? {} : { policy: options.policy }),
+      ...(options.now === undefined ? {} : { now: options.now }),
+      runner: options.runner ?? { run: async () => completed(0.02) },
+      prepare: async (request) => {
+        be.setRunner(request.runner);
+        return { ok: true, backend: be.backend, accountingPrepared: preparedFor(1) };
+      },
+    });
+    return {
+      root,
+      owner,
+      coordinator: h.coordinator,
+      requests,
+      start: (callId = `call-${label}`) => invoke(h.coordinator, callId),
+    };
+  }
+
+  const SYNTHETIC_CONFIG_SHA256 = "c".repeat(64);
+  const SYNTHETIC_APPENDIX_SHA256 = "d".repeat(64);
+
+  function lifecycleCleanupEvent(
+    request: WorkerRequest,
+  ): Record<string, unknown> {
+    return {
+      type: "cleanupObserved",
+      runId: request.runId,
+      stage: request.stage,
+      spawnAttempted: false,
+      closeSeen: false,
+      closeCode: null,
+      closeSignal: null,
+      groupObservation: "unknown",
+      groupObservedAt: null,
+      hostWorkSettled: true,
+      approvalWorkSettled: true,
+      logFlush: "success",
+    };
+  }
+
+  function lifecycleResultEvent(
+    request: WorkerRequest,
+    result: WorkerResult,
+    overrides: Record<string, unknown> = {},
+  ): Record<string, unknown> {
+    return {
+      type: "resultObserved",
+      runId: request.runId,
+      stage: request.stage,
+      resultSha256: canonicalResultSha256(result),
+      status: result.status,
+      usage: {
+        inputTokens: result.usage.inputTokens,
+        outputTokens: result.usage.outputTokens,
+        costUsd: result.usage.costUsd,
+      },
+      startedAt: result.startedAt,
+      endedAt: result.endedAt,
+      usageEstimated: result.usageEstimated === true,
+      ...overrides,
+    };
+  }
+
+  function lifecyclePort(request: WorkerRequest): {
+    checkpoint(event: unknown, assertPersistable: () => void): Promise<void>;
+    assertAdvanceCurrent(): void;
+  } {
+    return request.lifecycle as unknown as {
+      checkpoint(event: unknown, assertPersistable: () => void): Promise<void>;
+      assertAdvanceCurrent(): void;
+    };
+  }
+
+  test("split result mismatch: exact event scalars with a wrong digest refuses", async () => {
+    const actual = completed(0.1);
+    const tracked = trackedLifecycleBridge();
+    const runner: Runner = {
+      async run(request): Promise<WorkerResult> {
+        const port = lifecyclePort(request);
+        await port.checkpoint(lifecycleCleanupEvent(request), () => {});
+        await port.checkpoint(lifecycleResultEvent(request, actual, {
+          resultSha256: "0".repeat(64),
+        }), () => {});
+        return actual;
+      },
+    };
+    const setup = await setupLifecycleDispatch("split-digest", tracked.bridge, { runner });
+    const result = await setup.start();
+    expect(result.outcome).toBe("unknown");
+    expect(result.executionState).toBe("pending-unknown");
+    expect(result.cost).toEqual({
+      allocatedUsd: 1,
+      observedUsd: null,
+      unknownUsd: 1,
+      overspendUsd: 0,
+    });
+    expect(tracked.calls).toHaveLength(2);
+    expect(setup.requests).toHaveLength(1);
+    const checkpoint = await readCheckpoint(setup.root, setup.owner);
+    expect(checkpoint.admissions[0]!.settlement).toMatchObject({
+      mode: "unknown",
+      observedUsd: null,
+      concurrencyHeld: true,
+    });
+    expect(setup.coordinator.inspect().operations[0]!.concurrencyHeld).toBe(true);
+  }, 10_000);
+
+  test("split result mismatch: exact canonical digest with one wrong scalar refuses", async () => {
+    const actual = completed(0.1);
+    const variants: ReadonlyArray<{
+      readonly name: string;
+      readonly overrides: Record<string, unknown>;
+    }> = [
+      { name: "cost", overrides: { usage: { inputTokens: 10, outputTokens: 5, costUsd: 0.5 } } },
+      { name: "status", overrides: { status: "failed" } },
+      { name: "time", overrides: { endedAt: "2026-11-17T00:00:02.000Z" } },
+    ];
+    for (const variant of variants) {
+      const tracked = trackedLifecycleBridge();
+      const runner: Runner = {
+        async run(request): Promise<WorkerResult> {
+          const port = lifecyclePort(request);
+          await port.checkpoint(lifecycleCleanupEvent(request), () => {});
+          await port.checkpoint(lifecycleResultEvent(request, actual, variant.overrides), () => {});
+          return actual;
+        },
+      };
+      const setup = await setupLifecycleDispatch(`split-${variant.name}`, tracked.bridge, { runner });
+      const result = await setup.start(`call-split-${variant.name}`);
+      expect(result.outcome, variant.name).toBe("unknown");
+      expect(result.executionState, variant.name).toBe("pending-unknown");
+      expect(result.cost.unknownUsd, variant.name).toBe(1);
+      expect(result.cost.observedUsd, variant.name).toBeNull();
+      expect(tracked.calls, variant.name).toHaveLength(2);
+      expect(setup.requests, variant.name).toHaveLength(1);
+      const checkpoint = await readCheckpoint(setup.root, setup.owner);
+      expect(checkpoint.admissions[0]!.settlement?.concurrencyHeld, variant.name).toBe(true);
+      expect(setup.coordinator.inspect().operations[0]!.concurrencyHeld, variant.name).toBe(true);
+    }
+  }, 20_000);
+
+  test("a swallowed sink failure sticks: later valid-looking events make no sink calls", async () => {
+    const actual = completed(0.1);
+    const tracked = trackedLifecycleBridge((event) => {
+      if (event.type === "preLaunch") throw new Error("synthetic sink refusal");
+    });
+    let checkpointAttempts = 0;
+    const runner: Runner = {
+      async run(request): Promise<WorkerResult> {
+        const port = lifecyclePort(request);
+        const preLaunch = {
+          type: "preLaunch",
+          runId: request.runId,
+          stage: request.stage,
+          runtimeRoot: WORKSPACE,
+          timeoutMs: 1000,
+          configSha256: SYNTHETIC_CONFIG_SHA256,
+          appendixSha256: SYNTHETIC_APPENDIX_SHA256,
+        };
+        for (const event of [
+          preLaunch,
+          lifecycleCleanupEvent(request),
+          lifecycleResultEvent(request, actual),
+        ]) {
+          checkpointAttempts += 1;
+          try {
+            await port.checkpoint(event, () => {});
+          } catch {
+            // The Runner deliberately swallows the first refusal and offers
+            // later valid-looking events.
+          }
+        }
+        return actual;
+      },
+    };
+    const setup = await setupLifecycleDispatch("swallowed", tracked.bridge, { runner });
+    const result = await setup.start();
+    expect(checkpointAttempts).toBe(3);
+    expect(tracked.calls).toHaveLength(1);
+    expect((tracked.calls[0] as Record<string, unknown>).type).toBe("preLaunch");
+    expect(result.outcome).toBe("unknown");
+    expect(result.executionState).toBe("pending-unknown");
+    expect(result.cost.observedUsd).toBeNull();
+    expect(result.cost.unknownUsd).toBe(1);
+    const checkpoint = await readCheckpoint(setup.root, setup.owner);
+    expect(checkpoint.admissions[0]!.settlement).toMatchObject({
+      mode: "unknown",
+      observedUsd: null,
+      concurrencyHeld: true,
+    });
+    expect(setup.coordinator.inspect().operations[0]!.concurrencyHeld).toBe(true);
+  }, 10_000);
+
+  test("a held checkpoint released after cancellation refuses advancement but allows cleanup persistence", async () => {
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    const tracked = trackedLifecycleBridge(async (event, assertPersistable) => {
+      if (event.type === "preLaunch") {
+        entered.resolve(undefined);
+        await release.promise;
+      }
+      assertPersistable();
+    });
+    const observed: { advanceError: string | null } = { advanceError: null };
+    const runner: Runner = {
+      async run(request): Promise<WorkerResult> {
+        const port = lifecyclePort(request);
+        await port.checkpoint({
+          type: "preLaunch",
+          runId: request.runId,
+          stage: request.stage,
+          runtimeRoot: WORKSPACE,
+          timeoutMs: 1000,
+          configSha256: SYNTHETIC_CONFIG_SHA256,
+          appendixSha256: SYNTHETIC_APPENDIX_SHA256,
+        }, () => {});
+        try {
+          port.assertAdvanceCurrent();
+        } catch (error) {
+          observed.advanceError = (error as Error).message;
+        }
+        // Cleanup persistence is owned by the original per-operation
+        // assertion, not resurrected execution authority.
+        await port.checkpoint(lifecycleCleanupEvent(request), () => {});
+        return completed(0.1);
+      },
+    };
+    const setup = await setupLifecycleDispatch("held-cancel", tracked.bridge, { runner });
+    const pending = setup.start("call-held-cancel");
+    await entered.promise;
+    setup.coordinator.cancel("call-held-cancel");
+    release.resolve(undefined);
+    const result = await pending;
+    expect(observed.advanceError).toContain("cancelled");
+    expect(tracked.calls.map((event) => (event as Record<string, unknown>).type))
+      .toEqual(["preLaunch", "cleanupObserved"]);
+    expect(result.outcome).toBe("cancelled");
+    expect(result.executionState).toBe("pending-unknown");
+    expect(result.cost.observedUsd).toBeNull();
+    expect(result.cost.unknownUsd).toBe(1);
+    const checkpoint = await readCheckpoint(setup.root, setup.owner);
+    expect(checkpoint.admissions[0]!.settlement?.concurrencyHeld).toBe(true);
+  }, 10_000);
+
+  test("late lifecycle completion after published pending-unknown changes no accounting", async () => {
+    const actual = completed(0.1);
+    const tracked = trackedLifecycleBridge();
+    const workerStarted = deferred<void>();
+    const workerResult = deferred<WorkerResult>();
+    const holdExecution = deferred<unknown>();
+    const guardedState: { promise: Promise<WorkerResult> | null } = { promise: null };
+    let released = false;
+    const releaseAll = (): void => {
+      if (released) return;
+      released = true;
+      workerResult.resolve(actual);
+      holdExecution.resolve({ status: "completed" });
+    };
+    teardownReleases.push(releaseAll);
+    const setup = await setupLifecycleDispatch("late-completion", tracked.bridge, {
+      policy: { cleanupGraceMs: 20 },
+      runner: {
+        async run(request): Promise<WorkerResult> {
+          const port = lifecyclePort(request);
+          // Acknowledge the exact matching cleanup and result first. The only
+          // remaining unknown source at publication is the delayed settlement.
+          await port.checkpoint(lifecycleCleanupEvent(request), () => {});
+          await port.checkpoint(lifecycleResultEvent(request, actual), () => {});
+          workerStarted.resolve(undefined);
+          return await workerResult.promise;
+        },
+      },
+      execute: async (_runId, guarded, request) => {
+        guardedState.promise = guarded.run(request);
+        void guardedState.promise.catch(() => undefined);
+        return await holdExecution.promise;
+      },
+    });
+    const pending = setup.start("call-late-completion");
+    await workerStarted.promise;
+    expect(tracked.calls).toHaveLength(2);
+    // Cancellation starts the single original cleanup-grace timer. The
+    // acknowledged worker still stays in flight past publication.
+    setup.coordinator.cancel("call-late-completion");
+    const result = await pending;
+    expect(result.outcome).toBe("unknown");
+    expect(result.executionState).toBe("pending-unknown");
+    expect(result.cost.unknownUsd).toBe(1);
+    expect(result.cost.observedUsd).toBeNull();
+    expect(setup.coordinator.inspect().operations[0]!.concurrencyHeld).toBe(true);
+    await waitForAsync(async () =>
+      (await readCheckpoint(setup.root, setup.owner)).admissions[0]!.settlement !== null,
+    "published unknown settlement bytes");
+    const before = await readCheckpoint(setup.root, setup.owner);
+    expect(before.admissions[0]!.settlement).toMatchObject({
+      mode: "unknown",
+      observedUsd: null,
+      concurrencyHeld: true,
+    });
+    try {
+      // Release the exact acknowledged result and await the actual original
+      // guarded dispatch promise before claiming the late branch observed it.
+      workerResult.resolve(actual);
+      await guardedState.promise!;
+      const after = await readCheckpoint(setup.root, setup.owner);
+      expect(after).toEqual(before);
+      expect(tracked.calls).toHaveLength(2);
+      expect(setup.coordinator.inspect().operations[0]!.concurrencyHeld).toBe(true);
+      expect(setup.coordinator.inspect().operations[0]!.cost.unknownUsd).toBe(1);
+      expect(setup.coordinator.inspect().operations[0]!.cost.observedUsd).toBeNull();
+    } finally {
+      releaseAll();
+      if (guardedState.promise !== null) await guardedState.promise.catch(() => undefined);
+    }
+  }, 10_000);
+
+  test("dispatchClosed before publication does not make a settling lifecycle worker late", async () => {
+    const actual = completed(0.1);
+    const tracked = trackedLifecycleBridge();
+    const workerStarted = deferred<void>();
+    const releaseWorker = deferred<void>();
+    teardownReleases.push(() => releaseWorker.resolve(undefined));
+    const runner: Runner = {
+      async run(request): Promise<WorkerResult> {
+        workerStarted.resolve(undefined);
+        const port = lifecyclePort(request);
+        await port.checkpoint(lifecycleCleanupEvent(request), () => {});
+        await port.checkpoint(lifecycleResultEvent(request, actual), () => {});
+        await releaseWorker.promise;
+        return actual;
+      },
+    };
+    const setup = await setupLifecycleDispatch("dispatch-closed", tracked.bridge, {
+      runner,
+      execute: async (_runId, guarded, request) => {
+        void guarded.run(request).catch(() => undefined);
+        return { status: "completed" };
+      },
+    });
+    const pending = setup.start("call-dispatch-closed");
+    await workerStarted.promise;
+    // Let the backend execute promise settle so dispatchClosed is set while
+    // this already-dispatched worker is still pending.
+    await tick(10);
+    releaseWorker.resolve(undefined);
+    const result = await pending;
+    expect(result.outcome).toBe("backend-completed");
+    expect(result.executionState).toBe("settled");
+    expect(result.cost.observedUsd).toBe(0.1);
+    expect(result.cost.unknownUsd).toBe(0);
+    expect(tracked.calls).toHaveLength(2);
+    const checkpoint = await readCheckpoint(setup.root, setup.owner);
+    expect(checkpoint.admissions[0]!.settlement).toEqual({
+      revision: checkpoint.admissions[0]!.settlement!.revision,
+      mode: "known",
+      observedUsd: 0.1,
+      concurrencyHeld: false,
+    });
+    expect(setup.coordinator.inspect().operations[0]!.concurrencyHeld).toBe(false);
+  }, 10_000);
 });

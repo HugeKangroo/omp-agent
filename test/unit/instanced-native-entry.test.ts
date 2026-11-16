@@ -1,7 +1,7 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -60,6 +60,7 @@ import {
 } from "../../src/native-harness-recovery-source.ts";
 import type { NativeContext, NativeToolResult } from "../../src/native-entry.ts";
 import { clearPublishedTaskOwner, publishTaskOwner } from "../../src/task-entry-port.ts";
+import { OmpRpcRunner } from "../../vendor/harness2/index.ts";
 import type { Runner, WorkerRequest, WorkerResult } from "../../vendor/harness2/index.ts";
 import { deepFreeze, NATIVE_WORK_TOOL, nodeFileIo } from "../../src/native-work.ts";
 
@@ -218,10 +219,109 @@ function makePorts(overrides: Partial<InstancedNativePorts> = {}): InstancedNati
 
 const controls: InstancedNativeEntryControls[] = [];
 const actualHarnessDirs: string[] = [];
+const actualHelperMarkers = new Set<string>();
+const actualHelperPidFiles = new Set<string>();
+const actualOwnedPids = new Set<number>();
+let actualHelperLaunches = 0;
+let actualHelperCleanupRoots = 0;
+let helperCleanupLatch: string | undefined;
+const FIXTURE_SOURCE = path.resolve(import.meta.dir, "../fixtures/harness-lifecycle-worker.mjs");
+
+function assertHelperSetupAllowed(): void {
+  if (helperCleanupLatch !== undefined) {
+    throw new Error(`Fixture cleanup is latched after an unconfirmed owned helper cleanup; refusing new helpers. ${helperCleanupLatch}`);
+  }
+}
+
+function groupExists(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+}
+
+async function waitForGroupGone(pid: number, timeoutMs = 4000): Promise<void> {
+  const until = Date.now() + timeoutMs;
+  while (groupExists(pid)) {
+    if (Date.now() >= until) throw new Error(`owned helper process group ${pid} did not reach ESRCH`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
 
 afterEach(async () => {
   for (const control of controls.splice(0)) control.dispose();
-  for (const dir of actualHarnessDirs.splice(0)) await rm(dir, { recursive: true, force: true });
+  // Once an owned cleanup is latched, later unrelated tests must not clear the
+  // retained roots/markers. Keep the exact evidence until an operator inspects
+  // it; every subsequent cleanup fails closed with the same latch.
+  if (helperCleanupLatch !== undefined) {
+    throw new Error(helperCleanupLatch);
+  }
+  const failures: string[] = [];
+  const pids = new Set<number>(actualOwnedPids);
+  for (const marker of actualHelperMarkers) {
+    if (!existsSync(marker)) continue;
+    try {
+      const text = readFileSync(marker, "utf8").trim();
+      if (!/^[1-9][0-9]*$/.test(text)) {
+        failures.push(`helper PID marker ${marker} does not contain a positive PID`);
+        continue;
+      }
+      pids.add(Number(text));
+    } catch (error) {
+      failures.push(`helper PID marker ${marker} is unreadable: ${(error as Error).message}`);
+    }
+  }
+  for (const pidFile of actualHelperPidFiles) {
+    if (!existsSync(pidFile)) continue;
+    try {
+      const lines = readFileSync(pidFile, "utf8").split("\n").filter((line) => line.length > 0);
+      for (const line of lines) {
+        if (!/^[1-9][0-9]*$/.test(line)) {
+          failures.push(`helper PID log ${pidFile} contains a non-PID line`);
+          continue;
+        }
+        pids.add(Number(line));
+      }
+    } catch (error) {
+      failures.push(`helper PID log ${pidFile} is unreadable: ${(error as Error).message}`);
+    }
+  }
+  for (const pid of pids) {
+    if (groupExists(pid)) {
+      try {
+        process.kill(-pid, "SIGKILL");
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ESRCH") failures.push(`SIGKILL for owned group ${pid} failed: ${code ?? String(error)}`);
+      }
+    }
+    try {
+      await waitForGroupGone(pid);
+    } catch (error) {
+      failures.push((error as Error).message);
+    }
+  }
+  if (failures.length > 0) {
+    helperCleanupLatch ??= `Unconfirmed cleanup for owned PID(s) ${[...pids].join(", ") || "(none)"}; helper launches=${actualHelperLaunches}; retained exact roots: ${actualHarnessDirs.join(", ")}: ${failures.join("; ")}`;
+    throw new Error(helperCleanupLatch);
+  }
+  actualHelperMarkers.clear();
+  actualHelperPidFiles.clear();
+  actualOwnedPids.clear();
+  for (const dir of actualHarnessDirs.splice(0)) {
+    await rm(dir, { recursive: true, force: true });
+    actualHelperCleanupRoots += 1;
+  }
+});
+
+afterAll(() => {
+  // Finite actual fixture counters, not a per-test expectation. Retained roots
+  // remain if the cleanup latch is set.
+  console.log(
+    `[lifecycle-fixture] launches=${actualHelperLaunches} cleanedRoots=${actualHelperCleanupRoots} latched=${helperCleanupLatch !== undefined}`,
+  );
 });
 
 interface HostOptions {
@@ -903,6 +1003,40 @@ interface ActualHarnessCaptureFixture {
   readonly backendConfigs: NativeHarnessBackendHostConfig[];
   readonly preparedContexts: NativeContext[];
   readonly session: TestSession | null;
+  readonly lifecycleHelper: string | null;
+}
+
+function makeActualLifecycleRunner(): Runner {
+  const inner = new OmpRpcRunner({
+    env: {
+      PATH: process.env.PATH ?? "/usr/local/bin:/usr/bin:/bin",
+      OPENAI_API_KEY: "lifecycle-fixture-not-a-real-key",
+      TMPDIR: tmpdir(),
+    },
+  });
+  return {
+    async run(request: WorkerRequest): Promise<WorkerResult> {
+      assertHelperSetupAllowed();
+      actualHelperLaunches += 1;
+      if (actualHelperLaunches > 24) {
+        throw new Error("bounded helper launch budget exhausted for this test file");
+      }
+      const lifecycle = request.lifecycle;
+      if (lifecycle !== undefined) {
+        request.lifecycle = Object.freeze({
+          ...lifecycle,
+          checkpoint: async (event: unknown, assertPersistable: () => void): Promise<void> => {
+            const candidate = event as { type?: unknown; pid?: unknown };
+            if (candidate.type === "processBound" && typeof candidate.pid === "number" && candidate.pid > 1) {
+              actualOwnedPids.add(candidate.pid);
+            }
+            return lifecycle.checkpoint(event as never, assertPersistable);
+          },
+        });
+      }
+      return inner.run(request);
+    },
+  };
 }
 
 async function startActualHarnessCapture(
@@ -914,6 +1048,7 @@ async function startActualHarnessCapture(
     readonly session?: TestSession;
     readonly noopEnsure?: boolean;
     readonly ensureGate?: Promise<void>;
+    readonly actualLifecycleRunner?: boolean;
   } = {},
 ): Promise<ActualHarnessCaptureFixture> {
   const mainTools = options.mainTools ?? HARNESS_MAIN_TOOLS;
@@ -924,7 +1059,18 @@ async function startActualHarnessCapture(
   await mkdir(sourceRoot, { mode: 0o700 });
   await mkdir(storageRoot, { mode: 0o700 });
   await writeFile(path.join(sourceRoot, "a.txt"), "alpha\n", { mode: 0o600 });
-  const runner = actualHarnessRunner(options.candidateText);
+  let runner = actualHarnessRunner(options.candidateText);
+  let backendModel = "fixture/main";
+  let backendCommand = "/usr/bin/fake-omp";
+  if (options.actualLifecycleRunner === true) {
+    assertHelperSetupAllowed();
+    backendModel = "openai/lifecycle-fixture";
+    backendCommand = path.join(dir, "harness-lifecycle-worker-durable.mjs");
+    await writeFile(backendCommand, await readFile(FIXTURE_SOURCE), { mode: 0o700 });
+    actualHelperMarkers.add(`${backendCommand}.started`);
+    actualHelperPidFiles.add(`${backendCommand}.started-pids`);
+    runner = { requests: [], runner: makeActualLifecycleRunner() };
+  }
   const backendConfigs: NativeHarnessBackendHostConfig[] = [];
   const preparedContexts: NativeContext[] = [];
   const persistent = options.history === true || options.durableAccounting === true;
@@ -937,8 +1083,8 @@ async function startActualHarnessCapture(
     : null);
   const harness: InstancedHarnessConfig = {
     backend: {
-      model: "fixture/main",
-      ompCommand: "/usr/bin/fake-omp",
+      model: backendModel,
+      ompCommand: backendCommand,
       storageRoot,
       inputFiles: ["a.txt"],
     },
@@ -974,6 +1120,7 @@ async function startActualHarnessCapture(
     backendConfigs,
     preparedContexts,
     session,
+    lifecycleHelper: options.actualLifecycleRunner === true ? backendCommand : null,
   };
 }
 
@@ -1256,6 +1403,33 @@ async function readDurableRunFacts(
   }
   const costSum = Math.round(stageCosts.reduce((sum, value) => sum + value, 0) * 1e9) / 1e9;
   return { run, stageCosts, costSum };
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const source = value as Record<string, unknown>;
+    return `{${Object.keys(source).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(source[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) as string;
+}
+
+async function readDurableDispatchRows(
+  storageRoot: string,
+  admission: Record<string, any>,
+): Promise<Record<string, any>[]> {
+  const prepared = admission.prepared as Record<string, any> | null;
+  expect(prepared).not.toBeNull();
+  const inventoryPath = path.join(
+    storageRoot,
+    prepared!.storeRelativeRoot as string,
+    "runs",
+    admission.runId as string,
+    "dispatch-inventory.json",
+  );
+  const inventory = JSON.parse(await readFile(inventoryPath, "utf8")) as Record<string, any>;
+  expect(inventory.schema).toBe("omp-agent.native-harness-dispatch-inventory.v2");
+  return inventory.dispatches as Record<string, any>[];
 }
 
 interface DurableSourceFacts {
@@ -7792,6 +7966,7 @@ describe("actual instanced Harness durable accounting composition", () => {
     const fixture = await startActualHarnessCapture({
       history: false,
       durableAccounting: true,
+      actualLifecycleRunner: true,
     });
     const session = fixture.session!;
     await beginWork(fixture.root, "durable selected work");
@@ -7895,6 +8070,33 @@ describe("actual instanced Harness durable accounting composition", () => {
     });
     expect(runFacts.stageCosts).toHaveLength(3);
     expect(runFacts.costSum).toBeCloseTo(0.03, 9);
+    const dispatches = await readDurableDispatchRows(fixture.storageRoot, admission);
+    expect(dispatches).toHaveLength(3);
+    for (const row of dispatches) {
+      expect(row.state).toBe("terminal");
+      expect(row.launch.runtimeRoot).toStartWith("/");
+      expect(row.launch.configSha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(row.process.pid).toBeNumber();
+      expect(row.prompt.promptBytes).toBeGreaterThan(0);
+      expect(row.cleanup.observationKind).toBe("runner-observation");
+      expect(row.cleanup.observation.hostWorkSettled).toBe(true);
+      expect(row.cleanup.observation.groupObservation).toBe("not-observed");
+      expect(row.terminal.observationKind).toBe("runner-observation");
+      expect(row.terminal.outcome).toBe("completed");
+      expect(row.terminal.resultSha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(row.terminal.usageCostUsd).toBe(0.01);
+      expect(row.terminal.usageEstimated).toBe(false);
+      const stageResult = runFacts.run.stages[row.stage].result as Record<string, any>;
+      expect(row.terminal.resultSha256).toBe(createHash("sha256").update(canonicalJson(stageResult)).digest("hex"));
+      expect(row.terminal.outcome).toBe("completed");
+      expect(row.terminal.usageCostUsd).toBe(stageResult.usage.costUsd);
+      expect(row.terminal.observedAt).toBe(Date.parse(stageResult.endedAt));
+      expect(row.cleanup.observation.runId).toBe(runFacts.run.id);
+      expect(row.cleanup.observation.stage).toBe(row.stage);
+      expect(row.prompt.promptSha256).toMatch(/^[0-9a-f]{64}$/);
+      expect(row.prompt.effectiveTimeoutMs).toBeLessThanOrEqual(row.launch.effectiveTimeoutMs);
+      expect(row.launch.effectiveTimeoutMs).toBeLessThanOrEqual(row.requestTimeoutMs);
+    }
     expect(admission.settlement.observedUsd).toBe(runFacts.costSum);
     expect(inspection?.coordinator?.accounting?.lastCheckpoint).toMatchObject({
       activeOperations: 0,
@@ -7908,7 +8110,7 @@ describe("actual instanced Harness durable accounting composition", () => {
   }, 60_000);
 
   test("later work and a fresh same-session root reuse the one owner and retain prior admissions", async () => {
-    const fixture = await startActualHarnessCapture({ durableAccounting: true });
+    const fixture = await startActualHarnessCapture({ durableAccounting: true, actualLifecycleRunner: true });
     const session = fixture.session!;
     await beginWork(fixture.root, "durable first work");
     const firstSource = await executeActualHarness(
@@ -8002,15 +8204,15 @@ describe("actual instanced Harness durable accounting composition", () => {
       children: [childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1", { workspace: fixture.sourceRoot })],
       harness: {
         backend: {
-          model: "fixture/main",
-          ompCommand: "/usr/bin/fake-omp",
+          model: "openai/lifecycle-fixture",
+          ompCommand: fixture.lifecycleHelper!,
           storageRoot: fixture.storageRoot,
           inputFiles: ["a.txt"],
         },
         durableAccounting: true,
       },
       harnessBackendFactory(config) {
-        return createNativeHarnessBackend(config, { deterministicRunner: fixture.runner.runner });
+        return createNativeHarnessBackend(config, { deterministicRunner: makeActualLifecycleRunner() });
       },
     });
     await beginWork(second, "durable fresh root work");
