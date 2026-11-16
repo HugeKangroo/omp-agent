@@ -8,13 +8,9 @@ OMP 负责模型与工具调用循环；插件维护任务身份、要求版本�
 
 ## 当前状态
 
-项目处于实验阶段，尚未正式发布版本。默认受管入口使用宿主 JSON 配置，其实际接线验证固定在 macOS、OMP 18.18.0 和 Bun 1.4.0；另有单独加载的原生工作观察入口、可配置主会话定义入口和原生子实例入口，在 macOS、OMP 18.20.2 和 Bun 1.4.0 上分别做版本限定验证。不同入口的验证范围分别记录，其他环境需单独验证。真人使用验收尚未完成。A3 宿主侧报告重读工程包已独立接受并发布（`ca6366f82d34384a9375a80a9695afe9df91a943`），但它不包含 G5-3 Harness 来源 `harnessResult` 的 report parser/publisher、实例接线或真实 OMP/模型最终组合。
+项目处于实验阶段，尚未正式发布版本。当前最新的有界实际证据是 B3：在固定 macOS、OMP 18.20.2、Bun 1.4.0 和 DeepSeek Flash 主会话（请求关闭 thinking）上，一次正常实际运行完成了原生输入读取→agent_harness→inspect→capture→captured read→check→report→持久化 inspect，最终产物与持久化报告校验通过且最终回复一致，报告发布前完成 60 ms 同版本有界重读。首次尝试保留为 FAIL（最终回复误报输入字节数），第二次仅对同一已知用例做通用报告纪律修复；这不证明通用质量、跨进程恢复或产品就绪，六项产品交付均未关闭。
 
-包的默认入口为 `src/daily-entry.ts`。可以从源码检出目录或本地打包后的解包目录加载；下文配置和命令只影响本次启动，不会自动安装到现有 OMP profile。
-
-可配置主会话定义和原生子实例入口已作为可选实验入口提供；完整独立 Agent 实例生命周期、实例间 Flow、跨进程恢复和产物接受仍未接通。子实例入口已加入进程内的结果信封与工作状态只读观察，并已在固定宿主上完成一次有界的 C1 实际运行，自动判定与独立原始复核均通过。C1 观察本身保持只读且未改变；在其之上另提供可选的单结果报告关联（C2），普通报告和默认入口不变。定义入口在同一 OMP 内核上加载一份显式 Agent Markdown 的初始文本，选择模型并收窄工具范围；子实例入口再把一份显式主定义与限定数量的原生直接子任务关联起来，但不替换 OMP 调度、权限或模型循环。两个入口均已在本机固定版本范围内演示有界行为，定义入口包括只读汇总与实际转换产物；但仍有已确认的真实模型内容错误和已恢复的工具错误，原生观察入口也仍有未通过独立内容复核的真实模型样本。详见[测试记录](docs/testing.md)。
-
-当前产品主方向是普通 OMP 对话中选择定义，并按需使用原生实例与 Harness；默认入口仍为 `daily-entry.ts`，尚未切换，默认切换须等最终迁移与实际使用门通过。日常受管的 `TaskOwner`、严格接收和隔离保留为显式可选兼容行为；native report 不继承其正式任务接收或隔离保证。有限收敛与六项剩余产品交付（D1–D3、G5、必要 G3、G4、G8/C3）的当前状态、非目标、依赖和退出证据见[架构的当前交付节](docs/architecture.md#current-delivery-and-convergence)，验收矩阵见[测试](docs/testing.md#current-delivery-acceptance-matrix)。原生 flat 双任务并行/汇合仍待产品级证明；batch/async/worker-thread 模式未开放。只读历史查询不等同于实际运行状态核对或原 run 续跑。
+质量、跨进程恢复和真人验收仍待完成；版本矩阵与默认入口保持不变：默认入口为 `src/daily-entry.ts`，默认受管入口固定 macOS、OMP 18.18.0 和 Bun 1.4.0，原生工作观察、定义和实例入口固定 macOS、OMP 18.20.2 和 Bun 1.4.0，其他环境需单独验证。当前产品主方向仍是普通 OMP 对话中选择定义并按需使用原生实例与 Harness；默认切换、六项产品交付、flat 并行/汇合及 R1–R3 均未完成。详见[架构的 B3 小节](docs/architecture.md#actual-ompmodel-harness-report-exit-g5-3b3)、[当前交付节](docs/architecture.md#current-delivery-and-convergence)与[测试](docs/testing.md#current-delivery-acceptance-matrix)。
 
 ## 已实现能力
 
