@@ -79,6 +79,85 @@ export interface Usage {
   costUsd: number;
 }
 
+/** Bounded observation of one original Runner lifecycle. Events contain only
+ * owned scalars/digests; never prompts, credentials, argv, context or result text. */
+export interface WorkerLifecyclePreLaunchEvent {
+  readonly type: "preLaunch";
+  readonly runId: string;
+  readonly stage: StageId;
+  readonly runtimeRoot: string;
+  readonly timeoutMs: number;
+  readonly configSha256: string;
+  readonly appendixSha256: string;
+}
+
+export interface WorkerLifecycleProcessBoundEvent {
+  readonly type: "processBound";
+  readonly runId: string;
+  readonly stage: StageId;
+  readonly pid: number | null;
+  readonly pgid: number | null;
+  /** Association-only digest of actual spawn facts; not a boot/authenticated identity. */
+  readonly associationSha256: string;
+}
+
+export interface WorkerLifecyclePrePromptEvent {
+  readonly type: "prePrompt";
+  readonly runId: string;
+  readonly stage: StageId;
+  /** SHA-256 of the exact encoded RPC frame bytes that will be sent. */
+  readonly promptSha256: string;
+  readonly promptBytes: number;
+  readonly timeoutMs: number;
+}
+
+export interface WorkerLifecycleCleanupObservedEvent {
+  readonly type: "cleanupObserved";
+  readonly runId: string;
+  readonly stage: StageId;
+  readonly spawnAttempted: boolean;
+  readonly closeSeen: boolean;
+  readonly closeCode: number | null;
+  readonly closeSignal: string | null;
+  /** Actual probe result of the original PGID; "not-observed" means an actual ESRCH probe. */
+  readonly groupObservation: "not-observed" | "present" | "unknown";
+  /** Time of the actual probe, or null when no original-PGID probe occurred (no rpc/missing PID). */
+  readonly groupObservedAt: string | null;
+  readonly hostWorkSettled: boolean;
+  readonly approvalWorkSettled: boolean;
+  readonly logFlush: "success" | "failure";
+}
+
+export interface WorkerLifecycleResultObservedEvent {
+  readonly type: "resultObserved";
+  readonly runId: string;
+  readonly stage: StageId;
+  /** SHA-256 of canonical JSON for the exact final WorkerResult. */
+  readonly resultSha256: string;
+  readonly status: WorkerResult["status"];
+  readonly usage: Usage;
+  readonly startedAt: string;
+  readonly endedAt: string;
+  readonly usageEstimated: boolean;
+}
+
+export type WorkerLifecycleEvent =
+  | WorkerLifecyclePreLaunchEvent
+  | WorkerLifecycleProcessBoundEvent
+  | WorkerLifecyclePrePromptEvent
+  | WorkerLifecycleCleanupObservedEvent
+  | WorkerLifecycleResultObservedEvent;
+
+/** Host-owned optional port. Methods/scalars are captured once, before async work. */
+export interface WorkerLifecyclePort {
+  /** Trusted one-shot cleanup budget for this worker lifecycle. */
+  readonly cleanupGraceMs: number;
+  /** Throw on refusal; must return void synchronously. */
+  assertAdvanceCurrent(): void;
+  /** Awaited persistence for one bounded event. Throw on refusal; never ignore assertPersistable. */
+  checkpoint(event: WorkerLifecycleEvent, assertPersistable: () => void): Promise<void>;
+}
+
 export interface WorkerRequest {
   runId: string;
   stage: StageId;
@@ -98,6 +177,8 @@ export interface WorkerRequest {
   generatedExtensions?: import("./generated-extension").GeneratedExtension[];
   execution?: import("./runtime-policy").ExecutionProfile;
   approval?: import("./runtime-policy").ApprovalHandler;
+  /** Optional host-owned lifecycle sink; not tool/model input and never serialized. */
+  lifecycle?: WorkerLifecyclePort;
 }
 
 export interface WorkerEvent { type: string; timestamp: string; data: unknown }

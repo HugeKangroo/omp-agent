@@ -12,7 +12,7 @@
     "distributionPath": "relative to the omp-agent package root",
     "upstreamPath": "relative to the upstream repository root"
   },
-  "sourceId": "5415f078b33c22f1360e0e56125a0dc0b0784dd27fe1778ca7d3412a1bb36e50",
+  "sourceId": "159a6ebd4d657dad6b09419cbd8ec35eb30b0b317eae9848e799956c81a0e551",
   "sourceIdAlgorithm": "sha256 over UTF-8 canonical JSON with object keys sorted recursively, arrays in stored order, and no insignificant whitespace, of {schemaVersion, upstreamRepository, baseCommit, files:[{distributionPath, bundledSha256}]}; files are every distributed content file except vendor/harness2/SOURCE.json, sorted by distributionPath; SOURCE.json is excluded to avoid self-referential metadata hashing.",
   "license": {
     "upstreamLicensePath": "LICENSE",
@@ -247,10 +247,10 @@
       "upstreamPath": "src/runner.ts",
       "kind": "upstream-source",
       "originalSha256": "589cde36411bcb71ea06a2c628b4fa28dbbc36f44d1431043452e98d9f829f24",
-      "bundledSha256": "cef2792d9cc8bb40efbe455111c8836c39f1dbe8947f481ebad2503de28d9b76",
-      "bytes": 37611,
+      "bundledSha256": "e815dd860f1257c8fe1c42d6707940929c63556ba43065b3ab2a24163a3f47ec",
+      "bytes": 62743,
       "modified": true,
-      "note": "Strict optional-property adaptation: completed RPC chunk state is deleted instead of assigned undefined. Existing decoder value checks retain their meaning, while own-property reflection can observe absence. This adaptation does not itself establish runtime protocol compatibility."
+      "note": "Strict optional-property adaptation: completed RPC chunk state is deleted instead of assigned undefined. Existing decoder value checks retain their meaning, while own-property reflection can observe absence. Later optional host lifecycle sink: own-data request/port capture, five bounded awaited event categories, throw-on-refusal synchronous guards, intrinsic Promise/AbortSignal checks, one captured cleanup budget, receipt-before-delete and one final-result observation. Optional lifecycle runtime/ownership removals keep the original rm call, observe its raw settlement before any test-only observation delay, join both under the same absolute cleanup deadline and take the actual rm outcome as the removal result; observer failure or an unsettled/expired join latches rejection without later deletion or result observation. The no-sink path retains prior behavior; this does not establish runtime protocol compatibility, stop proof or execution authority."
     },
     {
       "distributionPath": "vendor/harness2/upstream/src/runtime-policy.ts",
@@ -297,10 +297,10 @@
       "upstreamPath": "src/types.ts",
       "kind": "upstream-source",
       "originalSha256": "b3e0f123e816beb0ea1bb29522a3bc9aa7c9afde29bce02aa11548508cde7842",
-      "bundledSha256": "df4441220fdfb58845db14ec275ffb13840c2d92104c0d6f11ec6922dad97f4e",
-      "bytes": 6944,
+      "bundledSha256": "b30e02db85781a9a49eaba539b9cdab17c8d87d003f6c4e6226006a4a9d1e028",
+      "bytes": 9998,
       "modified": true,
-      "note": "Upstream types plus RunRecoverySeed/RunRecoveryOrigin fixed-shape declarations and an optional RunRecord.recoveryOrigin field. The schemaVersion 1/2 meanings and all existing fields are unchanged; no dispatch, eligibility or mutable-budget claim was added."
+      "note": "Upstream types plus RunRecoverySeed/RunRecoveryOrigin fixed-shape declarations, an optional RunRecord.recoveryOrigin field and optional WorkerRequest.lifecycle event/port declarations. The schemaVersion 1/2 meanings and all existing fields are unchanged; no dispatch, eligibility, mutable-budget or execution-authority claim was added."
     },
     {
       "distributionPath": "vendor/harness2/upstream/src/workflows.ts",
