@@ -49,6 +49,7 @@ import {
   type NativeHarnessBackendHost,
   type NativeHarnessBackendHostConfig,
 } from "../../src/native-harness-backend.ts";
+import { NATIVE_HARNESS_RESULT_TOOL } from "../../src/native-harness-checks.ts";
 import type { NativeHarnessOutputCapture } from "../../src/native-harness-output.ts";
 import type { NativeContext, NativeToolResult } from "../../src/native-entry.ts";
 import { clearPublishedTaskOwner, publishTaskOwner } from "../../src/task-entry-port.ts";
@@ -667,6 +668,8 @@ function harnessBackendConfig(
 }
 
 const HARNESS_MAIN_TOOLS = ["read", "task", NATIVE_HARNESS_TOOL] as const;
+const HARNESS_RESULT_MAIN_TOOLS = ["read", "task", NATIVE_HARNESS_TOOL, NATIVE_HARNESS_RESULT_TOOL] as const;
+const RESULT_ONLY_MAIN_TOOLS = ["read", "task", NATIVE_HARNESS_RESULT_TOOL] as const;
 
 function harnessMainOptions(
   tools: readonly string[] = HARNESS_MAIN_TOOLS,
@@ -764,8 +767,9 @@ interface ActualHarnessCaptureFixture {
 }
 
 async function startActualHarnessCapture(
-  options: { readonly candidateText?: string } = {},
+  options: { readonly candidateText?: string; readonly mainTools?: readonly string[] } = {},
 ): Promise<ActualHarnessCaptureFixture> {
+  const mainTools = options.mainTools ?? HARNESS_MAIN_TOOLS;
   const dir = await realpath(await mkdtemp(path.join(tmpdir(), "omp-a22c-")));
   actualHarnessDirs.push(dir);
   const sourceRoot = path.join(dir, "source");
@@ -785,8 +789,8 @@ async function startActualHarnessCapture(
   };
   const root = await startRoot({
     workspace: sourceRoot,
-    main: mainSnapshot(sourceRoot, HARNESS_MAIN_TOOLS),
-    hostActiveTools: HARNESS_MAIN_TOOLS,
+    main: mainSnapshot(sourceRoot, mainTools),
+    hostActiveTools: mainTools,
     children: [childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1", { workspace: sourceRoot })],
     harness,
     harnessBackendFactory(config) {
@@ -899,6 +903,56 @@ function startHarness(
   context: InstancedNativeContext = root.host.context,
 ): Promise<NativeToolResult> {
   return executeHarness(root, toolCallId, task, signal, context);
+}
+
+function resultPayload(wire: NativeToolResult): Record<string, any> {
+  expect(wire.content).toHaveLength(1);
+  expect(wire.content[0]?.type).toBe("text");
+  return JSON.parse(wire.content[0]?.text ?? "") as Record<string, any>;
+}
+
+async function resultPreflight(
+  root: RootFixture,
+  toolCallId: string,
+  input: unknown,
+  context: InstancedNativeContext = root.host.context,
+): Promise<unknown> {
+  return await root.host.emit("tool_call", {
+    toolCallId,
+    toolName: NATIVE_HARNESS_RESULT_TOOL,
+    input,
+  }, context);
+}
+
+async function executeHarnessResult(
+  root: RootFixture,
+  toolCallId: string,
+  input: unknown,
+  signal: AbortSignal = new AbortController().signal,
+  context: InstancedNativeContext = root.host.context,
+): Promise<NativeToolResult> {
+  const blocked = await resultPreflight(root, toolCallId, input, context);
+  if (isRecord(blocked) && blocked.block === true) {
+    throw new Error(`result preflight was blocked: ${blockedReason(blocked)}`);
+  }
+  const tool = root.host.tools.get(NATIVE_HARNESS_RESULT_TOOL);
+  if (tool === undefined) throw new Error("agent_harness_result was not registered");
+  const result = await tool.execute(toolCallId, input, signal, undefined, context);
+  await root.host.emit("tool_result", {
+    toolCallId,
+    toolName: NATIVE_HARNESS_RESULT_TOOL,
+    input,
+    content: result.content,
+    isError: result.isError === true,
+    details: result.details,
+  }, context);
+  return result;
+}
+
+function resultTool(root: RootFixture): RegisteredTool {
+  const tool = root.host.tools.get(NATIVE_HARNESS_RESULT_TOOL);
+  if (tool === undefined) throw new Error("agent_harness_result was not registered");
+  return tool;
 }
 
 function harnessDetails(result: NativeToolResult): NativeHarnessDelegationResult {
@@ -5628,6 +5682,833 @@ describe("actual instanced Harness composition", () => {
     expect(fake.events).toEqual([]);
     expect(harness.calls).toHaveLength(1);
   });
+});
+
+describe("actual instanced Harness result composition", () => {
+  test("registration, availability and backend counts follow source/result selection", async () => {
+    const sourceFake = createFakeHarness();
+    const sourceHarness = harnessFixture(sourceFake);
+    const sourceOnly = await startRoot({
+      ...harnessMainOptions(),
+      harness: sourceHarness.harness,
+      harnessBackendFactory: sourceHarness.factory,
+    });
+    expect(sourceOnly.host.tools.has(NATIVE_HARNESS_TOOL)).toBe(true);
+    expect(sourceOnly.host.tools.has(NATIVE_HARNESS_RESULT_TOOL)).toBe(true);
+    expect(resultTool(sourceOnly).defaultInactive).toBe(true);
+    expect(sourceOnly.host.tools.get(NATIVE_HARNESS_TOOL)!.defaultInactive).toBe(true);
+    expect(sourceHarness.calls).toHaveLength(1);
+    const sourcePreflight = await resultPreflight(sourceOnly, "source-only-result-call", { action: "inspect" });
+    expect(blockedReason(sourcePreflight)).toMatch(/agent_harness_result is no longer in the actual main active tool set/);
+    const sourceDirect = await resultTool(sourceOnly).execute(
+      "source-only-direct-call",
+      { action: "inspect" },
+      new AbortController().signal,
+      undefined,
+      sourceOnly.host.context,
+    );
+    expect(resultPayload(sourceDirect).error).toMatchObject({ code: "root-unavailable" });
+    expect(JSON.stringify(resultPayload(sourceDirect))).toMatch(/agent_harness_result is no longer|not explicitly selected/);
+    expect(sourceHarness.calls).toHaveLength(1);
+    expect(sourceFake.events).toEqual([]);
+    sourceOnly.entry.dispose();
+
+    const resultFake = createFakeHarness();
+    let resultOnlyFactoryCalls = 0;
+    const resultOnly = await startRoot({
+      main: mainSnapshot(WORKSPACE, RESULT_ONLY_MAIN_TOOLS),
+      hostActiveTools: RESULT_ONLY_MAIN_TOOLS,
+      harness: { backend: harnessBackendConfig() },
+      harnessBackendFactory() {
+        resultOnlyFactoryCalls += 1;
+        return resultFake.host;
+      },
+    });
+    expect(resultOnly.host.tools.has(NATIVE_HARNESS_TOOL)).toBe(true);
+    expect(resultOnly.host.tools.has(NATIVE_HARNESS_RESULT_TOOL)).toBe(true);
+    expect(resultOnlyFactoryCalls).toBe(0);
+    expect(resultFake.events).toEqual([]);
+    const resultOnlyPreflight = await resultPreflight(resultOnly, "result-only-result-call", { action: "inspect" });
+    expect(blockedReason(resultOnlyPreflight)).toMatch(/not enabled and explicitly selected/);
+    for (const [call, tool] of [
+      ["result-only-direct", resultTool(resultOnly)],
+      ["result-only-source-direct", resultOnly.host.tools.get(NATIVE_HARNESS_TOOL)!],
+    ] as const) {
+      const direct = await tool.execute(
+        call,
+        tool.name === NATIVE_HARNESS_RESULT_TOOL ? { action: "inspect" } : { task: "must not run" },
+        new AbortController().signal,
+        undefined,
+        resultOnly.host.context,
+      );
+      expect(direct.isError).toBe(true);
+      expect(JSON.stringify(direct)).toMatch(/not enabled and explicitly selected/);
+    }
+    expect(resultOnlyFactoryCalls).toBe(0);
+    expect(resultFake.events).toEqual([]);
+    resultOnly.entry.dispose();
+
+    const both = await startActualHarnessCapture({ mainTools: HARNESS_RESULT_MAIN_TOOLS });
+    await beginWork(both.root, "empty inspect work");
+    expect(both.root.host.tools.has(NATIVE_HARNESS_TOOL)).toBe(true);
+    expect(resultTool(both.root).defaultInactive).toBe(true);
+    expect(both.backendConfigs).toHaveLength(1);
+    expect(both.runner.requests).toHaveLength(0);
+    const inspectWire = await executeHarnessResult(both.root, "empty-result-inspect", { action: "inspect" });
+    const inspect = resultPayload(inspectWire);
+    expect(inspect.ok).toBe(true);
+    expect(inspect.action).toBe("inspect");
+    expect(inspect.rows).toEqual([]);
+    expect(both.runner.requests).toHaveLength(0);
+    expect(both.backendConfigs).toHaveLength(1);
+  }, 30_000);
+
+  test("a model read that drops the result tool during execute is refused before the catalog", async () => {
+    const fixture = await startActualHarnessCapture({ mainTools: HARNESS_RESULT_MAIN_TOOLS });
+    await beginWork(fixture.root, "late model read result work");
+    const baselineWire = await executeHarnessResult(
+      fixture.root,
+      "late-model-read-baseline",
+      { action: "inspect" },
+    );
+    const baseline = resultPayload(baselineWire);
+    expect(baseline.ok).toBe(true);
+    expect(baseline.action).toBe("inspect");
+    expect(baseline.rows).toEqual([]);
+    expect(fixture.backendConfigs).toHaveLength(1);
+    expect(fixture.runner.requests).toHaveLength(0);
+
+    const models = fixture.root.host.context.models as {
+      current(): InstancedModel | undefined;
+    };
+    const originalCurrent = models.current.bind(models);
+    let armed = false;
+    let modelReads = 0;
+    models.current = () => {
+      modelReads += 1;
+      // The D1 refresh reads the model first. Fire on the resolver's final
+      // model read so the callback removes the tool after D1 has passed.
+      if (armed && modelReads > 1) {
+        fixture.root.host.activeTools = HARNESS_RESULT_MAIN_TOOLS.filter(
+          (tool) => tool !== NATIVE_HARNESS_RESULT_TOOL,
+        );
+      }
+      return originalCurrent();
+    };
+
+    const preflight = await resultPreflight(
+      fixture.root,
+      "late-model-read-result",
+      { action: "inspect" },
+    );
+    expect(isRecord(preflight) && preflight.block === true).toBe(false);
+    modelReads = 0;
+    armed = true;
+    const wire = await resultTool(fixture.root).execute(
+      "late-model-read-result",
+      { action: "inspect" },
+      new AbortController().signal,
+      undefined,
+      fixture.root.host.context,
+    );
+    expect(modelReads).toBe(2);
+    expect(fixture.root.host.activeTools).not.toContain(NATIVE_HARNESS_RESULT_TOOL);
+    const payload = resultPayload(wire);
+    expect(payload.ok).toBe(false);
+    expect(payload.error).toMatchObject({ code: "root-unavailable" });
+    expect(String(payload.error?.reason)).toMatch(/tool set changed/);
+    expect(payload.rows).toBeUndefined();
+    expect(fixture.backendConfigs).toHaveLength(1);
+    expect(fixture.runner.requests).toHaveLength(0);
+  }, 30_000);
+
+  test("a final model read that drops the result tool during the coordinator refresh reaches the context gate", async () => {
+    const fixture = await startActualHarnessCapture({ mainTools: HARNESS_RESULT_MAIN_TOOLS });
+    await beginWork(fixture.root, "final model read result work");
+    const models = fixture.root.host.context.models as {
+      current(): InstancedModel | undefined;
+    };
+    const originalCurrent = models.current.bind(models);
+
+    const baselinePreflight = await resultPreflight(
+      fixture.root,
+      "final-model-read-baseline",
+      { action: "inspect" },
+    );
+    expect(isRecord(baselinePreflight) && baselinePreflight.block === true).toBe(false);
+    let baselineReads = 0;
+    models.current = () => {
+      baselineReads += 1;
+      return originalCurrent();
+    };
+    const baselineWire = await resultTool(fixture.root).execute(
+      "final-model-read-baseline",
+      { action: "inspect" },
+      new AbortController().signal,
+      undefined,
+      fixture.root.host.context,
+    );
+    models.current = originalCurrent;
+    const baseline = resultPayload(baselineWire);
+    expect(baseline.ok).toBe(true);
+    expect(baseline.action).toBe("inspect");
+    expect(baseline.rows).toEqual([]);
+    expect(baselineReads).toBeGreaterThan(0);
+    expect(fixture.backendConfigs).toHaveLength(1);
+    expect(fixture.runner.requests).toHaveLength(0);
+
+    const preflight = await resultPreflight(
+      fixture.root,
+      "final-model-read-drift",
+      { action: "inspect" },
+    );
+    expect(isRecord(preflight) && preflight.block === true).toBe(false);
+    const targetReads = baselineReads;
+    let modelReads = 0;
+    let triggered = false;
+    models.current = () => {
+      const value = originalCurrent();
+      modelReads += 1;
+      if (modelReads === targetReads) {
+        triggered = true;
+        fixture.root.host.activeTools = HARNESS_RESULT_MAIN_TOOLS.filter(
+          (tool) => tool !== NATIVE_HARNESS_RESULT_TOOL,
+        );
+      }
+      return value;
+    };
+    const wire = await resultTool(fixture.root).execute(
+      "final-model-read-drift",
+      { action: "inspect" },
+      new AbortController().signal,
+      undefined,
+      fixture.root.host.context,
+    );
+    models.current = originalCurrent;
+    expect(triggered).toBe(true);
+    expect(modelReads).toBe(targetReads);
+    expect(fixture.root.host.activeTools).not.toContain(NATIVE_HARNESS_RESULT_TOOL);
+    expect(fixture.root.host.tools.has(NATIVE_HARNESS_RESULT_TOOL)).toBe(true);
+    const payload = resultPayload(wire);
+    expect(payload.ok).toBe(false);
+    expect(payload.error).toMatchObject({ code: "coordinator-refused" });
+    expect(payload.error?.reason).toBe(
+      "the actual main context threw: the actual main tool set changed since the Harness root was admitted",
+    );
+    expect(payload.rows).toBeUndefined();
+    expect(payload.returnedSources).toBeUndefined();
+    expect(fixture.backendConfigs).toHaveLength(1);
+    expect(fixture.runner.requests).toHaveLength(0);
+  }, 30_000);
+
+  test("actual main capture, inspect, read and check reuse one root coordinator", async () => {
+    const fixture = await startActualHarnessCapture({
+      mainTools: HARNESS_RESULT_MAIN_TOOLS,
+      candidateText: "known output\n",
+    });
+    await beginWork(fixture.root, "result composition work");
+    const source = await executeActualHarness(
+      fixture.root,
+      "result-source-call",
+      "bounded result composition task",
+    );
+    await observeActualHarness(fixture.root, source);
+    const sourceDetails = harnessDetails(source.result);
+    expect(sourceDetails.outcome).toBe("backend-completed");
+    expect(sourceDetails.authorityFresh).toBe(true);
+    const runnerCalls = fixture.runner.requests.length;
+    const workEpoch = status(fixture.root).root?.workEpoch;
+    const sourceWire = JSON.stringify(source.result);
+
+    const captureWire = await executeHarnessResult(
+      fixture.root,
+      "result-capture-action",
+      { action: "capture", sourceToolCallId: "result-source-call" },
+    );
+    const capture = resultPayload(captureWire);
+    expect(capture.ok).toBe(true);
+    expect(capture.action).toBe("capture");
+    expect(capture.sourceToolCallId).toBe("result-source-call");
+    expect(capture.actionToolCallId).toBe("result-capture-action");
+    expect(capture.captureId).toEqual(expect.any(String));
+    expect(capture.captureDigest).toMatch(/^[0-9a-f]{64}$/);
+    expect(capture.origin).toMatchObject({
+      kind: "harness2-native",
+      observation: "captured-now",
+      filesystemFreshness: "observed-during-capture",
+    });
+    expect(capture.files).toEqual([
+      expect.objectContaining({
+        path: "candidate.txt",
+        kind: "add",
+        bytes: Buffer.byteLength("known output\n", "utf8"),
+        sha256: createHash("sha256").update("known output\n").digest("hex"),
+      }),
+    ]);
+    expect(fixture.runner.requests).toHaveLength(runnerCalls);
+    const afterCapture = fixture.root.entry.harnessInspect?.(fixture.root.host.context);
+    expect(afterCapture?.coordinator?.output.retainedCaptures).toBe(1);
+    expect(afterCapture?.coordinator?.output.active).toBe(false);
+
+    const inspectWire = await executeHarnessResult(
+      fixture.root,
+      "result-inspect-action",
+      { action: "inspect" },
+    );
+    const inspect = resultPayload(inspectWire);
+    expect(inspect.ok).toBe(true);
+    expect(inspect.action).toBe("inspect");
+    expect(inspect.rows).toEqual([
+      expect.objectContaining({
+        sourceToolCallId: "result-source-call",
+        outputState: "captured",
+        capture: expect.objectContaining({
+          captureId: capture.captureId,
+          captureDigest: capture.captureDigest,
+          files: [expect.objectContaining({ path: "candidate.txt" })],
+        }),
+      }),
+    ]);
+
+    const readWire = await executeHarnessResult(
+      fixture.root,
+      "result-read-action",
+      {
+        action: "read",
+        sourceToolCallId: "result-source-call",
+        captureId: capture.captureId,
+        captureDigest: capture.captureDigest,
+        path: "candidate.txt",
+      },
+    );
+    const read = resultPayload(readWire);
+    expect(read.ok).toBe(true);
+    expect(read.action).toBe("read");
+    expect(read.actionToolCallId).toBe("result-read-action");
+    expect(read.text).toBe("known output\n");
+    expect(read.file).toMatchObject({
+      relativePath: "candidate.txt",
+      bytes: Buffer.byteLength("known output\n", "utf8"),
+      sha256: createHash("sha256").update("known output\n").digest("hex"),
+    });
+    expect(read.observation).toBe("cached-historical");
+    expect(read.filesystemFreshness).toBe("not-rechecked");
+
+    const checkWire = await executeHarnessResult(
+      fixture.root,
+      "result-check-action",
+      {
+        action: "check",
+        sourceToolCallId: "result-source-call",
+        captureId: capture.captureId,
+        captureDigest: capture.captureDigest,
+        path: "candidate.txt",
+        conditions: [{ id: "has-known-output", kind: "text-includes", value: "known output" }],
+      },
+    );
+    const check = resultPayload(checkWire);
+    expect(check.ok).toBe(true);
+    expect(check.action).toBe("check");
+    expect(check.actionToolCallId).toBe("result-check-action");
+    expect(check.originalComputationToolCallId).toEqual(expect.any(String));
+    expect(check.selectors).toEqual({
+      sourceToolCallId: "result-source-call",
+      captureId: capture.captureId,
+      captureDigest: capture.captureDigest,
+      path: "candidate.txt",
+    });
+    expect(check.receipt).toMatchObject({
+      outcome: "pass",
+      taskAccepted: false,
+    });
+    expect(check.receipt.conditions).toEqual([
+      { id: "has-known-output", result: "pass", detail: expect.any(String) },
+    ]);
+    expect(check.taskAccepted).toBe(false);
+    expect(check.semanticAcceptance).toBe("not-evaluated");
+
+    // Query/check actions reuse retained bytes and never mutate the source run,
+    // backend budget or the parent work generation.
+    expect(fixture.runner.requests).toHaveLength(runnerCalls);
+    expect(JSON.stringify(source.result)).toBe(sourceWire);
+    expect(status(fixture.root).root?.workEpoch).toBe(workEpoch);
+    const after = fixture.root.entry.harnessInspect?.(fixture.root.host.context);
+    expect(after?.coordinator?.operations[0]?.output.state).toBe("captured");
+    expect(after?.coordinator?.output.retainedCaptures).toBe(1);
+    expect(after?.coordinator?.output.retainedBytes).toBe(Buffer.byteLength("known output\n", "utf8"));
+    await expect(readFile(path.join(fixture.sourceRoot, "candidate.txt"), "utf8")).rejects.toThrow();
+  }, 30_000);
+
+  test("work-ending cancels only the actual capture action id", async () => {
+    for (const action of ["agent_end", "session_stop", "navigation", "dispose"] as const) {
+      const fixture = await startActualHarnessCapture({ mainTools: HARNESS_RESULT_MAIN_TOOLS });
+      await beginWork(fixture.root, `${action} result capture work`);
+      const source = await executeActualHarness(
+        fixture.root,
+        `${action}-result-source`,
+        `${action} bounded result task`,
+      );
+      await observeActualHarness(fixture.root, source);
+      const sourceDetails = harnessDetails(source.result);
+      expect(sourceDetails.outcome).toBe("backend-completed");
+      const runnerCalls = fixture.runner.requests.length;
+      const actionCallId = `${action}-result-capture`;
+      const controller = new AbortController();
+      const blocked = await resultPreflight(
+        fixture.root,
+        actionCallId,
+        { action: "capture", sourceToolCallId: `${action}-result-source` },
+      );
+      expect(isRecord(blocked) && blocked.block === true).toBe(false);
+      const pending = resultTool(fixture.root).execute(
+        actionCallId,
+        { action: "capture", sourceToolCallId: `${action}-result-source` },
+        controller.signal,
+        undefined,
+        fixture.root.host.context,
+      );
+      expect(fixture.root.entry.harnessInspect?.(fixture.root.host.context)?.coordinator?.output.active).toBe(true);
+
+      let ending: Promise<unknown>;
+      if (action === "agent_end") {
+        ending = fixture.root.host.emit("agent_end", {});
+      } else if (action === "session_stop") {
+        ending = fixture.root.host.emit("session_stop", {});
+      } else if (action === "navigation") {
+        ending = fixture.root.host.emit("session_switch", {});
+      } else {
+        fixture.root.entry.dispose();
+        ending = Promise.resolve();
+      }
+      const wire = await pending;
+      await ending;
+      const payload = resultPayload(wire);
+      expect(payload.ok).toBe(false);
+      expect(String(payload.error?.reason)).toMatch(/cancel|dispos/i);
+      expect(controller.signal.aborted).toBe(false);
+      expect(fixture.runner.requests).toHaveLength(runnerCalls);
+      const afterDetails = harnessDetails(source.result);
+      expect(afterDetails.cost).toEqual(sourceDetails.cost);
+      expect(afterDetails.runId).toBe(sourceDetails.runId);
+      expect(afterDetails.executionState).toBe("settled");
+      expect(afterDetails.outcome).toBe("backend-completed");
+      expect(afterDetails.cancellation).toBe("none");
+      expect(afterDetails.cancelError).toBeNull();
+      if (action === "agent_end" || action === "session_stop") {
+        const inspection = fixture.root.entry.harnessInspect?.(fixture.root.host.context);
+        expect(inspection?.coordinator?.output.active).toBe(false);
+        expect(inspection?.coordinator?.output.retainedCaptures).toBe(0);
+        expect(inspection?.coordinator?.output.reservedBytes).toBe(0);
+        expect(inspection?.coordinator?.operations[0]?.output.state).toBe("failed");
+      }
+      await expect(readFile(path.join(fixture.sourceRoot, "candidate.txt"), "utf8")).rejects.toThrow();
+      fixture.root.entry.dispose();
+    }
+  }, 60_000);
+  test("child, foreign, direct and altered-input result calls refuse before new backend work", async () => {
+    const fixture = await startActualHarnessCapture({ mainTools: HARNESS_RESULT_MAIN_TOOLS });
+    await beginWork(fixture.root, "result refusal work");
+    const source = await executeActualHarness(
+      fixture.root,
+      "refusal-result-source",
+      "bounded refusal result task",
+    );
+    await observeActualHarness(fixture.root, source);
+    const runnerCalls = fixture.runner.requests.length;
+
+    const direct = await resultTool(fixture.root).execute(
+      "direct-no-preflight-result",
+      { action: "capture", sourceToolCallId: "refusal-result-source" },
+      new AbortController().signal,
+      undefined,
+      fixture.root.host.context,
+    );
+    expect(resultPayload(direct).ok).toBe(false);
+    expect(String(resultPayload(direct).error?.reason)).toMatch(/not observed|native call|call-not-observed|capture/i);
+
+    const childContext = ownerContext({
+      agentKind: "sub",
+      agentId: "ChildResultRefusal",
+      sessionId: "session-child-result-refusal",
+      cwd: fixture.sourceRoot,
+    });
+    const childDirect = await resultTool(fixture.root).execute(
+      "child-result-direct",
+      { action: "inspect" },
+      new AbortController().signal,
+      undefined,
+      childContext,
+    );
+    expect(resultPayload(childDirect).error).toMatchObject({ code: "invalid-context" });
+
+    const foreignContext = ownerContext({
+      agentId: "OtherResultRefusal",
+      sessionId: "session-other-result-refusal",
+      cwd: fixture.sourceRoot,
+    });
+    const foreignDirect = await resultTool(fixture.root).execute(
+      "foreign-result-direct",
+      { action: "inspect" },
+      new AbortController().signal,
+      undefined,
+      foreignContext,
+    );
+    expect(resultPayload(foreignDirect).error).toMatchObject({ code: "root-unavailable" });
+    expect(String(resultPayload(foreignDirect).error?.reason)).toMatch(/owning main root|not the owning/);
+
+    const capture = resultPayload(await executeHarnessResult(
+      fixture.root,
+      "refusal-result-capture",
+      { action: "capture", sourceToolCallId: "refusal-result-source" },
+    ));
+    expect(capture.ok).toBe(true);
+    const readInput = {
+      action: "read",
+      sourceToolCallId: "refusal-result-source",
+      captureId: capture.captureId,
+      captureDigest: capture.captureDigest,
+      path: "candidate.txt",
+    };
+    await resultPreflight(fixture.root, "altered-read-result", readInput);
+    const altered = await resultTool(fixture.root).execute(
+      "altered-read-result",
+      { ...readInput, path: "other.txt" },
+      new AbortController().signal,
+      undefined,
+      fixture.root.host.context,
+    );
+    expect(resultPayload(altered).ok).toBe(false);
+    expect(String(resultPayload(altered).error?.reason)).toMatch(/path|selector|preflight|conflict/i);
+
+    expect(fixture.runner.requests).toHaveLength(runnerCalls);
+    await expect(readFile(path.join(fixture.sourceRoot, "candidate.txt"), "utf8")).rejects.toThrow();
+  }, 30_000);
+
+  test("a child that lists the result tool is still denied at the native gate", async () => {
+    const fake = createFakeHarness();
+    const harness = harnessFixture(fake);
+    const childDefinition = childSnapshot("alpha", "ALPHA_BODY_V1", "alpha-v1", {
+      tools: ["read", NATIVE_HARNESS_RESULT_TOOL],
+    });
+    const root = await startRoot({
+      children: [childDefinition],
+      ...harnessMainOptions(HARNESS_RESULT_MAIN_TOOLS),
+      harness: harness.harness,
+      harnessBackendFactory: harness.factory,
+    });
+    await beginWork(root, "child result refusal work");
+    await admit(root, "task-child-result");
+    await spawn(root);
+    const child = await startChild(root, "task-child-result", "ChildResultGate", {
+      activeTools: ["read", NATIVE_HARNESS_RESULT_TOOL],
+    });
+    const blocked = await child.host.emit("tool_call", {
+      toolCallId: "child-result-call",
+      toolName: NATIVE_HARNESS_RESULT_TOOL,
+      input: { action: "inspect" },
+    });
+    expect(isRecord(blocked) && blocked.block).toBe(true);
+    expect(blockedReason(blocked)).toMatch(/owning actual main root/);
+    expect(fake.events).toEqual([]);
+  }, 30_000);
+
+  test("a changed observed projection refuses the result capture", async () => {
+    const fixture = await startActualHarnessCapture({ mainTools: HARNESS_RESULT_MAIN_TOOLS });
+    await beginWork(fixture.root, "changed projection result work");
+    const source = await executeActualHarness(
+      fixture.root,
+      "changed-projection-source",
+      "bounded changed projection task",
+    );
+    await fixture.root.host.emit("tool_result", {
+      ...source.event,
+      content: [{ type: "text", text: "rewritten result projection" }],
+    }, fixture.root.host.context);
+    const runnerCalls = fixture.runner.requests.length;
+    const wire = await executeHarnessResult(
+      fixture.root,
+      "changed-projection-capture",
+      { action: "capture", sourceToolCallId: "changed-projection-source" },
+    );
+    expect(resultPayload(wire).ok).toBe(false);
+    expect(String(resultPayload(wire).error?.reason)).toMatch(/conflict|rewrit|observation|call-evidence|authority/i);
+    expect(fixture.runner.requests).toHaveLength(runnerCalls);
+    await expect(readFile(path.join(fixture.sourceRoot, "candidate.txt"), "utf8")).rejects.toThrow();
+  }, 30_000);
+
+  test("model, tool, settings and root drift refuse without a new run", async () => {
+    for (const drift of ["model", "tools"] as const) {
+      const fixture = await startActualHarnessCapture({ mainTools: HARNESS_RESULT_MAIN_TOOLS });
+      await beginWork(fixture.root, `${drift} result drift work`);
+      const source = await executeActualHarness(
+        fixture.root,
+        `${drift}-result-source`,
+        `${drift} bounded result task`,
+      );
+      await observeActualHarness(fixture.root, source);
+      const runnerCalls = fixture.runner.requests.length;
+      if (drift === "model") {
+        fixture.root.host.currentModel = OTHER_MODEL;
+      } else {
+        fixture.root.host.activeTools = [...HARNESS_RESULT_MAIN_TOOLS, "extra-result-tool"];
+      }
+      const blocked = await resultPreflight(fixture.root, `${drift}-result-inspect`, { action: "inspect" });
+      expect(isRecord(blocked) && blocked.block).toBe(true);
+      expect(blockedReason(blocked)).toMatch(drift === "model" ? /model changed/ : /tool set changed|active tools changed/);
+      expect(fixture.runner.requests).toHaveLength(runnerCalls);
+      fixture.root.entry.dispose();
+    }
+
+    const settingsFixture = await startActualHarnessCapture({ mainTools: HARNESS_RESULT_MAIN_TOOLS });
+    await beginWork(settingsFixture.root, "settings result drift work");
+    const settingsSource = await executeActualHarness(
+      settingsFixture.root,
+      "settings-result-source",
+      "settings bounded result task",
+    );
+    await observeActualHarness(settingsFixture.root, settingsSource);
+    const settingsRunnerCalls = settingsFixture.runner.requests.length;
+    (settingsFixture.root.ports as { readScopedSettings: () => unknown }).readScopedSettings = () => ({
+      ok: true,
+      settings: { ...SUPPORTED_SETTINGS, taskBatch: true },
+    });
+    const settingsBlocked = await resultPreflight(
+      settingsFixture.root,
+      "settings-result-inspect",
+      { action: "inspect" },
+    );
+    expect(isRecord(settingsBlocked) && settingsBlocked.block).toBe(true);
+    expect(blockedReason(settingsBlocked)).toMatch(/settings/i);
+    expect(settingsFixture.runner.requests).toHaveLength(settingsRunnerCalls);
+    settingsFixture.root.entry.dispose();
+
+    const closed = await startActualHarnessCapture({ mainTools: HARNESS_RESULT_MAIN_TOOLS });
+    await beginWork(closed.root, "closed result drift work");
+    closed.root.entry.dispose();
+    const closedPreflight = await resultPreflight(closed.root, "closed-result-inspect", { action: "inspect" });
+    expect(blockedReason(closedPreflight)).toMatch(/disposed/i);
+    const closedDirect = await resultTool(closed.root).execute(
+      "closed-result-direct",
+      { action: "inspect" },
+      new AbortController().signal,
+      undefined,
+      closed.root.host.context,
+    );
+    expect(resultPayload(closedDirect).error).toMatchObject({ code: "disposed" });
+  }, 60_000);
+
+  test("an old result adapter stays disposed after a replacement root is admitted", async () => {
+    const first = await startActualHarnessCapture({ mainTools: HARNESS_RESULT_MAIN_TOOLS });
+    await beginWork(first.root, "old result adapter work");
+    const oldTool = resultTool(first.root);
+    first.root.entry.dispose();
+
+    const second = await startActualHarnessCapture({ mainTools: HARNESS_RESULT_MAIN_TOOLS });
+    await beginWork(second.root, "replacement result adapter work");
+    const oldDirect = await oldTool.execute(
+      "old-result-after-replacement",
+      { action: "inspect" },
+      new AbortController().signal,
+      undefined,
+      second.root.host.context,
+    );
+    expect(resultPayload(oldDirect).error).toMatchObject({ code: "disposed" });
+    const inspectWire = await executeHarnessResult(
+      second.root,
+      "replacement-result-inspect",
+      { action: "inspect" },
+    );
+    expect(resultPayload(inspectWire).ok).toBe(true);
+    expect(second.runner.requests).toHaveLength(0);
+  }, 30_000);
+
+  test("same-signal duplicate result capture joins the original tracked promise", async () => {
+    const fixture = await startActualHarnessCapture({ mainTools: HARNESS_RESULT_MAIN_TOOLS });
+    await beginWork(fixture.root, "joined result capture work");
+    const source = await executeActualHarness(
+      fixture.root,
+      "joined-result-source",
+      "bounded joined result task",
+    );
+    await observeActualHarness(fixture.root, source);
+    const runnerCalls = fixture.runner.requests.length;
+    const input = { action: "capture", sourceToolCallId: "joined-result-source" };
+    await resultPreflight(fixture.root, "joined-result-action", input);
+    const controller = new AbortController();
+    const tool = resultTool(fixture.root);
+    const first = tool.execute(
+      "joined-result-action",
+      input,
+      controller.signal,
+      undefined,
+      fixture.root.host.context,
+    );
+    const second = tool.execute(
+      "joined-result-action",
+      input,
+      controller.signal,
+      undefined,
+      fixture.root.host.context,
+    );
+    const [firstWire, secondWire] = await Promise.all([first, second]);
+    const firstPayload = resultPayload(firstWire);
+    const secondPayload = resultPayload(secondWire);
+    expect(firstPayload.ok).toBe(true);
+    expect(secondPayload.ok).toBe(true);
+    expect(firstPayload.captureId).toBe(secondPayload.captureId);
+    expect(firstPayload.captureDigest).toBe(secondPayload.captureDigest);
+    expect(controller.signal.aborted).toBe(false);
+    expect(fixture.runner.requests).toHaveLength(runnerCalls);
+    const inspection = fixture.root.entry.harnessInspect?.(fixture.root.host.context);
+    expect(inspection?.coordinator?.output.retainedCaptures).toBe(1);
+    expect(inspection?.coordinator?.output.active).toBe(false);
+    expect(inspection?.coordinator?.output.reservedBytes).toBe(0);
+  }, 30_000);
+
+  test("synchronous session_stop during the result capture guard cancels the now-tracked action", async () => {
+    const fixture = await startActualHarnessCapture({ mainTools: HARNESS_RESULT_MAIN_TOOLS });
+    await beginWork(fixture.root, "synchronous result stop work");
+    const source = await executeActualHarness(
+      fixture.root,
+      "synchronous-result-source",
+      "bounded synchronous result task",
+    );
+    await observeActualHarness(fixture.root, source);
+    const sourceDetails = harnessDetails(source.result);
+    expect(sourceDetails.outcome).toBe("backend-completed");
+    expect(sourceDetails.executionState).toBe("settled");
+    const runnerCalls = fixture.runner.requests.length;
+    const workEpochBefore = status(fixture.root).root?.workEpoch;
+    const input = { action: "capture", sourceToolCallId: "synchronous-result-source" };
+    await resultPreflight(fixture.root, "synchronous-result-action", input);
+
+    const context = fixture.root.host.context;
+    const sessionManager = (context as unknown as {
+      sessionManager: { getSessionId(): string; getCwd(): string };
+    }).sessionManager;
+    const readSessionId = sessionManager.getSessionId.bind(sessionManager);
+    let fired = false;
+    let inspecting = false;
+    const trigger = {
+      calls: 0,
+      active: false,
+      reservedBytes: -1,
+      retainedCaptures: -1,
+      stopResults: [] as unknown[],
+    };
+    sessionManager.getSessionId = () => {
+      if (!fired && !inspecting) {
+        inspecting = true;
+        let active = false;
+        let reservedBytes = -1;
+        let retainedCaptures = -1;
+        try {
+          const output = fixture.root.entry.harnessInspect?.(context)?.coordinator?.output;
+          if (output?.active === true) {
+            active = true;
+            reservedBytes = output.reservedBytes;
+            retainedCaptures = output.retainedCaptures;
+          }
+        } finally {
+          inspecting = false;
+        }
+        if (active) {
+          fired = true;
+          trigger.calls += 1;
+          trigger.active = true;
+          trigger.reservedBytes = reservedBytes;
+          trigger.retainedCaptures = retainedCaptures;
+          trigger.stopResults = sessionStopHooksSynchronously(fixture.root.host);
+        }
+      }
+      return readSessionId();
+    };
+
+    const pending = resultTool(fixture.root).execute(
+      "synchronous-result-action",
+      input,
+      new AbortController().signal,
+      undefined,
+      context,
+    );
+    expect(trigger.calls).toBe(1);
+    expect(trigger.active).toBe(true);
+    expect(trigger.reservedBytes).toBe(1_048_576);
+    expect(trigger.retainedCaptures).toBe(0);
+    expect(trigger.stopResults.length).toBe(fixture.root.host.handlers.get("session_stop")?.length ?? 0);
+    expect(trigger.stopResults.some((result) => isRecord(result) && result.continue === true)).toBe(true);
+    expect(status(fixture.root).root?.workEpoch).toBe((workEpochBefore ?? 0) + 1);
+
+    const wire = await pending;
+    expect(resultPayload(wire).error?.reason).toMatch(/cancel/i);
+    expect(fixture.runner.requests).toHaveLength(runnerCalls);
+    const afterDetails = harnessDetails(source.result);
+    expect(afterDetails.cost).toEqual(sourceDetails.cost);
+    expect(afterDetails.runId).toBe(sourceDetails.runId);
+    expect(afterDetails.executionState).toBe("settled");
+    expect(afterDetails.outcome).toBe("backend-completed");
+    expect(afterDetails.cancellation).toBe("none");
+    expect(afterDetails.cancelError).toBeNull();
+    const after = fixture.root.entry.harnessInspect?.(fixture.root.host.context);
+    expect(after?.coordinator?.output.active).toBe(false);
+    expect(after?.coordinator?.output.retainedCaptures).toBe(0);
+    expect(after?.coordinator?.output.retainedBytes).toBe(0);
+    expect(after?.coordinator?.output.reservedBytes).toBe(0);
+    expect(after?.coordinator?.operations[0]?.output.state).toBe("failed");
+    await expect(readFile(path.join(fixture.sourceRoot, "candidate.txt"), "utf8")).rejects.toThrow();
+  }, 30_000);
+
+  test("a same-id changed-signal refusal cannot untrack the original capture action", async () => {
+    const fixture = await startActualHarnessCapture({ mainTools: HARNESS_RESULT_MAIN_TOOLS });
+    await beginWork(fixture.root, "same-id result tracking work");
+    const source = await executeActualHarness(
+      fixture.root,
+      "same-id-result-source",
+      "bounded same-id result task",
+    );
+    await observeActualHarness(fixture.root, source);
+    const sourceDetails = harnessDetails(source.result);
+    const runnerCalls = fixture.runner.requests.length;
+    const input = { action: "capture", sourceToolCallId: "same-id-result-source" };
+    await resultPreflight(fixture.root, "same-id-result-action", input);
+    const originalSignal = new AbortController();
+    const original = resultTool(fixture.root).execute(
+      "same-id-result-action",
+      input,
+      originalSignal.signal,
+      undefined,
+      fixture.root.host.context,
+    );
+    expect(fixture.root.entry.harnessInspect?.(fixture.root.host.context)?.coordinator?.output.active).toBe(true);
+
+    // A different promise for the same actual id is a refusal, not a new
+    // tracked entry. The original deferred action remains cancelable.
+    const changedSignal = await resultTool(fixture.root).execute(
+      "same-id-result-action",
+      input,
+      new AbortController().signal,
+      undefined,
+      fixture.root.host.context,
+    );
+    expect(resultPayload(changedSignal).ok).toBe(false);
+    expect(String(resultPayload(changedSignal).error?.reason)).toMatch(/signal/i);
+    expect(fixture.root.entry.harnessInspect?.(fixture.root.host.context)?.coordinator?.output.active).toBe(true);
+
+    const ending = fixture.root.host.emit("agent_end", {});
+    const wire = await original;
+    await ending;
+    expect(resultPayload(wire).error?.reason).toMatch(/cancel/i);
+    expect(fixture.runner.requests).toHaveLength(runnerCalls);
+    const afterDetails = harnessDetails(source.result);
+    expect(afterDetails.runId).toBe(sourceDetails.runId);
+    expect(afterDetails.outcome).toBe("backend-completed");
+    expect(afterDetails.cancellation).toBe("none");
+    const inspection = fixture.root.entry.harnessInspect?.(fixture.root.host.context);
+    expect(inspection?.coordinator?.output.active).toBe(false);
+    expect(inspection?.coordinator?.output.retainedCaptures).toBe(0);
+    expect(inspection?.coordinator?.output.reservedBytes).toBe(0);
+    expect(inspection?.coordinator?.operations[0]?.output.state).toBe("failed");
+  }, 30_000);
 });
 
 describe("actual instanced Harness host-only output capture", () => {

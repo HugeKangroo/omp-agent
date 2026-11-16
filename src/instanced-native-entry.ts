@@ -97,6 +97,11 @@ import {
   captureNativeHarnessOutput,
   matchesNativeHarnessOutputCapture,
 } from "./native-harness-output.ts";
+import { NATIVE_HARNESS_RESULT_TOOL } from "./native-harness-checks.ts";
+import {
+  createNativeHarnessResultEntry,
+  type NativeHarnessResultEntry,
+} from "./native-harness-result-entry.ts";
 import {
   createNativeHarnessEntry,
   type NativeHarnessEntry,
@@ -3022,12 +3027,21 @@ function harnessContextFailure(
   if (root.harness !== harness || !root.open || root.phase !== "ready") {
     return "the root Harness authority was invalidated during revalidation";
   }
+  // The model getter is a host callback and may change the active set. Finish
+  // it before the final exact tool-set observation.
+  const model = readCurrentModel(context);
+  if (!sameModel(model, harness.mainModel)) return "the actual main model changed since the Harness root was admitted";
   const tools = readActiveTools(pi);
   if (tools === null) return "the actual main active tools are unavailable";
   if (!sameSet(tools, harness.mainTools)) return "the actual main tool set changed since the Harness root was admitted";
   if (!tools.includes(NATIVE_HARNESS_TOOL)) return "agent_harness is no longer in the actual main active tool set";
-  const model = readCurrentModel(context);
-  if (!sameModel(model, harness.mainModel)) return "the actual main model changed since the Harness root was admitted";
+  // Last are pure local identity/state checks only; no host callbacks rerun
+  // after the bounded actual-context observation above.
+  if (factory.disposed) return "the instanced native entry was disposed";
+  if (moduleRoot !== root || root.factoryId !== factory.id) return "the instance root was replaced";
+  if (factory.rootToken === null || root.token !== factory.rootToken) return "the instance root generation changed";
+  if (!root.open || root.phase !== "ready") return "the instance root is no longer open and ready";
+  if (root.harness !== harness) return "the root Harness coordinator changed";
   return null;
 }
 
@@ -3204,6 +3218,7 @@ function resolveMainHarnessRoot(
   factory: FactoryContext,
   context: NativeContext,
   pi: DefinedOmpApi,
+  requiredTool: string = NATIVE_HARNESS_TOOL,
 ): NativeHarnessRootResolution {
   if (factory.disposed) return { ok: false, reason: "the instanced native entry was disposed" };
   const root = moduleRoot;
@@ -3236,17 +3251,61 @@ function resolveMainHarnessRoot(
   if (root.harness !== harness || !root.open || root.phase !== "ready") {
     return { ok: false, reason: "the root Harness authority was invalidated during resolution" };
   }
+  // Keep the existing required-tool refusal before selection, then re-read the
+  // exact admitted set after the selection/model callbacks finish below.
   const tools = readActiveTools(pi);
   if (tools === null) return { ok: false, reason: "the actual main active tools are unavailable" };
-  if (!sameSet(tools, harness.mainTools)) {
-    return { ok: false, reason: "the actual main tool set changed since the Harness root was admitted" };
+  if (!tools.includes(requiredTool)) {
+    return { ok: false, reason: `${requiredTool} is no longer in the actual main active tool set` };
   }
-  if (!tools.includes(NATIVE_HARNESS_TOOL)) {
-    return { ok: false, reason: "agent_harness is no longer in the actual main active tool set" };
+  // Selection and model getters are host callbacks; finish both before the
+  // final exact active-tool observation.
+  // The result adapter needs its own explicit D1 role/effective selection in
+  // addition to the source capability that admitted this root. The default
+  // source requirement stays exactly agent_harness for existing callers.
+  if (requiredTool === NATIVE_HARNESS_RESULT_TOOL) {
+    let resultSelected = false;
+    try {
+      const main = factory.definitionEntry.controller.getStatus();
+      resultSelected = main.phase === "bound"
+        && main.roleTools.includes(NATIVE_HARNESS_RESULT_TOOL)
+        && main.effectiveTools.includes(NATIVE_HARNESS_RESULT_TOOL);
+    } catch {
+      resultSelected = false;
+    }
+    if (!resultSelected) {
+      return {
+        ok: false,
+        reason: "agent_harness_result is not explicitly selected by the current D1 main binding",
+      };
+    }
   }
   const model = readCurrentModel(context);
   if (!sameModel(model, harness.mainModel)) {
     return { ok: false, reason: "the actual main model changed since the Harness root was admitted" };
+  }
+  const finalTools = readActiveTools(pi);
+  if (finalTools === null) return { ok: false, reason: "the actual main active tools are unavailable" };
+  if (!sameSet(finalTools, harness.mainTools)) {
+    return { ok: false, reason: "the actual main tool set changed since the Harness root was admitted" };
+  }
+  if (!finalTools.includes(requiredTool)) {
+    return { ok: false, reason: `${requiredTool} is no longer in the actual main active tool set` };
+  }
+  // Last are pure local identity/state checks only; no host callbacks rerun
+  // after the bounded actual-context observation above.
+  if (factory.disposed) return { ok: false, reason: "the instanced native entry was disposed" };
+  if (moduleRoot !== root || root.factoryId !== factory.id) {
+    return { ok: false, reason: "the instance root was replaced" };
+  }
+  if (factory.rootToken === null || root.token !== factory.rootToken) {
+    return { ok: false, reason: "the instance root generation changed" };
+  }
+  if (!root.open || root.phase !== "ready") {
+    return { ok: false, reason: "the instance root is no longer open and ready" };
+  }
+  if (root.harness !== harness) {
+    return { ok: false, reason: "the root Harness coordinator changed" };
   }
   return {
     ok: true,
@@ -5791,8 +5850,9 @@ function childToolCall(
   if (!childGuard(factory, pi, root, record, context) || record === null) {
     return block("Native child instance binding or runtime facts are refused; no tool ran.");
   }
-  if (isRecord(event) && event.toolName === NATIVE_HARNESS_TOOL) {
-    return block("agent_harness is available only to the owning actual main root; no child backend ran.");
+  if (isRecord(event)
+    && (event.toolName === NATIVE_HARNESS_TOOL || event.toolName === NATIVE_HARNESS_RESULT_TOOL)) {
+    return block("Harness tools are available only to the owning actual main root; no child backend ran.");
   }
   if (!isRecord(event) || event.toolName !== NATIVE_SNAPSHOT_TOOL) return undefined;
   if (record.handoffOffer === null || record.handoffToken === null) {
@@ -6280,6 +6340,7 @@ export function createInstancedNativeEntry(
   let handoffEntry: NativeHandoffEntry | null = null;
   let snapshotEntry: NativeSnapshotEntry | null = null;
   let harnessEntry: NativeHarnessEntry | null = null;
+  let harnessResultEntry: NativeHarnessResultEntry | null = null;
   let toolRegistrationFailure: string | null = null;
   if (harnessConfig !== null) {
     harnessEntry = createNativeHarnessEntry({
@@ -6288,6 +6349,14 @@ export function createInstancedNativeEntry(
           return { ok: false, reason: "the native Harness entry is not initialized" };
         }
         return resolveMainHarnessRoot(toolFactory, context, pi);
+      },
+    });
+    harnessResultEntry = createNativeHarnessResultEntry({
+      resolveRoot(context: NativeContext) {
+        if (toolFactory === null) {
+          return { ok: false, reason: "the native Harness result entry is not initialized" };
+        }
+        return resolveMainHarnessRoot(toolFactory, context, pi, NATIVE_HARNESS_RESULT_TOOL);
       },
     });
   }
@@ -6332,6 +6401,7 @@ export function createInstancedNativeEntry(
     pi.registerTool(handoffTool);
     pi.registerTool(snapshotTool);
     if (harnessEntry !== null) pi.registerTool(harnessEntry.tool as unknown as NativeTool);
+    if (harnessResultEntry !== null) pi.registerTool(harnessResultEntry.tool as unknown as NativeTool);
   } catch (error) {
     toolRegistrationFailure = boundedMessage(`Native handoff tool registration failed: ${errorMessage(error)}`);
   }
@@ -6529,6 +6599,11 @@ export function createInstancedNativeEntry(
       }
       if (!refreshRoot(factory, root, pi, context)) {
         return block(root.failure ?? "The native instance root is not valid; no tool ran.");
+      }
+      if (isRecord(event) && event.toolName === NATIVE_HARNESS_RESULT_TOOL) {
+        const resolved = resolveMainHarnessRoot(factory, context, pi, NATIVE_HARNESS_RESULT_TOOL);
+        if (!resolved.ok) return block(resolved.reason);
+        return undefined;
       }
       if (isRecord(event) && event.toolName === NATIVE_HANDOFF_TOOL) {
         return mainHandoffPreflight(factory, root, event, context);
@@ -6803,6 +6878,7 @@ export function createInstancedNativeEntry(
       handoffEntry?.dispose();
       snapshotEntry?.dispose();
       harnessEntry?.dispose();
+      harnessResultEntry?.dispose();
       definitionEntry.dispose();
     },
   };
