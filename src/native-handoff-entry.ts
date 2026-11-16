@@ -30,6 +30,7 @@ import {
   type NativeWorkspaceTextSnapshot,
 } from "./native-work.ts";
 import type { NativeContext, NativeToolResult } from "./native-entry.ts";
+import type { NativeHandoffReportCoreFacts } from "./native-instance-report.ts";
 
 /**
  * Bounded `agent_handoff` main-tool adapter and root-owned operation
@@ -58,6 +59,8 @@ const MAX_COPY_ARRAY_ITEMS = 64;
 const MAX_COPY_OBJECT_KEYS = 16;
 const MAX_COPY_KEY_CHARS = 128;
 const MAX_COPY_STRING_CHARS = 8192;
+/** Fixed report handoff facts portion from the C2 contract. */
+const MAX_NATIVE_HANDOFF_REPORT_CORE_FACTS_BYTES = 32 * 1024;
 
 export type NativeHandoffAction = "capture" | "offer" | "adopt" | "inspect";
 
@@ -384,6 +387,207 @@ export function createNativeHandoffCoordinator(
   coordinatorStates.set(coordinator, state);
   coordinatorsByRoot.set(rootRef, coordinator);
   return coordinator;
+}
+
+/**
+ * INTERNAL: returns the original store owned by an exact issued coordinator.
+ * Foreign objects, clones and closed coordinators return null. It reads only
+ * this module's private WeakMap, never caller properties or a caller store.
+ */
+export function getNativeHandoffCoordinatorStore(
+  coordinator: NativeHandoffCoordinator,
+): NativeHandoffStore | null {
+  if (typeof coordinator !== "object" || coordinator === null) return null;
+  const state = coordinatorStates.get(coordinator);
+  if (state === undefined || state.closed) return null;
+  return state.store;
+}
+
+export interface NativeHandoffReportPrepareRequest {
+  readonly adoptionId: string;
+  readonly work: NativeHandoffWorkFacts;
+  readonly producer: object;
+  readonly consumer: object;
+  readonly consumerParentTaskCall: object;
+}
+
+export interface NativeHandoffPreparedReport {
+  readonly facts: NativeHandoffReportCoreFacts;
+  readonly revalidate: () => string | null;
+}
+
+export type NativeHandoffReportPrepareResult =
+  | { readonly ok: true; readonly prepared: NativeHandoffPreparedReport }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * INTERNAL trusted-composition report preparation. It authenticates only the
+ * exact issued coordinator/store, the original PASS adoption and the original
+ * adopt operation slot that issued it. Request IDs/work facts are copied as
+ * bounded own data first; opaque producer/consumer/parent-call references are
+ * compared by identity only. No host read, file I/O, new slot/receipt/adoption
+ * or alternate work token is created.
+ */
+export function prepareNativeHandoffReport(
+  coordinator: NativeHandoffCoordinator,
+  request: NativeHandoffReportPrepareRequest,
+): NativeHandoffReportPrepareResult {
+  let normalized: {
+    readonly adoptionId: string;
+    readonly work: NativeHandoffWorkFacts;
+    readonly producer: object;
+    readonly consumer: object;
+    readonly consumerParentTaskCall: object;
+  } | null = null;
+  try {
+    const fields = readStrictFields(
+      request,
+      ["adoptionId", "work", "producer", "consumer", "consumerParentTaskCall"],
+      ["adoptionId", "work", "producer", "consumer", "consumerParentTaskCall"],
+    );
+    if (fields === null) {
+      return { ok: false, reason: "the native handoff report request is malformed" };
+    }
+    const adoptionId = boundedString(fields.get("adoptionId"), MAX_ID_CHARS);
+    const work = parseWorkFacts(fields.get("work"));
+    const producer = fields.get("producer");
+    const consumer = fields.get("consumer");
+    const consumerParentTaskCall = fields.get("consumerParentTaskCall");
+    if (adoptionId === null || work === null) {
+      return { ok: false, reason: "the native handoff report ID or work facts are invalid" };
+    }
+    if (
+      !isOpaqueRef(producer)
+      || !isOpaqueRef(consumer)
+      || !isOpaqueRef(consumerParentTaskCall)
+    ) {
+      return { ok: false, reason: "the native handoff report references are invalid" };
+    }
+    normalized = { adoptionId, work, producer, consumer, consumerParentTaskCall };
+  } catch {
+    // Revoked proxies can make even Array.isArray/own-key reflection throw.
+    return { ok: false, reason: "the native handoff report request could not be inspected" };
+  }
+  if (normalized === null) {
+    return { ok: false, reason: "the native handoff report request is malformed" };
+  }
+  const { adoptionId, work, producer, consumer, consumerParentTaskCall } = normalized;
+
+  // Authentication happens after every request descriptor was read/copied, so
+  // a reentrant proxy trap cannot race the private WeakMap lookup.
+  const state = typeof coordinator === "object" && coordinator !== null
+    ? coordinatorStates.get(coordinator)
+    : undefined;
+  if (state === undefined) {
+    return { ok: false, reason: "the native handoff report coordinator is not authentic" };
+  }
+  if (state.closed) {
+    return { ok: false, reason: "the native handoff report coordinator is closed" };
+  }
+  const store = state.store;
+  const adoption = store.resolveAdoption(adoptionId);
+  const adoptionView = adoption === null ? null : store.lookupAdoption(adoptionId);
+  if (adoption === null || adoptionView === null) {
+    return { ok: false, reason: "the native handoff report adoption is unavailable" };
+  }
+  const capture = store.resolveCapture(adoptionView.captureId);
+  const captureView = store.lookupCapture(adoptionView.captureId);
+  if (capture === null || captureView === null) {
+    return { ok: false, reason: "the native handoff report capture is unavailable" };
+  }
+
+  // Only the original adopt slot that published this adoption may supply the
+  // core work/call tokens. No other same-work slot is accepted as a fallback.
+  const slot = state.slots.get(adoptionView.adoptionCall.callId);
+  if (slot === undefined) {
+    return { ok: false, reason: "the original handoff adopt operation slot is unavailable" };
+  }
+  if (slot.action !== "adopt") {
+    return { ok: false, reason: "the original handoff operation was not an adoption" };
+  }
+  if (slot.state === "conflict") {
+    return {
+      ok: false,
+      reason: boundedReason(slot.conflictReason, "the original handoff adoption conflicted"),
+    };
+  }
+  if (slot.state !== "settled") {
+    return { ok: false, reason: "the original handoff adoption is not settled" };
+  }
+  if (!slot.committed) {
+    return { ok: false, reason: "the original handoff adoption did not commit" };
+  }
+  if (!sameWork(slot.work, work)) {
+    return { ok: false, reason: "the report work facts do not match the original adoption" };
+  }
+  const workRef = slot.workRef;
+  const adoptionCall = slot.originalCallRef as HandoffCallRef;
+  const bindingProblem = store.checkAdoptionReportBinding(
+    adoption,
+    workRef,
+    producer,
+    consumer,
+    consumerParentTaskCall,
+    adoptionCall,
+  );
+  if (bindingProblem !== null) return { ok: false, reason: bindingProblem };
+
+  const facts = deepFreeze({
+    adoption: {
+      ...adoptionView,
+      file: { ...adoptionView.file },
+      parentBinding: { ...adoptionView.parentBinding },
+      producer: { ...adoptionView.producer },
+      proposal: { ...adoptionView.proposal },
+      adoptionCall: { ...adoptionView.adoptionCall },
+    },
+    snapshotId: captureView.snapshotId,
+    checkerId: captureView.checkerId,
+    checkerVersion: captureView.checkerVersion,
+  }) satisfies NativeHandoffReportCoreFacts;
+  let factsBytes: number;
+  try {
+    factsBytes = new TextEncoder().encode(JSON.stringify(facts)).byteLength;
+  } catch {
+    return { ok: false, reason: "the native handoff report facts could not be bounded" };
+  }
+  if (factsBytes > MAX_NATIVE_HANDOFF_REPORT_CORE_FACTS_BYTES) {
+    return { ok: false, reason: "the native handoff report facts exceed the fixed byte limit" };
+  }
+
+  const revalidate = (): string | null => {
+    if (state.closed) return "the root handoff coordinator was closed";
+    if (coordinatorStates.get(coordinator) !== state) {
+      return "the original handoff coordinator state changed";
+    }
+    if (state.slots.get(slot.toolCallId) !== slot) {
+      return "the original handoff adopt operation slot is no longer current";
+    }
+    if (slot.action !== "adopt") return "the original handoff operation was not an adoption";
+    if (slot.state === "conflict") {
+      return boundedReason(slot.conflictReason, "the original handoff adoption conflicted");
+    }
+    if (slot.state !== "settled") return "the original handoff adoption is no longer settled";
+    if (!slot.committed) return "the original handoff adoption lost its commit";
+    if (!sameWork(slot.work, work)) return "the original handoff adoption work changed";
+    if (slot.workRef !== workRef || slot.originalCallRef !== adoptionCall) {
+      return "the original handoff adoption references changed";
+    }
+    return store.checkAdoptionReportBinding(
+      adoption,
+      workRef,
+      producer,
+      consumer,
+      consumerParentTaskCall,
+      adoptionCall,
+    );
+  };
+  const finalProblem = revalidate();
+  if (finalProblem !== null) return { ok: false, reason: finalProblem };
+  return {
+    ok: true,
+    prepared: Object.freeze({ facts, revalidate }),
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -785,6 +989,28 @@ function parseArguments(value: unknown): ParsedArguments {
     };
   }
   return { ok: false, reason: "agent_handoff action must be capture, offer, adopt or inspect" };
+}
+
+export type NativeHandoffRequestDescriptorRead =
+  | { readonly ok: true; readonly descriptor: NativeHandoffRequestDescriptor }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * INTERNAL: the same bounded strict parser used by the main tool, exported for
+ * trusted report composition that must not duplicate the parameter schema.
+ * Reflection failures become bounded refusals; the descriptor and digest are
+ * unchanged.
+ */
+export function readNativeHandoffRequestDescriptor(
+  value: unknown,
+): NativeHandoffRequestDescriptorRead {
+  try {
+    const parsed = parseArguments(value);
+    if (!parsed.ok) return { ok: false, reason: parsed.reason };
+    return { ok: true, descriptor: parsed.descriptor };
+  } catch {
+    return { ok: false, reason: "agent_handoff arguments could not be inspected" };
+  }
 }
 
 function parseWorkFacts(value: unknown): NativeHandoffWorkFacts | null {
@@ -2305,12 +2531,7 @@ export function createNativeHandoffEntry(options: NativeHandoffEntryOptions): Na
       if (actualToolCallId === null) {
         return Promise.resolve(notAdmitted("the actual handoff tool call id is unavailable"));
       }
-      let parsed: ParsedArguments;
-      try {
-        parsed = parseArguments(params);
-      } catch {
-        return Promise.resolve(notAdmitted("agent_handoff arguments could not be inspected"));
-      }
+      const parsed = readNativeHandoffRequestDescriptor(params);
       if (!parsed.ok) return Promise.resolve(notAdmitted(parsed.reason));
       const descriptor = parsed.descriptor;
 

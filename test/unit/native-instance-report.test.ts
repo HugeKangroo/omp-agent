@@ -14,6 +14,7 @@ import {
 import {
   boundNativeInstanceReportCatalog,
   snapshotNativeInstanceReportFacts,
+  type NativeHandoffReportFacts,
   type NativeInstanceReportCatalog,
   type NativeInstanceReportFacts,
   type NativeInstanceReportPort,
@@ -21,6 +22,10 @@ import {
   type NativeInstanceReportSelection,
   type NativeReportWorkIdentity,
 } from "../../src/native-instance-report.ts";
+import {
+  NATIVE_TEXT_CHECKER_ID,
+  NATIVE_TEXT_CHECKER_VERSION,
+} from "../../src/native-snapshot-checker.ts";
 import {
   nodeFileIo,
   type NativeFileHandle,
@@ -30,6 +35,11 @@ import { clearPublishedTaskOwner } from "../../src/task-entry-port.ts";
 
 const AGENT_WORK = "agent_work";
 const DIGEST = createHash("sha256").update("observed-envelope").digest("hex");
+const CONSUMER_DIGEST = createHash("sha256").update("consumer-envelope").digest("hex");
+const PLAN_DIGEST = createHash("sha256").update("handoff-plan").digest("hex");
+const HANDOFF_TEXT = "selected handoff bytes\n";
+const HANDOFF_BYTES = Buffer.byteLength(HANDOFF_TEXT, "utf8");
+const HANDOFF_SHA = createHash("sha256").update(HANDOFF_TEXT).digest("hex");
 
 type RegisteredTool = Parameters<NativeOmpApi["registerTool"]>[0];
 type Handler = (event: unknown, context: NativeContext) => unknown;
@@ -106,6 +116,7 @@ class Host {
 function makeFacts(
   selection: NativeInstanceReportSelection,
   work: NativeReportWorkIdentity,
+  handoff?: NativeHandoffReportFacts,
 ): NativeInstanceReportFacts {
   return {
     result: {
@@ -131,7 +142,92 @@ function makeFacts(
     envelope: { sha256: selection.envelopeSha256, bytes: 256, scope: "tool-result-middleware" },
     artifactBasis: "observed-during-report",
     semanticAcceptance: "not-evaluated",
+    ...(handoff === undefined ? {} : { handoff }),
   };
+}
+
+function makeHandoffFacts(
+  selection: NativeInstanceReportSelection,
+  work: NativeReportWorkIdentity,
+  text = HANDOFF_TEXT,
+  adoptionId = "adoption-1",
+  filePath = "out.txt",
+): NativeHandoffReportFacts {
+  const bytes = Buffer.byteLength(text, "utf8");
+  const sha256 = createHash("sha256").update(text).digest("hex");
+  return {
+    adoption: {
+      adoptionId,
+      receiptId: `receipt-${adoptionId}`,
+      offerId: `offer-${adoptionId}`,
+      captureId: `capture-${adoptionId}`,
+      chainId: `chain-${adoptionId}`,
+      version: 1,
+      source: "model-proposed",
+      planDigest: PLAN_DIGEST,
+      relativePath: filePath,
+      file: { relativePath: filePath, bytes, sha256 },
+      outcome: "pass",
+      parentBinding: {
+        callId: "task-2",
+        workId: work.observationId,
+        definitionVersion: "1.0.0",
+      },
+      producer: {
+        callId: selection.parentToolCallId,
+        workId: work.observationId,
+        definitionVersion: "1.0.0",
+      },
+      proposal: {
+        callId: "proposal-1",
+        workId: work.observationId,
+        definitionVersion: "1.0.0",
+      },
+      adoptionCall: { callId: "adopt-1" },
+      taskAccepted: false,
+      semanticAcceptance: "not-evaluated",
+      authority: "non-authoritative",
+    },
+    snapshotId: "snapshot-1",
+    checkerId: NATIVE_TEXT_CHECKER_ID,
+    checkerVersion: NATIVE_TEXT_CHECKER_VERSION,
+    consumer: {
+      result: {
+        instanceId: "instance-consumer",
+        parentToolCallId: "task-2",
+        index: 0,
+        childId: "child-2",
+        childSessionId: "child-session-2",
+        agentName: "consumer",
+        parentSessionId: work.sessionId,
+        workspaceRoot: work.workspaceRoot,
+        rootEpoch: 1,
+        definitionVersion: "1.0.0",
+      },
+      work: {
+        observationId: work.observationId,
+        generation: work.generation,
+        sessionId: work.sessionId,
+        workspaceRoot: work.workspaceRoot,
+        toolCallId: "task-2",
+        toolName: "task",
+      },
+      envelope: { sha256: CONSUMER_DIGEST, bytes: 128, scope: "tool-result-middleware" },
+      completed: true,
+    },
+  };
+}
+
+function countingFileIo(): { io: NativeFileIo; opens(): number } {
+  let opens = 0;
+  const io: NativeFileIo = {
+    ...nodeFileIo,
+    open(target, flags) {
+      opens += 1;
+      return nodeFileIo.open(target, flags);
+    },
+  };
+  return { io, opens: () => opens };
 }
 
 type AnyHook = (...args: any[]) => unknown;
@@ -147,22 +243,29 @@ class FakePort implements NativeInstanceReportPort {
   revalidateHook: AnyHook | null = null;
   inspectHook: AnyHook | null = null;
   factsHook: ((facts: NativeInstanceReportFacts) => unknown) | null = null;
+  handoffFactory: ((selection: NativeInstanceReportSelection, work: NativeReportWorkIdentity) => NativeHandoffReportFacts) | null = null;
   lastSelection: NativeInstanceReportSelection | null = null;
   lastWork: NativeReportWorkIdentity | null = null;
   lastInspectWork: NativeReportWorkIdentity | null = null;
   lastPreparation: NativeInstanceReportPreparation | null = null;
+  lastHandoffAdoptionId: string | undefined;
 
   prepare(
     selection: NativeInstanceReportSelection,
     work: NativeReportWorkIdentity,
     context: NativeContext,
+    handoffAdoptionId?: string,
   ): any {
     this.prepareCalls += 1;
     this.lastSelection = selection;
     this.lastWork = work;
+    this.lastHandoffAdoptionId = handoffAdoptionId;
     if (this.prepareHook !== null) return this.prepareHook(selection, work, context);
     if (this.conflict) return { ok: false, reason: "a later instance result conflict was observed" };
-    const facts = makeFacts(selection, work);
+    const handoff = this.handoffFactory === null
+      ? undefined
+      : this.handoffFactory(selection, work);
+    const facts = makeFacts(selection, work, handoff);
     const prepared: NativeInstanceReportPreparation = {
       facts: (this.factsHook === null ? facts : this.factsHook(facts)) as NativeInstanceReportFacts,
       refresh: () => {
@@ -290,6 +393,7 @@ function reportArgs(
   outputFiles: string[] = [],
   selection?: Record<string, unknown>,
   summary = "selected result report",
+  handoffAdoptionId?: string,
 ): Record<string, unknown> {
   return {
     action: "report",
@@ -299,6 +403,7 @@ function reportArgs(
     summary,
     limitations: ["semantic acceptance was not evaluated"],
     ...(selection === undefined ? {} : { instanceResult: selection }),
+    ...(handoffAdoptionId === undefined ? {} : { handoffAdoptionId }),
   };
 }
 
@@ -433,6 +538,7 @@ describe("C2 fixed instance report preparation", () => {
       expect(Object.isFrozen(snapshot.facts.envelope)).toBe(true);
     }
     expect(f.port.prepareCalls).toBe(1);
+    expect(f.port.lastHandoffAdoptionId).toBeUndefined();
     expect(f.port.refreshCalls).toBe(2);
     expect(f.port.revalidateCalls).toBe(2);
 
@@ -912,6 +1018,557 @@ describe("C2 fixed instance report preparation", () => {
       f.signal(),
     ), /unreadable failure|threw/);
     expect((await inspect(f)).current.report).toBeNull();
+  });
+});
+
+describe("C2 handoff adoption report surface", () => {
+  test("publishes one PASS adopted file with frozen conditional facts", async () => {
+    const f = await fixture();
+    await taskWork(f);
+    await f.host.observe(f.ctx, "task-2", "task", "consumer completed");
+    await writeFile(path.join(f.workspace, "out.txt"), HANDOFF_TEXT, "utf8");
+    f.port.handoffFactory = (selection, work) => makeHandoffFacts(selection, work);
+    const result = await f.host.call(
+      "report-handoff-valid",
+      reportArgs(
+        [{ toolCallId: "task-1", purpose: "producer delegated work" }],
+        ["out.txt"],
+        selector(),
+        "handoff report",
+        "adoption-1",
+      ),
+      f.ctx,
+      f.signal(),
+    );
+    const report = reportDetails(result);
+    expect(f.port.lastHandoffAdoptionId).toBe("adoption-1");
+    expect(report.instanceResult?.handoff?.adoption.adoptionId).toBe("adoption-1");
+    expect(report.instanceResult?.handoff?.adoption.outcome).toBe("pass");
+    expect(report.instanceResult?.handoff?.consumer.completed).toBe(true);
+    expect(report.instanceResult?.handoff?.consumer.result.parentSessionId).toBe(report.work.sessionId);
+    expect(report.observed.outputFiles).toHaveLength(1);
+    expect(report.observed.outputFiles[0]?.relativePath).toBe("out.txt");
+    expect(report.observed.outputFiles[0]?.bytes).toBe(HANDOFF_BYTES);
+    expect(report.observed.outputFiles[0]?.sha256).toBe(HANDOFF_SHA);
+    expect(report.modelDeclared.outcome).toBe("completed");
+    expect(report.caveats.some((caveat) => caveat.includes("frozen handoff condition was PASS"))).toBe(true);
+
+    const identity = {
+      observationId: report.work.observationId,
+      generation: report.work.generation,
+      sessionId: report.work.sessionId,
+      workspaceRoot: report.work.workspaceRoot,
+    };
+    const snapshot = snapshotNativeInstanceReportFacts(
+      report.instanceResult,
+      selector() as unknown as NativeInstanceReportSelection,
+      identity,
+      "adoption-1",
+    );
+    expect(snapshot.ok).toBe(true);
+    if (snapshot.ok) {
+      expect(Object.isFrozen(snapshot.facts.handoff)).toBe(true);
+      expect(Object.isFrozen(snapshot.facts.handoff?.consumer)).toBe(true);
+    }
+  });
+
+  test("refuses handoff selector, file-count and prepared-presence violations before I/O", async () => {
+    const counted = countingFileIo();
+    const f = await fixture({ fileIo: counted.io });
+    await taskWork(f);
+    await writeFile(path.join(f.workspace, "out.txt"), HANDOFF_TEXT, "utf8");
+    await writeFile(path.join(f.workspace, "out2.txt"), "second\n", "utf8");
+
+    expectError(await f.host.call(
+      "report-handoff-no-selector",
+      reportArgs([{ toolCallId: "task-1", purpose: "delegated" }], ["out.txt"], undefined, "x", "adoption-1"),
+      f.ctx,
+      f.signal(),
+    ), /requires an explicit instanceResult/);
+    expectError(await f.host.call(
+      "report-handoff-two-files",
+      reportArgs(
+        [{ toolCallId: "task-1", purpose: "delegated" }],
+        ["out.txt", "out2.txt"],
+        selector(),
+        "x",
+        "adoption-1",
+      ),
+      f.ctx,
+      f.signal(),
+    ), /exactly one outputFiles/);
+
+    const accessorParams = reportArgs(
+      [{ toolCallId: "task-1", purpose: "delegated" }],
+      ["out.txt"],
+      selector(),
+      "x",
+    );
+    let getterRuns = 0;
+    Object.defineProperty(accessorParams, "handoffAdoptionId", {
+      configurable: true,
+      get() {
+        getterRuns += 1;
+        return "adoption-1";
+      },
+    });
+    expectError(await f.host.call("report-handoff-accessor", accessorParams, f.ctx, f.signal()), /accessor/);
+    expect(getterRuns).toBe(0);
+
+    for (const [index, bad] of [
+      undefined,
+      null,
+      "",
+      "x".repeat(257),
+    ].entries()) {
+      const params = {
+        ...reportArgs([{ toolCallId: "task-1", purpose: "delegated" }], ["out.txt"], selector(), "x"),
+        handoffAdoptionId: bad,
+      };
+      expectError(await f.host.call(`report-handoff-bad-id-${index}`, params, f.ctx, f.signal()), /handoffAdoptionId/);
+    }
+
+    expectError(await f.host.call(
+      "report-handoff-missing-facts",
+      reportArgs(
+        [{ toolCallId: "task-1", purpose: "delegated" }],
+        ["out.txt"],
+        selector(),
+        "x",
+        "adoption-1",
+      ),
+      f.ctx,
+      f.signal(),
+    ), /contain no handoff data/);
+
+    f.port.handoffFactory = (selection, work) => makeHandoffFacts(selection, work);
+    expectError(await f.host.call(
+      "report-handoff-unsolicited",
+      reportArgs([{ toolCallId: "task-1", purpose: "delegated" }], ["out.txt"], selector(), "x"),
+      f.ctx,
+      f.signal(),
+    ), /did not request/);
+    expectError(await f.host.call(
+      "report-handoff-untrimmed",
+      reportArgs(
+        [{ toolCallId: "task-1", purpose: "delegated" }],
+        ["out.txt"],
+        selector(),
+        "x",
+        " adoption-1 ",
+      ),
+      f.ctx,
+      f.signal(),
+    ), /does not match the requested handoffAdoptionId/);
+    expect(counted.opens()).toBe(0);
+    expect((await inspect(f)).current.report).toBeNull();
+
+    const noPort = await fixture({ port: null });
+    await taskWork(noPort);
+    expectError(await noPort.host.call(
+      "report-handoff-no-port",
+      reportArgs(
+        [{ toolCallId: "task-1", purpose: "delegated" }],
+        ["out.txt"],
+        selector(),
+        "x",
+        "adoption-1",
+      ),
+      noPort.ctx,
+      noPort.signal(),
+    ), /no instance result composition/);
+  });
+
+  test("refuses adopted path, byte and digest mismatches", async () => {
+    for (const mode of ["path", "bytes", "sha"] as const) {
+      const counted = countingFileIo();
+      const f = await fixture({ fileIo: counted.io });
+      await taskWork(f);
+      await writeFile(path.join(f.workspace, "out.txt"), HANDOFF_TEXT, "utf8");
+      f.port.handoffFactory = (selection, work) => {
+        if (mode === "path") {
+          return makeHandoffFacts(selection, work, HANDOFF_TEXT, "adoption-1", "other.txt");
+        }
+        const facts = makeHandoffFacts(selection, work);
+        return mode === "bytes"
+          ? {
+              ...facts,
+              adoption: {
+                ...facts.adoption,
+                file: { ...facts.adoption.file, bytes: facts.adoption.file.bytes + 1 },
+              },
+            }
+          : {
+              ...facts,
+              adoption: {
+                ...facts.adoption,
+                file: { ...facts.adoption.file, sha256: "0".repeat(64) },
+              },
+            };
+      };
+      expectError(await f.host.call(
+        `report-handoff-file-${mode}`,
+        reportArgs(
+          [{ toolCallId: "task-1", purpose: "delegated" }],
+          ["out.txt"],
+          selector(),
+          "x",
+          "adoption-1",
+        ),
+        f.ctx,
+        f.signal(),
+      ), mode === "path"
+        ? /adopted file path|exactly one outputFiles/
+        : mode === "bytes"
+          ? /byte count differs/
+          : /sha256 differs/);
+      expect(counted.opens()).toBe(mode === "path" ? 0 : 1);
+      expect((await inspect(f)).current.report).toBeNull();
+    }
+  });
+
+  test("refuses mismatched consumer, root, work, definition, envelope, PASS and constants", async () => {
+    const cases: Array<[(facts: NativeHandoffReportFacts) => unknown, RegExp]> = [
+      [(facts) => ({
+        ...facts,
+        consumer: {
+          ...facts.consumer,
+          work: { ...facts.consumer.work, observationId: "other-work" },
+        },
+      }), /consumer work/],
+      [(facts) => ({
+        ...facts,
+        consumer: {
+          ...facts.consumer,
+          result: { ...facts.consumer.result, workspaceRoot: "other-workspace" },
+        },
+      }), /root, session and workspace/],
+      [(facts) => ({
+        ...facts,
+        adoption: {
+          ...facts.adoption,
+          parentBinding: { ...facts.adoption.parentBinding, definitionVersion: "2.0.0" },
+        },
+      }), /parent binding/],
+      [(facts) => ({
+        ...facts,
+        consumer: {
+          ...facts.consumer,
+          envelope: { ...facts.consumer.envelope, sha256: "bad" },
+        },
+      }), /consumer envelope/],
+      [(facts) => ({
+        ...facts,
+        adoption: { ...facts.adoption, outcome: "fail" },
+      }), /PASS/],
+      [(facts) => ({ ...facts, checkerId: "other-checker" }), /checker/],
+      [(facts) => ({
+        ...facts,
+        adoption: {
+          ...facts.adoption,
+          producer: { ...facts.adoption.producer, callId: "other-producer" },
+        },
+      }), /producer/],
+    ];
+    for (const [index, [mutate, pattern]] of cases.entries()) {
+      const counted = countingFileIo();
+      const f = await fixture({ fileIo: counted.io });
+      await taskWork(f);
+      await writeFile(path.join(f.workspace, "out.txt"), HANDOFF_TEXT, "utf8");
+      f.port.handoffFactory = (selection, work) =>
+        mutate(makeHandoffFacts(selection, work)) as NativeHandoffReportFacts;
+      expectError(await f.host.call(
+        `report-handoff-mismatch-${index}`,
+        reportArgs(
+          [{ toolCallId: "task-1", purpose: "delegated" }],
+          ["out.txt"],
+          selector(),
+          "x",
+          "adoption-1",
+        ),
+        f.ctx,
+        f.signal(),
+      ), pattern);
+      expect(counted.opens()).toBe(0);
+      expect((await inspect(f)).current.report).toBeNull();
+    }
+  });
+
+  test("refuses handoff accessors, thenables and oversized metadata", async () => {
+    const f = await fixture();
+    await taskWork(f);
+    await writeFile(path.join(f.workspace, "out.txt"), HANDOFF_TEXT, "utf8");
+    const params = reportArgs(
+      [{ toolCallId: "task-1", purpose: "delegated" }],
+      ["out.txt"],
+      selector(),
+      "x",
+      "adoption-1",
+    );
+
+    let topGetterRuns = 0;
+    f.port.factsHook = (facts) => {
+      const altered = { ...facts };
+      Object.defineProperty(altered, "handoff", {
+        configurable: true,
+        get() {
+          topGetterRuns += 1;
+          return {};
+        },
+      });
+      return altered;
+    };
+    expectError(await f.host.call("report-handoff-top-accessor", params, f.ctx, f.signal()), /own data field, not an accessor/);
+    expect(topGetterRuns).toBe(0);
+
+    f.port.factsHook = null;
+    let nestedGetterRuns = 0;
+    f.port.handoffFactory = (selection, work) => {
+      const facts = makeHandoffFacts(selection, work);
+      const adoption = { ...facts.adoption };
+      Object.defineProperty(adoption, "outcome", {
+        configurable: true,
+        get() {
+          nestedGetterRuns += 1;
+          return "pass";
+        },
+      });
+      return { ...facts, adoption } as NativeHandoffReportFacts;
+    };
+    expectError(await f.host.call("report-handoff-nested-accessor", params, f.ctx, f.signal()), /PASS/);
+    expect(nestedGetterRuns).toBe(0);
+
+    let thenRuns = 0;
+    f.port.handoffFactory = (selection, work) => ({
+      ...makeHandoffFacts(selection, work),
+      then() {
+        thenRuns += 1;
+      },
+    }) as unknown as NativeHandoffReportFacts;
+    expectError(await f.host.call("report-handoff-thenable", params, f.ctx, f.signal()), /strict own-data/);
+    expect(thenRuns).toBe(0);
+    expect((await inspect(f)).current.report).toBeNull();
+
+    const maxId = "m".repeat(256);
+    // 2048 astral characters are 4096 UTF-16 code units but 8192 UTF-8
+    // bytes, so four bounded fields exceed the 32 KiB handoff JSON cap.
+    const longText = "😀".repeat(2048);
+    const longWork: NativeReportWorkIdentity = {
+      observationId: maxId,
+      generation: 1,
+      sessionId: longText,
+      workspaceRoot: longText,
+    };
+    const longSelection: NativeInstanceReportSelection = {
+      instanceId: maxId,
+      parentToolCallId: maxId,
+      envelopeSha256: DIGEST,
+    };
+    const longPath = [
+      "a".repeat(250),
+      "b".repeat(250),
+      "c".repeat(250),
+      "d".repeat(250),
+    ].join("/");
+    const baseFacts = makeFacts(
+      longSelection,
+      longWork,
+      makeHandoffFacts(longSelection, longWork, HANDOFF_TEXT, "adoption-1", longPath),
+    );
+    const oversizedFacts: NativeInstanceReportFacts = {
+      ...baseFacts,
+      result: {
+        ...baseFacts.result,
+        instanceId: maxId,
+        parentToolCallId: maxId,
+        childId: maxId,
+        childSessionId: maxId,
+        agentName: maxId,
+        definitionVersion: "1.0.0",
+      },
+      work: { ...baseFacts.work, toolCallId: maxId },
+      handoff: {
+        ...baseFacts.handoff!,
+        snapshotId: maxId,
+        adoption: {
+          ...baseFacts.handoff!.adoption,
+          receiptId: maxId,
+          offerId: maxId,
+          captureId: maxId,
+          chainId: maxId,
+          parentBinding: { callId: maxId, workId: maxId, definitionVersion: maxId },
+          producer: {
+            callId: maxId,
+            workId: maxId,
+            definitionVersion: "1.0.0",
+          },
+          proposal: { callId: maxId, workId: maxId, definitionVersion: maxId },
+          adoptionCall: { callId: maxId },
+        },
+        consumer: {
+          ...baseFacts.handoff!.consumer,
+          result: {
+            ...baseFacts.handoff!.consumer.result,
+            instanceId: maxId,
+            parentToolCallId: maxId,
+            childId: maxId,
+            childSessionId: maxId,
+            agentName: maxId,
+            definitionVersion: maxId,
+          },
+          work: { ...baseFacts.handoff!.consumer.work, toolCallId: maxId },
+        },
+      },
+    };
+    const oversized = snapshotNativeInstanceReportFacts(
+      oversizedFacts,
+      longSelection,
+      longWork,
+      "adoption-1",
+    );
+    expect(oversized.ok).toBe(false);
+    if (!oversized.ok) expect(oversized.reason).toMatch(/exceed 32768 bytes/);
+  });
+
+  test("handoff reports do not publish after read cancellation or final getter reentry", async () => {
+    for (const mode of ["abort", "work"] as const) {
+      const gate = gateIo(1);
+      const f = await fixture({ fileIo: gate.io });
+      await taskWork(f);
+      await writeFile(path.join(f.workspace, "out.txt"), HANDOFF_TEXT, "utf8");
+      f.port.handoffFactory = (selection, work) => makeHandoffFacts(selection, work);
+      const controller = new AbortController();
+      const running = f.host.call(
+        `report-handoff-${mode}-during-read`,
+        reportArgs(
+          [{ toolCallId: "task-1", purpose: "delegated" }],
+          ["out.txt"],
+          selector(),
+          "x",
+          "adoption-1",
+        ),
+        f.ctx,
+        controller.signal,
+      );
+      await gate.waitForReads;
+      if (mode === "abort") controller.abort();
+      else f.setSessionId("changed-during-read");
+      gate.release();
+      expectError(await running, mode === "abort" ? /cancelled/ : /session or workspace changed/);
+      expect((await inspect(f)).current?.report ?? null).toBeNull();
+    }
+
+    const reentrant = await fixture();
+    await taskWork(reentrant);
+    await writeFile(path.join(reentrant.workspace, "out.txt"), HANDOFF_TEXT, "utf8");
+    reentrant.port.handoffFactory = (selection, work) => makeHandoffFacts(selection, work);
+    let getterCount = 0;
+    let conflictSeen = false;
+    reentrant.port.revalidateHook = () => conflictSeen
+      ? "revalidate saw the final host read mutation"
+      : null;
+    reentrant.setCwdGetterHook(() => {
+      getterCount += 1;
+      if (getterCount >= 3) conflictSeen = true;
+    });
+    expectError(await reentrant.host.call(
+      "report-handoff-reentrant",
+      reportArgs(
+        [{ toolCallId: "task-1", purpose: "delegated" }],
+        ["out.txt"],
+        selector(),
+        "x",
+        "adoption-1",
+      ),
+      reentrant.ctx,
+      reentrant.signal(),
+    ), /final host read mutation/);
+    expect((await inspect(reentrant)).current?.report ?? null).toBeNull();
+  });
+
+  test("historical handoff replay preserves original observed bytes without rereading and changed id conflicts", async () => {
+    const counted = countingFileIo();
+    const f = await fixture({ fileIo: counted.io });
+    await taskWork(f);
+    await writeFile(path.join(f.workspace, "out.txt"), HANDOFF_TEXT, "utf8");
+    f.port.handoffFactory = (selection, work) => makeHandoffFacts(selection, work);
+    const params = reportArgs(
+      [{ toolCallId: "task-1", purpose: "delegated" }],
+      ["out.txt"],
+      selector(),
+      "handoff replay",
+      "adoption-1",
+    );
+    const original = reportDetails(await f.host.call("report-handoff-original", params, f.ctx, f.signal()));
+    expect(counted.opens()).toBe(1);
+
+    await writeFile(path.join(f.workspace, "out.txt"), "changed after report\n", "utf8");
+    const replayResult = await f.host.call("report-handoff-replay", params, f.ctx, f.signal());
+    const replay = reportDetails(replayResult);
+    expect(replay.recordedAt).toBe(original.recordedAt);
+    expect(replay.observed).toEqual(original.observed);
+    expect(replay.instanceResult?.handoff).toEqual(original.instanceResult?.handoff);
+    expect(replayResult.content[0]?.text ?? "").toContain("files were not reread");
+    expect(counted.opens()).toBe(1);
+
+    f.port.handoffFactory = (selection, work) =>
+      makeHandoffFacts(selection, work, "tampered adoption facts\n", "adoption-1");
+    expectError(await f.host.call(
+      "report-handoff-replay-mismatch",
+      params,
+      f.ctx,
+      f.signal(),
+    ), /does not match the current adopted handoff file/);
+    expect(counted.opens()).toBe(1);
+
+    f.port.handoffFactory = (selection, work) =>
+      makeHandoffFacts(selection, work, HANDOFF_TEXT, "adoption-2");
+    expectError(await f.host.call(
+      "report-handoff-changed-id",
+      reportArgs(
+        [{ toolCallId: "task-1", purpose: "delegated" }],
+        ["out.txt"],
+        selector(),
+        "handoff replay",
+        "adoption-2",
+      ),
+      f.ctx,
+      f.signal(),
+    ), /different report/);
+    expect(counted.opens()).toBe(1);
+    const unchanged = await inspect(f);
+    expect(unchanged.current.report.recordedAt).toBe(original.recordedAt);
+    expect(unchanged.current.report.observed.outputFiles[0]?.sha256).toBe(HANDOFF_SHA);
+  });
+
+  test("concurrent identical handoff reports return the original observed facts", async () => {
+    const gate = gateIo(2);
+    const f = await fixture({ fileIo: gate.io });
+    await taskWork(f);
+    await writeFile(path.join(f.workspace, "out.txt"), HANDOFF_TEXT, "utf8");
+    f.port.handoffFactory = (selection, work) => makeHandoffFacts(selection, work);
+    const params = reportArgs(
+      [{ toolCallId: "task-1", purpose: "delegated" }],
+      ["out.txt"],
+      selector(),
+      "handoff concurrent",
+      "adoption-1",
+    );
+    const first = f.host.call("report-handoff-concurrent-a", params, f.ctx, f.signal());
+    const second = f.host.call("report-handoff-concurrent-b", params, f.ctx, f.signal());
+    await gate.waitForReads;
+    gate.release();
+    const firstResult = await first;
+    const secondResult = await second;
+    const a = reportDetails(firstResult);
+    const b = reportDetails(secondResult);
+    expect(b.recordedAt).toBe(a.recordedAt);
+    expect(b.observed).toEqual(a.observed);
+    expect(b.instanceResult?.handoff).toEqual(a.instanceResult?.handoff);
+    const texts = [firstResult, secondResult].map((result) => result.content[0]?.text ?? "");
+    expect(texts.filter((text) => text.includes(
+      "this invocation's file reads were not published",
+    ))).toHaveLength(1);
   });
 });
 

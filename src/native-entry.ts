@@ -22,6 +22,7 @@ import {
 } from "./task-entry-port.ts";
 import {
   boundNativeInstanceReportCatalog,
+  MAX_NATIVE_INSTANCE_REPORT_ID_CHARS,
   readNativeInstanceReportSelection,
   snapshotNativeInstanceReportFacts,
   unavailableNativeInstanceReportCatalog,
@@ -65,7 +66,7 @@ const MAX_RESULT_EXCERPT_CHARS = 1000;
 export const NATIVE_WORK_GUIDANCE = [
   "Work in the ordinary OMP native loop: understand the goal and constraints, choose methods, inspect relevant inputs, execute, actually check the result, and repair or report limits.",
   "The explicitly loaded agent_work tool records only non-authoritative per-request observations in this main session; it is not the managed TaskOwner, permission, acceptance, verification, or a replacement task system.",
-  "If you use agent_work report, select only real completed tool calls from that same work, state a model-declared outcome and limitations, and distinguish observed result facts from unverified coverage. Never describe a report as accepted or globally verified. When associating one observed native instance result, copy its instanceId, parentToolCallId and envelopeSha256 from agent_work inspect into the optional instanceResult selector and include that task call in checks; outputFiles remain bytes observed during this report, not semantic acceptance.",
+  "If you use agent_work report, select only real completed tool calls from that same work, state a model-declared outcome and limitations, and distinguish observed result facts from unverified coverage. Never describe a report as accepted or globally verified. When associating one observed native instance result, copy its instanceId, parentToolCallId and envelopeSha256 from agent_work inspect into the optional instanceResult selector and include that task call in checks; outputFiles remain bytes observed during this report, not semantic acceptance. When an exact PASS handoffAdoptionId is available, use exactly one outputFiles entry equal to that adopted file; the frozen PASS still applies only to these observed bytes, not semantic acceptance.",
   "Native tools and OMP authorization are unchanged; perform proportional actual checks when supported, and otherwise report unverified or blocked outcomes plainly rather than claiming a pass.",
   "For tasks restricted to supplied evidence, separate facts and derivations the sources support from assumptions and recommendations, and treat missing information as unknown instead of adding an unrequested alternative premise. Check the final artifact and final reply against the original sources and the requested constraints, including scope and length, not just a self-written checker or keyword presence, then report remaining uncertainty honestly.",
   "This does not forbid explicitly requested hypothetical exploration, labeled as such, or proportionate curiosity in other tasks.",
@@ -460,6 +461,7 @@ type ParsedArguments =
       summary: string | null;
       limitations: string[];
       instanceResult?: NativeInstanceReportSelection;
+      handoffAdoptionId?: string;
     };
 
 type ReportArguments = Extract<ParsedArguments, { action: "report" }>;
@@ -710,10 +712,13 @@ function prepareReportInstance(
   selection: NativeInstanceReportSelection,
   work: NativeReportWorkIdentity,
   context: NativeContext,
+  handoffAdoptionId: string | undefined,
 ): PreparedPortSuccess | PortInvocationFailure {
   let raw: unknown;
   try {
-    raw = port.prepare(selection, work, context);
+    raw = handoffAdoptionId === undefined
+      ? port.prepare(selection, work, context)
+      : port.prepare(selection, work, context, handoffAdoptionId);
   } catch (error) {
     return {
       ok: false,
@@ -769,7 +774,7 @@ function prepareReportInstance(
   if (typeof refreshValue !== "function" || typeof revalidateValue !== "function") {
     return { ok: false, reason: "instance result preparation did not provide synchronous refresh and revalidate methods" };
   }
-  const facts = snapshotNativeInstanceReportFacts(factsValue, selection, work);
+  const facts = snapshotNativeInstanceReportFacts(factsValue, selection, work, handoffAdoptionId);
   if (!facts.ok) return { ok: false, reason: facts.reason };
   const refresh = refreshValue as (this: unknown, context: NativeContext) => NativeInstanceReportCheck;
   const revalidate = revalidateValue as (this: unknown) => string | null;
@@ -870,6 +875,7 @@ function parseArguments(value: unknown): ParsedArguments {
     "summary",
     "limitations",
     "instanceResult",
+    "handoffAdoptionId",
   ]);
   const unsupported = keys.filter((key) => !allowed.has(key));
   if (unsupported.length > 0) throw new Error(`agent_work report has unsupported field(s): ${unsupported.join(", ")}.`);
@@ -948,6 +954,29 @@ function parseArguments(value: unknown): ParsedArguments {
     instanceResult = read.selection;
   }
 
+  let handoffAdoptionId: string | undefined;
+  if (Object.hasOwn(value, "handoffAdoptionId")) {
+    const descriptor = Object.getOwnPropertyDescriptor(value, "handoffAdoptionId");
+    if (descriptor === undefined || !("value" in descriptor)) {
+      throw new Error("agent_work handoffAdoptionId must be an own data field, not an accessor.");
+    }
+    const raw = descriptor.value;
+    if (typeof raw !== "string" || raw.length < 1 || raw.length > MAX_NATIVE_INSTANCE_REPORT_ID_CHARS) {
+      throw new Error(
+        `agent_work handoffAdoptionId must be a non-empty own string of 1-${MAX_NATIVE_INSTANCE_REPORT_ID_CHARS} characters; it is never trimmed or coerced.`,
+      );
+    }
+    handoffAdoptionId = raw;
+  }
+  if (handoffAdoptionId !== undefined) {
+    if (instanceResult === undefined) {
+      throw new Error("agent_work handoffAdoptionId requires an explicit instanceResult selector.");
+    }
+    if (outputFiles.length !== 1) {
+      throw new Error("agent_work handoffAdoptionId requires exactly one outputFiles entry for the adopted file.");
+    }
+  }
+
   return {
     action: "report",
     checks,
@@ -956,6 +985,7 @@ function parseArguments(value: unknown): ParsedArguments {
     summary,
     limitations,
     ...(instanceResult === undefined ? {} : { instanceResult }),
+    ...(handoffAdoptionId === undefined ? {} : { handoffAdoptionId }),
   };
 }
 
@@ -1632,6 +1662,7 @@ function reportSignature(work: Work, parsed: ReportArguments): string {
     summary: parsed.summary ?? "",
     limitations: parsed.limitations,
     ...(parsed.instanceResult === undefined ? {} : { instanceResult: parsed.instanceResult }),
+    ...(parsed.handoffAdoptionId === undefined ? {} : { handoffAdoptionId: parsed.handoffAdoptionId }),
   }));
 }
 
@@ -1755,6 +1786,9 @@ function buildReport(
       "Tool result facts are this plugin's tool_result hook observation after any earlier middleware; they are not untouched native output.",
       "Tool names, success flags, file bytes and hashes do not establish semantic correctness or full check coverage.",
       "No host-level independent verification or global acceptance was performed.",
+      ...(instanceResult?.handoff === undefined ? [] : [
+        "The frozen handoff condition was PASS for the exact bytes observed during this report; this does not establish exclusive authorship, a commit-time file snapshot, or an atomic commit.",
+      ]),
     ],
     ...(instanceResult === undefined ? {} : { instanceResult }),
   };
@@ -2290,6 +2324,81 @@ function selectedSignalFailure(signal: unknown, when: string): NativeToolResult 
   return null;
 }
 
+function handoffFileMismatch(
+  expected: { readonly relativePath: string; readonly bytes: number; readonly sha256: string },
+  observed: NativeObservedFile,
+): string | null {
+  if (observed.relativePath !== expected.relativePath) {
+    return "the observed relative path differs from the adopted file path";
+  }
+  if (observed.bytes !== expected.bytes) {
+    return "the observed byte count differs from the adopted file bytes";
+  }
+  if (observed.sha256 !== expected.sha256) {
+    return "the observed sha256 differs from the adopted file digest";
+  }
+  return null;
+}
+
+/**
+ * The selected handoff path is decided before any file I/O. The adoption file
+ * is the only expected output; there is no second drifting copy.
+ */
+function selectedHandoffPathFailure(
+  parsed: ReportArguments,
+  facts: NativeInstanceReportFacts,
+): NativeToolResult | null {
+  const handoff = facts.handoff;
+  if (handoff === undefined) {
+    return parsed.handoffAdoptionId === undefined
+      ? null
+      : errorResult("agent_work report refused: the prepared result has no handoff facts for the requested handoffAdoptionId. No report was recorded.");
+  }
+  if (parsed.handoffAdoptionId === undefined) {
+    return errorResult("agent_work report refused: the prepared result contains unsolicited handoff facts. No report was recorded.");
+  }
+  if (parsed.outputFiles.length !== 1
+    || parsed.outputFiles[0] !== handoff.adoption.file.relativePath) {
+    return errorResult(
+      `agent_work report refused: handoffAdoptionId requires exactly one outputFiles entry equal to the adopted file path ${JSON.stringify(handoff.adoption.file.relativePath)}. No report was recorded.`,
+    );
+  }
+  return null;
+}
+
+/**
+ * Historical replay compares the original published file facts with the
+ * currently prepared adoption file. It never reads the file again and never
+ * grafts this invocation's facts into the existing report.
+ */
+function historicalHandoffReplayFailure(
+  report: NativeWorkReport,
+  prepared: NativeInstanceReportFacts,
+): NativeToolResult | null {
+  const handoff = prepared.handoff;
+  if (handoff === undefined) return null;
+  const publishedHandoff = report.instanceResult?.handoff;
+  if (publishedHandoff === undefined
+    || publishedHandoff.adoption.adoptionId !== handoff.adoption.adoptionId) {
+    return errorResult(
+      "agent_work report refused: the existing identical report has no matching frozen handoff adoption. No report was recorded.",
+    );
+  }
+  const observed = report.observed.outputFiles;
+  if (observed.length !== 1) {
+    return errorResult(
+      "agent_work report refused: the existing identical handoff report does not have exactly one observed output file. No report was recorded.",
+    );
+  }
+  const mismatch = handoffFileMismatch(handoff.adoption.file, observed[0]!);
+  if (mismatch !== null) {
+    return errorResult(
+      `agent_work report refused: the existing identical report's observed output file does not match the current adopted handoff file: ${mismatch}. No report was recorded.`,
+    );
+  }
+  return null;
+}
+
 async function executeSelectedReport(
   state: EntryState,
   toolCallId: string,
@@ -2340,11 +2449,13 @@ async function executeSelectedReport(
   if (workIdentity === null) {
     return errorResult("agent_work report refused: session or workspace identity is unavailable. No report was recorded.");
   }
-  const prepared = prepareReportInstance(port, selection, workIdentity, context);
+  const prepared = prepareReportInstance(port, selection, workIdentity, context, parsed.handoffAdoptionId);
   if (!prepared.ok) {
     return errorResult(`agent_work report refused: ${prepared.reason}. No report was recorded.`);
   }
   const instanceFacts = prepared.facts;
+  const handoffPath = selectedHandoffPathFailure(parsed, instanceFacts);
+  if (handoffPath !== null) return handoffPath;
   const preRefresh = invokePreparedRefresh(() => prepared.refresh());
   if (!preRefresh.ok) {
     return errorResult(`agent_work report refused: ${preRefresh.reason}. No report was recorded.`);
@@ -2368,6 +2479,8 @@ async function executeSelectedReport(
   const signature = reportSignature(work, parsed);
   if (work.report !== null) {
     if (work.reportSignature === signature) {
+      const replayFailure = historicalHandoffReplayFailure(work.report, instanceFacts);
+      if (replayFailure !== null) return replayFailure;
       return successResult(
         clonePlain(work.report),
         "Existing identical report observed; files were not reread and the original recordedAt is preserved.",
@@ -2391,6 +2504,15 @@ async function executeSelectedReport(
       return errorResult(
         `agent_work report refused output file ${JSON.stringify(relativePath)}${code}: ${errorMessage(error)} No report was recorded.`,
       );
+    }
+    const handoff = instanceFacts.handoff;
+    if (handoff !== undefined) {
+      const mismatch = handoffFileMismatch(handoff.adoption.file, file);
+      if (mismatch !== null) {
+        return errorResult(
+          `agent_work report refused: ${mismatch}. No report was recorded.`,
+        );
+      }
     }
     totalBytes += file.bytes;
     if (totalBytes > MAX_OUTPUT_TOTAL_BYTES) {
@@ -2429,6 +2551,8 @@ async function executeSelectedReport(
   if (invalidatedSelected !== null) return invalidatedSelected;
   if (work.report !== null) {
     if (work.reportSignature === finalSignature) {
+      const replayFailure = historicalHandoffReplayFailure(work.report, instanceFacts);
+      if (replayFailure !== null) return replayFailure;
       return successResult(
         clonePlain(work.report),
         "Existing identical report observed; this invocation's file reads were not published and the original recordedAt and byte observations are preserved.",
@@ -3293,6 +3417,12 @@ const AGENT_WORK_PARAMETERS = {
       required: ["instanceId", "parentToolCallId", "envelopeSha256"],
       additionalProperties: false,
       description: "Optional one observed native instance result for this report. Selectors come only from inspect; byte/file observations do not establish semantic acceptance.",
+    },
+    handoffAdoptionId: {
+      type: "string",
+      minLength: 1,
+      maxLength: MAX_NATIVE_INSTANCE_REPORT_ID_CHARS,
+      description: "Optional exact PASS adoption id from the trusted handoff composition. Requires instanceResult and exactly one outputFiles entry equal to the adopted file.",
     },
   },
   required: ["action"],

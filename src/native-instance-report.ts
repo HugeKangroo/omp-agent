@@ -1,14 +1,26 @@
 import type { NativeContext, NativeWorkCallReference } from "./native-entry.ts";
 import type { NativeInstanceResultAssociation } from "./native-instance-result.ts";
+import {
+  NATIVE_HANDOFF_SOURCE,
+  type HandoffAdoptionView,
+  type HandoffBindingFacts,
+  type HandoffLiveFileFacts,
+  type HandoffToolCallFacts,
+} from "./native-handoff.ts";
+import {
+  NATIVE_TEXT_CHECKER_ID,
+  NATIVE_TEXT_CHECKER_VERSION,
+} from "./native-snapshot-checker.ts";
+import { MAX_OUTPUT_FILE_BYTES, validateRelativePath } from "./native-work.ts";
 
 /**
  * Fixed internal contract for associating one C1-observed native instance
  * result with an existing agent_work report.
  *
- * This module owns only bounded plain types and pure metadata validation. It
- * has no runtime imports and no access to instance roots, records, work state,
- * files, clocks or host context. The instanced entry later implements the port;
- * the ordinary native entry owns report validation, publication and replay.
+ * Runtime imports are fixed constants and path validation from core leaves.
+ * This module has no access to instance roots, records, work state, files,
+ * clocks or host context. The instanced entry later implements the port; the
+ * ordinary native entry owns report validation, publication and replay.
  */
 
 export const NATIVE_INSTANCE_REPORT_CATALOG_SCHEMA = "omp-agent.native-instance-report-catalog.v1";
@@ -17,6 +29,7 @@ export const MAX_NATIVE_INSTANCE_REPORT_ROOT_CHARS = 4096;
 export const MAX_NATIVE_INSTANCE_REPORT_REASON_CHARS = 500;
 export const MAX_NATIVE_INSTANCE_REPORT_CATALOG_ITEMS = 64;
 export const MAX_NATIVE_INSTANCE_REPORT_CATALOG_BYTES = 64 * 1024;
+export const MAX_NATIVE_HANDOFF_REPORT_BYTES = 32 * 1024;
 const MAX_ENVELOPE_BYTES = 64 * 1024;
 
 /** Strict report-only selector. IDs and digest are never normalized. */
@@ -34,16 +47,43 @@ export interface NativeReportWorkIdentity {
   readonly workspaceRoot: string;
 }
 
+export interface NativeInstanceReportEnvelope {
+  readonly sha256: string;
+  readonly bytes: number;
+  readonly scope: "tool-result-middleware";
+}
+
+/**
+ * Fixed core facts for one PASS adoption. Copied IDs and digests are facts for
+ * later comparison, not proof that this module authenticated a core handle.
+ */
+export interface NativeHandoffReportCoreFacts {
+  readonly adoption: HandoffAdoptionView;
+  readonly snapshotId: string;
+  readonly checkerId: typeof NATIVE_TEXT_CHECKER_ID;
+  readonly checkerVersion: typeof NATIVE_TEXT_CHECKER_VERSION;
+}
+
+/**
+ * Full report handoff facts. The consumer result and work are crosschecked
+ * against the producer facts and this report's root/session/work/definition.
+ */
+export interface NativeHandoffReportFacts extends NativeHandoffReportCoreFacts {
+  readonly consumer: {
+    readonly result: NativeInstanceResultAssociation;
+    readonly work: NativeWorkCallReference;
+    readonly envelope: NativeInstanceReportEnvelope;
+    readonly completed: true;
+  };
+}
+
 export interface NativeInstanceReportFacts {
   readonly result: NativeInstanceResultAssociation;
   readonly work: NativeWorkCallReference;
-  readonly envelope: {
-    readonly sha256: string;
-    readonly bytes: number;
-    readonly scope: "tool-result-middleware";
-  };
+  readonly envelope: NativeInstanceReportEnvelope;
   readonly artifactBasis: "observed-during-report";
   readonly semanticAcceptance: "not-evaluated";
+  readonly handoff?: NativeHandoffReportFacts;
 }
 
 export type NativeInstanceReportCheck =
@@ -123,10 +163,16 @@ export type NativeInstanceReportCatalog =
  * throws, malformed returns, thenables and mismatched facts.
  */
 export interface NativeInstanceReportPort {
+  /**
+   * Old three-argument implementations remain valid because the handoff
+   * selector is optional. The entry passes it only when the report requested
+   * handoff adoption.
+   */
   prepare(
     selection: NativeInstanceReportSelection,
     work: NativeReportWorkIdentity,
     context: NativeContext,
+    handoffAdoptionId?: string,
   ): NativeInstanceReportPrepareResult;
   inspect(
     context: NativeContext,
@@ -427,6 +473,300 @@ function workReferenceSnapshot(value: unknown): NativeWorkCallReference | null {
   return { observationId, generation, sessionId, workspaceRoot, toolCallId, toolName: "task" };
 }
 
+const ADOPTION_FIELDS = [
+  "adoptionId",
+  "receiptId",
+  "offerId",
+  "captureId",
+  "chainId",
+  "version",
+  "source",
+  "planDigest",
+  "relativePath",
+  "file",
+  "outcome",
+  "parentBinding",
+  "producer",
+  "proposal",
+  "adoptionCall",
+  "taskAccepted",
+  "semanticAcceptance",
+  "authority",
+] as const;
+const BINDING_FIELDS = ["callId", "workId", "definitionVersion"] as const;
+const RESULT_FIELDS = [
+  "instanceId",
+  "parentToolCallId",
+  "index",
+  "childId",
+  "childSessionId",
+  "agentName",
+  "parentSessionId",
+  "workspaceRoot",
+  "rootEpoch",
+  "definitionVersion",
+] as const;
+const WORK_REFERENCE_FIELDS = [
+  "observationId",
+  "generation",
+  "sessionId",
+  "workspaceRoot",
+  "toolCallId",
+  "toolName",
+] as const;
+const ENVELOPE_FIELDS = ["sha256", "bytes", "scope"] as const;
+const CONSUMER_FIELDS = ["result", "work", "envelope", "completed"] as const;
+const HANDOFF_FIELDS = ["adoption", "snapshotId", "checkerId", "checkerVersion", "consumer"] as const;
+
+/**
+ * Strict own-data record with an exact field set. Accessors, symbols, extra
+ * fields and thenable-shaped objects are refused without invoking a getter.
+ */
+function strictOwnDataRecord(
+  value: unknown,
+  fields: readonly string[],
+): Record<string, unknown> | null {
+  if (!isRecord(value) || "then" in value) return null;
+  const keys = ownKeys(value);
+  if (keys === null || keys.length !== fields.length) return null;
+  for (const field of fields) {
+    if (!keys.includes(field)) return null;
+    const descriptor = Object.getOwnPropertyDescriptor(value, field);
+    if (descriptor === undefined || !("value" in descriptor)) return null;
+  }
+  return value;
+}
+
+function relativePathSnapshot(value: unknown): string | null {
+  try {
+    return validateRelativePath(value);
+  } catch {
+    return null;
+  }
+}
+
+function bindingFactsSnapshot(value: unknown): HandoffBindingFacts | null {
+  const record = strictOwnDataRecord(value, BINDING_FIELDS);
+  if (record === null) return null;
+  const callId = boundedText(ownDataValue(record, "callId"), MAX_NATIVE_INSTANCE_REPORT_ID_CHARS);
+  const workId = boundedText(ownDataValue(record, "workId"), MAX_NATIVE_INSTANCE_REPORT_ID_CHARS);
+  const definitionVersion = boundedText(
+    ownDataValue(record, "definitionVersion"),
+    MAX_NATIVE_INSTANCE_REPORT_ID_CHARS,
+  );
+  if (callId === null || workId === null || definitionVersion === null) return null;
+  return { callId, workId, definitionVersion };
+}
+
+function toolCallFactsSnapshot(value: unknown): HandoffToolCallFacts | null {
+  const record = strictOwnDataRecord(value, ["callId"]);
+  if (record === null) return null;
+  const callId = boundedText(ownDataValue(record, "callId"), MAX_NATIVE_INSTANCE_REPORT_ID_CHARS);
+  return callId === null ? null : { callId };
+}
+
+function adoptionSnapshot(value: unknown): HandoffAdoptionView | null {
+  const record = strictOwnDataRecord(value, ADOPTION_FIELDS);
+  if (record === null) return null;
+  const adoptionId = boundedText(ownDataValue(record, "adoptionId"), MAX_NATIVE_INSTANCE_REPORT_ID_CHARS);
+  const receiptId = boundedText(ownDataValue(record, "receiptId"), MAX_NATIVE_INSTANCE_REPORT_ID_CHARS);
+  const offerId = boundedText(ownDataValue(record, "offerId"), MAX_NATIVE_INSTANCE_REPORT_ID_CHARS);
+  const captureId = boundedText(ownDataValue(record, "captureId"), MAX_NATIVE_INSTANCE_REPORT_ID_CHARS);
+  const chainId = boundedText(ownDataValue(record, "chainId"), MAX_NATIVE_INSTANCE_REPORT_ID_CHARS);
+  const version = safeInteger(ownDataValue(record, "version"), 1);
+  const planDigest = ownDataValue(record, "planDigest");
+  const relativePath = relativePathSnapshot(ownDataValue(record, "relativePath"));
+  const fileRecord = strictOwnDataRecord(ownDataValue(record, "file"), ["relativePath", "bytes", "sha256"]);
+  const filePath = fileRecord === null
+    ? null
+    : relativePathSnapshot(ownDataValue(fileRecord, "relativePath"));
+  const bytes = fileRecord === null ? null : safeInteger(ownDataValue(fileRecord, "bytes"), 0);
+  const fileSha256 = fileRecord === null ? null : ownDataValue(fileRecord, "sha256");
+  const parentBinding = bindingFactsSnapshot(ownDataValue(record, "parentBinding"));
+  const producer = bindingFactsSnapshot(ownDataValue(record, "producer"));
+  const proposal = bindingFactsSnapshot(ownDataValue(record, "proposal"));
+  const adoptionCall = toolCallFactsSnapshot(ownDataValue(record, "adoptionCall"));
+  if (adoptionId === null
+    || receiptId === null
+    || offerId === null
+    || captureId === null
+    || chainId === null
+    || version === null
+    || !lowercaseSha256(planDigest)
+    || relativePath === null
+    || filePath === null
+    || relativePath !== filePath
+    || bytes === null
+    || bytes > MAX_OUTPUT_FILE_BYTES
+    || !lowercaseSha256(fileSha256)
+    || ownDataValue(record, "source") !== NATIVE_HANDOFF_SOURCE
+    || ownDataValue(record, "outcome") !== "pass"
+    || parentBinding === null
+    || producer === null
+    || proposal === null
+    || adoptionCall === null
+    || ownDataValue(record, "taskAccepted") !== false
+    || ownDataValue(record, "semanticAcceptance") !== "not-evaluated"
+    || ownDataValue(record, "authority") !== "non-authoritative") {
+    return null;
+  }
+  return {
+    adoptionId,
+    receiptId,
+    offerId,
+    captureId,
+    chainId,
+    version,
+    source: NATIVE_HANDOFF_SOURCE,
+    planDigest,
+    relativePath,
+    file: { relativePath: filePath, bytes, sha256: fileSha256 },
+    outcome: "pass",
+    parentBinding,
+    producer,
+    proposal,
+    adoptionCall,
+    taskAccepted: false,
+    semanticAcceptance: "not-evaluated",
+    authority: "non-authoritative",
+  };
+}
+
+function strictAssociationSnapshot(value: unknown): NativeInstanceResultAssociation | null {
+  return strictOwnDataRecord(value, RESULT_FIELDS) === null ? null : associationSnapshot(value);
+}
+
+function strictWorkReferenceSnapshot(value: unknown): NativeWorkCallReference | null {
+  return strictOwnDataRecord(value, WORK_REFERENCE_FIELDS) === null
+    ? null
+    : workReferenceSnapshot(value);
+}
+
+function strictEnvelopeSnapshot(value: unknown): NativeInstanceReportEnvelope | null {
+  const record = strictOwnDataRecord(value, ENVELOPE_FIELDS);
+  if (record === null) return null;
+  const sha256 = ownDataValue(record, "sha256");
+  const bytes = safeInteger(ownDataValue(record, "bytes"), 1);
+  if (!lowercaseSha256(sha256)
+    || bytes === null
+    || bytes > MAX_ENVELOPE_BYTES
+    || ownDataValue(record, "scope") !== "tool-result-middleware") {
+    return null;
+  }
+  return { sha256, bytes, scope: "tool-result-middleware" };
+}
+
+type HandoffFactsResult =
+  | { readonly ok: true; readonly facts: NativeHandoffReportFacts }
+  | { readonly ok: false; readonly reason: string };
+
+/**
+ * Copy the additional handoff facts as bounded own data. This verifies copied
+ * facts only; it cannot authenticate a core handle or OMP identity.
+ */
+function snapshotHandoffFacts(
+  value: unknown,
+  handoffAdoptionId: string,
+  result: NativeInstanceResultAssociation,
+  work: NativeWorkCallReference,
+  workIdentity: NativeReportWorkIdentity,
+): HandoffFactsResult {
+  const record = strictOwnDataRecord(value, HANDOFF_FIELDS);
+  if (record === null) {
+    return {
+      ok: false,
+      reason: "The prepared handoff facts must be a strict own-data object with exactly the fixed adoption, snapshot, checker and consumer fields.",
+    };
+  }
+  const adoption = adoptionSnapshot(ownDataValue(record, "adoption"));
+  if (adoption === null) {
+    return {
+      ok: false,
+      reason: "The prepared handoff adoption must be one strict bounded non-authoritative PASS fact with a valid expected file.",
+    };
+  }
+  if (adoption.adoptionId !== handoffAdoptionId) {
+    return { ok: false, reason: "The prepared handoff adoptionId does not match the requested handoffAdoptionId." };
+  }
+  const snapshotId = boundedText(
+    ownDataValue(record, "snapshotId"),
+    MAX_NATIVE_INSTANCE_REPORT_ID_CHARS,
+  );
+  const checkerId = ownDataValue(record, "checkerId");
+  const checkerVersion = ownDataValue(record, "checkerVersion");
+  if (snapshotId === null) {
+    return { ok: false, reason: "The prepared handoff snapshotId must be a bounded own string." };
+  }
+  if (checkerId !== NATIVE_TEXT_CHECKER_ID || checkerVersion !== NATIVE_TEXT_CHECKER_VERSION) {
+    return { ok: false, reason: "The prepared handoff checker id or version is not the existing native text checker constant." };
+  }
+  const consumerRecord = strictOwnDataRecord(ownDataValue(record, "consumer"), CONSUMER_FIELDS);
+  if (consumerRecord === null) {
+    return {
+      ok: false,
+      reason: "The prepared handoff consumer must be a strict own-data result/work/envelope/completed object.",
+    };
+  }
+  const consumerResult = strictAssociationSnapshot(ownDataValue(consumerRecord, "result"));
+  const consumerWork = strictWorkReferenceSnapshot(ownDataValue(consumerRecord, "work"));
+  const consumerEnvelope = strictEnvelopeSnapshot(ownDataValue(consumerRecord, "envelope"));
+  if (consumerResult === null) {
+    return { ok: false, reason: "The prepared handoff consumer result is not a complete bounded instance association." };
+  }
+  if (consumerWork === null) {
+    return { ok: false, reason: "The prepared handoff consumer work is not a complete bounded task work reference." };
+  }
+  if (consumerEnvelope === null) {
+    return { ok: false, reason: "The prepared handoff consumer envelope is not a bounded observed tool-result-middleware envelope." };
+  }
+  if (ownDataValue(consumerRecord, "completed") !== true) {
+    return { ok: false, reason: "The prepared handoff consumer must be completed: true." };
+  }
+  if (consumerResult.parentSessionId !== result.parentSessionId
+    || consumerResult.workspaceRoot !== result.workspaceRoot
+    || consumerResult.rootEpoch !== result.rootEpoch) {
+    return { ok: false, reason: "The prepared handoff consumer result does not share this report's actual root, session and workspace." };
+  }
+  if (consumerWork.observationId !== workIdentity.observationId
+    || consumerWork.generation !== workIdentity.generation
+    || consumerWork.sessionId !== workIdentity.sessionId
+    || consumerWork.workspaceRoot !== workIdentity.workspaceRoot
+    || consumerWork.toolCallId !== consumerResult.parentToolCallId
+    || consumerWork.toolName !== "task") {
+    return { ok: false, reason: "The prepared handoff consumer work does not match this report's work or its parent task call." };
+  }
+  if (adoption.producer.callId !== result.parentToolCallId
+    || adoption.producer.definitionVersion !== result.definitionVersion
+    || adoption.producer.workId !== workIdentity.observationId) {
+    return { ok: false, reason: "The prepared handoff producer facts do not match the selected C2 producer work and frozen definition." };
+  }
+  if (adoption.parentBinding.callId !== consumerResult.parentToolCallId
+    || adoption.parentBinding.definitionVersion !== consumerResult.definitionVersion
+    || adoption.parentBinding.workId !== workIdentity.observationId) {
+    return { ok: false, reason: "The prepared handoff parent binding does not match the consumer parent task and frozen definition." };
+  }
+  const facts: NativeHandoffReportFacts = {
+    adoption,
+    snapshotId,
+    checkerId: NATIVE_TEXT_CHECKER_ID,
+    checkerVersion: NATIVE_TEXT_CHECKER_VERSION,
+    consumer: {
+      result: consumerResult,
+      work: consumerWork,
+      envelope: consumerEnvelope,
+      completed: true,
+    },
+  };
+  deepFreeze(facts);
+  if (Buffer.byteLength(JSON.stringify(facts), "utf8") > MAX_NATIVE_HANDOFF_REPORT_BYTES) {
+    return {
+      ok: false,
+      reason: `The complete prepared handoff facts exceed ${MAX_NATIVE_HANDOFF_REPORT_BYTES} bytes.`,
+    };
+  }
+  return { ok: true, facts };
+}
+
 /**
  * Copy and validate prepared facts before any file I/O. The returned object is
  * a deep-frozen primitive snapshot; later callback aliasing cannot change what
@@ -436,6 +776,7 @@ export function snapshotNativeInstanceReportFacts(
   value: unknown,
   selection: NativeInstanceReportSelection,
   work: NativeReportWorkIdentity,
+  handoffAdoptionId?: string,
 ): NativeInstanceReportFactsResult {
   try {
     if (!isRecord(value)) {
@@ -485,12 +826,51 @@ export function snapshotNativeInstanceReportFacts(
       || workRef.toolCallId !== selection.parentToolCallId) {
       return { ok: false, reason: "The prepared work reference does not match this report work and selected parent task call." };
     }
+    let requestedHandoffId: string | null = null;
+    if (handoffAdoptionId !== undefined) {
+      requestedHandoffId = boundedText(handoffAdoptionId, MAX_NATIVE_INSTANCE_REPORT_ID_CHARS);
+      if (requestedHandoffId === null) {
+        return {
+          ok: false,
+          reason: `The report handoffAdoptionId must be a non-empty own string of 1-${MAX_NATIVE_INSTANCE_REPORT_ID_CHARS} characters.`,
+        };
+      }
+    }
+    const handoffDescriptor = Object.getOwnPropertyDescriptor(value, "handoff");
+    const hasHandoff = handoffDescriptor !== undefined;
+    if (hasHandoff !== (requestedHandoffId !== null)) {
+      return {
+        ok: false,
+        reason: hasHandoff
+          ? "The prepared facts contain handoff data that the report did not request."
+          : "The report requested a handoff adoption but the prepared facts contain no handoff data.",
+      };
+    }
+    let handoff: NativeHandoffReportFacts | undefined;
+    if (hasHandoff) {
+      if (!("value" in handoffDescriptor)) {
+        return { ok: false, reason: "The prepared handoff field must be an own data field, not an accessor." };
+      }
+      if (requestedHandoffId === null) {
+        return { ok: false, reason: "The prepared handoff data has no matching requested handoffAdoptionId." };
+      }
+      const handoffResult = snapshotHandoffFacts(
+        handoffDescriptor.value,
+        requestedHandoffId,
+        result,
+        workRef,
+        work,
+      );
+      if (!handoffResult.ok) return handoffResult;
+      handoff = handoffResult.facts;
+    }
     const facts: NativeInstanceReportFacts = {
       result: { ...result },
       work: { ...workRef },
       envelope: { sha256, bytes, scope: "tool-result-middleware" },
       artifactBasis: "observed-during-report",
       semanticAcceptance: "not-evaluated",
+      ...(handoff === undefined ? {} : { handoff }),
     };
     return { ok: true, facts: deepFreeze(facts) };
   } catch {

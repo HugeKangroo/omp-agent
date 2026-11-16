@@ -110,7 +110,15 @@ Focused checks run `bun test test/unit/native-handoff-entry.test.ts` with `test/
 
 Focused checks use `bun test test/unit/native-call-association.test.ts`. An independent run passed 15 tests and 222 assertions, and type checking passed. Six new cases use the native-entry unit event fixtures to exercise preparation and replay: valid `preflight` preparation, invalidation after the result becomes `observed`, and a fresh preparation on the original issued reference that captures the observed result; late context-getter input and new-work injection; result/conflict/call-prune/work-prune/disable/dispose/late-owner refusal; foreign, cloned and cross-controller getter-reference refusal; direct owner-presence layouts; and prepared checks through the descriptor-only owner probe. Fixtures restore global owner descriptors and prototypes in `finally`.
 
-The full `bun run check` passed type checking, 825 unit tests (43 files, 35,181 assertions) and 15 human-review simulations (155 assertions), exit 0. These are unit fixtures, not an actual handoff core commit or an actual OMP host test; no adapter invocation, child read/result wiring or final report gate is exercised.
+The full `bun run check` passed type checking, 825 unit tests (43 files, 35,181 assertions) and 15 human-review simulations (155 assertions), exit 0. These are unit fixtures, not an actual handoff core commit or an actual OMP host test; no actual adapter invocation, child read/result wiring or instanced final report composition is exercised. The later focused report checks cover its surface and helper gates with fake ports.
+
+### Native child snapshot and adopted report checks
+
+Focused checks use `bun test test/unit/native-handoff-snapshot.test.ts` (20 tests, 260 assertions), `bun test test/unit/native-instance-report.test.ts test/unit/native-handoff-snapshot.test.ts` (48 tests, 716 assertions), and `bun test test/unit/native-handoff.test.ts test/unit/native-handoff-entry.test.ts` (58 tests, 681 assertions). The first focused child run retained an intermediate 16-pass/4-fail result before targeted fixes; the final runs above pass. Final `bun run check` passed type checking, 860 unit tests (44 files, 35,699 assertions) and 15 human-review simulations (155 assertions), exit 0.
+
+Coverage includes exact read-result observation separate from execute, immediate and sticky same-call conflict revocation, per-entry dispose without harming another entry or root, bounded escaped read responses, identity-only original adopt-slot and core binding proof, path/byte/SHA refusal, historical and concurrent report facts without reread, and getter or cancellation reentry before publication. The tests use fake trusted ports with the real core and A1 helpers plus real temporary files; they do not exercise an actual instanced composition, OMP host acceptance or a real-model run.
+
+The report binding gate requires the current chain head for a PASS adoption, but a direct PASS-then-new-head case is not reachable through public core behavior because repair requires a usable FAIL from the current head; the gate is present without that scenario. Optional `handoffAdoptionId` omission remains compatible.
 
 ## Commands
 

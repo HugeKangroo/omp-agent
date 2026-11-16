@@ -481,6 +481,21 @@ export interface NativeHandoffStore {
     work: HandoffWorkRef,
     producer: HandoffProducerRef,
   ): boolean;
+  /**
+   * Fixed-purpose report gate. It accepts only handles/refs already issued or
+   * retained by this store and compares them by exact object identity without
+   * reading caller properties. A PASS adoption remains report-eligible only
+   * while its original receipt/offer/capture binding, chain head, A1 receipt
+   * and captured file facts are unchanged. This is not host currentness.
+   */
+  checkAdoptionReportBinding(
+    adoption: HandoffAdoption,
+    work: HandoffWorkRef,
+    producer: HandoffProducerRef,
+    consumer: HandoffConsumerRef,
+    consumerParentTaskCall: HandoffCallRef,
+    adoptionCall: HandoffCallRef,
+  ): string | null;
   invalidate(reason?: string): void;
   dispose(): void;
 }
@@ -2138,6 +2153,66 @@ class NativeHandoffStoreImpl implements NativeHandoffStore {
     // Exact opaque object identity only. No caller property is read, no host
     // callback runs and no state/head/currentness is consulted.
     return record.workRef === work && record.producerRef === producer;
+  }
+
+  checkAdoptionReportBinding(
+    adoption: HandoffAdoption,
+    work: HandoffWorkRef,
+    producer: HandoffProducerRef,
+    consumer: HandoffConsumerRef,
+    consumerParentTaskCall: HandoffCallRef,
+    adoptionCall: HandoffCallRef,
+  ): string | null {
+    if (this.#state !== "active") return "the handoff store is no longer active";
+    if (typeof adoption !== "object" || adoption === null) {
+      return "the report adoption was not issued by this store";
+    }
+    const record = this.#adoptionHandles.get(adoption);
+    if (record === undefined) return "the report adoption was not issued by this store";
+    const receipt = record.receipt;
+    const capture = record.capture;
+    const offer = receipt.offer;
+    // Every external argument below is an opaque object compared only by
+    // identity. No caller property, getter or conversion is consulted.
+    if (
+      adoptionCall !== record.adoptionCallRef
+      || work !== record.workRef
+      || work !== capture.workRef
+      || producer !== record.producerRef
+      || producer !== capture.producerRef
+      || consumer !== record.consumerRef
+    ) {
+      return "the report adoption references changed";
+    }
+    if (receipt.capture !== capture || offer.capture !== capture) {
+      return "the report adoption records are inconsistent";
+    }
+    if (receipt.a1.outcome !== "pass") {
+      return "the report adoption did not pass its frozen check";
+    }
+    if (
+      consumerParentTaskCall !== receipt.callRef
+      || receipt.consumerRef !== consumer
+      || offer.receipt !== receipt
+      || offer.state !== "bound"
+      || offer.consumerRef !== consumer
+      || offer.callRef !== consumerParentTaskCall
+    ) {
+      return "the report adoption offer binding changed";
+    }
+    if (capture.chain.headCaptureId !== capture.captureId) {
+      return "the report adoption capture is not the current chain head";
+    }
+    if (capture.chain.plan !== capture.plan) {
+      return "the report adoption plan identity changed";
+    }
+    if (!sameLiveFile(record.file, capture.file)) {
+      return "the report adoption file facts changed";
+    }
+    if (!matchesNativeTextCheckReceipt(receipt.a1, capture.snapshot, capture.plan)) {
+      return "the report adoption snapshot or plan identity changed";
+    }
+    return null;
   }
 
   invalidate(reason?: string): void {

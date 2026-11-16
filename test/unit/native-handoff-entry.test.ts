@@ -7,6 +7,8 @@ import {
   MAX_HANDOFF_OPERATION_RESPONSE_BYTES,
   createNativeHandoffCoordinator,
   createNativeHandoffEntry,
+  prepareNativeHandoffReport,
+  readNativeHandoffRequestDescriptor,
   type NativeHandoffCallIdentity,
   type NativeHandoffCheck,
   type NativeHandoffCoordinator,
@@ -15,6 +17,7 @@ import {
   type NativeHandoffPreparedOperation,
   type NativeHandoffPrepareRequest,
   type NativeHandoffPrepareResult,
+  type NativeHandoffReportPrepareRequest,
   type NativeHandoffRequestDescriptor,
   type NativeHandoffRootResolution,
   type NativeHandoffWorkFacts,
@@ -28,6 +31,7 @@ import {
   type NativeHandoffStore,
 } from "../../src/native-handoff.ts";
 import {
+  captureWorkspaceText,
   nodeFileIo,
   type NativeFileIo,
 } from "../../src/native-work.ts";
@@ -1553,5 +1557,396 @@ describe("handoff entry review regressions", () => {
     const recovered = await exec(harness, "identity-call", params);
     expect(details(recovered).captureId).toBe(captureId);
     expect(harness.opens.count).toBe(opens);
+  });
+});
+
+interface PassReportSetup {
+  harness: Harness;
+  producer: ProducerEntry;
+  consumer: object;
+  parentCall: object;
+  captureId: string;
+  offerId: string;
+  adoptionId: string;
+  receiptId: string;
+}
+
+async function passReportSetup(
+  options: HarnessOptions = {},
+  observeAdoption?: (input: {
+    harness: Harness;
+    adoptionId: string;
+    producer: ProducerEntry;
+    consumer: object;
+    parentCall: object;
+  }) => void,
+): Promise<PassReportSetup> {
+  const harness = await makeHarness(options);
+  await writeRelative(harness.root, "data.json", '{"status":"done"}');
+  const producer = addProducer(harness.fixture, selectorFor(1));
+  const captured = await exec(harness, "call-capture", captureParams(producer.selector));
+  expect(details(captured).operationOutcome).toBe("succeeded");
+  const captureId = asString(details(captured).captureId);
+  const offerId = asString(details(captured).offerId);
+
+  const consumer = {};
+  const parentCall = {};
+  addConsumer(harness.fixture, "consumer-parent", consumer, true);
+  const { receiptId } = bindReadCheck(harness.store, offerId, consumer, parentCall, harness.fixture);
+  expect(harness.store.lookupReceipt(receiptId)?.outcome).toBe("pass");
+
+  if (observeAdoption !== undefined) {
+    const originalAdopt = harness.store.adopt.bind(harness.store);
+    harness.store.adopt = (request) => {
+      const adoption = originalAdopt(request);
+      observeAdoption({
+        harness,
+        adoptionId: adoption.adoptionId,
+        producer,
+        consumer,
+        parentCall,
+      });
+      return adoption;
+    };
+  }
+
+  const adopted = await exec(harness, "call-adopt", {
+    action: "adopt",
+    receiptId,
+    captureId,
+    consumerParentToolCallId: "consumer-parent",
+  });
+  expect(details(adopted).operationOutcome).toBe("succeeded");
+  expect(details(adopted).outcome).toBe("pass");
+  return {
+    harness,
+    producer,
+    consumer,
+    parentCall,
+    captureId,
+    offerId,
+    adoptionId: asString(details(adopted).adoptionId),
+    receiptId,
+  };
+}
+
+function reportRequest(
+  setup: Pick<PassReportSetup, "harness" | "producer" | "consumer" | "parentCall" | "adoptionId">,
+  overrides: Partial<NativeHandoffReportPrepareRequest> = {},
+): NativeHandoffReportPrepareRequest {
+  return {
+    adoptionId: setup.adoptionId,
+    work: copyWork(setup.harness.fixture.work),
+    producer: setup.producer.ref,
+    consumer: setup.consumer,
+    consumerParentTaskCall: setup.parentCall,
+    ...overrides,
+  };
+}
+
+describe("native handoff report preparation", () => {
+  test("prepares exact PASS core facts and refuses changed refs or foreign coordinators", async () => {
+    const setup = await passReportSetup();
+    const prepared = prepareNativeHandoffReport(setup.harness.coordinator, reportRequest(setup));
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) throw new Error(`report preparation failed: ${prepared.reason}`);
+    const adoptionView = setup.harness.store.lookupAdoption(setup.adoptionId)!;
+    const captureView = setup.harness.store.lookupCapture(setup.captureId)!;
+    expect(prepared.prepared.facts.adoption).toEqual(adoptionView);
+    expect(prepared.prepared.facts.adoption.outcome).toBe("pass");
+    expect(prepared.prepared.facts.adoption.taskAccepted).toBe(false);
+    expect(prepared.prepared.facts.adoption.semanticAcceptance).toBe("not-evaluated");
+    expect(prepared.prepared.facts.snapshotId).toBe(captureView.snapshotId);
+    expect(prepared.prepared.facts.checkerId).toBe(captureView.checkerId);
+    expect(prepared.prepared.facts.checkerVersion).toBe(captureView.checkerVersion);
+    expect(Object.isFrozen(prepared.prepared.facts)).toBe(true);
+    expect(new TextEncoder().encode(JSON.stringify(prepared.prepared.facts)).byteLength)
+      .toBeLessThanOrEqual(32 * 1024);
+    expect(prepared.prepared.revalidate()).toBeNull();
+    expect(prepared.prepared.revalidate()).toBeNull();
+
+    const wrongWork = {
+      observationId: "other-observation",
+      generation: 1,
+      sessionId: "session-1",
+      workspaceRoot: setup.harness.root,
+    };
+    for (const overrides of [
+      { producer: {} },
+      { consumer: {} },
+      { consumerParentTaskCall: {} },
+      { work: wrongWork },
+    ]) {
+      const rejected = prepareNativeHandoffReport(
+        setup.harness.coordinator,
+        reportRequest(setup, overrides),
+      );
+      expect(rejected.ok).toBe(false);
+    }
+
+    const clone = { ...setup.harness.coordinator } as NativeHandoffCoordinator;
+    expect(prepareNativeHandoffReport(clone, reportRequest(setup)).ok).toBe(false);
+    const foreign = await makeHarness();
+    expect(prepareNativeHandoffReport(foreign.coordinator, reportRequest(setup)).ok).toBe(false);
+  });
+
+  test("refuses FAIL adoption and missing, conflicted or closed original adopt slots", async () => {
+    const setup = await passReportSetup();
+
+    await writeRelative(setup.harness.root, "pending.json", '{"status":"pending"}');
+    const failedProducer = addProducer(setup.harness.fixture, selectorFor(2));
+    const failedCapture = await exec(
+      setup.harness,
+      "call-capture-fail",
+      captureParams(failedProducer.selector, "pending.json"),
+    );
+    const failedCaptureId = asString(details(failedCapture).captureId);
+    const failedOfferId = asString(details(failedCapture).offerId);
+    const failedConsumer = {};
+    const failedParentCall = {};
+    addConsumer(setup.harness.fixture, "failed-parent", failedConsumer, true);
+    const { receiptId: failedReceiptId } = bindReadCheck(
+      setup.harness.store,
+      failedOfferId,
+      failedConsumer,
+      failedParentCall,
+      setup.harness.fixture,
+    );
+    expect(setup.harness.store.lookupReceipt(failedReceiptId)?.outcome).toBe("fail");
+    const failedAdopted = await exec(setup.harness, "call-adopt-fail", {
+      action: "adopt",
+      receiptId: failedReceiptId,
+      captureId: failedCaptureId,
+      consumerParentToolCallId: "failed-parent",
+    });
+    expect(details(failedAdopted).outcome).toBe("fail");
+    expect(prepareNativeHandoffReport(setup.harness.coordinator, {
+      adoptionId: asString(details(failedAdopted).adoptionId),
+      work: copyWork(setup.harness.fixture.work),
+      producer: failedProducer.ref,
+      consumer: failedConsumer,
+      consumerParentTaskCall: failedParentCall,
+    }).ok).toBe(false);
+
+    // A real core-issued PASS adoption with no entry operation slot cannot be
+    // promoted through the coordinator helper.
+    const coreWork = {};
+    const coreProducer = {};
+    const coreConsumer = {};
+    const coreParentCall = {};
+    const coreAdoptionCall = {};
+    const coreReservation = setup.harness.store.reserveCapture({
+      work: coreWork,
+      producer: coreProducer,
+      producerFacts: { callId: "core-producer", workId: "core-work", definitionVersion: "v1" },
+      proposalCall: {},
+      proposalFacts: { callId: "core-proposal", workId: "core-work", definitionVersion: "v1" },
+      relativePath: "core-pass.json",
+      conditions: [{ id: "done", kind: "json-equals", pointer: "/status", value: "done" }],
+    });
+    await writeRelative(setup.harness.root, "core-pass.json", '{"status":"done"}');
+    const coreSnapshot = await captureWorkspaceText(
+      setup.harness.root,
+      "core-pass.json",
+      nodeFileIo,
+      1,
+    );
+    const coreCommit = setup.harness.store.commitCapture(coreReservation, coreSnapshot);
+    setup.harness.store.bindOfferConsumer(coreCommit.offer, coreConsumer, coreParentCall, {
+      callId: "core-consumer",
+      workId: "core-work",
+      definitionVersion: "v1",
+    });
+    const coreReadTool = {};
+    const coreRead = setup.harness.store.prepareRead(
+      coreCommit.offer,
+      coreConsumer,
+      coreParentCall,
+      coreReadTool,
+      "core-read",
+    );
+    expect(setup.harness.store.observeReadResult(
+      coreRead.read,
+      coreConsumer,
+      coreParentCall,
+      coreReadTool,
+      "core-read",
+      coreRead.digest,
+      true,
+    )).toBe(true);
+    const coreReceipt = setup.harness.store.check(
+      coreCommit.offer,
+      coreConsumer,
+      coreParentCall,
+      {},
+      "core-check",
+    );
+    const coreAdoption = setup.harness.store.adopt({
+      receipt: coreReceipt,
+      capture: coreCommit.capture,
+      work: coreWork,
+      consumer: coreConsumer,
+      producer: coreProducer,
+      file: {
+        relativePath: coreSnapshot.file.relativePath,
+        bytes: coreSnapshot.file.bytes,
+        sha256: coreSnapshot.file.sha256,
+      },
+      adoptionCall: coreAdoptionCall,
+      adoptionCallId: "core-adopt",
+    });
+    const missingSlot = prepareNativeHandoffReport(setup.harness.coordinator, {
+      adoptionId: coreAdoption.adoptionId,
+      work: copyWork(setup.harness.fixture.work),
+      producer: coreProducer,
+      consumer: coreConsumer,
+      consumerParentTaskCall: coreParentCall,
+    });
+    expect(missingSlot.ok).toBe(false);
+    expect(missingSlot.ok ? "" : missingSlot.reason).toContain("slot");
+
+    const conflicted = await exec(setup.harness, "call-adopt", {
+      action: "adopt",
+      receiptId: setup.receiptId,
+      captureId: setup.captureId,
+      consumerParentToolCallId: "different-parent",
+    });
+    expect(details(conflicted).resultKind).toBe("conflict");
+    expect(details(conflicted).stickyConflict).toBe(true);
+    expect(prepareNativeHandoffReport(
+      setup.harness.coordinator,
+      reportRequest(setup),
+    ).ok).toBe(false);
+
+    setup.harness.coordinator.close();
+    expect(prepareNativeHandoffReport(
+      setup.harness.coordinator,
+      reportRequest(setup),
+    ).ok).toBe(false);
+  });
+
+  test("observes a real running adopt slot and succeeds only after settlement", async () => {
+    const observation: { value: ReturnType<typeof prepareNativeHandoffReport> | null } = {
+      value: null,
+    };
+    const setup = await passReportSetup({}, ({ harness, adoptionId, producer, consumer, parentCall }) => {
+      observation.value = prepareNativeHandoffReport(harness.coordinator, {
+        adoptionId,
+        work: copyWork(harness.fixture.work),
+        producer: producer.ref,
+        consumer,
+        consumerParentTaskCall: parentCall,
+      });
+    });
+    if (observation.value === null) throw new Error("running adopt observation was not captured");
+    const running = observation.value;
+    expect(running.ok).toBe(false);
+    expect(running.ok ? "" : running.reason).toContain("not settled");
+    expect(prepareNativeHandoffReport(
+      setup.harness.coordinator,
+      reportRequest(setup),
+    ).ok).toBe(true);
+  });
+
+  test("prepared revalidate follows the original slot, offer and store lifetime", async () => {
+    const setup = await passReportSetup();
+    const prepared = prepareNativeHandoffReport(setup.harness.coordinator, reportRequest(setup));
+    expect(prepared.ok).toBe(true);
+    if (!prepared.ok) throw new Error(`report preparation failed: ${prepared.reason}`);
+    expect(prepared.prepared.revalidate()).toBeNull();
+    expect(prepared.prepared.revalidate()).toBeNull();
+    const offer = setup.harness.store.resolveOffer(setup.offerId);
+    expect(offer).not.toBeNull();
+    setup.harness.store.markBindingFailed(offer!, "late offer failure");
+    expect(prepared.prepared.revalidate()).not.toBeNull();
+    expect(prepared.prepared.revalidate()).not.toBeNull();
+
+    const invalidated = await passReportSetup();
+    const invalidatedPrepared = prepareNativeHandoffReport(
+      invalidated.harness.coordinator,
+      reportRequest(invalidated),
+    );
+    expect(invalidatedPrepared.ok).toBe(true);
+    if (!invalidatedPrepared.ok) throw new Error("invalidated setup did not prepare");
+    invalidated.harness.store.invalidate("test invalidation");
+    expect(invalidatedPrepared.prepared.revalidate()).not.toBeNull();
+
+    const disposed = await passReportSetup();
+    const disposedPrepared = prepareNativeHandoffReport(
+      disposed.harness.coordinator,
+      reportRequest(disposed),
+    );
+    expect(disposedPrepared.ok).toBe(true);
+    if (!disposedPrepared.ok) throw new Error("disposed setup did not prepare");
+    disposed.harness.store.dispose();
+    expect(disposedPrepared.prepared.revalidate()).not.toBeNull();
+  });
+
+  test("refuses revoked proxies and accessors without reading or throwing", async () => {
+    const setup = await passReportSetup();
+    const valid = reportRequest(setup);
+
+    const revoked = Proxy.revocable(valid, {});
+    revoked.revoke();
+    expect(() => prepareNativeHandoffReport(
+      setup.harness.coordinator,
+      revoked.proxy as never,
+    )).not.toThrow();
+    expect(prepareNativeHandoffReport(
+      setup.harness.coordinator,
+      revoked.proxy as never,
+    ).ok).toBe(false);
+
+    const revokedWork = Proxy.revocable({
+      observationId: "observation-1",
+      generation: 1,
+      sessionId: "session-1",
+      workspaceRoot: setup.harness.root,
+    }, {});
+    revokedWork.revoke();
+    expect(() => prepareNativeHandoffReport(setup.harness.coordinator, reportRequest(setup, {
+      work: revokedWork.proxy,
+    }))).not.toThrow();
+    expect(prepareNativeHandoffReport(setup.harness.coordinator, reportRequest(setup, {
+      work: revokedWork.proxy,
+    })).ok).toBe(false);
+
+    let getterReads = 0;
+    const accessor = {
+      adoptionId: valid.adoptionId,
+      work: valid.work,
+      producer: valid.producer,
+      consumer: valid.consumer,
+    };
+    Object.defineProperty(accessor, "consumerParentTaskCall", {
+      enumerable: true,
+      get() {
+        getterReads++;
+        throw new Error("report request accessor must not run");
+      },
+    });
+    expect(prepareNativeHandoffReport(
+      setup.harness.coordinator,
+      accessor as never,
+    ).ok).toBe(false);
+    expect(getterReads).toBe(0);
+  });
+
+  test("exports the same strict main descriptor parser for trusted report composition", () => {
+    const inspect = readNativeHandoffRequestDescriptor({ action: "inspect" });
+    expect(inspect.ok).toBe(true);
+    if (!inspect.ok) throw new Error(`inspect descriptor refused: ${inspect.reason}`);
+    expect(inspect.descriptor.action).toBe("inspect");
+    expect(inspect.descriptor.params).toEqual({ action: "inspect" });
+    expect(inspect.descriptor.digest).toMatch(/^[0-9a-f]{64}$/);
+
+    const unknown = readNativeHandoffRequestDescriptor({ action: "inspect", extra: true });
+    expect(unknown.ok).toBe(false);
+    expect(unknown.ok ? "" : unknown.reason).toContain("unsupported");
+
+    const revoked = Proxy.revocable({ action: "inspect" }, {});
+    revoked.revoke();
+    expect(() => readNativeHandoffRequestDescriptor(revoked.proxy)).not.toThrow();
+    expect(readNativeHandoffRequestDescriptor(revoked.proxy).ok).toBe(false);
   });
 });

@@ -591,6 +591,260 @@ describe("native handoff independent offers and forged identity", () => {
   });
 });
 
+describe("native handoff report binding", () => {
+  test("accepts only the exact PASS adoption binding and refuses wrong refs or historical ABA", async () => {
+    const root = await workspace();
+    const store = openNativeHandoffStore({});
+    const work = {};
+    const producer = {};
+    const proposalCall = {};
+
+    const makePass = async (relativePath: string) => {
+      const consumer = {};
+      const parentCall = {};
+      const adoptionCall = {};
+      const capture = await initial(store, root, {
+        work,
+        producer,
+        proposalCall,
+        relativePath,
+        content: '{"status":"done"}',
+        conditions: [{ id: "done", kind: "json-equals", pointer: "/status", value: "done" }],
+      });
+      store.bindOfferConsumer(capture.offer, consumer, parentCall, facts(`consumer-${relativePath}`));
+      const read = prepare(store, capture.offer, consumer, parentCall, undefined, `read-${relativePath}`);
+      expect(observed(store, read, consumer, parentCall, undefined, `read-${relativePath}`)).toBe(true);
+      const receipt = check(store, capture.offer, consumer, parentCall, undefined, `check-${relativePath}`);
+      expect(store.lookupReceipt(receipt.receiptId)?.outcome).toBe("pass");
+      const adoption = adopt(store, {
+        receipt,
+        capture: capture.capture,
+        work,
+        consumer,
+        producer,
+        file: live(capture.snapshot),
+      }, adoptionCall, `adopt-${relativePath}`);
+      return { capture, consumer, parentCall, adoptionCall, adoption, receipt, read };
+    };
+
+    const first = await makePass("data.json");
+    expect(store.lookupAdoption(first.adoption.adoptionId)?.outcome).toBe("pass");
+    expect(store.checkAdoptionReportBinding(
+      first.adoption,
+      work,
+      producer,
+      first.consumer,
+      first.parentCall,
+      first.adoptionCall,
+    )).toBeNull();
+
+    // Every external reference is identity-only, so a clone or lookalike is
+    // refused without reading its properties.
+    expect(store.checkAdoptionReportBinding(
+      { ...first.adoption },
+      work,
+      producer,
+      first.consumer,
+      first.parentCall,
+      first.adoptionCall,
+    )).not.toBeNull();
+    expect(store.checkAdoptionReportBinding(
+      first.adoption,
+      {},
+      producer,
+      first.consumer,
+      first.parentCall,
+      first.adoptionCall,
+    )).not.toBeNull();
+    expect(store.checkAdoptionReportBinding(
+      first.adoption,
+      work,
+      {},
+      first.consumer,
+      first.parentCall,
+      first.adoptionCall,
+    )).not.toBeNull();
+    expect(store.checkAdoptionReportBinding(
+      first.adoption,
+      work,
+      producer,
+      {},
+      first.parentCall,
+      first.adoptionCall,
+    )).not.toBeNull();
+    expect(store.checkAdoptionReportBinding(
+      first.adoption,
+      work,
+      producer,
+      first.consumer,
+      {},
+      first.adoptionCall,
+    )).not.toBeNull();
+    expect(store.checkAdoptionReportBinding(
+      first.adoption,
+      work,
+      producer,
+      first.consumer,
+      first.parentCall,
+      {},
+    )).not.toBeNull();
+
+    const hostile = new Proxy({}, {
+      get: () => {
+        throw new Error("caller getter must not run");
+      },
+      getOwnPropertyDescriptor: () => {
+        throw new Error("caller descriptor must not run");
+      },
+      ownKeys: () => {
+        throw new Error("caller keys must not be read");
+      },
+    });
+    expect(() => store.checkAdoptionReportBinding(
+      first.adoption,
+      hostile,
+      producer,
+      first.consumer,
+      first.parentCall,
+      first.adoptionCall,
+    )).not.toThrow();
+    expect(() => store.checkAdoptionReportBinding(
+      hostile as never,
+      work,
+      producer,
+      first.consumer,
+      first.parentCall,
+      first.adoptionCall,
+    )).not.toThrow();
+    expect(store.checkAdoptionReportBinding(
+      first.adoption,
+      hostile,
+      producer,
+      first.consumer,
+      first.parentCall,
+      first.adoptionCall,
+    )).not.toBeNull();
+
+    const foreignStore = openNativeHandoffStore({});
+    expect(foreignStore.checkAdoptionReportBinding(
+      first.adoption,
+      work,
+      producer,
+      first.consumer,
+      first.parentCall,
+      first.adoptionCall,
+    )).not.toBeNull();
+
+    // Same bytes and conditions in a later independently issued capture cannot
+    // replace the original capture behind the old receipt.
+    const aba = await initial(store, root, {
+      work,
+      producer,
+      proposalCall,
+      relativePath: "data.json",
+      content: '{"status":"done"}',
+      observedAt: 2,
+      conditions: [{ id: "done", kind: "json-equals", pointer: "/status", value: "done" }],
+    });
+    expect(aba.capture.captureId).not.toBe(first.capture.capture.captureId);
+    expect(store.lookupAdoption(first.adoption.adoptionId)?.captureId)
+      .toBe(first.capture.capture.captureId);
+    expect(matchesNativeTextCheckReceipt(
+      store.lookupReceipt(first.receipt.receiptId)!.a1,
+      aba.snapshot,
+      first.read.view.plan,
+    )).toBe(false);
+    expect(store.checkAdoptionReportBinding(
+      first.adoption,
+      work,
+      producer,
+      first.consumer,
+      first.parentCall,
+      first.adoptionCall,
+    )).toBeNull();
+
+    // A FAIL adoption keeps its historical feedback but is not report-eligible.
+    const failed = await initial(store, root, {
+      work,
+      producer,
+      proposalCall,
+      relativePath: "failed.json",
+      content: '{"status":"pending"}',
+      conditions: [{ id: "done", kind: "json-equals", pointer: "/status", value: "done" }],
+    });
+    const failedConsumer = {};
+    const failedParentCall = {};
+    const failedAdoptionCall = {};
+    store.bindOfferConsumer(failed.offer, failedConsumer, failedParentCall, facts("failed-consumer"));
+    const failedRead = prepare(store, failed.offer, failedConsumer, failedParentCall, undefined, "failed-read");
+    expect(observed(store, failedRead, failedConsumer, failedParentCall, undefined, "failed-read")).toBe(true);
+    const failedReceipt = check(store, failed.offer, failedConsumer, failedParentCall, undefined, "failed-check");
+    const failedAdoption = adopt(store, {
+      receipt: failedReceipt,
+      capture: failed.capture,
+      work,
+      consumer: failedConsumer,
+      producer,
+      file: live(failed.snapshot),
+    }, failedAdoptionCall, "failed-adopt");
+    expect(store.checkAdoptionReportBinding(
+      failedAdoption,
+      work,
+      producer,
+      failedConsumer,
+      failedParentCall,
+      failedAdoptionCall,
+    )).not.toBeNull();
+
+    // Another independent PASS adoption remains usable until its own offer or
+    // the store itself is no longer active.
+    const second = await makePass("second.json");
+    expect(store.checkAdoptionReportBinding(
+      second.adoption,
+      work,
+      producer,
+      second.consumer,
+      second.parentCall,
+      second.adoptionCall,
+    )).toBeNull();
+    store.markBindingFailed(first.capture.offer, "late binding failure");
+    expect(store.checkAdoptionReportBinding(
+      first.adoption,
+      work,
+      producer,
+      first.consumer,
+      first.parentCall,
+      first.adoptionCall,
+    )).not.toBeNull();
+    expect(store.checkAdoptionReportBinding(
+      second.adoption,
+      work,
+      producer,
+      second.consumer,
+      second.parentCall,
+      second.adoptionCall,
+    )).toBeNull();
+    store.invalidate("report test invalidation");
+    expect(store.checkAdoptionReportBinding(
+      second.adoption,
+      work,
+      producer,
+      second.consumer,
+      second.parentCall,
+      second.adoptionCall,
+    )).not.toBeNull();
+    store.dispose();
+    expect(store.checkAdoptionReportBinding(
+      second.adoption,
+      work,
+      producer,
+      second.consumer,
+      second.parentCall,
+      second.adoptionCall,
+    )).not.toBeNull();
+  });
+});
+
 describe("native handoff reservations, capacity and repair use", () => {
   test("overlapping reserves, abandon, double commit and failed commit release exactly once", async () => {
     const root = await workspace();
