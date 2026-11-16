@@ -96,6 +96,14 @@ import {
 } from "./native-harness-output.ts";
 import { NATIVE_HARNESS_RESULT_TOOL } from "./native-harness-checks.ts";
 import {
+  createNativeHarnessReportFailure,
+  createNativeHarnessReportRereadFailure,
+  type NativeHarnessReportBindingResult,
+  type NativeHarnessReportRequest,
+  type NativeHarnessReportRereadResult,
+} from "./native-harness-report.ts";
+import type { NativeHarnessReportPort } from "./native-harness-report-protocol.ts";
+import {
   createNativeHarnessResultEntry,
   type NativeHarnessResultEntry,
 } from "./native-harness-result-entry.ts";
@@ -103,6 +111,7 @@ import {
   createNativeHarnessEntry,
   type NativeHarnessEntry,
   type NativeHarnessEntryInspection,
+  type NativeHarnessResolvedRoot,
   type NativeHarnessRootResolution,
 } from "./native-harness-entry.ts";
 import {
@@ -3168,6 +3177,220 @@ function resolveMainHarnessRoot(
   };
 }
 
+interface HarnessReportOrigin {
+  readonly root: RootState;
+  readonly harness: HarnessRootState;
+  readonly rootToken: symbol;
+  readonly workEpoch: number;
+  readonly handle: NativeHarnessResolvedRoot;
+  /** Authenticated by the original A3 preparation before this is read. */
+  readonly reportToolCallId: string;
+}
+
+/**
+ * Pure local identity check for one captured report preparation. It never
+ * resolves a root, reads a host getter/context, status, clock or encoding.
+ */
+function harnessReportOriginFailure(
+  factory: FactoryContext,
+  origin: HarnessReportOrigin,
+): string | null {
+  if (factory.disposed) return "the instanced native entry was disposed";
+  if (moduleRoot !== origin.root) return "the instance root was replaced";
+  if (origin.root.factoryId !== factory.id) return "the instance root factory changed";
+  if (factory.rootToken === null || factory.rootToken !== origin.rootToken) {
+    return "the instance root token changed";
+  }
+  if (origin.root.token !== origin.rootToken) return "the instance root generation changed";
+  if (origin.root.harness !== origin.harness) return "the root Harness coordinator changed";
+  if (origin.harness.coordinator !== origin.handle.coordinator) {
+    return "the original Harness report coordinator was replaced";
+  }
+  if (origin.root.workEpoch !== origin.workEpoch) {
+    return "the Harness work ended after report preparation";
+  }
+  if (!origin.root.open || origin.root.phase !== "ready") {
+    return "the owning main Harness root is not open and ready";
+  }
+  return null;
+}
+
+/**
+ * Internal trusted adapter over the original A3 preparation. It captures the
+ * original module root, Harness state, factory token, work epoch and resolved
+ * root handle once; later calls only revalidate those exact objects. Failures
+ * from the actual coordinator are returned unchanged.
+ */
+function prepareHarnessReport(
+  factory: FactoryContext,
+  pi: DefinedOmpApi,
+  request: NativeHarnessReportRequest,
+  actualSignal: unknown,
+  actualContext: NativeContext,
+): NativeHarnessReportBindingResult {
+  const root = moduleRoot;
+  if (root === null || !root.open || root.phase !== "ready") {
+    return createNativeHarnessReportFailure(
+      "authority-lost",
+      "the owning main Harness root is not open and ready",
+    );
+  }
+  const harness = root.harness;
+  if (harness === null) {
+    return createNativeHarnessReportFailure(
+      "authority-lost",
+      "the Harness capability is not enabled and explicitly selected for this main root",
+    );
+  }
+  const rootToken = factory.rootToken;
+  if (rootToken === null) {
+    return createNativeHarnessReportFailure(
+      "authority-lost",
+      "the instance root generation is unavailable",
+    );
+  }
+  const captured = {
+    root,
+    harness,
+    rootToken,
+    workEpoch: root.workEpoch,
+  };
+  const beforeResolve = captured.root.harness === captured.harness
+    ? null
+    : "the root Harness coordinator changed";
+  if (beforeResolve !== null) {
+    return createNativeHarnessReportFailure("authority-lost", beforeResolve);
+  }
+  const resolved = resolveMainHarnessRoot(factory, actualContext, pi, NATIVE_HARNESS_RESULT_TOOL);
+  if (!resolved.ok) {
+    return createNativeHarnessReportFailure("authority-lost", resolved.reason);
+  }
+  if (resolved.root.coordinator !== captured.harness.coordinator) {
+    return createNativeHarnessReportFailure(
+      "authority-lost",
+      "the fresh main resolution selected a different Harness coordinator",
+    );
+  }
+  const handle = resolved.root;
+  const provisional: HarnessReportOrigin = { ...captured, handle, reportToolCallId: "" };
+  const afterResolve = harnessReportOriginFailure(factory, provisional);
+  if (afterResolve !== null) {
+    return createNativeHarnessReportFailure("authority-lost", afterResolve);
+  }
+
+  let raw: NativeHarnessReportBindingResult;
+  try {
+    raw = captured.harness.scope.run(
+      actualContext,
+      () => captured.harness.coordinator.prepareReport(request, actualSignal),
+    );
+  } catch {
+    return createNativeHarnessReportFailure(
+      "source-conflict",
+      "the trusted Harness report preparation failed unexpectedly",
+    );
+  }
+  if (!raw.ok) return raw;
+
+  const reportToolCallId = request.reportRef.toolCallId;
+  if (typeof reportToolCallId !== "string"
+    || reportToolCallId.length < 1
+    || reportToolCallId.length > 256) {
+    return createNativeHarnessReportFailure(
+      "authority-lost",
+      "the authenticated report call id is unavailable",
+    );
+  }
+  const origin: HarnessReportOrigin = { ...captured, handle, reportToolCallId };
+  const original = raw.prepared;
+  const refreshMethod = original.refresh;
+  const revalidateMethod = original.revalidate;
+  const rereadMethod = original.reread;
+  return Object.freeze({
+    ok: true as const,
+    prepared: Object.freeze({
+      facts: original.facts,
+      refresh(): string | null {
+        const before = harnessReportOriginFailure(factory, origin);
+        if (before !== null) return before;
+        const fresh = resolveMainHarnessRoot(factory, actualContext, pi, NATIVE_HARNESS_RESULT_TOOL);
+        if (!fresh.ok) return fresh.reason;
+        if (fresh.root.coordinator !== origin.harness.coordinator) {
+          return "the fresh main resolution selected a different Harness coordinator";
+        }
+        const resolvedIdentity = harnessReportOriginFailure(factory, origin);
+        if (resolvedIdentity !== null) return resolvedIdentity;
+        let value: unknown;
+        try {
+          value = origin.harness.scope.run(
+            actualContext,
+            () => Reflect.apply(refreshMethod, original, []),
+          );
+        } catch {
+          return "the Harness report refresh failed unexpectedly";
+        }
+        const after = harnessReportOriginFailure(factory, origin);
+        if (after !== null) return after;
+        if (value === null) return null;
+        return typeof value === "string"
+          ? value
+          : "the Harness report refresh returned an unreadable result";
+      },
+      revalidate(): string | null {
+        const before = harnessReportOriginFailure(factory, origin);
+        if (before !== null) return before;
+        let value: unknown;
+        try {
+          value = Reflect.apply(revalidateMethod, original, []);
+        } catch {
+          return "the Harness report revalidation failed unexpectedly";
+        }
+        const after = harnessReportOriginFailure(factory, origin);
+        if (after !== null) return after;
+        if (value === null) return null;
+        return typeof value === "string"
+          ? value
+          : "the Harness report revalidation returned an unreadable result";
+      },
+      reread(): Promise<NativeHarnessReportRereadResult> {
+        const before = harnessReportOriginFailure(factory, origin);
+        if (before !== null) {
+          return Promise.resolve(createNativeHarnessReportRereadFailure("authority-lost", before));
+        }
+        const fresh = resolveMainHarnessRoot(factory, actualContext, pi, NATIVE_HARNESS_RESULT_TOOL);
+        if (!fresh.ok) {
+          return Promise.resolve(createNativeHarnessReportRereadFailure("authority-lost", fresh.reason));
+        }
+        if (fresh.root.coordinator !== origin.harness.coordinator) {
+          return Promise.resolve(createNativeHarnessReportRereadFailure(
+            "authority-lost",
+            "the fresh main resolution selected a different Harness coordinator",
+          ));
+        }
+        const resolvedIdentity = harnessReportOriginFailure(factory, origin);
+        if (resolvedIdentity !== null) {
+          return Promise.resolve(createNativeHarnessReportRereadFailure(
+            "authority-lost",
+            resolvedIdentity,
+          ));
+        }
+        try {
+          return origin.handle.runWithContext(
+            actualContext,
+            origin.reportToolCallId,
+            () => Reflect.apply(rereadMethod, original, []) as Promise<NativeHarnessReportRereadResult>,
+          );
+        } catch {
+          return Promise.resolve(createNativeHarnessReportRereadFailure(
+            "authority-lost",
+            "the Harness report reread could not be scoped to the owning main root",
+          ));
+        }
+      },
+    }),
+  });
+}
+
 function harnessCaptureFailure(
   code: NativeHarnessOutputSelectionCode,
   reason: string,
@@ -6142,6 +6365,21 @@ export function createInstancedNativeEntry(
       return inspectInstanceReportCatalog(portFactory, context, work);
     },
   });
+  const harnessReportPort: NativeHarnessReportPort = Object.freeze({
+    prepare(
+      request: NativeHarnessReportRequest,
+      actualSignal: unknown,
+      context: NativeContext,
+    ): NativeHarnessReportBindingResult {
+      if (portFactory === null) {
+        return createNativeHarnessReportFailure(
+          "not-ready",
+          "the native instance entry is not initialized",
+        );
+      }
+      return prepareHarnessReport(portFactory, pi, request, actualSignal, context);
+    },
+  });
   // The companion and optional Harness tools are registered before D1 chooses
   // the actual definition/tool catalog. They stay defaultInactive and their
   // resolvers refuse until this factory and root are fully initialized.
@@ -6228,6 +6466,7 @@ export function createInstancedNativeEntry(
     ...(options.loadMainDefinition === undefined ? {} : { loadDefinition: options.loadMainDefinition }),
     startupTimeoutMs: d1TimeoutMs,
     instanceReports: instanceReportPort,
+    ...(harnessConfig === null ? {} : { harnessReports: harnessReportPort }),
     statusComposition: {
       instanceStatus: {
         isRegistered: () => statusFactory !== null && statusFactory.statusCommandRegistered,

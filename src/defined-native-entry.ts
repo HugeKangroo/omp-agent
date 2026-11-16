@@ -26,6 +26,7 @@ import {
   type NativeWorkCallInspection,
 } from "./native-entry.ts";
 import type { NativeInstanceReportPort } from "./native-instance-report.ts";
+import type { NativeHarnessReportPort } from "./native-harness-report-protocol.ts";
 import { NATIVE_WORK_TOOL } from "./native-work.ts";
 import {
   loadOmpDefinitionPorts,
@@ -114,6 +115,11 @@ export interface DefinedNativeEntryOptions {
    * createNativeEntry and never read or configured from user/model input.
    */
   readonly instanceReports?: NativeInstanceReportPort;
+  /**
+   * INTERNAL trusted composition only; forwarded unchanged beside
+   * instanceReports and never read or configured from user/model input.
+   */
+  readonly harnessReports?: NativeHarnessReportPort;
 }
 
 export interface DefinedNativeEntryControls {
@@ -403,12 +409,25 @@ function nativeToolError(message: string, status: ReturnType<DefinitionBindingCo
   };
 }
 
+function isNativeHarnessReportSuccess(result: NativeToolOutcome): boolean {
+  if (result.isError === true) return false;
+  const details = result.details;
+  return isRecord(details)
+    && details.kind === "native-work-report"
+    && isRecord(details.harnessResult);
+}
+
 function annotateAgentWorkResult(
   controller: DefinitionBindingController,
   toolName: string,
   result: NativeToolOutcome,
 ): NativeToolOutcome {
   if (toolName !== NATIVE_WORK_TOOL) return result;
+  // The actual native Harness branch has already encoded and bounded its exact
+  // original winner wire. Appending a definition annotation after publication
+  // would change that wire, so this successful trusted result is returned
+  // unchanged. Ordinary/instance/handoff reports still receive the annotation.
+  if (isNativeHarnessReportSuccess(result)) return result;
   const binding = controller.getReportBinding();
   if (binding === null) return result;
   const line = [
@@ -855,7 +874,10 @@ export function createDefinedNativeEntry(
   try {
     nativeEntry = createNativeEntry(
       guardedNativeApi(pi, controller, touch),
-      options.instanceReports === undefined ? {} : { instanceReports: options.instanceReports },
+      {
+        ...(options.instanceReports === undefined ? {} : { instanceReports: options.instanceReports }),
+        ...(options.harnessReports === undefined ? {} : { harnessReports: options.harnessReports }),
+      },
     );
   } catch (error) {
     controller.startupFailed(`Native observer composition failed: ${errorMessage(error)}`);

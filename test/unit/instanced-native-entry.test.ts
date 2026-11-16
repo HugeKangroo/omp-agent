@@ -54,7 +54,7 @@ import type { NativeHarnessOutputCapture } from "../../src/native-harness-output
 import type { NativeContext, NativeToolResult } from "../../src/native-entry.ts";
 import { clearPublishedTaskOwner, publishTaskOwner } from "../../src/task-entry-port.ts";
 import type { Runner, WorkerRequest, WorkerResult } from "../../vendor/harness2/index.ts";
-import { deepFreeze, NATIVE_WORK_TOOL } from "../../src/native-work.ts";
+import { deepFreeze, NATIVE_WORK_TOOL, nodeFileIo } from "../../src/native-work.ts";
 
 const WORKSPACE = "/workspace";
 const MAIN_MODEL: InstancedModel = { provider: "fixture", id: "main" };
@@ -840,6 +840,111 @@ async function observeActualHarness(
   execution: ActualHarnessExecution,
 ): Promise<void> {
   await root.host.emit("tool_result", execution.event, root.host.context);
+}
+
+interface ActualHarnessReportSetup {
+  readonly sourceId: string;
+  readonly captureId: string;
+  readonly captureDigest: string;
+  readonly checkId: string;
+  readonly input: Record<string, unknown>;
+}
+
+async function setupActualHarnessReport(
+  root: RootFixture,
+  prefix: string,
+): Promise<ActualHarnessReportSetup> {
+  await beginWork(root, `${prefix} native report work`);
+  const sourceId = `${prefix}-source`;
+  const source = await executeActualHarness(root, sourceId, `${prefix} bounded report task`);
+  await observeActualHarness(root, source);
+  expect(harnessDetails(source.result).outcome).toBe("backend-completed");
+  const captureWire = await executeHarnessResult(root, `${prefix}-capture`, {
+    action: "capture",
+    sourceToolCallId: sourceId,
+  });
+  const capture = resultPayload(captureWire);
+  expect(capture.ok).toBe(true);
+  const checkId = `${prefix}-check`;
+  const checkWire = await executeHarnessResult(root, checkId, {
+    action: "check",
+    sourceToolCallId: sourceId,
+    captureId: capture.captureId,
+    captureDigest: capture.captureDigest,
+    path: "candidate.txt",
+    conditions: [{ id: "known-output", kind: "text-includes", value: "known output" }],
+  });
+  const check = resultPayload(checkWire);
+  expect(check.ok).toBe(true);
+  expect(check.receipt?.outcome).toBe("pass");
+  return {
+    sourceId,
+    captureId: capture.captureId,
+    captureDigest: capture.captureDigest,
+    checkId,
+    input: {
+      action: "report",
+      checks: [
+        { toolCallId: sourceId, purpose: "Observed the actual source execution; not acceptance" },
+        { toolCallId: checkId, purpose: "Observed one fixed condition on the original capture" },
+      ],
+      outputFiles: [],
+      outcome: "completed",
+      limitations: ["Fixture report is not semantic acceptance"],
+      harnessResult: {
+        sourceToolCallId: sourceId,
+        captureId: capture.captureId,
+        captureDigest: capture.captureDigest,
+        checkToolCallIds: [checkId],
+      },
+    },
+  };
+}
+
+function holdNextNativeRead(): {
+  readonly started: Promise<void>;
+  release(): void;
+  restore(): void;
+} {
+  const originalOpen = nodeFileIo.open;
+  let held = false;
+  let released = false;
+  let signalStarted!: () => void;
+  let release!: () => void;
+  const started = new Promise<void>((resolve) => {
+    signalStarted = resolve;
+  });
+  const drain = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  nodeFileIo.open = async (target, flags) => {
+    const handle = await originalOpen(target, flags);
+    return {
+      stat: (options) => handle.stat(options),
+      async read(buffer, offset, length, position) {
+        const result = await handle.read(buffer, offset, length, position);
+        if (!held) {
+          held = true;
+          signalStarted();
+          await drain;
+        }
+        return result;
+      },
+      close: () => handle.close(),
+    };
+  };
+  return {
+    started,
+    release() {
+      if (!released) {
+        released = true;
+        release();
+      }
+    },
+    restore() {
+      nodeFileIo.open = originalOpen;
+    },
+  };
 }
 
 async function hostCapture(
@@ -6037,6 +6142,176 @@ describe("actual instanced Harness result composition", () => {
     expect(after?.coordinator?.output.retainedCaptures).toBe(1);
     expect(after?.coordinator?.output.retainedBytes).toBe(Buffer.byteLength("known output\n", "utf8"));
     await expect(readFile(path.join(fixture.sourceRoot, "candidate.txt"), "utf8")).rejects.toThrow();
+  }, 30_000);
+
+  test("actual instanced report selection preserves the native wire and replays without new rereads", async () => {
+    const fixture = await startActualHarnessCapture({
+      mainTools: HARNESS_RESULT_MAIN_TOOLS,
+      candidateText: "known output\n",
+    });
+    const setup = await setupActualHarnessReport(fixture.root, "instanced-report");
+    const runnerCalls = fixture.runner.requests.length;
+    const first = await fixture.root.host.workWithSignal(
+      "instanced-report-A",
+      setup.input,
+      new AbortController().signal,
+    );
+    expect(first.isError).not.toBe(true);
+    expect(first.content).toHaveLength(1);
+    const details = first.details as Record<string, any>;
+    expect(details.kind).toBe("native-work-report");
+    expect(details.authority).toBe("non-authoritative");
+    expect(details.definitionBinding).toBeUndefined();
+    expect(details.harnessResult.facts).toMatchObject({
+      schema: "omp-agent.native-harness-report-binding.v1",
+      authority: "non-authoritative",
+      source: { toolCallId: setup.sourceId },
+      capture: { captureId: setup.captureId, captureDigest: setup.captureDigest },
+      coverage: {
+        selectedPathCount: 1,
+        passPathCount: 1,
+        failPathCount: 0,
+        missingPathCount: 0,
+        completedCoverage: true,
+      },
+      filesystemFreshness: "not-rechecked",
+      taskAccepted: false,
+      semanticAcceptance: "not-evaluated",
+    });
+    expect(details.harnessResult.reread).toMatchObject({
+      ok: true,
+      schema: "omp-agent.native-harness-report-reread.v1",
+      sourceToolCallId: setup.sourceId,
+      reportToolCallId: "instanced-report-A",
+      captureId: setup.captureId,
+      attempt: 1,
+      sameVersion: true,
+      taskAccepted: false,
+    });
+    expect(fixture.runner.requests).toHaveLength(runnerCalls);
+
+    const replay = await fixture.root.host.workWithSignal(
+      "instanced-report-B",
+      setup.input,
+      new AbortController().signal,
+    );
+    expect(replay.isError).not.toBe(true);
+    expect(replay.content).toHaveLength(1);
+    expect(replay.details).toBe(first.details);
+    expect((replay.details as Record<string, any>).recordedAt).toBe(details.recordedAt);
+    expect(fixture.runner.requests).toHaveLength(runnerCalls);
+    const inspection = fixture.root.entry.harnessInspect?.(fixture.root.host.context);
+    expect(inspection?.coordinator?.output.retainedCaptures).toBe(1);
+    expect(inspection?.coordinator?.output.active).toBe(false);
+    fixture.root.entry.dispose();
+  }, 30_000);
+
+  test("an ordinary agent_work report keeps the D1 definition annotation", async () => {
+    const root = await startRoot();
+    await beginWork(root, "ordinary annotation work");
+    await root.host.observe("ordinary-report-check", "read", "observed");
+    const result = await root.host.work("ordinary-report", {
+      action: "report",
+      checks: [{ toolCallId: "ordinary-report-check", purpose: "Observed read result" }],
+      outputFiles: [],
+      outcome: "completed",
+    });
+    expect(result.isError).not.toBe(true);
+    expect(result.content).toHaveLength(2);
+    expect(String(result.content[1]?.text)).toMatch(/^Definition binding observation:/);
+    const details = result.details as Record<string, any>;
+    expect(details.kind).toBe("native-work-report");
+    expect(details.definitionBinding).toMatchObject({ authority: "non-authoritative" });
+    root.entry.dispose();
+  }, 30_000);
+
+  test("an unconfigured root refuses the explicit Harness selector without a backend", async () => {
+    const root = await startRoot();
+    await beginWork(root, "unconfigured report work");
+    await root.host.observe("unconfigured-report-source", "read", "observed");
+    const result = await root.host.workWithSignal("unconfigured-report", {
+      action: "report",
+      checks: [{ toolCallId: "unconfigured-report-source", purpose: "Observed read result" }],
+      outputFiles: [],
+      outcome: "completed",
+      harnessResult: {
+        sourceToolCallId: "unconfigured-report-source",
+        captureId: "unconfigured-capture",
+        captureDigest: "a".repeat(64),
+        checkToolCallIds: [],
+      },
+    }, new AbortController().signal);
+    expect(result.isError).toBe(true);
+    expect(String(result.content[0]?.text)).toMatch(
+      /no Harness report composition is configured/,
+    );
+    expect(root.entry.harnessInspect?.(root.host.context)).toBeUndefined();
+    root.entry.dispose();
+  }, 30_000);
+
+  test("source-only and result-only selections refuse the report before a new backend or reread", async () => {
+    for (const mainTools of [HARNESS_MAIN_TOOLS, RESULT_ONLY_MAIN_TOOLS] as const) {
+      const fixture = await startActualHarnessCapture({ mainTools });
+      await beginWork(fixture.root, `${mainTools.length} selection report work`);
+      await fixture.root.host.observe("unselected-report-source", "read", "observed");
+      const backendConfigs = fixture.backendConfigs.length;
+      const result = await fixture.root.host.workWithSignal("unselected-report", {
+        action: "report",
+        checks: [{ toolCallId: "unselected-report-source", purpose: "Observed read result" }],
+        outputFiles: [],
+        outcome: "completed",
+        harnessResult: {
+          sourceToolCallId: "unselected-report-source",
+          captureId: "unselected-capture",
+          captureDigest: "a".repeat(64),
+          checkToolCallIds: [],
+        },
+      }, new AbortController().signal);
+      expect(result.isError).toBe(true);
+      expect(String(result.content[0]?.text)).toMatch(/agent_work report refused:/);
+      expect(String(result.content[0]?.text)).toMatch(
+        /not enabled|not explicitly selected|no longer in the actual main active tool set/,
+      );
+      expect(fixture.runner.requests).toHaveLength(0);
+      expect(fixture.backendConfigs).toHaveLength(backendConfigs);
+      fixture.root.entry.dispose();
+    }
+  }, 30_000);
+
+  test("agent_end and session_stop cancel the held actual report reread by report id", async () => {
+    for (const action of ["session_stop", "agent_end"] as const) {
+      const fixture = await startActualHarnessCapture({
+        mainTools: HARNESS_RESULT_MAIN_TOOLS,
+        candidateText: "known output\n",
+      });
+      const setup = await setupActualHarnessReport(fixture.root, `held-report-${action}`);
+      const runnerCalls = fixture.runner.requests.length;
+      const beforeEpoch = status(fixture.root).root?.workEpoch;
+      const held = holdNextNativeRead();
+      const controller = new AbortController();
+      const pending = fixture.root.host.workWithSignal(
+        `held-report-${action}-A`,
+        setup.input,
+        controller.signal,
+      );
+      try {
+        await held.started;
+        await fixture.root.host.emit(action, {});
+        held.release();
+        const wire = await pending;
+        expect(wire.isError).toBe(true);
+        expect(String(wire.content[0]?.text)).toMatch(/the report reread was cancelled by the host/);
+        expect(controller.signal.aborted).toBe(false);
+        expect(fixture.runner.requests).toHaveLength(runnerCalls);
+        expect(status(fixture.root).root?.workEpoch).not.toBe(beforeEpoch);
+        const inspection = fixture.root.entry.harnessInspect?.(fixture.root.host.context);
+        expect(inspection?.coordinator?.output.active).toBe(false);
+      } finally {
+        held.release();
+        held.restore();
+        fixture.root.entry.dispose();
+      }
+    }
   }, 30_000);
 
   test("work-ending cancels only the actual capture action id", async () => {
