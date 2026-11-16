@@ -2,9 +2,13 @@
  * Host-only entry to the vendored Harness² backend.
  *
  * This is a library wrapper, not an OMP extension or CLI entry. It exposes the
- * controller and the types needed to construct requests and read results.
+ * controller, the actual API-key RPC runner, the capability probe and the types
+ * needed to construct requests and read results. Importing this module starts
+ * no process and reads no credential.
  */
 export { HarnessController } from "./upstream/src/controller.ts";
+export { OmpRpcRunner, probeRpcCapabilities } from "./upstream/src/runner.ts";
+export type { OmpRpcRunnerOptions } from "./upstream/src/runner.ts";
 export type {
   ApplyResult,
   Change,

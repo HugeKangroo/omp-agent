@@ -12,7 +12,7 @@
     "distributionPath": "relative to the omp-agent package root",
     "upstreamPath": "relative to the upstream repository root"
   },
-  "sourceId": "1edfaf2a5b39f15adaf53e9d351b43c29a62853b6dd27cf52b028a77d656b031",
+  "sourceId": "d07cab99cc3e3527a0802b45e40d4e50f0f68c372fbf5d9e69d615a4f8257169",
   "sourceIdAlgorithm": "sha256 over UTF-8 canonical JSON with object keys sorted recursively, arrays in stored order, and no insignificant whitespace, of {schemaVersion, upstreamRepository, baseCommit, files:[{distributionPath, bundledSha256}]}; files are every distributed content file except vendor/harness2/SOURCE.json, sorted by distributionPath; SOURCE.json is excluded to avoid self-referential metadata hashing.",
   "license": {
     "upstreamLicensePath": "LICENSE",
@@ -37,10 +37,10 @@
       "upstreamPath": null,
       "kind": "wrapper",
       "originalSha256": null,
-      "bundledSha256": "4e3b5251ab00c74f65f2d9a70dc9866b393577c51af9168a098a364d3a13f68c",
-      "bytes": 670,
+      "bundledSha256": "209892a75a07526e9a70fc7f9278a6b3e03c6de34ef19cf83a193d466feea2ab",
+      "bytes": 942,
       "modified": false,
-      "note": "Authored host-only library entry. Re-exports HarnessController and the minimal public types; no OMP extension, CLI, bin, or HTTP entry."
+      "note": "Authored host-only library entry. Re-exports HarnessController, the actual OmpRpcRunner, the credential-free capability probe and the minimal public types; no OMP extension, CLI, bin, or HTTP entry, and importing it starts no process."
     },
     {
       "distributionPath": "vendor/harness2/upstream/LICENSE",

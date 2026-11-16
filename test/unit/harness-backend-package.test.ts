@@ -27,7 +27,7 @@ const VENDOR_ROOT = path.join(REPO_ROOT, "vendor/harness2");
 const SOURCE_MANIFEST = path.join(VENDOR_ROOT, "SOURCE.json");
 const UPSTREAM_REPOSITORY = "https://github.com/HugeKangroo/omp-harness2";
 const UPSTREAM_BASE_COMMIT = "6d5cd6386c8a085d0070cfb660ddbc5c7f76b92e";
-const EXPECTED_SOURCE_ID = "1edfaf2a5b39f15adaf53e9d351b43c29a62853b6dd27cf52b028a77d656b031";
+const EXPECTED_SOURCE_ID = "d07cab99cc3e3527a0802b45e40d4e50f0f68c372fbf5d9e69d615a4f8257169";
 const UPSTREAM_MODULES = [
   "adaptation.ts",
   "approval-channel.ts",
@@ -360,8 +360,10 @@ describe("G5-1 vendored Harness² source capsule", () => {
     const extractedIndex = path.join(artifact.packageRoot, "vendor/harness2/index.ts");
     expect(realpathSync(extractedIndex).startsWith(`${realPackageRoot}${path.sep}`)).toBe(true);
     const vendored = await import(pathToFileURL(extractedIndex).href) as Record<string, unknown>;
-    expect(Object.keys(vendored)).toEqual(["HarnessController"]);
+    expect(Object.keys(vendored)).toEqual(["HarnessController", "OmpRpcRunner", "probeRpcCapabilities"]);
     expect(typeof vendored.HarnessController).toBe("function");
+    expect(typeof vendored.OmpRpcRunner).toBe("function");
+    expect(typeof vendored.probeRpcCapabilities).toBe("function");
 
     const closure = resolveVendorClosure(extractedIndex, artifact.packageRoot);
     expect(closure).toEqual(
