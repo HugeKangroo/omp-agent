@@ -8,6 +8,18 @@ import {
   type RunRecord,
 } from "../vendor/harness2/index.ts";
 import { readActualAbortSignal } from "./native-abort.ts";
+import {
+  NATIVE_HARNESS_HISTORY_PROCESS_LIMITS,
+  collectNativeHarnessHistoryProcess,
+  decodeNativeHarnessHistoryProcessOwner,
+  deriveNativeHarnessHistoryProcessTargets,
+  ownerReadWithoutIo,
+  uninspectedProcessObservation,
+  type NativeHarnessHistoryProcessObservation,
+  type NativeHarnessHistoryProcessOsObserver,
+  type NativeHarnessHistoryProcessOwnerRead,
+  type NativeHarnessHistoryProcessTarget,
+} from "./native-harness-history-process.ts";
 import { fingerprintNativeJson } from "./native-instance-result.ts";
 import {
   NativeFileError,
@@ -153,6 +165,11 @@ export interface NativeHarnessHistoryInspectRequest {
   /** Narrow test seam. Production uses the existing native-work file IO. */
   readonly fileIo?: NativeFileIo;
   readonly now?: () => number;
+  /**
+   * Optional trusted bounded OS observer. Omission preserves the exact old
+   * `inspected:false` projection and starts zero extra I/O.
+   */
+  readonly processObserver?: NativeHarnessHistoryProcessOsObserver;
 }
 
 export interface NativeHarnessHistoryReason {
@@ -300,19 +317,14 @@ export interface NativeHarnessHistoryArtifactIntegrity {
   readonly limitations: readonly string[];
 }
 
-export interface NativeHarnessHistoryProcessEntry {
-  readonly state: "unknown";
-  readonly coverage: "unknown";
-  readonly observedAt: null;
-  readonly source: "not-inspected-in-r1a";
-}
-
-export interface NativeHarnessHistoryProcessObservation {
-  readonly inspected: false;
-  readonly controller: NativeHarnessHistoryProcessEntry;
-  readonly workers: NativeHarnessHistoryProcessEntry;
-  readonly limitations: readonly string[];
-}
+export type {
+  NativeHarnessHistoryProcessEntry,
+  NativeHarnessHistoryProcessObservation,
+} from "./native-harness-history-process.ts";
+export type {
+  NativeHarnessHistoryProcessLimitedObservation,
+  NativeHarnessHistoryProcessRow,
+} from "./native-harness-history-process.ts";
 
 export interface NativeHarnessHistoryEligibility {
   readonly readOnly: true;
@@ -873,6 +885,74 @@ function eventsProblem(error: unknown): NativeHarnessHistoryReason {
   return reason(`events-${code}`, EVENTS_ERROR_DETAILS[code]);
 }
 
+function ownerReadFailure(
+  target: NativeHarnessHistoryProcessTarget,
+  error: unknown,
+): NativeHarnessHistoryProcessOwnerRead {
+  const code = fileErrorCode(error);
+  switch (code) {
+    case "missing":
+      return {
+        targetId: target.targetId,
+        state: "missing",
+        bytes: null,
+        sha256: null,
+        observedAt: null,
+        problem: reason(
+          "owner-missing",
+          "The owner/lock file is missing; this is one possible cleanup, pre-write or crash outcome, not a stopped proof.",
+        ),
+        declaration: null,
+      };
+    case "non-text":
+    case "too-large":
+      return {
+        targetId: target.targetId,
+        state: "invalid",
+        bytes: null,
+        sha256: null,
+        observedAt: null,
+        problem: code === "too-large"
+          ? reason("owner-oversize", "The owner file exceeds the readonly owner-read profile; it was not trusted.")
+          : reason("owner-non-text", "The owner file is not valid UTF-8 text; it was not trusted."),
+        declaration: null,
+      };
+    case "unsafe-path":
+    case "changed":
+      return {
+        targetId: target.targetId,
+        state: "unavailable",
+        bytes: null,
+        sha256: null,
+        observedAt: null,
+        problem: code === "unsafe-path"
+          ? reason("owner-unsafe-path", "The owner path traverses a link or escapes the pinned root; it was not read.")
+          : reason("owner-changed", "The owner file changed while it was being observed; its bytes are uncertain."),
+        declaration: null,
+      };
+    case "invalid-path":
+      return {
+        targetId: target.targetId,
+        state: "invalid",
+        bytes: null,
+        sha256: null,
+        observedAt: null,
+        problem: reason("owner-invalid-path", "The derived owner path is not a valid workspace-relative path."),
+        declaration: null,
+      };
+    default:
+      return {
+        targetId: target.targetId,
+        state: "unavailable",
+        bytes: null,
+        sha256: null,
+        observedAt: null,
+        problem: reason("owner-unavailable", "The owner file could not be observed."),
+        declaration: null,
+      };
+  }
+}
+
 function artifactStatus(error: unknown): NativeHarnessHistoryArtifactStatus {
   switch (fileErrorCode(error)) {
     case "missing": return "missing";
@@ -1214,22 +1294,7 @@ function buildAccounting(record: RunRecord | null): NativeHarnessHistoryAccounti
 }
 
 function processObservation(): NativeHarnessHistoryProcessObservation {
-  const entry: NativeHarnessHistoryProcessEntry = {
-    state: "unknown",
-    coverage: "unknown",
-    observedAt: null,
-    source: "not-inspected-in-r1a",
-  };
-  return {
-    inspected: false,
-    controller: entry,
-    workers: entry,
-    limitations: [
-      "No OS process or signal observation was performed in R1a.",
-      "A recorded run status is not a current controller or worker state.",
-      "Missing owner/lock metadata would not prove that any process stopped.",
-    ],
-  };
+  return uninspectedProcessObservation();
 }
 
 function eligibility(): NativeHarnessHistoryEligibility {
@@ -1507,6 +1572,8 @@ interface InspectionParts {
   readonly artifactIntegrity: NativeHarnessHistoryArtifactIntegrity;
   readonly accounting: NativeHarnessHistoryAccounting;
   readonly reasons: readonly NativeHarnessHistoryReason[];
+  /** Absent preserves the exact uninspected projection. */
+  readonly processObservation?: NativeHarnessHistoryProcessObservation;
 }
 
 function minimalReasons(value: NativeHarnessHistoryReason): readonly NativeHarnessHistoryReason[] {
@@ -1622,7 +1689,7 @@ function finalizeInspection(
     query: { ...parts.query, completedAt },
     recorded: parts.recorded,
     originCompatibility: parts.originCompatibility,
-    processObservation: processObservation(),
+    processObservation: parts.processObservation ?? processObservation(),
     artifactIntegrity: parts.artifactIntegrity,
     accounting: parts.accounting,
     eligibility: eligibility(),
@@ -2116,6 +2183,85 @@ export async function inspectNativeHarnessHistory(
     ));
   }
 
+  // Process diagnosis runs only after the existing run/events/artifact reads.
+  // It targets the current recorded attempts plus one controller lock owner;
+  // every owner read still uses the original pin, scoped IO and query budget.
+  let processObservation: NativeHarnessHistoryProcessObservation | undefined;
+  if (request.processObserver !== undefined && record !== null && !rootChanged) {
+    const targets = deriveNativeHarnessHistoryProcessTargets(
+      pin.path,
+      locator.storeRelativePath,
+      record.id,
+      Object.entries(record.stages).flatMap(([id, stage]) => stage === undefined ? [] : [{
+        id,
+        status: stage.status,
+        attempt: stage.attempt,
+        cwd: stage.cwd,
+      }]),
+    );
+    let ownerReadOpen = true;
+    const readOwner = async (
+      target: NativeHarnessHistoryProcessTarget,
+    ): Promise<NativeHarnessHistoryProcessOwnerRead> => {
+      if (!ownerReadOpen) {
+        return ownerReadWithoutIo(
+          target,
+          "not-attempted",
+          "The owner-read closure was closed after the bounded process observation returned.",
+        );
+      }
+      const reservation = NATIVE_HARNESS_HISTORY_PROCESS_LIMITS.ownerReadReservationBytes;
+      if (!readBudget.reserve(reservation)) {
+        return ownerReadWithoutIo(
+          target,
+          "budget-exhausted",
+          `The ${NATIVE_HARNESS_HISTORY_LIMITS.queryBytes}-byte whole-query budget was reached before this owner read.`,
+        );
+      }
+      try {
+        const snapshot = await captureWorkspaceText(
+          pin.path,
+          target.ownerRelativePath,
+          scopedIo,
+          observationNow(),
+        );
+        readBudget.settle(reservation, snapshot.file.bytes);
+        observedBytes += snapshot.file.bytes;
+        query.observedBytes = observedBytes;
+        return decodeNativeHarnessHistoryProcessOwner(target, record.id, {
+          text: snapshot.text,
+          bytes: snapshot.file.bytes,
+          sha256: snapshot.file.sha256,
+          observedAt: snapshot.file.observedAt,
+        });
+      } catch (error) {
+        readBudget.settle(reservation, null);
+        return ownerReadFailure(target, error);
+      }
+    };
+    let collected: Awaited<ReturnType<typeof collectNativeHarnessHistoryProcess>>;
+    try {
+      collected = await collectNativeHarnessHistoryProcess({
+        targets,
+        readOwner,
+        osObserver: request.processObserver,
+        signal: request.signal,
+        isRootCurrent: async () => !rootChanged && await rootIdentityStillCurrent(scopedIo, pin),
+        isAborted: () => signalProblem(request.signal) !== null,
+      });
+    } finally {
+      ownerReadOpen = false;
+    }
+    processObservation = collected.observation;
+    if (!collected.rootCurrentAfterQuery && !rootChanged) {
+      rootChanged = true;
+      addReason(reasons, reason(
+        "storage-root-changed",
+        "The pinned storage root identity changed after the process observation.",
+      ));
+    }
+  }
+
   const finalSignal = signalProblem(request.signal);
   if (finalSignal !== null) {
     addReason(reasons, finalSignal);
@@ -2126,6 +2272,7 @@ export async function inspectNativeHarnessHistory(
       artifactIntegrity,
       accounting: buildAccounting(record),
       reasons,
+      ...(processObservation === undefined ? {} : { processObservation }),
     });
   }
 
@@ -2141,5 +2288,6 @@ export async function inspectNativeHarnessHistory(
     artifactIntegrity,
     accounting: buildAccounting(record),
     reasons,
+    ...(processObservation === undefined ? {} : { processObservation }),
   });
 }

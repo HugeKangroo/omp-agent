@@ -8,7 +8,10 @@ import {
   type NativeHarnessHistorySession,
   type NativeHarnessHistorySessionInspection,
 } from "./native-harness-history-session.ts";
-import type { NativeHarnessHistoryLocator } from "./native-harness-history.ts";
+import type {
+  NativeHarnessHistoryLocator,
+  NativeHarnessHistoryProcessObservation,
+} from "./native-harness-history.ts";
 import { deepFreeze } from "./native-work.ts";
 import type { NativeContext, NativeToolResult } from "./native-entry.ts";
 
@@ -49,6 +52,37 @@ export interface NativeHarnessHistoryVersionComparison {
   readonly configurationSha256: NativeHarnessHistoryLabelComparison;
 }
 
+/**
+ * Bounded inspect-only process summary. Counts and labels only: no PID,
+ * command, token, runtime path or environment value is copied here.
+ */
+export interface NativeHarnessHistoryHostProcessSummary {
+  readonly inspected: true;
+  readonly platform: "darwin" | "unsupported";
+  readonly osQuery:
+    | "completed"
+    | "not-observed"
+    | "limited-unknown"
+    | "not-run"
+    | "unsupported"
+    | "aborted";
+  readonly osQueryExecuted: boolean;
+  readonly controllerPresence: "present" | "not-observed" | "unknown";
+  readonly workerPresence: {
+    readonly present: number;
+    readonly notObserved: number;
+    readonly unknown: number;
+  };
+  readonly workerCoverage: "current-recorded-attempts-only";
+  readonly groupCoverage: "not-inspected";
+  readonly historicalAttempts: "incomplete";
+  readonly stopProof: "not-established";
+}
+
+export type NativeHarnessHistoryHostProcessObservation =
+  | "unknown/not-inspected"
+  | NativeHarnessHistoryHostProcessSummary;
+
 export interface NativeHarnessHistoryHostInspection {
   readonly schema: typeof NATIVE_HARNESS_HISTORY_HOST_SCHEMA;
   readonly authority: "non-authoritative";
@@ -59,7 +93,7 @@ export interface NativeHarnessHistoryHostInspection {
   readonly rootLabels: NativeHarnessHistoryRootLabels | null;
   readonly recoveredAuthority: false;
   readonly resume: false;
-  readonly processObservation: "unknown/not-inspected";
+  readonly processObservation: NativeHarnessHistoryHostProcessObservation;
   readonly history: NativeHarnessHistorySessionInspection | null;
   readonly reason: string | null;
 }
@@ -114,7 +148,7 @@ interface NativeHarnessHistoryToolResult {
   readonly semanticAcceptance: "not-evaluated";
   readonly recoveredAuthority: false;
   readonly resume: false;
-  readonly processObservation: "unknown/not-inspected";
+  readonly processObservation: NativeHarnessHistoryHostProcessObservation;
   readonly state: NativeHarnessHistoryToolState;
   readonly history: NativeHarnessHistoryListResult | NativeHarnessHistoryHostInspection | null;
   readonly reason: string | null;
@@ -279,6 +313,29 @@ export function compareNativeHarnessHistoryLabels(
   });
 }
 
+function buildHostProcessObservation(
+  history: NativeHarnessHistorySessionInspection,
+): NativeHarnessHistoryHostProcessObservation {
+  const process = history.inspection?.processObservation ?? null;
+  if (process === null || process.inspected === false) return "unknown/not-inspected";
+  return {
+    inspected: true,
+    platform: process.platform,
+    osQuery: process.osInspection.state,
+    osQueryExecuted: process.osInspection.executed,
+    controllerPresence: process.controller.presence,
+    workerPresence: {
+      present: process.workers.counts.present,
+      notObserved: process.workers.counts.notObserved,
+      unknown: process.workers.counts.unknown,
+    },
+    workerCoverage: process.workers.coverage,
+    groupCoverage: process.workers.groupCoverage,
+    historicalAttempts: process.workers.historicalAttempts,
+    stopProof: process.summary.stopProof,
+  };
+}
+
 export function buildNativeHarnessHistoryHostInspection(
   history: NativeHarnessHistorySessionInspection,
   labels: NativeHarnessHistoryRootLabels,
@@ -298,7 +355,7 @@ export function buildNativeHarnessHistoryHostInspection(
     rootLabels,
     recoveredAuthority: false as const,
     resume: false as const,
-    processObservation: "unknown/not-inspected" as const,
+    processObservation: buildHostProcessObservation(history),
     history,
     reason: null,
   });
@@ -383,7 +440,7 @@ function inspectProjection(host: NativeHarnessHistoryHostInspection): NativeHarn
     semanticAcceptance: "not-evaluated" as const,
     recoveredAuthority: false as const,
     resume: false as const,
-    processObservation: "unknown/not-inspected" as const,
+    processObservation: host.processObservation,
     state: host.state,
     history: host,
     reason: null,
@@ -447,6 +504,30 @@ function listModelView(list: NativeHarnessHistoryListResult): Record<string, unk
     reasons: modelReasons(list.reasons),
     processObservation: "unknown/not-inspected" as const,
     ...modelAuthorityFields(),
+  };
+}
+
+function modelProcessObservation(
+  process: NativeHarnessHistoryProcessObservation | null,
+): Record<string, unknown> | null {
+  if (process === null) return null;
+  if (process.inspected === false) {
+    return { inspected: false, controller: "unknown", workers: "unknown" };
+  }
+  return {
+    inspected: true,
+    platform: process.platform,
+    osQuery: process.osInspection.state,
+    osQueryExecuted: process.osInspection.executed,
+    requestedPids: process.osInspection.requestedPids,
+    observedPids: process.osInspection.observedPids,
+    cleanup: process.osInspection.cleanup,
+    controllerPresence: process.controller.presence,
+    workerPresence: process.workers.counts,
+    workerCoverage: process.workers.coverage,
+    groupCoverage: process.workers.groupCoverage,
+    historicalAttempts: process.workers.historicalAttempts,
+    stopProof: process.summary.stopProof,
   };
 }
 
@@ -526,11 +607,7 @@ function inspectModelView(host: NativeHarnessHistoryHostInspection): Record<stri
         usageEstimated: stage.usageEstimated,
       })),
     },
-    processObservation: process === null ? null : {
-      inspected: process.inspected,
-      controller: process.controller.state,
-      workers: process.workers.coverage,
-    },
+    processObservation: modelProcessObservation(process),
     hostProcessObservation: host.processObservation,
     reasons: modelReasons([...(leaf?.reasons ?? []), ...(projection?.reasons ?? [])]),
     reason: host.reason,

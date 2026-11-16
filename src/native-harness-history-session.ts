@@ -12,6 +12,7 @@ import {
   type NativeHarnessHistoryLocator,
   type NativeHarnessHistoryReason,
 } from "./native-harness-history.ts";
+import type { NativeHarnessHistoryProcessOsObserver } from "./native-harness-history-process.ts";
 import { fingerprintNativeJson } from "./native-instance-result.ts";
 import {
   NATIVE_WORK_INTERFACE,
@@ -153,6 +154,11 @@ export interface NativeHarnessHistorySessionOptions {
   readonly isOwnerCurrent: (context: unknown) => boolean;
   readonly now?: () => number;
   readonly fileIo?: NativeFileIo;
+  /**
+   * Optional trusted bounded OS observer. Omission keeps the old
+   * uninspected process projection and starts no extra owner/OS work.
+   */
+  readonly processObserver?: NativeHarnessHistoryProcessOsObserver;
   /** Test seam may lower the fixed 2s persistence profile, never raise it. */
   readonly ensureOnDiskTimeoutMs?: number;
 }
@@ -3111,6 +3117,7 @@ export function createNativeHarnessHistorySession(
         signal: actualSignal as AbortSignal,
         fileIo: io,
         now: () => nowValue(options),
+        ...(options.processObserver === undefined ? {} : { processObserver: options.processObserver }),
       });
       const rootAfter = await pinDirectory(storageRoot, io);
       if (rootAfter === null || !sameDirectoryPin(rootBefore, rootAfter)) {

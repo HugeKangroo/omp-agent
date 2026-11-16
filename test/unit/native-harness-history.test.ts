@@ -31,6 +31,10 @@ import {
   type NativeHarnessHistoryLocator,
   type NativeHarnessHistoryLocatorDecodeReason,
 } from "../../src/native-harness-history.ts";
+import type {
+  NativeHarnessHistoryProcessOsObserver,
+  NativeHarnessHistoryProcessOsObservation,
+} from "../../src/native-harness-history-process.ts";
 import {
   nodeFileIo,
   type NativeFileHandle,
@@ -89,6 +93,7 @@ interface InspectOptions {
   readonly fileIo?: NativeFileIo;
   readonly now?: () => number;
   readonly storageRoot?: string;
+  readonly processObserver?: NativeHarnessHistoryProcessOsObserver;
 }
 
 const tempRoots: string[] = [];
@@ -296,6 +301,7 @@ async function inspectFixture(
     signal: options.signal ?? new AbortController().signal,
     ...(options.fileIo === undefined ? {} : { fileIo: options.fileIo }),
     ...(options.now === undefined ? {} : { now: options.now }),
+    ...(options.processObserver === undefined ? {} : { processObserver: options.processObserver }),
   });
 }
 
@@ -1073,5 +1079,296 @@ describe("file IO seams and abort draining", () => {
     expect(result.state).toBe("aborted");
     expect(result.reasons.map((reason) => reason.code)).toContain("query-aborted");
     expect(closed).toBe(true);
+  });
+});
+
+describe("bounded process observation wiring", () => {
+  function completedOs(
+    rows: NativeHarnessHistoryProcessOsObservation["rows"],
+  ): NativeHarnessHistoryProcessOsObservation {
+    return {
+      state: "completed",
+      cause: null,
+      rows,
+      observedAt: 1234,
+      queryStarted: true,
+      cleanup: "settled",
+      problem: null,
+    };
+  }
+
+  function observerFor(
+    calls: number[][],
+    rows: NativeHarnessHistoryProcessOsObservation["rows"],
+  ): NativeHarnessHistoryProcessOsObserver {
+    return {
+      platform: "darwin",
+      async observePids(pids) {
+        calls.push([...pids]);
+        return completedOs(rows);
+      },
+    };
+  }
+
+  async function writeWorkerOwner(fixture: Fixture, runtimeRoot: string): Promise<void> {
+    const artifacts = path.join(path.dirname(fixture.winnerCwd), "artifacts");
+    await mkdir(artifacts, { recursive: true });
+    await writeFile(path.join(artifacts, "worker-owner.json"), JSON.stringify({
+      schemaVersion: 1,
+      runId: RUN_ID,
+      stage: "baseline",
+      pid: 4321,
+      pgid: 4321,
+      privateRuntimeRoot: runtimeRoot,
+      startedAt: STARTED_AT,
+    }), "utf8");
+  }
+
+  test("reads the current attempt owner, queries only its PID and never projects marker material", async () => {
+    const fixture = await makeFixture();
+    const runtimeRoot = path.join(fixture.root, "omp-harness2-worker-abcdef");
+    await writeWorkerOwner(fixture, runtimeRoot);
+    const calls: number[][] = [];
+    const result = await inspectFixture(fixture, {
+      processObserver: observerFor(calls, [{
+        pid: 4321,
+        pgid: 4321,
+        stat: "S",
+        startedAt: "Mon Jan 1 00:00:00 2026",
+        command: `/usr/bin/omp --config ${runtimeRoot}/config.yml --append-system-prompt ${runtimeRoot}/harness.txt`,
+      }]),
+    });
+    expect(calls).toEqual([[4321]]);
+    expect(result.state).toBe("observed");
+    expect(result.eligibility.resumeAvailable).toBe(false);
+    expect(result.eligibility.authorityRestored).toBe(false);
+    if (!result.processObservation.inspected) throw new Error("expected a limited process observation");
+    const process = result.processObservation;
+    expect(process.osInspection.executed).toBe(true);
+    expect(process.osInspection.state).toBe("completed");
+    expect(process.controller.owner.state).toBe("missing");
+    expect(process.controller.presence).toBe("unknown");
+    expect(process.workers.rows).toHaveLength(1);
+    const row = process.workers.rows[0]!;
+    expect(row.owner.state).toBe("observed");
+    expect(row.os.presence).toBe("present");
+    expect(row.os.processState).toBe("other");
+    expect(row.os.pgidComparison).toBe("match");
+    expect(row.identity).toBe("runtime-marker-consistent");
+    expect(process.summary.stopProof).toBe("not-established");
+    expect(process.workers.groupCoverage).toBe("not-inspected");
+    expect(process.workers.historicalAttempts).toBe("incomplete");
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain(runtimeRoot);
+    expect(serialized).not.toContain("config.yml");
+    expect(serialized).not.toContain("/usr/bin/omp --config");
+  });
+
+  test("no valid owner PID starts zero OS queries and is not a completed inspection", async () => {
+    const fixture = await makeFixture();
+    const calls: number[][] = [];
+    const result = await inspectFixture(fixture, { processObserver: observerFor(calls, []) });
+    expect(calls).toEqual([]);
+    if (!result.processObservation.inspected) throw new Error("expected a limited process observation");
+    const process = result.processObservation;
+    expect(process.osInspection.executed).toBe(false);
+    expect(process.osInspection.state).toBe("not-run");
+    expect(process.osInspection.requestedPids).toBe(0);
+    expect(process.osInspection.observedAt).toBeNull();
+    expect(process.workers.rows[0]?.owner.state).toBe("missing");
+    expect(process.workers.rows[0]?.os.presence).toBe("unknown");
+    expect(process.workers.rows[0]?.os.observedAt).toBeNull();
+    expect(process.summary.osQueries).toBe(0);
+    expect(result.state).toBe("observed");
+  });
+
+  test("PID/PGID reuse and zombies never become runtime-marker-consistent", async () => {
+    const fixture = await makeFixture();
+    const runtimeRoot = path.join(fixture.root, "omp-harness2-worker-abcdef");
+    await writeWorkerOwner(fixture, runtimeRoot);
+    const command = `/usr/bin/omp --config ${runtimeRoot}/config.yml --append-system-prompt ${runtimeRoot}/harness.txt`;
+    const reused = await inspectFixture(fixture, {
+      processObserver: observerFor([], [{
+        pid: 4321,
+        pgid: 9999,
+        stat: "S",
+        startedAt: "Mon Jan 1 00:00:00 2026",
+        command,
+      }]),
+    });
+    if (!reused.processObservation.inspected) throw new Error("expected a limited process observation");
+    const reusedRow = reused.processObservation.workers.rows[0]!;
+    expect(reusedRow.os.pgidComparison).toBe("mismatch");
+    expect(reusedRow.identity).toBe("mismatch");
+
+    const zombie = await inspectFixture(fixture, {
+      processObserver: observerFor([], [{
+        pid: 4321,
+        pgid: 4321,
+        stat: "Z",
+        startedAt: "Mon Jan 1 00:00:00 2026",
+        command,
+      }]),
+    });
+    if (!zombie.processObservation.inspected) throw new Error("expected a limited process observation");
+    const zombieRow = zombie.processObservation.workers.rows[0]!;
+    expect(zombieRow.os.presence).toBe("present");
+    expect(zombieRow.os.processState).toBe("zombie");
+    expect(zombieRow.identity).toBe("unknown");
+  });
+
+  test("an owner file beyond the 256 KiB read profile is invalid with no OS query", async () => {
+    const fixture = await makeFixture();
+    const artifacts = path.join(path.dirname(fixture.winnerCwd), "artifacts");
+    await mkdir(artifacts, { recursive: true });
+    await writeFile(path.join(artifacts, "worker-owner.json"), "x".repeat(NATIVE_HARNESS_HISTORY_LIMITS.runBytes + 1), "utf8");
+    let osCalls = 0;
+    const observer: NativeHarnessHistoryProcessOsObserver = {
+      platform: "darwin",
+      async observePids() {
+        osCalls += 1;
+        return completedOs([]);
+      },
+    };
+    const result = await inspectFixture(fixture, { processObserver: observer });
+    expect(osCalls).toBe(0);
+    if (!result.processObservation.inspected) throw new Error("expected a limited process observation");
+    const row = result.processObservation.workers.rows[0]!;
+    expect(row.owner.state).toBe("invalid");
+    expect(row.owner.problem?.code).toBe("owner-oversize");
+    expect(row.os.presence).toBe("unknown");
+    expect(result.processObservation.summary.osQueries).toBe(0);
+    expect(result.query.readBudget.failedReads).toBeGreaterThan(0);
+  });
+
+  test("whole-query owner reservations stop later reads and OS dispatch", async () => {
+    const fixture = await makeFixture();
+    const ids = ["baseline", "inv_edit", "dom_edit", "inv_probe", "dom_probe", "compose_edit", "final", "select", "reflect"];
+    fixture.run.stages = {};
+    for (const id of ids) {
+      // Missing owner files keep their full 256 KiB reservation charged.
+      const cwd = path.join(fixture.runDir, "stages", id, `attempt-1-${ATTEMPT_ID}`, "workspace");
+      fixture.run.stages[id] = {
+        id,
+        status: "completed",
+        attempt: 1,
+        cwd,
+        startedAt: STARTED_AT,
+        endedAt: ENDED_AT,
+      };
+    }
+    await writeRun(fixture);
+    let osCalls = 0;
+    const observer: NativeHarnessHistoryProcessOsObserver = {
+      platform: "darwin",
+      async observePids() {
+        osCalls += 1;
+        return completedOs([]);
+      },
+    };
+    const result = await inspectFixture(fixture, { processObserver: observer });
+    expect(osCalls).toBe(0);
+    if (!result.processObservation.inspected) throw new Error("expected a limited process observation");
+    expect(result.recorded.stages).toHaveLength(9);
+    expect(result.processObservation.summary.ownerReads.attempted).toBeGreaterThan(0);
+    expect(result.processObservation.summary.ownerReads.attempted).toBeLessThan(10);
+    expect(result.processObservation.summary.ownerReads.notAttempted).toBeGreaterThan(0);
+    expect(result.processObservation.summary.osQueries).toBe(0);
+    expect(result.processObservation.osInspection.state).toBe("not-run");
+    expect(result.query.readBudget.outcome).toBe("exhausted");
+    expect(result.query.readBudget.chargedBytes).toBeLessThanOrEqual(NATIVE_HARNESS_HISTORY_LIMITS.queryBytes);
+  });
+
+  test("a spawn-error observation reports zero executed OS queries", async () => {
+    const fixture = await makeFixture();
+    const runtimeRoot = path.join(fixture.root, "omp-harness2-worker-abcdef");
+    await writeWorkerOwner(fixture, runtimeRoot);
+    const observer: NativeHarnessHistoryProcessOsObserver = {
+      platform: "darwin",
+      async observePids() {
+        return {
+          state: "unknown",
+          cause: "spawn-error",
+          rows: [],
+          observedAt: null,
+          queryStarted: false,
+          cleanup: "not-needed",
+          problem: { code: "os-spawn-error", detail: "bounded spawn failure" },
+        };
+      },
+    };
+    const result = await inspectFixture(fixture, { processObserver: observer });
+    if (!result.processObservation.inspected) throw new Error("expected a limited process observation");
+    expect(result.processObservation.summary.osQueries).toBe(0);
+    expect(result.processObservation.osInspection.executed).toBe(false);
+    expect(result.processObservation.osInspection.requestedPids).toBe(1);
+    expect(result.processObservation.workers.rows[0]?.os.presence).toBe("unknown");
+  });
+
+  test("exit 1 empty counts controller and worker not-observed consistently", async () => {
+    const fixture = await makeFixture();
+    const runtimeRoot = path.join(fixture.root, "omp-harness2-worker-abcdef");
+    await writeWorkerOwner(fixture, runtimeRoot);
+    const lockDir = path.join(fixture.runDir, ".run.lock");
+    await mkdir(lockDir, { recursive: true });
+    await writeFile(path.join(lockDir, "owner.json"), JSON.stringify({
+      pid: 99,
+      token: "lock-token",
+      createdAt: STARTED_AT,
+    }), "utf8");
+    const calls: number[][] = [];
+    const observer: NativeHarnessHistoryProcessOsObserver = {
+      platform: "darwin",
+      async observePids(pids) {
+        calls.push([...pids]);
+        return {
+          state: "not-observed",
+          cause: null,
+          rows: [],
+          observedAt: 1234,
+          queryStarted: true,
+          cleanup: "settled",
+          problem: null,
+        };
+      },
+    };
+    const result = await inspectFixture(fixture, { processObserver: observer });
+    expect(calls).toEqual([[99, 4321]]);
+    if (!result.processObservation.inspected) throw new Error("expected a limited process observation");
+    expect(result.processObservation.controller.presence).toBe("not-observed");
+    expect(result.processObservation.workers.rows[0]?.os.presence).toBe("not-observed");
+    expect(result.processObservation.summary.presence.notObserved).toBe(2);
+    expect(result.processObservation.summary.presence.present).toBe(0);
+    expect(result.processObservation.summary.presence.unknown).toBe(0);
+    expect(result.processObservation.summary.stopProof).toBe("not-established");
+  });
+
+  test("an OS-axis failure stays unknown and does not erase recorded facts", async () => {
+    const fixture = await makeFixture();
+    const runtimeRoot = path.join(fixture.root, "omp-harness2-worker-abcdef");
+    await writeWorkerOwner(fixture, runtimeRoot);
+    const observer: NativeHarnessHistoryProcessOsObserver = {
+      platform: "darwin",
+      async observePids() {
+        return {
+          state: "unknown",
+          cause: "stderr",
+          rows: [],
+          observedAt: null,
+          queryStarted: true,
+          cleanup: "settled",
+          problem: { code: "os-stderr", detail: "bounded OS query wrote stderr" },
+        };
+      },
+    };
+    const result = await inspectFixture(fixture, { processObserver: observer });
+    expect(result.state).toBe("observed");
+    expect(result.recorded.status).toBe("completed");
+    expect(result.recorded.stages[0]?.id).toBe("baseline");
+    if (!result.processObservation.inspected) throw new Error("expected a limited process observation");
+    expect(result.processObservation.osInspection.state).toBe("limited-unknown");
+    expect(result.processObservation.workers.rows[0]?.os.presence).toBe("unknown");
+    expect(result.processObservation.workers.rows[0]?.identity).toBe("unknown");
+    expect(result.eligibility.liveAttach).toBe("unsupported");
   });
 });

@@ -7510,6 +7510,14 @@ describe("actual instanced Harness history composition", () => {
     expect(inspected?.recoveredAuthority).toBe(false);
     expect(inspected?.resume).toBe(false);
     expect(["observed", "partial"]).toContain(inspected?.state ?? "unavailable");
+    // The deterministic runner writes no worker owner and the write lock is
+    // released, so the bounded process axis must start no `ps` subprocess.
+    expect(inspected?.processObservation).toMatchObject({
+      inspected: true,
+      osQueryExecuted: false,
+      stopProof: "not-established",
+    });
+    expect(inspected?.history?.inspection?.processObservation.inspected).toBe(true);
 
     fixture.root.entry.dispose();
     expect(fixture.root.entry.harnessHistoryList?.(fixture.root.host.context, { limit: 16 }).state)

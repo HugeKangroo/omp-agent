@@ -397,6 +397,114 @@ describe("agent_harness_history transport", () => {
     expect(visible.semanticAcceptance).toBe("not-evaluated");
   });
 
+  test("inspect host and model views carry the same limited process summary", async () => {
+    const leafProcess = {
+      inspected: true as const,
+      platform: "darwin" as const,
+      controller: {
+        state: "unknown" as const,
+        coverage: "controller-lock-only" as const,
+        presence: "unknown" as const,
+        owner: {
+          state: "missing" as const,
+          bytes: null,
+          sha256: null,
+          observedAt: null,
+          pid: null,
+          pgid: null,
+          basis: null,
+          problem: null,
+        },
+        os: {
+          presence: "unknown" as const,
+          pid: null,
+          pgid: null,
+          stat: null,
+          processState: "unknown" as const,
+          startedAt: null,
+          observedAt: null,
+          pgidComparison: "unknown" as const,
+          markerComparison: "unknown" as const,
+          problem: null,
+        },
+        identity: "unknown" as const,
+      },
+      workers: {
+        state: "unknown" as const,
+        coverage: "current-recorded-attempts-only" as const,
+        rows: [],
+        counts: {
+          targeted: 0,
+          present: 0,
+          notObserved: 0,
+          unknown: 0,
+          zombies: 0,
+          markerConsistent: 0,
+          markerMismatch: 0,
+        },
+        groupCoverage: "not-inspected" as const,
+        historicalAttempts: "incomplete" as const,
+      },
+      coverage: {
+        basis: "current-recorded-attempts-only" as const,
+        group: "not-inspected" as const,
+        historicalAttempts: "incomplete" as const,
+      },
+      osInspection: {
+        executed: false,
+        state: "not-run" as const,
+        requestedPids: 0,
+        observedPids: 0,
+        cleanup: "not-needed" as const,
+        observedAt: null,
+        problem: null,
+      },
+      summary: {
+        ownerReads: { attempted: 0, observed: 0, failed: 0, notAttempted: 0 },
+        osQueries: 0 as const,
+        presence: { present: 0, notObserved: 0, unknown: 0 },
+        stopProof: "not-established" as const,
+      },
+      observedAt: null,
+      limitations: [],
+    };
+    const selector = { entryId: "locator/token/0", locatorSha256: "a".repeat(64) };
+    const leaf = {
+      ...inspection(locator(), { ...projection(), processObservation: leafProcess }),
+      selector,
+    };
+    const fake = fakeRoot({ inspect: async () => leaf });
+    const entry = createNativeHarnessHistoryEntry({
+      resolveRoot: () => ({ ok: true, root: fake.root }),
+    });
+    const result = await entry.tool.execute(
+      "call-inspect-process",
+      { action: "inspect", ...selector },
+      new AbortController().signal,
+      undefined,
+      CONTEXT,
+    );
+    const body = payload(result);
+    expect(body.history.processObservation).toEqual({
+      inspected: true,
+      platform: "darwin",
+      osQuery: "not-run",
+      osQueryExecuted: false,
+      controllerPresence: "unknown",
+      workerPresence: { present: 0, notObserved: 0, unknown: 0 },
+      workerCoverage: "current-recorded-attempts-only",
+      groupCoverage: "not-inspected",
+      historicalAttempts: "incomplete",
+      stopProof: "not-established",
+    });
+    expect(body.processObservation).toEqual(body.history.processObservation);
+    const visible = JSON.parse(result.content[0]!.text.slice("agent_harness_history ".length));
+    expect(visible.processObservation.inspected).toBe(true);
+    expect(visible.processObservation.osQuery).toBe("not-run");
+    expect(visible.processObservation.stopProof).toBe("not-established");
+    expect(visible.hostProcessObservation).toEqual(body.history.processObservation);
+  });
+
   test("late currentness failure returns unavailable, never a stale current view", async () => {
     const fake = fakeRoot({ revalidate: () => "the root navigation changed" });
     const entry = createNativeHarnessHistoryEntry({

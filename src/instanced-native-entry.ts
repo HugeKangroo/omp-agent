@@ -135,6 +135,7 @@ import {
   type NativeHarnessHistoryRootLabels,
   type NativeHarnessHistoryRootResolution,
 } from "./native-harness-history-entry.ts";
+import { createDarwinHistoryProcessObserver } from "./native-harness-history-process.ts";
 import {
   createNativeSnapshotEntry,
   MAX_SNAPSHOT_OPERATIONS,
@@ -3176,6 +3177,9 @@ function admitHistoryRoot(
     const session = createNativeHarnessHistorySession({
       storageRoot: config.backend.storageRoot,
       ...(factory.appendEntry === undefined ? {} : { appendEntry: factory.appendEntry }),
+      // Construction is stateless: no FS/OS I/O and no subprocess until an
+      // explicit inspect has validated owner metadata and selected a PID.
+      processObserver: createDarwinHistoryProcessObserver(),
       isOwnerCurrent(actualContext: unknown): boolean {
         return historyRef !== null && historyOwnerCurrent(factory, root, historyRef, actualContext);
       },
