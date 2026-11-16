@@ -485,6 +485,53 @@ function readCheckToolCallIds(value: unknown):
   return { ok: true, ids: Object.freeze(ids) };
 }
 
+export type NativeHarnessReportSelectionRead =
+  | { readonly ok: true; readonly selection: NativeHarnessReportSelection }
+  | NativeHarnessReportBindingFailure;
+
+/**
+ * One exact-shape read of the explicit Harness selector. The returned selection
+ * is a fresh frozen copy; no caller object or array is retained and raw id
+ * order is preserved. Shared by request normalization and selected-input
+ * snapshots so there is only one selector rule set.
+ */
+export function readNativeHarnessReportSelection(value: unknown): NativeHarnessReportSelectionRead {
+  try {
+    return readNativeHarnessReportSelectionUnchecked(value);
+  } catch {
+    return normalizationFailure("the report selection could not be inspected");
+  }
+}
+
+function readNativeHarnessReportSelectionUnchecked(
+  value: unknown,
+): NativeHarnessReportSelectionRead {
+  const selectionFields = readExactDataFields(value, SELECTION_KEYS, "selection");
+  if (!(selectionFields instanceof Map)) return selectionFields;
+  const sourceToolCallId = boundedString(
+    selectionFields.get("sourceToolCallId"),
+    NATIVE_HARNESS_REPORT_MAX_ID_CHARS,
+  );
+  const captureId = boundedString(selectionFields.get("captureId"), NATIVE_HARNESS_REPORT_MAX_ID_CHARS);
+  const captureDigest = selectionFields.get("captureDigest");
+  if (sourceToolCallId === null || captureId === null || !isHex64(captureDigest)) {
+    return normalizationFailure(
+      "selection must contain a source id, capture id and lowercase 64-character capture digest",
+    );
+  }
+  const ids = readCheckToolCallIds(selectionFields.get("checkToolCallIds"));
+  if (!ids.ok) return ids;
+  return {
+    ok: true as const,
+    selection: Object.freeze({
+      sourceToolCallId,
+      captureId,
+      captureDigest,
+      checkToolCallIds: ids.ids,
+    }),
+  };
+}
+
 /**
  * One exact-shape read of the trusted host request. The opaque reportRef is
  * preserved by identity and is never inspected here; native preparation must
@@ -534,21 +581,8 @@ function readNativeHarnessReportRequest(
     return normalizationFailure("work must be the exact observationId/generation/sessionId/workspaceRoot shape");
   }
 
-  const selectionFields = readExactDataFields(fields.get("selection"), SELECTION_KEYS, "selection");
-  if (!(selectionFields instanceof Map)) return selectionFields;
-  const sourceToolCallId = boundedString(
-    selectionFields.get("sourceToolCallId"),
-    NATIVE_HARNESS_REPORT_MAX_ID_CHARS,
-  );
-  const captureId = boundedString(selectionFields.get("captureId"), NATIVE_HARNESS_REPORT_MAX_ID_CHARS);
-  const captureDigest = selectionFields.get("captureDigest");
-  if (sourceToolCallId === null || captureId === null || !isHex64(captureDigest)) {
-    return normalizationFailure(
-      "selection must contain a source id, capture id and lowercase 64-character capture digest",
-    );
-  }
-  const ids = readCheckToolCallIds(selectionFields.get("checkToolCallIds"));
-  if (!ids.ok) return ids;
+  const selection = readNativeHarnessReportSelection(fields.get("selection"));
+  if (!selection.ok) return selection;
 
   const outcome = fields.get("outcome");
   if (typeof outcome !== "string" || !(OUTCOMES as readonly string[]).includes(outcome)) {
@@ -561,12 +595,7 @@ function readNativeHarnessReportRequest(
       reportRef,
       reportInputSha256,
       work: Object.freeze({ observationId, generation, sessionId, workspaceRoot }),
-      selection: Object.freeze({
-        sourceToolCallId,
-        captureId,
-        captureDigest,
-        checkToolCallIds: ids.ids,
-      }),
+      selection: selection.selection,
       outcome: outcome as ReportOutcome,
     }),
   });
