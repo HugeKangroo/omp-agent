@@ -12,6 +12,7 @@ import {
   type RunRecord,
   type RunRecoveryOrigin,
   type StageId,
+  type WorkerLifecycleCleanupObservedEvent,
 } from "../vendor/harness2/upstream/src/types.ts";
 import {
   captureWorkspaceText,
@@ -25,8 +26,9 @@ import {
 } from "./native-work.ts";
 
 /**
- * B1a storage leaf: bounded dispatch inventory for one actual recovery-origin
- * run. This module is storage, codec, CAS and append-only lifecycle data only.
+ * B1b2 storage leaf: bounded dispatch inventory for one actual
+ * recovery-origin run. This module is storage, codec, CAS and append-only
+ * lifecycle data only.
  *
  * It does not create or admit a run, expose a recovery switch, mark anything
  * executable/recoverable, observe an OS process, or authorize a resume. The
@@ -42,44 +44,59 @@ import {
  * they are not authenticated anti-rollback or proof against a local filesystem
  * adversary.
  *
+ * New creations use the v2 schema. Published v1 did not reserve cleanup
+ * receipt bytes, so it is decode/open/snapshot only: every v1 mutation is
+ * refused before argument access, guards, locking or write IO. There is no
+ * migration, fallback, remint, receipt backfill or old-terminal rewrite.
+ *
  * The sidecar is capped at 32 dispatch rows and 256 KiB canonical UTF-8 + LF.
- * Admission reserves each open row's maximum legal terminal encoding, so
- * pathological paths reduce usable rows instead of making a legal transition
- * inherently unable to fit. Old rows are never truncated or recycled.
+ * For v2, admission reserves each open row's maximum legal launch + prompt +
+ * cleanup + terminal encoding exactly once; already-written fields or a
+ * receipt are not counted twice. Pathological rows reduce usable rows instead
+ * of making a legal transition inherently unable to fit. Old rows are never
+ * truncated or recycled. V1 keeps its original reservation rule.
  *
  * innerDeadlineAt is stored exactly as the original actual value; execution
  * must gate at min(innerDeadlineAt, outerDeadlineAt), never rewrite the original
  * value to that minimum. requestTimeoutMs is the actual Controller request
- * timeout; prompt.effectiveTimeoutMs may only narrow it. No signal is persisted.
+ * timeout. V2 launch and prompt timeouts may only narrow it, and prompt must
+ * not widen launch. No signal is persisted.
  *
- * Lifecycle facts are finite: intended -> launch-pending -> process-bound ->
- * prompt-pending -> terminal, with terminal observation allowed directly from
- * any earlier phase. Terminal is a tagged observation, not a claim that the
- * process stopped or that coverage is complete. An absent process association
- * remains unknown. No clock, PID, process-group or credential is verified here.
+ * Lifecycle facts are finite:
+ * v2 intended -> launch-pending -> process-bound -> prompt-pending ->
+ * cleanup-observed -> terminal. A real cleanup receipt may close any
+ * nonterminal failure path; an explicit synthetic receipt may close only an
+ * intended row with no launch/process/prompt facts. Terminal is a tagged
+ * observation, not a claim that the process stopped or that coverage is
+ * complete. Receipt presence is not an all-stopped aggregate and grants no
+ * current dispatch authority. An absent process association remains unknown.
+ * No clock, PID, process-group or credential is verified here.
  *
  * The advance guard is the original execution signal/deadline check supplied by
  * the caller. It is invoked after every awaited lock/read/test hook and
  * immediately before a write. A synchronous guard that returns a Promise or
- * thenable is refused. Terminal finalization uses a separate cleanup guard and
- * deliberately does not re-apply the original live-execution guard.
+ * thenable is refused. Cleanup receipt and terminal finalization use a separate
+ * cleanup guard and deliberately do not re-apply the original live-execution
+ * guard.
  */
 
 export const NATIVE_HARNESS_DISPATCH_INVENTORY_SCHEMA =
   "omp-agent.native-harness-dispatch-inventory.v1";
+export const NATIVE_HARNESS_DISPATCH_INVENTORY_SCHEMA_V2 =
+  "omp-agent.native-harness-dispatch-inventory.v2";
 export const NATIVE_HARNESS_DISPATCH_INVENTORY_FILE = "dispatch-inventory.json";
 export const NATIVE_HARNESS_DISPATCH_INVENTORY_MAX_BYTES = 256 * 1024;
 export const NATIVE_HARNESS_DISPATCH_INVENTORY_MAX_DISPATCHES = 32;
+export const NATIVE_HARNESS_DISPATCH_PROMPT_MAX_BYTES = 1_048_576;
 
 const MAX_PATH_BYTES = 4096;
 const MAX_RUNTIME_ROOT_BYTES = 1024;
 /**
  * Conservative upper bound for the UTF-8 length of JSON encoding one finite
  * nonnegative ECMAScript number. Shortest round-trip decimal text is far
- * shorter than this for every finite nonnegative binary64 value; the longest
- * fixed form observed by the language algorithm is 24 bytes
- * (for example 0.0000010000000000000002). Fixed headroom keeps the storage
- * bound independent of the host's exact shortest-decimal implementation.
+ * shorter than this for every finite nonnegative binary64 value; fixed
+ * headroom keeps the storage bound independent of the host's exact
+ * shortest-decimal implementation.
  */
 const MAX_NUMERIC_JSON_BYTES = 32;
 const TERMINAL_USAGE_COST_PROJECTION = Number.MAX_VALUE;
@@ -89,6 +106,9 @@ const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const RUN_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const CONTROL_PATTERN = /[\x00-\x1f\x7f]/;
+const SIGNAL_TOKEN_PATTERN = /^SIG[A-Za-z0-9+._-]{0,29}$/;
+const MAX_CLEANUP_SIGNAL = `SIG${"X".repeat(29)}`;
+const MAX_CLEANUP_OBSERVED_AT = "+275760-09-13T00:00:00.000Z";
 
 const INVENTORY_KEYS = ["schema", "revision", "runId", "origin", "fixed", "dispatches"] as const;
 const FIXED_KEYS = ["stageTimeoutMs", "maxDurationMs", "maxCostUsd"] as const;
@@ -132,7 +152,8 @@ const ROW_BASE_KEYS = [
   "stageAllocatedCostUsd",
   "state",
 ] as const;
-const ROW_OPTIONAL_KEYS = ["launch", "process", "prompt", "terminal"] as const;
+const ROW_OPTIONAL_KEYS_V1 = ["launch", "process", "prompt", "terminal"] as const;
+const ROW_OPTIONAL_KEYS_V2 = ["launch", "process", "prompt", "cleanup", "terminal"] as const;
 const INTENT_KEYS = [
   "ordinal",
   "nonce",
@@ -147,9 +168,16 @@ const INTENT_KEYS = [
   "requestTimeoutMs",
   "stageAllocatedCostUsd",
 ] as const;
-const LAUNCH_KEYS = ["runtimeRoot"] as const;
+const LAUNCH_KEYS_V1 = ["runtimeRoot"] as const;
+const LAUNCH_KEYS_V2 = [
+  "runtimeRoot",
+  "configSha256",
+  "appendixSha256",
+  "effectiveTimeoutMs",
+] as const;
 const PROCESS_KEYS = ["pid", "pgid", "identitySha256"] as const;
-const PROMPT_KEYS = ["promptSha256", "effectiveTimeoutMs"] as const;
+const PROMPT_KEYS_V1 = ["promptSha256", "effectiveTimeoutMs"] as const;
+const PROMPT_KEYS_V2 = ["promptSha256", "promptBytes", "effectiveTimeoutMs"] as const;
 const TERMINAL_KEYS = [
   "outcome",
   "observationKind",
@@ -158,17 +186,43 @@ const TERMINAL_KEYS = [
   "usageCostUsd",
   "usageEstimated",
 ] as const;
+const CLEANUP_RECEIPT_KEYS = ["observationKind", "observation"] as const;
+const SYNTHETIC_CLEANUP_KEYS = ["observationKind"] as const;
+const CLEANUP_OBSERVATION_KEYS = [
+  "type",
+  "runId",
+  "stage",
+  "spawnAttempted",
+  "closeSeen",
+  "closeCode",
+  "closeSignal",
+  "groupObservation",
+  "groupObservedAt",
+  "hostWorkSettled",
+  "approvalWorkSettled",
+  "logFlush",
+] as const;
 const TEST_KEYS = ["fileIo", "testAfterPrimaryRead", "testAfterPrimaryWrite"] as const;
 const CREATE_KEYS = ["storeRoot", "runId"] as const;
 const OPEN_KEYS = ["storeRoot", "runId"] as const;
 
 const TERMINAL_OUTCOMES = ["completed", "failed", "cancelled", "timed-out", "unknown"] as const;
 const OBSERVATION_KINDS = ["runner-observation", "synthetic-fixture"] as const;
-const DISPATCH_STATES = [
+const GROUP_OBSERVATIONS = ["not-observed", "present", "unknown"] as const;
+const LOG_FLUSHES = ["success", "failure"] as const;
+const DISPATCH_STATES_V1 = [
   "intended",
   "launch-pending",
   "process-bound",
   "prompt-pending",
+  "terminal",
+] as const;
+const DISPATCH_STATES_V2 = [
+  "intended",
+  "launch-pending",
+  "process-bound",
+  "prompt-pending",
+  "cleanup-observed",
   "terminal",
 ] as const;
 
@@ -185,7 +239,8 @@ export type NativeHarnessDispatchInventoryErrorCode =
   | "exhausted"
   | "closed"
   | "ambiguous"
-  | "refused";
+  | "refused"
+  | "read-only";
 
 export class NativeHarnessDispatchInventoryError extends Error {
   override name = "NativeHarnessDispatchInventoryError";
@@ -202,9 +257,11 @@ export interface NativeHarnessDispatchInventoryFixed {
 }
 
 /**
- * Caller-owned immutable admission facts. The caller must copy attempt,
- * runRevision, cwd and artifactDir from the actual verified StageRecord;
- * WorkerRequest itself has no attempt and pathname parsing is not evidence.
+ * Caller-owned immutable admission facts. The caller must copy attempt, cwd and
+ * stage (with run ID/status evidence) from the actual verified StageRecord;
+ * runRevision comes from the actual RunRecord.revision; artifactDir comes from
+ * the same verified WorkerRequest, constrained to that attempt's sibling
+ * artifacts path. StageRecord itself has no revision or artifactDir field.
  * requestTimeoutMs is the actual bounded Controller WorkerRequest timeout.
  * innerDeadlineAt is stored exactly as supplied; execution gates at
  * min(innerDeadlineAt, outerDeadlineAt) and must not rewrite it to that min.
@@ -224,18 +281,43 @@ export interface NativeHarnessDispatchIntent {
   readonly stageAllocatedCostUsd: number;
 }
 
-export interface NativeHarnessDispatchLaunch {
+/** V1 diagnostic launch shape, retained only for old-byte decoding. */
+export interface NativeHarnessDispatchLaunchV1 {
   readonly runtimeRoot: string;
 }
 
+/**
+ * V2 complete owned launch facts. B1c copies these from the actual preLaunch
+ * event; this leaf neither renders configuration nor invents missing hashes.
+ */
+export interface NativeHarnessDispatchLaunch {
+  readonly runtimeRoot: string;
+  readonly configSha256: string;
+  readonly appendixSha256: string;
+  readonly effectiveTimeoutMs: number;
+}
+
+/**
+ * Association-only process facts. `identitySha256` may hold the actual Runner
+ * associationSha256; it is not a boot/authenticated process identity. A null
+ * PID/PGID from the Runner must not be turned into a process-bound row.
+ */
 export interface NativeHarnessDispatchProcess {
   readonly pid: number;
   readonly pgid: number;
   readonly identitySha256: string;
 }
 
+/** V1 diagnostic prompt shape, retained only for old-byte decoding. */
+export interface NativeHarnessDispatchPromptV1 {
+  readonly promptSha256: string;
+  readonly effectiveTimeoutMs: number;
+}
+
+/** V2 prompt facts. promptBytes is the actual encoded RPC frame UTF-8 size. */
 export interface NativeHarnessDispatchPrompt {
   readonly promptSha256: string;
+  readonly promptBytes: number;
   readonly effectiveTimeoutMs: number;
 }
 
@@ -245,15 +327,12 @@ export type NativeHarnessDispatchObservationKind = (typeof OBSERVATION_KINDS)[nu
 /**
  * Tagged terminal observation. `outcome` alone is not a stopped/complete-
  * coverage claim, and `observationKind` is descriptive data rather than
- * authority. B1b must add actual bounded cleanup/drain/exit observations at
- * the awaited Runner sink; this storage-only B1a shape does not fabricate them.
- * A synthetic-fixture completion may omit all process facts and is never
- * evidence that an actual process ran or stopped. A runner-observation
- * completion requires the recorded launch/process/prompt chain.
- * outcome/resultSha256 never prove actual drain or stop. B1b must record a
- * bounded cleanupReceipt before deleting runtime/worker-owner; a missing
- * receipt stays unknown forever and old terminal rows are not retroactively
- * backfilled. This B1a shape intentionally adds no guessed OS/cleanup fields.
+ * authority. V2 requires a prior cleanup receipt with the same
+ * observationKind. A synthetic-fixture completion may omit all process facts
+ * and is never evidence that an actual process ran or stopped. A
+ * runner-observation completion requires the recorded launch/process/prompt
+ * chain and its prior runner cleanup receipt. outcome/resultSha256 never prove
+ * actual drain or stop.
  */
 export interface NativeHarnessDispatchTerminal {
   readonly outcome: NativeHarnessDispatchTerminalOutcome;
@@ -264,7 +343,42 @@ export interface NativeHarnessDispatchTerminal {
   readonly usageEstimated: boolean;
 }
 
-export type NativeHarnessDispatchState = (typeof DISPATCH_STATES)[number];
+/** Exact owned cleanup receipt union. It contains no derived allStopped flag. */
+export type NativeHarnessDispatchCleanupReceipt =
+  | {
+    readonly observationKind: "runner-observation";
+    readonly observation: WorkerLifecycleCleanupObservedEvent;
+  }
+  | {
+    readonly observationKind: "synthetic-fixture";
+  };
+
+export type NativeHarnessDispatchStateV1 = (typeof DISPATCH_STATES_V1)[number];
+export type NativeHarnessDispatchState = (typeof DISPATCH_STATES_V2)[number];
+
+export interface NativeHarnessDispatchRowV1 {
+  readonly ordinal: number;
+  readonly nonce: string;
+  readonly runId: string;
+  readonly runRevision: number;
+  readonly stage: StageId;
+  readonly attempt: number;
+  readonly cwd: string;
+  readonly artifactDir: string;
+  readonly intentSha256: string;
+  readonly snapshotSha256: string;
+  readonly originNonce: string;
+  readonly sourceAssociationSha256: string;
+  readonly outerDeadlineAt: number;
+  readonly innerDeadlineAt: number;
+  readonly requestTimeoutMs: number;
+  readonly stageAllocatedCostUsd: number;
+  readonly state: NativeHarnessDispatchStateV1;
+  readonly launch?: NativeHarnessDispatchLaunchV1;
+  readonly process?: NativeHarnessDispatchProcess;
+  readonly prompt?: NativeHarnessDispatchPromptV1;
+  readonly terminal?: NativeHarnessDispatchTerminal;
+}
 
 export interface NativeHarnessDispatchRow {
   readonly ordinal: number;
@@ -287,17 +401,32 @@ export interface NativeHarnessDispatchRow {
   readonly launch?: NativeHarnessDispatchLaunch;
   readonly process?: NativeHarnessDispatchProcess;
   readonly prompt?: NativeHarnessDispatchPrompt;
+  readonly cleanup?: NativeHarnessDispatchCleanupReceipt;
   readonly terminal?: NativeHarnessDispatchTerminal;
 }
 
-export interface NativeHarnessDispatchInventory {
+export interface NativeHarnessDispatchInventoryV1 {
   readonly schema: typeof NATIVE_HARNESS_DISPATCH_INVENTORY_SCHEMA;
+  readonly revision: number;
+  readonly runId: string;
+  readonly origin: RunRecoveryOrigin;
+  readonly fixed: NativeHarnessDispatchInventoryFixed;
+  readonly dispatches: readonly NativeHarnessDispatchRowV1[];
+}
+
+export interface NativeHarnessDispatchInventoryV2 {
+  readonly schema: typeof NATIVE_HARNESS_DISPATCH_INVENTORY_SCHEMA_V2;
   readonly revision: number;
   readonly runId: string;
   readonly origin: RunRecoveryOrigin;
   readonly fixed: NativeHarnessDispatchInventoryFixed;
   readonly dispatches: readonly NativeHarnessDispatchRow[];
 }
+
+/** Common readonly snapshot union: v1 is diagnostic, v2 is current. */
+export type NativeHarnessDispatchInventory =
+  | NativeHarnessDispatchInventoryV1
+  | NativeHarnessDispatchInventoryV2;
 
 export interface NativeHarnessDispatchInventoryIdentity {
   readonly runId: string;
@@ -336,26 +465,28 @@ export interface NativeHarnessDispatchInventoryTestOptions {
 export interface NativeHarnessDispatchInventoryHandle {
   /** The last inventory owned by this handle, deeply frozen. */
   snapshot(): NativeHarnessDispatchInventory;
-  /** Appends exactly the next intended row. */
+  /** V2 only: appends exactly the next intended row. */
   intend(intent: NativeHarnessDispatchIntent, advanceGuard: () => void): Promise<NativeHarnessDispatchInventory>;
   /**
-   * Records awaited PRE-SPAWN launch-pending with the actual unique runtime
-   * root. This does not mean spawn succeeded; process association is separate.
+   * V2 only: records awaited PRE-SPAWN launch-pending with the complete actual
+   * runtime root, config/appendix digests and effective timeout. This does not
+   * mean spawn succeeded; process association is separate. No string-only
+   * placeholder path is offered.
    */
   markLaunched(
     ordinal: number,
     nonce: string,
-    runtimeRoot: string,
+    launch: NativeHarnessDispatchLaunch,
     advanceGuard: () => void,
   ): Promise<NativeHarnessDispatchInventory>;
-  /** Associates the actual PID/PGID facts reported by the original Runner. */
+  /** V2 only: associates the actual PID/PGID facts reported by the original Runner. */
   bindProcess(
     ordinal: number,
     nonce: string,
     process: NativeHarnessDispatchProcess,
     advanceGuard: () => void,
   ): Promise<NativeHarnessDispatchInventory>;
-  /** Records the encoded prompt digest and, at most, a narrowed timeout. */
+  /** V2 only: records the encoded prompt digest, byte length and narrowed timeout. */
   markPromptPending(
     ordinal: number,
     nonce: string,
@@ -363,9 +494,22 @@ export interface NativeHarnessDispatchInventoryHandle {
     advanceGuard: () => void,
   ): Promise<NativeHarnessDispatchInventory>;
   /**
-   * Records the already registered dispatch's real cleanup/result observation.
-   * The separate cleanup guard is not the original live-execution guard. This
-   * cannot extend execution, refund budget, or grant a next dispatch.
+   * V2 only: records one immutable cleanup receipt. A real observation may
+   * close any nonterminal failure path; a synthetic tag may close only an
+   * intended row with no launch/process/prompt facts. The separate cleanup
+   * guard is not the original live-execution guard. This cannot extend
+   * execution, refund budget, or grant a next dispatch.
+   */
+  markCleanupObserved(
+    ordinal: number,
+    nonce: string,
+    receipt: NativeHarnessDispatchCleanupReceipt,
+    cleanupGuard: () => void,
+  ): Promise<NativeHarnessDispatchInventory>;
+  /**
+   * V2 only: records the already registered dispatch's real result observation
+   * after a matching cleanup receipt. The separate cleanup guard is not the
+   * original live-execution guard.
    */
   finalize(
     ordinal: number,
@@ -409,6 +553,8 @@ interface EncodedInventory {
   readonly inventory: NativeHarnessDispatchInventory;
   readonly encoded: string;
 }
+
+type BaseRowFacts = Omit<NativeHarnessDispatchRow, "state" | "launch" | "process" | "prompt" | "cleanup" | "terminal">;
 
 function fail(code: NativeHarnessDispatchInventoryErrorCode, message: string): never {
   throw new NativeHarnessDispatchInventoryError(message, code);
@@ -469,6 +615,17 @@ function readSafeInteger(
 ): number {
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < minimum) {
     fail(code, `${label} must be a safe integer >= ${minimum}.`);
+  }
+  return value;
+}
+
+function readSignedSafeInteger(
+  value: unknown,
+  label: string,
+  code: NativeHarnessDispatchInventoryErrorCode,
+): number {
+  if (typeof value !== "number" || !Number.isSafeInteger(value)) {
+    fail(code, `${label} must be a signed safe integer.`);
   }
   return value;
 }
@@ -585,8 +742,8 @@ function sameFixed(
     && left.maxCostUsd === right.maxCostUsd;
 }
 
-function readLaunch(value: unknown, code: NativeHarnessDispatchInventoryErrorCode): NativeHarnessDispatchLaunch {
-  const record = readOwnedRecord(value, LAUNCH_KEYS, LAUNCH_KEYS, "launch fact", code);
+function readLaunchV1(value: unknown, code: NativeHarnessDispatchInventoryErrorCode): NativeHarnessDispatchLaunchV1 {
+  const record = readOwnedRecord(value, LAUNCH_KEYS_V1, LAUNCH_KEYS_V1, "launch fact", code);
   const runtimeRoot = typeof record.runtimeRoot === "string"
     && record.runtimeRoot.length > 0
     && path.isAbsolute(record.runtimeRoot)
@@ -597,6 +754,21 @@ function readLaunch(value: unknown, code: NativeHarnessDispatchInventoryErrorCod
   return Object.freeze({ runtimeRoot });
 }
 
+function readLaunchV2(value: unknown, code: NativeHarnessDispatchInventoryErrorCode): NativeHarnessDispatchLaunch {
+  const record = readOwnedRecord(value, LAUNCH_KEYS_V2, LAUNCH_KEYS_V2, "launch fact", code);
+  const runtimeRoot = typeof record.runtimeRoot === "string"
+    && record.runtimeRoot.length > 0
+    && path.isAbsolute(record.runtimeRoot)
+    && !CONTROL_PATTERN.test(record.runtimeRoot)
+    && Buffer.byteLength(record.runtimeRoot, "utf8") <= MAX_RUNTIME_ROOT_BYTES
+    ? record.runtimeRoot
+    : fail(code, "launch.runtimeRoot must be a bounded absolute path.");
+  const configSha256 = readSha256(record.configSha256, "launch.configSha256", code);
+  const appendixSha256 = readSha256(record.appendixSha256, "launch.appendixSha256", code);
+  const effectiveTimeoutMs = readSafeInteger(record.effectiveTimeoutMs, "launch.effectiveTimeoutMs", 1, code);
+  return Object.freeze({ runtimeRoot, configSha256, appendixSha256, effectiveTimeoutMs });
+}
+
 function readProcessValue(value: unknown, code: NativeHarnessDispatchInventoryErrorCode): NativeHarnessDispatchProcess {
   const record = readOwnedRecord(value, PROCESS_KEYS, PROCESS_KEYS, "process fact", code);
   const pid = readSafeInteger(record.pid, "process.pid", 1, code);
@@ -605,11 +777,22 @@ function readProcessValue(value: unknown, code: NativeHarnessDispatchInventoryEr
   return Object.freeze({ pid, pgid, identitySha256 });
 }
 
-function readPromptValue(value: unknown, code: NativeHarnessDispatchInventoryErrorCode): NativeHarnessDispatchPrompt {
-  const record = readOwnedRecord(value, PROMPT_KEYS, PROMPT_KEYS, "prompt fact", code);
+function readPromptV1(value: unknown, code: NativeHarnessDispatchInventoryErrorCode): NativeHarnessDispatchPromptV1 {
+  const record = readOwnedRecord(value, PROMPT_KEYS_V1, PROMPT_KEYS_V1, "prompt fact", code);
   const promptSha256 = readSha256(record.promptSha256, "prompt.promptSha256", code);
   const effectiveTimeoutMs = readSafeInteger(record.effectiveTimeoutMs, "prompt.effectiveTimeoutMs", 1, code);
   return Object.freeze({ promptSha256, effectiveTimeoutMs });
+}
+
+function readPromptV2(value: unknown, code: NativeHarnessDispatchInventoryErrorCode): NativeHarnessDispatchPrompt {
+  const record = readOwnedRecord(value, PROMPT_KEYS_V2, PROMPT_KEYS_V2, "prompt fact", code);
+  const promptSha256 = readSha256(record.promptSha256, "prompt.promptSha256", code);
+  const promptBytes = readSafeInteger(record.promptBytes, "prompt.promptBytes", 1, code);
+  if (promptBytes > NATIVE_HARNESS_DISPATCH_PROMPT_MAX_BYTES) {
+    fail(code, `prompt.promptBytes exceeds ${NATIVE_HARNESS_DISPATCH_PROMPT_MAX_BYTES}.`);
+  }
+  const effectiveTimeoutMs = readSafeInteger(record.effectiveTimeoutMs, "prompt.effectiveTimeoutMs", 1, code);
+  return Object.freeze({ promptSha256, promptBytes, effectiveTimeoutMs });
 }
 
 function readTerminalValue(
@@ -650,6 +833,173 @@ function readTerminalValue(
     usageCostUsd,
     usageEstimated: record.usageEstimated,
   });
+}
+
+function readBoolean(value: unknown, label: string, code: NativeHarnessDispatchInventoryErrorCode): boolean {
+  if (typeof value !== "boolean") fail(code, `${label} must be a strict boolean.`);
+  return value;
+}
+
+function readCanonicalIsoDate(
+  value: unknown,
+  label: string,
+  code: NativeHarnessDispatchInventoryErrorCode,
+): string {
+  if (typeof value !== "string" || value.length === 0 || value.length > 27) {
+    fail(code, `${label} must be a canonical ISO date of at most 27 characters.`);
+  }
+  const parsed = Date.parse(value);
+  if (!Number.isFinite(parsed) || new Date(parsed).toISOString() !== value) {
+    fail(code, `${label} must be a canonical ISO date of at most 27 characters.`);
+  }
+  return value;
+}
+
+function readCleanupReceipt(
+  value: unknown,
+  code: NativeHarnessDispatchInventoryErrorCode,
+): NativeHarnessDispatchCleanupReceipt {
+  const initial = readOwnedRecord(
+    value,
+    [...SYNTHETIC_CLEANUP_KEYS, "observation"],
+    ["observationKind"],
+    "cleanup receipt",
+    code,
+  );
+  const kind = initial.observationKind;
+  if (kind === "synthetic-fixture") {
+    readOwnedRecord(value, SYNTHETIC_CLEANUP_KEYS, SYNTHETIC_CLEANUP_KEYS, "synthetic cleanup receipt", code);
+    return Object.freeze({ observationKind: "synthetic-fixture" as const });
+  }
+  if (kind !== "runner-observation") {
+    fail(code, "cleanup receipt observationKind is not a bounded tag.");
+  }
+  const record = readOwnedRecord(
+    value,
+    CLEANUP_RECEIPT_KEYS,
+    CLEANUP_RECEIPT_KEYS,
+    "runner cleanup receipt",
+    code,
+  );
+  const observation = readOwnedRecord(
+    record.observation,
+    CLEANUP_OBSERVATION_KEYS,
+    CLEANUP_OBSERVATION_KEYS,
+    "cleanup observation",
+    code,
+  );
+  if (observation.type !== "cleanupObserved") {
+    fail(code, "cleanup observation type must be cleanupObserved.");
+  }
+  const runId = readRunId(observation.runId, code);
+  const stage = readStageId(observation.stage, code);
+  const spawnAttempted = readBoolean(observation.spawnAttempted, "cleanup.spawnAttempted", code);
+  const closeSeen = readBoolean(observation.closeSeen, "cleanup.closeSeen", code);
+  const closeCodeValue = observation.closeCode;
+  const closeCode = closeCodeValue === null
+    ? null
+    : readSignedSafeInteger(closeCodeValue, "cleanup.closeCode", code);
+  const closeSignalValue = observation.closeSignal;
+  let closeSignal: string | null;
+  if (closeSignalValue === null) {
+    closeSignal = null;
+  } else if (
+    typeof closeSignalValue === "string"
+    && SIGNAL_TOKEN_PATTERN.test(closeSignalValue)
+    && Buffer.byteLength(closeSignalValue, "utf8") <= 32
+  ) {
+    closeSignal = closeSignalValue;
+  } else {
+    fail(code, "cleanup.closeSignal must be null or a bounded ASCII SIG token.");
+  }
+  const groupValue = observation.groupObservation;
+  if (typeof groupValue !== "string" || !(GROUP_OBSERVATIONS as readonly string[]).includes(groupValue)) {
+    fail(code, "cleanup.groupObservation is not a bounded enum value.");
+  }
+  const groupObservation = groupValue as (typeof GROUP_OBSERVATIONS)[number];
+  const groupObservedAtValue = observation.groupObservedAt;
+  const groupObservedAt = groupObservedAtValue === null
+    ? null
+    : readCanonicalIsoDate(groupObservedAtValue, "cleanup.groupObservedAt", code);
+  const hostWorkSettled = readBoolean(observation.hostWorkSettled, "cleanup.hostWorkSettled", code);
+  const approvalWorkSettled = readBoolean(observation.approvalWorkSettled, "cleanup.approvalWorkSettled", code);
+  const logValue = observation.logFlush;
+  if (typeof logValue !== "string" || !(LOG_FLUSHES as readonly string[]).includes(logValue)) {
+    fail(code, "cleanup.logFlush is not a bounded enum value.");
+  }
+  if (closeSeen && closeCode === null && closeSignal === null) {
+    // A seen close with neither code nor signal is shape-valid; no stop claim.
+  } else if (!closeSeen && (closeCode !== null || closeSignal !== null)) {
+    fail(code, "cleanup.closeCode/closeSignal cannot be present when closeSeen is false.");
+  }
+  if (groupObservedAt === null && groupObservation !== "unknown") {
+    fail(code, "cleanup.groupObservation requires a probe time except for unknown.");
+  }
+  // "unknown" may carry an actual probe time: Runner.observeGroup reports an
+  // attempted probe that threw as unknown plus its real observedAt. No time
+  // still means no usable probe result.
+  if (!spawnAttempted) {
+    if (
+      closeSeen
+      || closeCode !== null
+      || closeSignal !== null
+      || groupObservedAt !== null
+      || groupObservation !== "unknown"
+    ) {
+      fail(code, "cleanup spawnAttempted=false cannot claim close or probe facts.");
+    }
+  }
+  const ownedObservation: WorkerLifecycleCleanupObservedEvent = Object.freeze({
+    type: "cleanupObserved" as const,
+    runId,
+    stage,
+    spawnAttempted,
+    closeSeen,
+    closeCode,
+    closeSignal,
+    groupObservation,
+    groupObservedAt,
+    hostWorkSettled,
+    approvalWorkSettled,
+    logFlush: logValue as (typeof LOG_FLUSHES)[number],
+  });
+  return Object.freeze({
+    observationKind: "runner-observation" as const,
+    observation: ownedObservation,
+  });
+}
+
+function assertCleanupMatchesRow(
+  row: { readonly runId: string; readonly stage: StageId },
+  receipt: NativeHarnessDispatchCleanupReceipt,
+  code: NativeHarnessDispatchInventoryErrorCode,
+): void {
+  if (receipt.observationKind === "synthetic-fixture") return;
+  if (receipt.observation.runId !== row.runId) {
+    fail(code, "Cleanup observation runId does not match the dispatch row.");
+  }
+  if (receipt.observation.stage !== row.stage) {
+    fail(code, "Cleanup observation stage does not match the dispatch row.");
+  }
+}
+
+function assertCleanupPrefixConsistency(
+  row: { readonly launch?: unknown; readonly process?: unknown; readonly prompt?: unknown },
+  receipt: NativeHarnessDispatchCleanupReceipt,
+  code: NativeHarnessDispatchInventoryErrorCode,
+): void {
+  if (receipt.observationKind === "synthetic-fixture") {
+    if (row.launch !== undefined || row.process !== undefined || row.prompt !== undefined) {
+      fail(code, "Synthetic cleanup cannot describe launch/process/prompt facts.");
+    }
+    return;
+  }
+  if (row.process !== undefined && !receipt.observation.spawnAttempted) {
+    fail(code, "Cleanup spawnAttempted=false contradicts a process-bound prefix.");
+  }
+  if (row.prompt !== undefined && !receipt.observation.spawnAttempted) {
+    fail(code, "Cleanup spawnAttempted=false contradicts a prompt prefix.");
+  }
 }
 
 function readIntentValue(value: unknown): NativeHarnessDispatchIntent {
@@ -750,8 +1100,8 @@ function runGuard(guard: () => void, label: string): void {
 }
 
 function baseRowFacts(
-  row: NativeHarnessDispatchRow,
-): Omit<NativeHarnessDispatchRow, "state" | "launch" | "process" | "prompt" | "terminal"> {
+  row: NativeHarnessDispatchRow | NativeHarnessDispatchRowV1,
+): BaseRowFacts {
   return {
     ordinal: row.ordinal,
     nonce: row.nonce,
@@ -772,33 +1122,18 @@ function baseRowFacts(
   };
 }
 
-function buildRow(
-  base: Omit<NativeHarnessDispatchRow, "state" | "launch" | "process" | "prompt" | "terminal">,
-  state: NativeHarnessDispatchState,
+function buildRowV1(
+  base: BaseRowFacts,
+  state: NativeHarnessDispatchStateV1,
   additions: {
-    readonly launch?: NativeHarnessDispatchLaunch;
+    readonly launch?: NativeHarnessDispatchLaunchV1;
     readonly process?: NativeHarnessDispatchProcess;
-    readonly prompt?: NativeHarnessDispatchPrompt;
+    readonly prompt?: NativeHarnessDispatchPromptV1;
     readonly terminal?: NativeHarnessDispatchTerminal;
   } = {},
-): NativeHarnessDispatchRow {
+): NativeHarnessDispatchRowV1 {
   return Object.freeze({
-    ordinal: base.ordinal,
-    nonce: base.nonce,
-    runId: base.runId,
-    runRevision: base.runRevision,
-    stage: base.stage,
-    attempt: base.attempt,
-    cwd: base.cwd,
-    artifactDir: base.artifactDir,
-    intentSha256: base.intentSha256,
-    snapshotSha256: base.snapshotSha256,
-    originNonce: base.originNonce,
-    sourceAssociationSha256: base.sourceAssociationSha256,
-    outerDeadlineAt: base.outerDeadlineAt,
-    innerDeadlineAt: base.innerDeadlineAt,
-    requestTimeoutMs: base.requestTimeoutMs,
-    stageAllocatedCostUsd: base.stageAllocatedCostUsd,
+    ...base,
     state,
     ...(additions.launch === undefined ? {} : { launch: additions.launch }),
     ...(additions.process === undefined ? {} : { process: additions.process }),
@@ -807,15 +1142,54 @@ function buildRow(
   });
 }
 
-function buildInventory(
+function buildRowV2(
+  base: BaseRowFacts,
+  state: NativeHarnessDispatchState,
+  additions: {
+    readonly launch?: NativeHarnessDispatchLaunch;
+    readonly process?: NativeHarnessDispatchProcess;
+    readonly prompt?: NativeHarnessDispatchPrompt;
+    readonly cleanup?: NativeHarnessDispatchCleanupReceipt;
+    readonly terminal?: NativeHarnessDispatchTerminal;
+  } = {},
+): NativeHarnessDispatchRow {
+  return Object.freeze({
+    ...base,
+    state,
+    ...(additions.launch === undefined ? {} : { launch: additions.launch }),
+    ...(additions.process === undefined ? {} : { process: additions.process }),
+    ...(additions.prompt === undefined ? {} : { prompt: additions.prompt }),
+    ...(additions.cleanup === undefined ? {} : { cleanup: additions.cleanup }),
+    ...(additions.terminal === undefined ? {} : { terminal: additions.terminal }),
+  });
+}
+
+function buildInventoryV1(
+  origin: RunRecoveryOrigin,
+  fixed: NativeHarnessDispatchInventoryFixed,
+  runId: string,
+  revision: number,
+  dispatches: readonly NativeHarnessDispatchRowV1[],
+): NativeHarnessDispatchInventoryV1 {
+  return deepFreeze({
+    schema: NATIVE_HARNESS_DISPATCH_INVENTORY_SCHEMA,
+    revision,
+    runId,
+    origin,
+    fixed,
+    dispatches: dispatches.map((row) => deepFreeze(row)),
+  });
+}
+
+function buildInventoryV2(
   origin: RunRecoveryOrigin,
   fixed: NativeHarnessDispatchInventoryFixed,
   runId: string,
   revision: number,
   dispatches: readonly NativeHarnessDispatchRow[],
-): NativeHarnessDispatchInventory {
+): NativeHarnessDispatchInventoryV2 {
   return deepFreeze({
-    schema: NATIVE_HARNESS_DISPATCH_INVENTORY_SCHEMA,
+    schema: NATIVE_HARNESS_DISPATCH_INVENTORY_SCHEMA_V2,
     revision,
     runId,
     origin,
@@ -829,19 +1203,13 @@ function encodeInventory(inventory: NativeHarnessDispatchInventory): string {
 }
 
 /**
- * Maximum legal terminal encoding projection for one nonterminal row.
- * runtimeRoot uses the maximum raw path length in backslashes, which JSON
- * escapes to the longest possible path form. Numeric fields whose legal
- * domain is a safe integer use the safe-integer maximum. usageCostUsd is the
- * only arbitrary finite nonnegative number; its field is represented by
- * Number.MAX_VALUE here, and the caller adds the documented numeric encoding
- * allowance for every open row. This is an internal size projection, not a
- * persisted row or a process claim.
+ * V1 maximum legal terminal encoding projection for one nonterminal row.
+ * This retains the published v1 reservation rule exactly.
  */
-function worstCaseTerminalRow(
-  row: NativeHarnessDispatchRow,
-): NativeHarnessDispatchRow {
-  const launch: NativeHarnessDispatchLaunch = Object.freeze({
+function worstCaseTerminalRowV1(
+  row: NativeHarnessDispatchRowV1,
+): NativeHarnessDispatchRowV1 {
+  const launch: NativeHarnessDispatchLaunchV1 = Object.freeze({
     runtimeRoot: `/${"\\".repeat(MAX_RUNTIME_ROOT_BYTES - 1)}`,
   });
   const process: NativeHarnessDispatchProcess = Object.freeze({
@@ -849,7 +1217,7 @@ function worstCaseTerminalRow(
     pgid: Number.MAX_SAFE_INTEGER,
     identitySha256: "f".repeat(64),
   });
-  const prompt: NativeHarnessDispatchPrompt = Object.freeze({
+  const prompt: NativeHarnessDispatchPromptV1 = Object.freeze({
     promptSha256: "f".repeat(64),
     effectiveTimeoutMs: row.requestTimeoutMs,
   });
@@ -861,10 +1229,75 @@ function worstCaseTerminalRow(
     usageCostUsd: TERMINAL_USAGE_COST_PROJECTION,
     usageEstimated: false,
   });
-  return buildRow(baseRowFacts(row), "terminal", { launch, process, prompt, terminal });
+  return buildRowV1(baseRowFacts(row), "terminal", { launch, process, prompt, terminal });
 }
 
-function assertCapacity(inventory: NativeHarnessDispatchInventory): void {
+/**
+ * Widest legal size-only cleanup receipt for this row. runId/stage are copied
+ * from the actual row; independent booleans use false (longer JSON than true).
+ * This is a projection, never a persisted observation.
+ */
+function worstCaseCleanupReceipt(row: NativeHarnessDispatchRow): NativeHarnessDispatchCleanupReceipt {
+  return Object.freeze({
+    observationKind: "runner-observation" as const,
+    observation: Object.freeze({
+      type: "cleanupObserved" as const,
+      runId: row.runId,
+      stage: row.stage,
+      // Size-only: false is one byte wider than true for every boolean.
+      spawnAttempted: false,
+      closeSeen: false,
+      closeCode: -Number.MAX_SAFE_INTEGER,
+      closeSignal: MAX_CLEANUP_SIGNAL,
+      groupObservation: "not-observed" as const,
+      groupObservedAt: MAX_CLEANUP_OBSERVED_AT,
+      hostWorkSettled: false,
+      approvalWorkSettled: false,
+      logFlush: "failure" as const,
+    }),
+  });
+}
+
+/**
+ * V2 maximum legal completion projection. The launch/prompt/fixed fields use
+ * their widest legal encodings; an already-written cleanup receipt is reused
+ * rather than counted twice. This is an internal size projection, never a
+ * persisted row or observation claim.
+ */
+function worstCaseV2TerminalRow(
+  row: NativeHarnessDispatchRow,
+): NativeHarnessDispatchRow {
+  const launch: NativeHarnessDispatchLaunch = Object.freeze({
+    runtimeRoot: `/${"\\".repeat(MAX_RUNTIME_ROOT_BYTES - 1)}`,
+    configSha256: "f".repeat(64),
+    appendixSha256: "f".repeat(64),
+    effectiveTimeoutMs: row.requestTimeoutMs,
+  });
+  const process: NativeHarnessDispatchProcess = Object.freeze({
+    pid: Number.MAX_SAFE_INTEGER,
+    pgid: Number.MAX_SAFE_INTEGER,
+    identitySha256: "f".repeat(64),
+  });
+  const prompt: NativeHarnessDispatchPrompt = Object.freeze({
+    promptSha256: "f".repeat(64),
+    promptBytes: NATIVE_HARNESS_DISPATCH_PROMPT_MAX_BYTES,
+    effectiveTimeoutMs: row.requestTimeoutMs,
+  });
+  const cleanup = row.state === "cleanup-observed" && row.cleanup !== undefined
+    ? row.cleanup
+    : worstCaseCleanupReceipt(row);
+  const terminal: NativeHarnessDispatchTerminal = Object.freeze({
+    outcome: "completed",
+    observationKind: cleanup.observationKind,
+    observedAt: Number.MAX_SAFE_INTEGER,
+    resultSha256: "f".repeat(64),
+    usageCostUsd: TERMINAL_USAGE_COST_PROJECTION,
+    usageEstimated: false,
+  });
+  return buildRowV2(baseRowFacts(row), "terminal", { launch, process, prompt, cleanup, terminal });
+}
+
+function assertCapacityV1(inventory: NativeHarnessDispatchInventoryV1): void {
   if (inventory.dispatches.length > NATIVE_HARNESS_DISPATCH_INVENTORY_MAX_DISPATCHES) {
     fail("exhausted", "Dispatch inventory exceeds the 32-row limit.");
   }
@@ -872,21 +1305,45 @@ function assertCapacity(inventory: NativeHarnessDispatchInventory): void {
   if (bytes > NATIVE_HARNESS_DISPATCH_INVENTORY_MAX_BYTES) {
     fail("too-large", `Dispatch inventory exceeds ${NATIVE_HARNESS_DISPATCH_INVENTORY_MAX_BYTES} bytes.`);
   }
-  // Re-encode the whole inventory with every open row at its maximum legal
-  // terminal encoding and with the widest legal revision. The fixed numeric
-  // allowance covers the longest JSON number text that Number.MAX_VALUE does
-  // not itself demonstrate (usageEstimated false and the 16-digit revision are
-  // already in the projection). Already-written launch/process/prompt fields
-  // are replaced by that projection, never counted a second time; terminal
-  // rows remain exact.
   const openRows = inventory.dispatches.filter((row) => row.state !== "terminal").length;
-  const projected = buildInventory(
+  const projected = buildInventoryV1(
     inventory.origin,
     inventory.fixed,
     inventory.runId,
     Number.MAX_SAFE_INTEGER,
     inventory.dispatches.map((row) =>
-      row.state === "terminal" ? row : worstCaseTerminalRow(row)),
+      row.state === "terminal" ? row : worstCaseTerminalRowV1(row)),
+  );
+  const projectedBytes = Buffer.byteLength(encodeInventory(projected), "utf8")
+    + openRows * TERMINAL_USAGE_COST_RESERVED_BYTES;
+  if (projectedBytes > NATIVE_HARNESS_DISPATCH_INVENTORY_MAX_BYTES) {
+    fail(
+      "too-large",
+      "Dispatch inventory lacks bounded completion capacity; reduce path/row size before admitting another dispatch.",
+    );
+  }
+}
+
+function assertCapacityV2(inventory: NativeHarnessDispatchInventoryV2): void {
+  if (inventory.dispatches.length > NATIVE_HARNESS_DISPATCH_INVENTORY_MAX_DISPATCHES) {
+    fail("exhausted", "Dispatch inventory exceeds the 32-row limit.");
+  }
+  const bytes = Buffer.byteLength(encodeInventory(inventory), "utf8");
+  if (bytes > NATIVE_HARNESS_DISPATCH_INVENTORY_MAX_BYTES) {
+    fail("too-large", `Dispatch inventory exceeds ${NATIVE_HARNESS_DISPATCH_INVENTORY_MAX_BYTES} bytes.`);
+  }
+  // Re-encode every open row at its maximum legal launch + prompt + cleanup +
+  // terminal encoding, with the widest legal revision. Already-written facts
+  // or a receipt are replaced by that projection, never added twice. The fixed
+  // numeric allowance covers arbitrary finite usage cost encodings.
+  const openRows = inventory.dispatches.filter((row) => row.state !== "terminal").length;
+  const projected = buildInventoryV2(
+    inventory.origin,
+    inventory.fixed,
+    inventory.runId,
+    Number.MAX_SAFE_INTEGER,
+    inventory.dispatches.map((row) =>
+      row.state === "terminal" ? row : worstCaseV2TerminalRow(row)),
   );
   const projectedBytes = Buffer.byteLength(encodeInventory(projected), "utf8")
     + openRows * TERMINAL_USAGE_COST_RESERVED_BYTES;
@@ -920,84 +1377,114 @@ function encodeAndValidate(
   return { inventory: validated, encoded };
 }
 
-function readRows(
+function readBaseRow(
+  record: Record<string, unknown>,
+  index: number,
+  runId: string,
+  origin: RunRecoveryOrigin,
+  fixed: NativeHarnessDispatchInventoryFixed,
+  deadlineBound: { readonly createdAt: number; readonly upper: number },
+  nonces: Set<string>,
+): BaseRowFacts {
+  const ordinal = readSafeInteger(record.ordinal, "row.ordinal", 1, "corrupt");
+  if (ordinal !== index + 1) {
+    fail("corrupt", "Dispatch ordinals must be contiguous and append-only.");
+  }
+  const nonce = readUuid(record.nonce, "row.nonce", "corrupt");
+  if (nonces.has(nonce)) fail("corrupt", "Dispatch nonce is not unique.");
+  nonces.add(nonce);
+  const rowRunId = readRunId(record.runId, "corrupt");
+  if (rowRunId !== runId) fail("identity-mismatch", "Dispatch row belongs to a different run.");
+  const runRevision = readSafeInteger(record.runRevision, "row.runRevision", 0, "corrupt");
+  const stage = readStageId(record.stage, "corrupt");
+  const attempt = readSafeInteger(record.attempt, "row.attempt", 1, "corrupt");
+  const cwd = readAbsolutePath(record.cwd, "row.cwd", MAX_PATH_BYTES);
+  const artifactDir = readAbsolutePath(record.artifactDir, "row.artifactDir", MAX_PATH_BYTES);
+  const intentSha256 = readSha256(record.intentSha256, "row.intentSha256", "corrupt");
+  const snapshotSha256 = readSha256(record.snapshotSha256, "row.snapshotSha256", "corrupt");
+  const originNonce = readUuid(record.originNonce, "row.originNonce", "corrupt");
+  if (originNonce !== origin.nonce) fail("corrupt", "Dispatch row origin nonce does not match genesis.");
+  const sourceAssociationSha256 = readSha256(
+    record.sourceAssociationSha256,
+    "row.sourceAssociationSha256",
+    "corrupt",
+  );
+  if (sourceAssociationSha256 !== origin.seed.sourceAssociationSha256) {
+    fail("corrupt", "Dispatch row source association does not match genesis.");
+  }
+  const outerDeadlineAt = readSafeInteger(record.outerDeadlineAt, "row.outerDeadlineAt", 1, "corrupt");
+  if (outerDeadlineAt !== origin.seed.deadlineAt) {
+    fail("corrupt", "Dispatch row outer deadline does not match the original admission.");
+  }
+  const innerDeadlineAt = readSafeInteger(record.innerDeadlineAt, "row.innerDeadlineAt", 1, "corrupt");
+  if (innerDeadlineAt <= deadlineBound.createdAt || innerDeadlineAt > deadlineBound.upper) {
+    fail("corrupt", "Dispatch row inner deadline is outside the original createdAt/duration bound.");
+  }
+  const requestTimeoutMs = readSafeInteger(record.requestTimeoutMs, "row.requestTimeoutMs", 1, "corrupt");
+  if (requestTimeoutMs > fixed.stageTimeoutMs) {
+    fail("corrupt", "Dispatch request timeout exceeds the original stage timeout.");
+  }
+  const stageAllocatedCostUsd = readPositiveFinite(
+    record.stageAllocatedCostUsd,
+    "row.stageAllocatedCostUsd",
+    "corrupt",
+  );
+  if (stageAllocatedCostUsd > origin.seed.allocatedCostUsd) {
+    fail("corrupt", "Dispatch row allocation exceeds the original run allocation.");
+  }
+  return {
+    ordinal,
+    nonce,
+    runId: rowRunId,
+    runRevision,
+    stage,
+    attempt,
+    cwd,
+    artifactDir,
+    intentSha256,
+    snapshotSha256,
+    originNonce,
+    sourceAssociationSha256,
+    outerDeadlineAt,
+    innerDeadlineAt,
+    requestTimeoutMs,
+    stageAllocatedCostUsd,
+  };
+}
+
+function readRowsV1(
   value: unknown,
   runId: string,
   origin: RunRecoveryOrigin,
   fixed: NativeHarnessDispatchInventoryFixed,
-): readonly NativeHarnessDispatchRow[] {
+): readonly NativeHarnessDispatchRowV1[] {
   const rawRows = readArray(value, "dispatches", "corrupt");
   if (rawRows.length > NATIVE_HARNESS_DISPATCH_INVENTORY_MAX_DISPATCHES) {
     fail("exhausted", "Dispatch inventory exceeds the 32-row limit.");
   }
-  const allowedKeys = [...ROW_BASE_KEYS, ...ROW_OPTIONAL_KEYS];
+  const allowedKeys = [...ROW_BASE_KEYS, ...ROW_OPTIONAL_KEYS_V1];
   const deadlineBound = originalInnerDeadlineBound(origin, fixed, "corrupt");
   const nonces = new Set<string>();
   const runtimeRoots = new Set<string>();
-  const rows: NativeHarnessDispatchRow[] = [];
+  const rows: NativeHarnessDispatchRowV1[] = [];
   for (const [index, rawRow] of rawRows.entries()) {
     const record = readOwnedRecord(rawRow, allowedKeys, ROW_BASE_KEYS, `dispatch row ${index + 1}`, "corrupt");
-    const ordinal = readSafeInteger(record.ordinal, "row.ordinal", 1, "corrupt");
-    if (ordinal !== index + 1) {
-      fail("corrupt", "Dispatch ordinals must be contiguous and append-only.");
-    }
-    const nonce = readUuid(record.nonce, "row.nonce", "corrupt");
-    if (nonces.has(nonce)) fail("corrupt", "Dispatch nonce is not unique.");
-    nonces.add(nonce);
-    const rowRunId = readRunId(record.runId, "corrupt");
-    if (rowRunId !== runId) fail("identity-mismatch", "Dispatch row belongs to a different run.");
-    const runRevision = readSafeInteger(record.runRevision, "row.runRevision", 0, "corrupt");
-    const stage = readStageId(record.stage, "corrupt");
-    const attempt = readSafeInteger(record.attempt, "row.attempt", 1, "corrupt");
-    const cwd = readAbsolutePath(record.cwd, "row.cwd", MAX_PATH_BYTES);
-    const artifactDir = readAbsolutePath(record.artifactDir, "row.artifactDir", MAX_PATH_BYTES);
-    const intentSha256 = readSha256(record.intentSha256, "row.intentSha256", "corrupt");
-    const snapshotSha256 = readSha256(record.snapshotSha256, "row.snapshotSha256", "corrupt");
-    const originNonce = readUuid(record.originNonce, "row.originNonce", "corrupt");
-    if (originNonce !== origin.nonce) fail("corrupt", "Dispatch row origin nonce does not match genesis.");
-    const sourceAssociationSha256 = readSha256(
-      record.sourceAssociationSha256,
-      "row.sourceAssociationSha256",
-      "corrupt",
-    );
-    if (sourceAssociationSha256 !== origin.seed.sourceAssociationSha256) {
-      fail("corrupt", "Dispatch row source association does not match genesis.");
-    }
-    const outerDeadlineAt = readSafeInteger(record.outerDeadlineAt, "row.outerDeadlineAt", 1, "corrupt");
-    if (outerDeadlineAt !== origin.seed.deadlineAt) {
-      fail("corrupt", "Dispatch row outer deadline does not match the original admission.");
-    }
-    const innerDeadlineAt = readSafeInteger(record.innerDeadlineAt, "row.innerDeadlineAt", 1, "corrupt");
-    if (innerDeadlineAt <= deadlineBound.createdAt || innerDeadlineAt > deadlineBound.upper) {
-      fail("corrupt", "Dispatch row inner deadline is outside the original createdAt/duration bound.");
-    }
-    const requestTimeoutMs = readSafeInteger(record.requestTimeoutMs, "row.requestTimeoutMs", 1, "corrupt");
-    if (requestTimeoutMs > fixed.stageTimeoutMs) {
-      fail("corrupt", "Dispatch request timeout exceeds the original stage timeout.");
-    }
-    const stageAllocatedCostUsd = readPositiveFinite(
-      record.stageAllocatedCostUsd,
-      "row.stageAllocatedCostUsd",
-      "corrupt",
-    );
-    if (stageAllocatedCostUsd > origin.seed.allocatedCostUsd) {
-      fail("corrupt", "Dispatch row allocation exceeds the original run allocation.");
-    }
+    const base = readBaseRow(record, index, runId, origin, fixed, deadlineBound, nonces);
     const stateValue = record.state;
     if (
       typeof stateValue !== "string"
-      || !(DISPATCH_STATES as readonly string[]).includes(stateValue)
+      || !(DISPATCH_STATES_V1 as readonly string[]).includes(stateValue)
     ) {
-      fail("corrupt", "Dispatch row state is not a bounded lifecycle state.");
+      fail("corrupt", "Dispatch row state is not a bounded v1 lifecycle state.");
     }
-    const state = stateValue as NativeHarnessDispatchState;
+    const state = stateValue as NativeHarnessDispatchStateV1;
     const hasLaunch = Object.hasOwn(record, "launch");
     const hasProcess = Object.hasOwn(record, "process");
     const hasPrompt = Object.hasOwn(record, "prompt");
     const hasTerminal = Object.hasOwn(record, "terminal");
-    const launch = hasLaunch ? readLaunch(record.launch, "corrupt") : undefined;
+    const launch = hasLaunch ? readLaunchV1(record.launch, "corrupt") : undefined;
     const process = hasProcess ? readProcessValue(record.process, "corrupt") : undefined;
-    const prompt = hasPrompt ? readPromptValue(record.prompt, "corrupt") : undefined;
+    const prompt = hasPrompt ? readPromptV1(record.prompt, "corrupt") : undefined;
     const terminal = hasTerminal ? readTerminalValue(record.terminal, "corrupt") : undefined;
     if (process !== undefined && launch === undefined) {
       fail("corrupt", "Dispatch process association is present without launch-pending.");
@@ -1005,7 +1492,7 @@ function readRows(
     if (prompt !== undefined && process === undefined) {
       fail("corrupt", "Dispatch prompt fact is present without process association.");
     }
-    if (prompt !== undefined && prompt.effectiveTimeoutMs > requestTimeoutMs) {
+    if (prompt !== undefined && prompt.effectiveTimeoutMs > base.requestTimeoutMs) {
       fail("corrupt", "Dispatch effective timeout is not a narrowing of the actual request timeout.");
     }
     if (launch !== undefined) {
@@ -1041,27 +1528,117 @@ function readRows(
     ) {
       fail("corrupt", "Prompt-pending dispatch row has an inconsistent lifecycle shape.");
     }
-    rows.push(buildRow({
-      ordinal,
-      nonce,
-      runId: rowRunId,
-      runRevision,
-      stage,
-      attempt,
-      cwd,
-      artifactDir,
-      intentSha256,
-      snapshotSha256,
-      originNonce,
-      sourceAssociationSha256,
-      outerDeadlineAt,
-      innerDeadlineAt,
-      requestTimeoutMs,
-      stageAllocatedCostUsd,
-    }, state, {
+    rows.push(buildRowV1(base, state, {
       ...(launch === undefined ? {} : { launch }),
       ...(process === undefined ? {} : { process }),
       ...(prompt === undefined ? {} : { prompt }),
+      ...(terminal === undefined ? {} : { terminal }),
+    }));
+  }
+  return Object.freeze(rows);
+}
+
+function readRowsV2(
+  value: unknown,
+  runId: string,
+  origin: RunRecoveryOrigin,
+  fixed: NativeHarnessDispatchInventoryFixed,
+): readonly NativeHarnessDispatchRow[] {
+  const rawRows = readArray(value, "dispatches", "corrupt");
+  if (rawRows.length > NATIVE_HARNESS_DISPATCH_INVENTORY_MAX_DISPATCHES) {
+    fail("exhausted", "Dispatch inventory exceeds the 32-row limit.");
+  }
+  const allowedKeys = [...ROW_BASE_KEYS, ...ROW_OPTIONAL_KEYS_V2];
+  const deadlineBound = originalInnerDeadlineBound(origin, fixed, "corrupt");
+  const nonces = new Set<string>();
+  const runtimeRoots = new Set<string>();
+  const rows: NativeHarnessDispatchRow[] = [];
+  for (const [index, rawRow] of rawRows.entries()) {
+    const record = readOwnedRecord(rawRow, allowedKeys, ROW_BASE_KEYS, `dispatch row ${index + 1}`, "corrupt");
+    const base = readBaseRow(record, index, runId, origin, fixed, deadlineBound, nonces);
+    const stateValue = record.state;
+    if (
+      typeof stateValue !== "string"
+      || !(DISPATCH_STATES_V2 as readonly string[]).includes(stateValue)
+    ) {
+      fail("corrupt", "Dispatch row state is not a bounded v2 lifecycle state.");
+    }
+    const state = stateValue as NativeHarnessDispatchState;
+    const hasLaunch = Object.hasOwn(record, "launch");
+    const hasProcess = Object.hasOwn(record, "process");
+    const hasPrompt = Object.hasOwn(record, "prompt");
+    const hasCleanup = Object.hasOwn(record, "cleanup");
+    const hasTerminal = Object.hasOwn(record, "terminal");
+    const launch = hasLaunch ? readLaunchV2(record.launch, "corrupt") : undefined;
+    const process = hasProcess ? readProcessValue(record.process, "corrupt") : undefined;
+    const prompt = hasPrompt ? readPromptV2(record.prompt, "corrupt") : undefined;
+    const cleanup = hasCleanup ? readCleanupReceipt(record.cleanup, "corrupt") : undefined;
+    const terminal = hasTerminal ? readTerminalValue(record.terminal, "corrupt") : undefined;
+    if (process !== undefined && launch === undefined) {
+      fail("corrupt", "Dispatch process association is present without launch-pending.");
+    }
+    if (prompt !== undefined && process === undefined) {
+      fail("corrupt", "Dispatch prompt fact is present without process association.");
+    }
+    if (launch !== undefined) {
+      if (launch.effectiveTimeoutMs > base.requestTimeoutMs) {
+        fail("corrupt", "Dispatch launch timeout is not a narrowing of the actual request timeout.");
+      }
+      if (runtimeRoots.has(launch.runtimeRoot)) fail("corrupt", "Dispatch runtime root is not unique.");
+      runtimeRoots.add(launch.runtimeRoot);
+    }
+    if (prompt !== undefined && launch !== undefined && prompt.effectiveTimeoutMs > launch.effectiveTimeoutMs) {
+      fail("corrupt", "Dispatch prompt timeout widens the recorded launch timeout.");
+    }
+    if (cleanup !== undefined) {
+      assertCleanupMatchesRow(base, cleanup, "corrupt");
+      assertCleanupPrefixConsistency({ launch, process, prompt }, cleanup, "corrupt");
+    }
+    if (state === "terminal") {
+      if (terminal === undefined || cleanup === undefined) {
+        fail("corrupt", "Terminal dispatch row requires a prior cleanup receipt and observation.");
+      }
+      if (terminal.observationKind !== cleanup.observationKind) {
+        fail("corrupt", "Terminal observation kind does not match its cleanup receipt.");
+      }
+      if (
+        terminal.outcome === "completed"
+        && terminal.observationKind === "runner-observation"
+        && (launch === undefined || process === undefined || prompt === undefined)
+      ) {
+        fail("corrupt", "A runner-observation completion requires the recorded launch/process/prompt chain.");
+      }
+    } else if (terminal !== undefined) {
+      fail("corrupt", "Non-terminal dispatch row contains a terminal observation.");
+    }
+    if (state === "cleanup-observed") {
+      if (cleanup === undefined || terminal !== undefined) {
+        fail("corrupt", "Cleanup-observed dispatch row has an inconsistent lifecycle shape.");
+      }
+    }
+    if (state === "intended" && (hasLaunch || hasProcess || hasPrompt || hasCleanup)) {
+      fail("corrupt", "Intended dispatch row contains later lifecycle facts.");
+    }
+    if (state === "launch-pending" && (launch === undefined || hasProcess || hasPrompt || hasCleanup)) {
+      fail("corrupt", "Launch-pending dispatch row has an inconsistent lifecycle shape.");
+    }
+    if (
+      state === "process-bound"
+      && (launch === undefined || process === undefined || hasPrompt || hasCleanup)
+    ) {
+      fail("corrupt", "Process-bound dispatch row has an inconsistent lifecycle shape.");
+    }
+    if (
+      state === "prompt-pending"
+      && (launch === undefined || process === undefined || prompt === undefined || hasCleanup)
+    ) {
+      fail("corrupt", "Prompt-pending dispatch row has an inconsistent lifecycle shape.");
+    }
+    rows.push(buildRowV2(base, state, {
+      ...(launch === undefined ? {} : { launch }),
+      ...(process === undefined ? {} : { process }),
+      ...(prompt === undefined ? {} : { prompt }),
+      ...(cleanup === undefined ? {} : { cleanup }),
       ...(terminal === undefined ? {} : { terminal }),
     }));
   }
@@ -1073,6 +1650,7 @@ function readRows(
  * limits, append-only ordinals, immutable associations, lifecycle consistency
  * and reserved completion capacity. It cannot verify the actual run primary or
  * the caller's truthfulness; create/open perform the run binding separately.
+ * V1 bytes decode with their exact original schema and are never upgraded.
  */
 export function decodeNativeHarnessDispatchInventoryText(
   raw: string,
@@ -1093,9 +1671,6 @@ export function decodeNativeHarnessDispatchInventoryText(
     fail("corrupt", "Dispatch inventory is not valid JSON. No fallback was applied.");
   }
   const record = readOwnedRecord(parsed, INVENTORY_KEYS, INVENTORY_KEYS, "dispatch inventory", "corrupt");
-  if (record.schema !== NATIVE_HARNESS_DISPATCH_INVENTORY_SCHEMA) {
-    fail("corrupt", "Dispatch inventory schema is not recognized.");
-  }
   const revision = readSafeInteger(record.revision, "inventory.revision", 0, "corrupt");
   const runId = readRunId(record.runId, "corrupt");
   if (runId !== expectedRunId) {
@@ -1103,10 +1678,19 @@ export function decodeNativeHarnessDispatchInventoryText(
   }
   const origin = readOriginValue(record.origin, runId);
   const fixed = readFixed(record.fixed, "corrupt");
-  const dispatches = readRows(record.dispatches, runId, origin, fixed);
-  const inventory = buildInventory(origin, fixed, runId, revision, dispatches);
-  assertCapacity(inventory);
-  return inventory;
+  if (record.schema === NATIVE_HARNESS_DISPATCH_INVENTORY_SCHEMA) {
+    const dispatches = readRowsV1(record.dispatches, runId, origin, fixed);
+    const inventory = buildInventoryV1(origin, fixed, runId, revision, dispatches);
+    assertCapacityV1(inventory);
+    return inventory;
+  }
+  if (record.schema === NATIVE_HARNESS_DISPATCH_INVENTORY_SCHEMA_V2) {
+    const dispatches = readRowsV2(record.dispatches, runId, origin, fixed);
+    const inventory = buildInventoryV2(origin, fixed, runId, revision, dispatches);
+    assertCapacityV2(inventory);
+    return inventory;
+  }
+  fail("corrupt", "Dispatch inventory schema is not recognized.");
 }
 
 function pinExistingDirectory(io: NativeFileIo, directory: string): Promise<PinnedDirectory> {
@@ -1332,17 +1916,17 @@ async function assertFreshInventory(io: NativeFileIo, primaryPath: string): Prom
   }
 }
 
-function nextRevision(inventory: NativeHarnessDispatchInventory): number {
+function nextRevision(inventory: NativeHarnessDispatchInventoryV2): number {
   if (inventory.revision >= Number.MAX_SAFE_INTEGER) {
     fail("exhausted", "Dispatch inventory revision counter is exhausted.");
   }
   return inventory.revision + 1;
 }
 
-function applyIntent(
-  inventory: NativeHarnessDispatchInventory,
+function applyIntentV2(
+  inventory: NativeHarnessDispatchInventoryV2,
   intent: NativeHarnessDispatchIntent,
-): NativeHarnessDispatchInventory {
+): NativeHarnessDispatchInventoryV2 {
   if (inventory.dispatches.length >= NATIVE_HARNESS_DISPATCH_INVENTORY_MAX_DISPATCHES) {
     fail("exhausted", "Dispatch inventory row limit is exhausted.");
   }
@@ -1362,7 +1946,7 @@ function applyIntent(
   if (intent.stageAllocatedCostUsd > inventory.origin.seed.allocatedCostUsd) {
     fail("invalid-input", "Dispatch allocation exceeds the original run allocation.");
   }
-  const row = buildRow({
+  const row = buildRowV2({
     ordinal: intent.ordinal,
     nonce: intent.nonce,
     runId: inventory.runId,
@@ -1380,7 +1964,7 @@ function applyIntent(
     requestTimeoutMs: intent.requestTimeoutMs,
     stageAllocatedCostUsd: intent.stageAllocatedCostUsd,
   }, "intended");
-  return buildInventory(
+  return buildInventoryV2(
     inventory.origin,
     inventory.fixed,
     inventory.runId,
@@ -1390,7 +1974,7 @@ function applyIntent(
 }
 
 function requireRow(
-  inventory: NativeHarnessDispatchInventory,
+  inventory: NativeHarnessDispatchInventoryV2,
   ordinal: number,
   nonce: string,
 ): NativeHarnessDispatchRow {
@@ -1404,69 +1988,102 @@ function requireRow(
   return row;
 }
 
-function applyLaunch(
-  inventory: NativeHarnessDispatchInventory,
+function applyLaunchV2(
+  inventory: NativeHarnessDispatchInventoryV2,
   ordinal: number,
   nonce: string,
-  runtimeRoot: string,
-): NativeHarnessDispatchInventory {
+  launch: NativeHarnessDispatchLaunch,
+): NativeHarnessDispatchInventoryV2 {
   const row = requireRow(inventory, ordinal, nonce);
   if (row.state !== "intended") {
     fail("invalid-transition", "Launch-pending requires an intended dispatch.");
   }
-  if (inventory.dispatches.some((candidate) => candidate.launch?.runtimeRoot === runtimeRoot)) {
+  if (launch.effectiveTimeoutMs > row.requestTimeoutMs) {
+    fail("invalid-input", "Launch timeout is not a narrowing of the actual request timeout.");
+  }
+  if (inventory.dispatches.some((candidate) => candidate.launch?.runtimeRoot === launch.runtimeRoot)) {
     fail("conflict", "Dispatch runtime root is not unique.");
   }
-  const next = buildRow(baseRowFacts(row), "launch-pending", {
-    launch: Object.freeze({ runtimeRoot }),
+  const next = buildRowV2(baseRowFacts(row), "launch-pending", {
+    launch,
   });
-  return replaceRow(inventory, ordinal, next);
+  return replaceRowV2(inventory, ordinal, next);
 }
 
-function applyProcess(
-  inventory: NativeHarnessDispatchInventory,
+function applyProcessV2(
+  inventory: NativeHarnessDispatchInventoryV2,
   ordinal: number,
   nonce: string,
   process: NativeHarnessDispatchProcess,
-): NativeHarnessDispatchInventory {
+): NativeHarnessDispatchInventoryV2 {
   const row = requireRow(inventory, ordinal, nonce);
   if (row.state !== "launch-pending" || row.launch === undefined) {
     fail("invalid-transition", "Process association requires a launch-pending dispatch.");
   }
-  const next = buildRow(baseRowFacts(row), "process-bound", { launch: row.launch, process });
-  return replaceRow(inventory, ordinal, next);
+  const next = buildRowV2(baseRowFacts(row), "process-bound", { launch: row.launch, process });
+  return replaceRowV2(inventory, ordinal, next);
 }
 
-function applyPrompt(
-  inventory: NativeHarnessDispatchInventory,
+function applyPromptV2(
+  inventory: NativeHarnessDispatchInventoryV2,
   ordinal: number,
   nonce: string,
   prompt: NativeHarnessDispatchPrompt,
-): NativeHarnessDispatchInventory {
+): NativeHarnessDispatchInventoryV2 {
   const row = requireRow(inventory, ordinal, nonce);
   if (row.state !== "process-bound" || row.launch === undefined || row.process === undefined) {
     fail("invalid-transition", "Prompt-pending requires a process-bound dispatch.");
   }
-  if (prompt.effectiveTimeoutMs > row.requestTimeoutMs) {
-    fail("invalid-input", "Effective timeout is not a narrowing of the actual request timeout.");
+  if (prompt.effectiveTimeoutMs > row.launch.effectiveTimeoutMs) {
+    fail("invalid-input", "Prompt timeout widens the recorded launch timeout.");
   }
-  const next = buildRow(baseRowFacts(row), "prompt-pending", {
+  const next = buildRowV2(baseRowFacts(row), "prompt-pending", {
     launch: row.launch,
     process: row.process,
     prompt,
   });
-  return replaceRow(inventory, ordinal, next);
+  return replaceRowV2(inventory, ordinal, next);
 }
 
-function applyTerminal(
-  inventory: NativeHarnessDispatchInventory,
+function applyCleanupV2(
+  inventory: NativeHarnessDispatchInventoryV2,
+  ordinal: number,
+  nonce: string,
+  receipt: NativeHarnessDispatchCleanupReceipt,
+): NativeHarnessDispatchInventoryV2 {
+  const row = requireRow(inventory, ordinal, nonce);
+  if (row.state === "terminal" || row.state === "cleanup-observed" || row.cleanup !== undefined) {
+    fail("invalid-transition", "Cleanup receipt is immutable and can be written only once.");
+  }
+  if (receipt.observationKind === "synthetic-fixture" && row.state !== "intended") {
+    fail("invalid-transition", "Synthetic cleanup requires an intended dispatch with no launch facts.");
+  }
+  assertCleanupMatchesRow(row, receipt, "invalid-input");
+  assertCleanupPrefixConsistency(row, receipt, "invalid-input");
+  const next = buildRowV2(baseRowFacts(row), "cleanup-observed", {
+    ...(row.launch === undefined ? {} : { launch: row.launch }),
+    ...(row.process === undefined ? {} : { process: row.process }),
+    ...(row.prompt === undefined ? {} : { prompt: row.prompt }),
+    cleanup: receipt,
+  });
+  return replaceRowV2(inventory, ordinal, next);
+}
+
+function applyTerminalV2(
+  inventory: NativeHarnessDispatchInventoryV2,
   ordinal: number,
   nonce: string,
   terminal: NativeHarnessDispatchTerminal,
-): NativeHarnessDispatchInventory {
+): NativeHarnessDispatchInventoryV2 {
   const row = requireRow(inventory, ordinal, nonce);
   if (row.state === "terminal") {
     fail("invalid-transition", "Dispatch is already terminal; terminal observations are immutable.");
+  }
+  if (row.state !== "cleanup-observed" || row.cleanup === undefined) {
+    fail("invalid-transition", "Terminal observation requires a prior cleanup receipt.");
+  }
+  if (terminal.observationKind !== row.cleanup.observationKind) {
+    fail("invalid-input", "Terminal observation kind does not match its cleanup receipt.");
   }
   if (
     terminal.outcome === "completed"
@@ -1475,23 +2092,24 @@ function applyTerminal(
   ) {
     fail("invalid-transition", "Runner-observation completion requires the recorded launch/process/prompt chain.");
   }
-  const next = buildRow(baseRowFacts(row), "terminal", {
+  const next = buildRowV2(baseRowFacts(row), "terminal", {
     ...(row.launch === undefined ? {} : { launch: row.launch }),
     ...(row.process === undefined ? {} : { process: row.process }),
     ...(row.prompt === undefined ? {} : { prompt: row.prompt }),
+    cleanup: row.cleanup,
     terminal,
   });
-  return replaceRow(inventory, ordinal, next);
+  return replaceRowV2(inventory, ordinal, next);
 }
 
-function replaceRow(
-  inventory: NativeHarnessDispatchInventory,
+function replaceRowV2(
+  inventory: NativeHarnessDispatchInventoryV2,
   ordinal: number,
   row: NativeHarnessDispatchRow,
-): NativeHarnessDispatchInventory {
+): NativeHarnessDispatchInventoryV2 {
   const dispatches = inventory.dispatches.map((candidate) =>
     candidate.ordinal === ordinal ? row : candidate);
-  return buildInventory(
+  return buildInventoryV2(
     inventory.origin,
     inventory.fixed,
     inventory.runId,
@@ -1511,12 +2129,14 @@ function makeHandle(
   let rawSha256 = initialSha256;
   let closed = false;
   let poisoned = false;
+  const readOnly = initial.schema === NATIVE_HARNESS_DISPATCH_INVENTORY_SCHEMA;
 
   const commit = async (
-    mutate: (inventory: NativeHarnessDispatchInventory) => NativeHarnessDispatchInventory,
+    mutate: (inventory: NativeHarnessDispatchInventoryV2) => NativeHarnessDispatchInventoryV2,
     guard: () => void,
     guardLabel: string,
   ): Promise<NativeHarnessDispatchInventory> => {
+    if (readOnly) fail("read-only", "Published v1 dispatch inventories are diagnostic and read-only.");
     if (closed) fail("closed", "Dispatch inventory handle is closed.");
     if (poisoned) fail("ambiguous", "Dispatch inventory handle is poisoned by an ambiguous write.");
     runGuard(guard, guardLabel);
@@ -1534,6 +2154,9 @@ function makeHandle(
         runGuard(guard, guardLabel);
         const observed = await readInventoryPrimary(test.io, pins, runId);
         runGuard(guard, guardLabel);
+        if (observed.inventory.schema !== NATIVE_HARNESS_DISPATCH_INVENTORY_SCHEMA_V2) {
+          fail("changed", "Dispatch inventory version changed during a v2 handle operation.");
+        }
         if (observed.inventory.revision !== checkpoint.revision) {
           fail("conflict", "Dispatch inventory revision changed before commit.");
         }
@@ -1559,7 +2182,7 @@ function makeHandle(
         }
         if (closed) fail("closed", "Dispatch inventory handle is closed.");
         if (poisoned) fail("ambiguous", "Dispatch inventory handle is poisoned by an ambiguous write.");
-        const candidate = mutate(observed.inventory);
+        const candidate = mutate(observed.inventory as NativeHarnessDispatchInventoryV2);
         const encoded = encodeAndValidate(candidate, runId);
         // The afterRead hook is reentrant and awaited. Re-verify the original
         // pinned run directory after it and after candidate validation, then
@@ -1621,25 +2244,36 @@ function makeHandle(
     return committed;
   };
 
+  const refuseReadOnlyMutation = (): void => {
+    if (readOnly) {
+      fail(
+        "read-only",
+        "Published v1 dispatch inventories are diagnostic and read-only; no mutation or migration is available.",
+      );
+    }
+  };
+
   return Object.freeze({
     snapshot: () => checkpoint,
     intend: (intent: NativeHarnessDispatchIntent, advanceGuard: () => void) => {
+      refuseReadOnlyMutation();
       const owned = readIntentValue(intent);
       const guard = readGuard(advanceGuard, "advance guard");
-      return commit((inventory) => applyIntent(inventory, owned), guard, "advance guard");
+      return commit((inventory) => applyIntentV2(inventory, owned), guard, "advance guard");
     },
     markLaunched: (
       ordinal: number,
       nonce: string,
-      runtimeRoot: string,
+      launch: NativeHarnessDispatchLaunch,
       advanceGuard: () => void,
     ) => {
+      refuseReadOnlyMutation();
       const ownedOrdinal = readOrdinal(ordinal);
       const ownedNonce = readNonce(nonce);
-      const ownedRoot = readAbsolutePath(runtimeRoot, "runtimeRoot", MAX_RUNTIME_ROOT_BYTES);
+      const ownedLaunch = readLaunchV2(launch, "invalid-input");
       const guard = readGuard(advanceGuard, "advance guard");
       return commit(
-        (inventory) => applyLaunch(inventory, ownedOrdinal, ownedNonce, ownedRoot),
+        (inventory) => applyLaunchV2(inventory, ownedOrdinal, ownedNonce, ownedLaunch),
         guard,
         "advance guard",
       );
@@ -1650,12 +2284,13 @@ function makeHandle(
       process: NativeHarnessDispatchProcess,
       advanceGuard: () => void,
     ) => {
+      refuseReadOnlyMutation();
       const ownedOrdinal = readOrdinal(ordinal);
       const ownedNonce = readNonce(nonce);
       const ownedProcess = readProcessValue(process, "invalid-input");
       const guard = readGuard(advanceGuard, "advance guard");
       return commit(
-        (inventory) => applyProcess(inventory, ownedOrdinal, ownedNonce, ownedProcess),
+        (inventory) => applyProcessV2(inventory, ownedOrdinal, ownedNonce, ownedProcess),
         guard,
         "advance guard",
       );
@@ -1666,14 +2301,32 @@ function makeHandle(
       prompt: NativeHarnessDispatchPrompt,
       advanceGuard: () => void,
     ) => {
+      refuseReadOnlyMutation();
       const ownedOrdinal = readOrdinal(ordinal);
       const ownedNonce = readNonce(nonce);
-      const ownedPrompt = readPromptValue(prompt, "invalid-input");
+      const ownedPrompt = readPromptV2(prompt, "invalid-input");
       const guard = readGuard(advanceGuard, "advance guard");
       return commit(
-        (inventory) => applyPrompt(inventory, ownedOrdinal, ownedNonce, ownedPrompt),
+        (inventory) => applyPromptV2(inventory, ownedOrdinal, ownedNonce, ownedPrompt),
         guard,
         "advance guard",
+      );
+    },
+    markCleanupObserved: (
+      ordinal: number,
+      nonce: string,
+      receipt: NativeHarnessDispatchCleanupReceipt,
+      cleanupGuard: () => void,
+    ) => {
+      refuseReadOnlyMutation();
+      const ownedOrdinal = readOrdinal(ordinal);
+      const ownedNonce = readNonce(nonce);
+      const ownedReceipt = readCleanupReceipt(receipt, "invalid-input");
+      const guard = readGuard(cleanupGuard, "cleanup guard");
+      return commit(
+        (inventory) => applyCleanupV2(inventory, ownedOrdinal, ownedNonce, ownedReceipt),
+        guard,
+        "cleanup guard",
       );
     },
     finalize: (
@@ -1682,12 +2335,13 @@ function makeHandle(
       terminal: NativeHarnessDispatchTerminal,
       cleanupGuard: () => void,
     ) => {
+      refuseReadOnlyMutation();
       const ownedOrdinal = readOrdinal(ordinal);
       const ownedNonce = readNonce(nonce);
       const ownedTerminal = readTerminalValue(terminal, "invalid-input");
       const guard = readGuard(cleanupGuard, "terminal cleanup guard");
       return commit(
-        (inventory) => applyTerminal(inventory, ownedOrdinal, ownedNonce, ownedTerminal),
+        (inventory) => applyTerminalV2(inventory, ownedOrdinal, ownedNonce, ownedTerminal),
         guard,
         "terminal cleanup guard",
       );
@@ -1699,7 +2353,7 @@ function makeHandle(
 }
 
 /**
- * Creates the sidecar for one already-existing actual recovery-origin run.
+ * Creates the v2 sidecar for one already-existing actual recovery-origin run.
  * The run primary is re-read under the original short run-directory write lock
  * and must still match the exact genesis origin/fixed facts. EEXIST, including
  * a `.bak` sibling, refuses; no existing bytes are adopted or overwritten.
@@ -1728,7 +2382,7 @@ export async function createNativeHarnessDispatchInventory(
         fail("changed", "Actual run genesis changed before inventory creation.");
       }
       await assertFreshInventory(test.io, pins.primaryPath);
-      const candidate = buildInventory(locked.origin, locked.fixed, owned.runId, 0, []);
+      const candidate = buildInventoryV2(locked.origin, locked.fixed, owned.runId, 0, []);
       const encoded = encodeAndValidate(candidate, owned.runId);
       await verifyPins(test.io, [pins.root, pins.run]);
       written = encoded;
@@ -1763,7 +2417,8 @@ export async function createNativeHarnessDispatchInventory(
  * Opens one existing sidecar after binding it to the exact actual run primary.
  * Missing/corrupt/oversized/symlinked primaries, a missing sidecar, an origin
  * or fixed-fact mismatch, and backup-only state all refuse. Open creates and
- * repairs nothing and returns no execution/recovery authority.
+ * repairs nothing and returns no execution/recovery authority. V1 sidecars
+ * remain readable but their handle refuses every mutation.
  */
 export async function openNativeHarnessDispatchInventory(
   options: NativeHarnessDispatchInventoryOpenOptions,
