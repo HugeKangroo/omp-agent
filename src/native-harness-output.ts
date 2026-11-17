@@ -9,9 +9,12 @@ import {
 import {
   NATIVE_HARNESS_COMPLETION_LIMITS,
   NATIVE_HARNESS_COMPLETION_SCHEMA,
+  NATIVE_HARNESS_COMPLETION_SOLVER_IDS,
+  copyWitnessBase,
   type NativeHarnessBackendCompletion,
   type NativeHarnessCompletionSelection,
 } from "./native-harness-completion.ts";
+import { STAGE_IDS } from "../vendor/harness2/upstream/src/types.ts";
 import {
   NativeFileError,
   captureWorkspaceText,
@@ -24,6 +27,7 @@ import {
   type NativeFileStats,
   type NativeWorkspaceTextSnapshot,
 } from "./native-work.ts";
+import type { NativeHarnessReconciliationContentPlan } from "./native-harness-reconciliation-content.ts";
 
 /**
  * Host-only, bounded observation of the complete supported regular-file change
@@ -315,6 +319,29 @@ function failureResult(failure: IssuedFailure): NativeHarnessOutputFailureResult
     : { ok: false, code: failure.code, reason: failure.reason };
 }
 
+export type NativeHarnessContentControlReason =
+  | "aborted"
+  | "deadline-expired"
+  | "control-unavailable";
+
+/**
+ * Fixed-mode control translation used only by the host reconciliation content
+ * mode. It is not an issued output failure and cannot be supplied by an
+ * arbitrary caller as success/authority. The same OutputError plumbing keeps
+ * abort/deadline primary even when a bounded reader normalizes early I/O
+ * errors.
+ */
+export function createNativeHarnessContentControlFailure(
+  reason: NativeHarnessContentControlReason,
+): Error {
+  const code: NativeHarnessOutputFailure = reason === "aborted"
+    ? "aborted"
+    : reason === "deadline-expired" ? "deadline" : "io-failure";
+  const error = new OutputError(code, reason);
+  issuedFailures.set(error, { code, reason });
+  return error;
+}
+
 function isErrno(error: unknown, code: string): boolean {
   return readOwnString(error, "code") === code;
 }
@@ -537,12 +564,22 @@ interface TraceObservation {
 
 interface TracePass {
   totalBytes: number;
+  /** Fixed content mode only: charge validated observed size before read. */
+  readonly charge?: (bytes: number) => void;
+}
+
+interface TraceExpectation {
+  readonly candidate: string;
+  readonly attempt: number;
+  readonly traceHash: string;
 }
 
 interface AuthorityContext {
   readonly guard: () => void;
   readonly signal: AbortSignal;
   readonly startedAt: number;
+  /** Fixed host reconciliation mode only; never set by issued capture. */
+  readonly contentControl?: boolean;
 }
 
 interface Context extends AuthorityContext {
@@ -569,7 +606,17 @@ function assertAuthority(ctx: AuthorityContext): void {
   let result: unknown;
   try {
     result = ctx.guard();
-  } catch {
+  } catch (error) {
+    // Only the fixed host reconciliation mode can translate its own live
+    // guard/deadline failure; issued capture keeps the exact authority-lost
+    // semantics for every thrown guard value.
+    if (
+      ctx.contentControl === true
+      && error instanceof OutputError
+      && (error.code === "aborted" || error.code === "deadline" || error.code === "io-failure")
+    ) {
+      throw error;
+    }
     fail("authority-lost", "The trusted guard refused the capture.");
   }
   rejectControlResult(result, "The trusted guard");
@@ -595,19 +642,19 @@ function guardedAuthority(
   }
 }
 
-function createGuardedIo(ctx: Omit<Context, "io">): NativeFileIo {
+function createGuardedIo(ctx: Omit<Context, "io">, baseIo: NativeFileIo = nodeFileIo): NativeFileIo {
   return {
-    O_RDONLY: nodeFileIo.O_RDONLY,
-    O_NOFOLLOW: nodeFileIo.O_NOFOLLOW,
+    O_RDONLY: baseIo.O_RDONLY,
+    O_NOFOLLOW: baseIo.O_NOFOLLOW,
     async realpath(target: string): Promise<string> {
       guardedAuthority(ctx);
-      const resolved = await nodeFileIo.realpath(target);
+      const resolved = await baseIo.realpath(target);
       guardedAuthority(ctx);
       return resolved;
     },
     async lstat(target: string, options: { bigint: true }): Promise<NativeFileStats> {
       guardedAuthority(ctx);
-      const info = await nodeFileIo.lstat(target, options);
+      const info = await baseIo.lstat(target, options);
       guardedAuthority(ctx);
       return info;
     },
@@ -616,7 +663,7 @@ function createGuardedIo(ctx: Omit<Context, "io">): NativeFileIo {
       // O_NONBLOCK makes a FIFO/device swap between the caller's lstat and this
       // open return immediately instead of blocking a cooperative guard. The
       // opened handle is re-inspected before any read.
-      const handle = await nodeFileIo.open(target, flags | O_NONBLOCK);
+      const handle = await baseIo.open(target, flags | O_NONBLOCK);
       // The protected cleanup lifetime starts immediately; no guard or
       // checkpoint runs between the successful open and this try block.
       try {
@@ -765,13 +812,76 @@ async function readDirectoryNames(ctx: Context, absolute: string, stage: string 
 interface TreeOptions {
   readonly root: string;
   readonly label: string;
-  readonly stage: NativeHarnessCompletionSelection | null;
+  readonly stage: { readonly candidate: string } | null;
   readonly allowMarker: boolean;
   readonly expectedMarkerBytes: string | null;
   readonly maxOrdinaryFiles: number;
   readonly maxFileBytes: number;
   readonly maxTotalBytes: number;
   readonly readFiles: boolean;
+  /** Fixed content mode only: charge validated observed size before read. */
+  readonly charge?: (bytes: number) => void;
+}
+
+interface ContentReadAccounting {
+  readonly charge: (bytes: number) => void;
+  readonly maxFileBytes: number;
+  readonly maxTotalBytes: number | null;
+  /** Actual opened sizes committed so far for this one tree/pass. */
+  totalBytes: number;
+}
+
+/**
+ * Reserves the pre-read lstat size, then binds any larger actual opened size
+ * before allocation/read. A smaller opened size is not refunded. Per-file and
+ * per-tree/per-marker limits are evaluated on this same actual opened-size
+ * frontier, so earlier disconnected directory lstat totals cannot authorize an
+ * over-cap read. This is fixed content mode only.
+ */
+function createContentSizeChargingIo(
+  base: NativeFileIo,
+  accounting: ContentReadAccounting,
+  reservedBytes: number,
+): NativeFileIo {
+  let reserved = reservedBytes;
+  return {
+    O_RDONLY: base.O_RDONLY,
+    O_NOFOLLOW: base.O_NOFOLLOW,
+    realpath: (target) => base.realpath(target),
+    lstat: (target, options) => base.lstat(target, options),
+    async open(target: string, flags: number): Promise<NativeFileHandle> {
+      const handle = await base.open(target, flags);
+      let openedSizeCharged = false;
+      return {
+        async stat(options: { bigint: true }): Promise<NativeFileStats> {
+          const info = await handle.stat(options);
+          if (!openedSizeCharged) {
+            openedSizeCharged = true;
+            const actual = Number(info.size);
+            if (!Number.isSafeInteger(actual) || actual < 0) {
+              fail("io-failure", "An opened content size was not a bounded integer.");
+            }
+            const delta = actual > reserved ? actual - reserved : 0;
+            if (delta > 0) accounting.charge(delta);
+            if (actual > accounting.maxFileBytes) {
+              fail("too-large", "An opened content file exceeds its fixed per-file byte bound.");
+            }
+            if (accounting.maxTotalBytes !== null) {
+              const nextTotal = accounting.totalBytes + actual;
+              if (nextTotal > accounting.maxTotalBytes) {
+                fail("too-large", "Opened content files exceed their fixed aggregate byte bound.");
+              }
+              accounting.totalBytes = nextTotal;
+            }
+            reserved = actual;
+          }
+          return info;
+        },
+        read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
+        close: () => handle.close(),
+      };
+    },
+  };
 }
 
 async function observeTextFile(
@@ -780,6 +890,7 @@ async function observeTextFile(
   relativePath: string,
   stage: string | null,
   read: boolean,
+  accounting?: ContentReadAccounting,
 ): Promise<ObservedTextFile> {
   const absolute = path.join(root, ...relativePath.split("/"));
   const before = await lstatOrFail(ctx, absolute, `file ${relativePath}`);
@@ -787,6 +898,9 @@ async function observeTextFile(
   if (!before.isFile()) failObserved("unsupported", `A special file is not supported: ${relativePath}`);
   const beforeSignature = signatureOf(before);
   assertOrdinaryMode(beforeSignature, relativePath);
+  // Reserve the validated observed size before any allocation or read,
+  // including a later per-file refusal. There is no refund or hidden retry.
+  accounting?.charge(Number(before.size));
   if (before.size > BigInt(NATIVE_HARNESS_OUTPUT_LIMITS.maxStageFileBytes)) {
     fail("too-large", `Stage file exceeds the supported per-file bound: ${relativePath}`);
   }
@@ -798,7 +912,14 @@ async function observeTextFile(
   await runCheckpoint(ctx, "before-text-read", stage, relativePath, Number(before.size));
   let snapshot: NativeWorkspaceTextSnapshot;
   try {
-    snapshot = await captureWorkspaceText(root, relativePath, ctx.io, Date.now());
+    snapshot = await captureWorkspaceText(
+      root,
+      relativePath,
+      accounting === undefined
+        ? ctx.io
+        : createContentSizeChargingIo(ctx.io, accounting, Number(before.size)),
+      Date.now(),
+    );
   } catch (error) {
     if (error instanceof OutputError) throw error;
     if (error instanceof NativeFileError) {
@@ -840,6 +961,14 @@ async function inventoryTree(ctx: Context, options: TreeOptions): Promise<TreeOb
   let fileCount = 0;
   let totalFileBytes = 0;
   let markerCount = 0;
+  const contentAccounting: ContentReadAccounting | null = options.charge === undefined
+    ? null
+    : {
+      charge: options.charge,
+      maxFileBytes: options.maxFileBytes,
+      maxTotalBytes: options.maxTotalBytes,
+      totalBytes: 0,
+    };
 
   const walk = async (relativeDirectory: string, depth: number): Promise<void> => {
     const absoluteDirectory = relativeDirectory === ""
@@ -883,6 +1012,7 @@ async function inventoryTree(ctx: Context, options: TreeOptions): Promise<TreeOb
         if ((signature.rawMode & 0o7777n) !== 0o600n) {
           fail("unsupported", "The origin marker mode is not exactly 0600.");
         }
+        options.charge?.(Number(signature.size));
         if (signature.size > BigInt(NATIVE_HARNESS_OUTPUT_LIMITS.maxMarkerBytes)) {
           fail("too-large", "The origin marker exceeds its byte bound.");
         }
@@ -890,7 +1020,23 @@ async function inventoryTree(ctx: Context, options: TreeOptions): Promise<TreeOb
           await runCheckpoint(ctx, "before-text-read", options.stage?.candidate ?? null, relativePath, Number(signature.size));
           let snapshot: NativeWorkspaceTextSnapshot;
           try {
-            snapshot = await captureWorkspaceText(options.root, relativePath, ctx.io, Date.now());
+            snapshot = await captureWorkspaceText(
+              options.root,
+              relativePath,
+              options.charge === undefined
+                ? ctx.io
+                : createContentSizeChargingIo(
+                  ctx.io,
+                  {
+                    charge: options.charge,
+                    maxFileBytes: NATIVE_HARNESS_OUTPUT_LIMITS.maxMarkerBytes,
+                    maxTotalBytes: null,
+                    totalBytes: 0,
+                  },
+                  Number(signature.size),
+                ),
+              Date.now(),
+            );
           } catch (error) {
             if (error instanceof OutputError) throw error;
             fail("changed", "The origin marker could not be read unchanged.");
@@ -916,22 +1062,46 @@ async function inventoryTree(ctx: Context, options: TreeOptions): Promise<TreeOb
         fail("too-large", "A trusted tree exceeds the ordinary-file bound.");
       }
       if (info.size > BigInt(options.maxFileBytes)) {
+        // Refused before the reader; retain the validated observation charge.
+        options.charge?.(Number(info.size));
         fail("too-large", `A file exceeds the supported per-file bound: ${bounded}`);
       }
-      totalFileBytes += Number(info.size);
-      if (totalFileBytes > options.maxTotalBytes) {
-        fail("too-large", "A trusted tree exceeds the ordinary-file byte bound.");
+      if (contentAccounting === null) {
+        totalFileBytes += Number(info.size);
+        if (totalFileBytes > options.maxTotalBytes) {
+          options.charge?.(Number(info.size));
+          fail("too-large", "A trusted tree exceeds the ordinary-file byte bound.");
+        }
       }
       entries.push({ relativePath: bounded, kind: "file", signature });
       if (options.readFiles) {
-        const observed = await observeTextFile(ctx, options.root, bounded, options.stage?.candidate ?? null, true);
+        // The reader reserves its own pre-read lstat size and binds any larger
+        // actual opened size to the charge, per-file cap and aggregate cap
+        // before allocation/read.
+        const observed = await observeTextFile(
+          ctx,
+          options.root,
+          bounded,
+          options.stage?.candidate ?? null,
+          true,
+          contentAccounting ?? undefined,
+        );
         files.set(bounded, observed);
       }
     }
   };
 
   await walk("", 0);
-  return { root: options.root, identity, entries, files, markerSignature, fileCount, directoryCount, totalFileBytes };
+  return {
+    root: options.root,
+    identity,
+    entries,
+    files,
+    markerSignature,
+    fileCount,
+    directoryCount,
+    totalFileBytes: contentAccounting?.totalBytes ?? totalFileBytes,
+  };
 }
 
 function sameTree(left: TreeObservation, right: TreeObservation): boolean {
@@ -947,6 +1117,31 @@ function sameTree(left: TreeObservation, right: TreeObservation): boolean {
     const after = right.entries[index]!;
     if (before.relativePath !== after.relativePath || before.kind !== after.kind) return false;
     if (!sameFileSignature(before.signature, after.signature)) return false;
+  }
+  return true;
+}
+
+/**
+ * Fixed content mode requires a second FULL byte pass. The stat-only
+ * `sameTree` comparison above is not sufficient: compare the complete path set,
+ * signatures, plain bytes/digests and mode-aware Controller hashes again.
+ */
+function sameContentTree(left: TreeObservation, right: TreeObservation): boolean {
+  if (!sameTree(left, right)) return false;
+  if (left.files.size !== right.files.size) return false;
+  for (const [relativePath, before] of left.files) {
+    const after = right.files.get(relativePath);
+    if (after === undefined) return false;
+    if (
+      before.relativePath !== after.relativePath
+      || before.controllerHash !== after.controllerHash
+      || before.snapshot.file.relativePath !== after.snapshot.file.relativePath
+      || before.snapshot.file.bytes !== after.snapshot.file.bytes
+      || before.snapshot.file.sha256 !== after.snapshot.file.sha256
+      || !sameFileSignature(before.signature, after.signature)
+    ) {
+      return false;
+    }
   }
   return true;
 }
@@ -1285,7 +1480,7 @@ async function observeStages(
 
 async function observeTrace(
   ctx: Context,
-  selection: NativeHarnessCompletionSelection,
+  selection: TraceExpectation,
   artifactDir: string,
   eventsPath: string,
   pass: TracePass,
@@ -1295,6 +1490,9 @@ async function observeTrace(
   if (!before.isFile()) fail("unsupported", "A stage trace is not a regular file.");
   const beforeSignature = signatureOf(before);
   assertOrdinaryMode(beforeSignature, `${selection.candidate} trace`);
+  // Charge the validated observed size before any allocation/open/read. A
+  // later per-trace or per-pass refusal retains this charge.
+  pass.charge?.(Number(before.size));
   if (before.size > BigInt(NATIVE_HARNESS_OUTPUT_LIMITS.maxTraceBytes)) {
     fail("too-large", "A stage trace exceeds the per-trace byte bound.");
   }
@@ -1438,6 +1636,950 @@ async function recheckTraceObservations(
       || !sameFileSignature(stage.trace.signature, again.signature)) {
       failObserved("changed", "A stage trace changed during capture.");
     }
+  }
+}
+
+/**
+ * Fixed ceiling for actual source/base/solver/tree/trace bytes read by the two
+ * content passes. It is derived from the same fixed output limits; B2b's
+ * primary document charge remains separate.
+ */
+const CONTENT_CHARGE_LIMIT_BYTES =
+  2 * (
+    2 * NATIVE_HARNESS_OUTPUT_LIMITS.maxSourceTotalBytes
+    + 8 * NATIVE_HARNESS_OUTPUT_LIMITS.maxStageTotalBytes
+    + 8 * NATIVE_HARNESS_OUTPUT_LIMITS.maxMarkerBytes
+  )
+  + 2 * NATIVE_HARNESS_OUTPUT_LIMITS.maxTraceTotalBytes;
+const MAX_CONTENT_STAGES = 15;
+const MAX_CONTENT_SOLVERS = 8;
+const SNAPSHOT_DIRECTORY_PATTERN =
+  /^snapshot-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+export interface NativeHarnessReconciliationContentByteSourceFact {
+  readonly path: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly observedAt: number;
+}
+
+export interface NativeHarnessReconciliationContentByteBaseEntryFact {
+  readonly path: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly mode: number;
+  readonly controllerHash: string;
+}
+
+export interface NativeHarnessReconciliationContentByteStageFact {
+  readonly stage: string;
+  readonly solver: boolean;
+  readonly attempt: number;
+  readonly artifactHash: string | null;
+  readonly changeManifestSha256: string | null;
+  readonly changeCount: number | null;
+  readonly ordinaryFileCount: number | null;
+  readonly directoryCount: number | null;
+  readonly totalFileBytes: number | null;
+  readonly trace: {
+    readonly bytes: number;
+    readonly sha256: string;
+    readonly observedAt: number;
+  };
+  readonly terminalObservationKind: "runner-observation";
+  readonly parent: { readonly stage: string; readonly artifactHash: string } | null;
+}
+
+export interface NativeHarnessReconciliationContentByteObservation {
+  readonly readOnly: true;
+  readonly resumeAvailable: false;
+  readonly processes: "not-inspected";
+  /** Exact scope: the latest completed trees were read, not artifact history. */
+  readonly artifacts: "latest-completed-bytes-checked";
+  /** Old attempt result/turn contents were never read or reused. */
+  readonly discardedAttemptContents: "not-verified-not-reused";
+  readonly status: "stable";
+  readonly observation: "two-pass";
+  readonly semanticAcceptance: "not-evaluated";
+  readonly sources: readonly NativeHarnessReconciliationContentByteSourceFact[];
+  readonly base: {
+    readonly snapshotId: string;
+    readonly snapshotSha256: string;
+    readonly manifestSha256: string;
+    readonly entries: readonly NativeHarnessReconciliationContentByteBaseEntryFact[];
+  };
+  readonly stages: readonly NativeHarnessReconciliationContentByteStageFact[];
+  /** Actual source/base/solver/tree/trace bytes charged for these two passes. */
+  readonly chargedBytes: number;
+  readonly chargeLimitBytes: number;
+  readonly tracePasses: 2;
+  readonly limitations: readonly string[];
+}
+
+export interface NativeHarnessReconciliationContentByteControls {
+  readonly guard: () => void;
+  readonly signal: AbortSignal;
+  /** Fixed ceiling supplied by the host mode; a lower test ceiling is honored. */
+  readonly chargeLimitBytes: number;
+  /** Existing narrow file IO seam; production callers omit it. */
+  readonly fileIo?: NativeFileIo;
+}
+
+export interface NativeHarnessReconciliationContentByteFailure extends NativeHarnessOutputFailureResult {
+  readonly chargedBytes: number;
+  readonly chargeLimitBytes: number;
+  readonly tracePassesStarted: 0 | 1 | 2;
+}
+
+export type NativeHarnessReconciliationContentByteResult =
+  | { readonly ok: true; readonly observation: NativeHarnessReconciliationContentByteObservation }
+  | NativeHarnessReconciliationContentByteFailure;
+
+const CONTENT_LIMITATIONS = Object.freeze([
+  "Byte/hash association for latest completed stage contents only; not semantic quality, acceptance, authorship, apply or current native work.",
+  "Old attempt contents are not reused and their discarded bytes are not verified.",
+  "Trace bytes were hashed, not parsed; terminal lifecycle facts are copied from the original inventory and WorkerResult declarations.",
+  "No resume permission, future eligibility, process query, original elapsed-deadline inference or accounting settlement is provided.",
+  "Observations are intervals: a change wholly between the two passes is not excluded and later writes are not prevented.",
+]);
+
+interface OwnedContentSource {
+  readonly path: string;
+  readonly bytes: number;
+  readonly sha256: string;
+}
+
+interface OwnedContentBaseEntry {
+  readonly path: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly mode: number;
+  readonly controllerHash: string;
+}
+
+interface OwnedContentStage {
+  readonly stage: string;
+  readonly solver: boolean;
+  readonly attempt: number;
+  readonly cwd: string;
+  readonly artifactDir: string;
+  readonly eventsPath: string;
+  readonly traceHash: string;
+  readonly artifactHash: string | null;
+  readonly terminalObservationKind: "runner-observation";
+  readonly parent: { readonly stage: string; readonly artifactHash: string } | null;
+}
+
+interface OwnedContentPlan {
+  readonly storageRoot: string;
+  readonly sourceRoot: string;
+  readonly preparedRoot: string;
+  readonly workspaceRoot: string;
+  readonly storeRoot: string;
+  readonly runRoot: string;
+  readonly sources: readonly OwnedContentSource[];
+  readonly base: {
+    readonly snapshotId: string;
+    readonly root: string;
+    readonly sourceRoot: string;
+    readonly createdAt: string;
+    readonly manifestSha256: string;
+    readonly snapshotSha256: string;
+    readonly entries: readonly OwnedContentBaseEntry[];
+  };
+  readonly stages: readonly OwnedContentStage[];
+}
+
+function contentCanonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map((item) => contentCanonicalJson(item)).join(",")}]`;
+  if (value !== null && typeof value === "object") {
+    const source = value as Record<string, unknown>;
+    return `{${Object.keys(source).sort().map((key) => `${JSON.stringify(key)}:${contentCanonicalJson(source[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value) as string;
+}
+
+function contentCompareCodeUnit(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function contentNonNegativeInteger(value: unknown, max: number): number | null {
+  return typeof value === "number"
+    && Number.isSafeInteger(value)
+    && value >= 0
+    && value <= max
+    ? value
+    : null;
+}
+
+function contentStageLayoutMatches(
+  runRoot: string,
+  stage: string,
+  attempt: number,
+  cwd: string,
+): boolean {
+  if (!isStrictlyContained(runRoot, cwd)) return false;
+  const segments = path.relative(runRoot, cwd).split(path.sep);
+  if (segments.length !== 4) return false;
+  const [stages, stageSegment, attemptSegment, workspace] = segments;
+  const prefix = `attempt-${attempt}-`;
+  return stages === "stages"
+    && stageSegment === stage
+    && attemptSegment?.startsWith(prefix) === true
+    && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(attemptSegment.slice(prefix.length))
+    && workspace === "workspace";
+}
+
+function readContentPlan(value: unknown): OwnedContentPlan {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    fail("source-unavailable", "The content plan is not an exact bounded object.");
+  }
+  const plan = value as NativeHarnessReconciliationContentPlan;
+  if (
+    plan.schema !== "omp-agent.native-harness-reconciliation-content-plan.v1"
+    || plan.readOnly !== true
+    || plan.resumeAvailable !== false
+    || plan.processes !== "not-inspected"
+  ) {
+    fail("source-unavailable", "The content plan does not have the expected fixed schema.");
+  }
+  const storageRoot = trustedAbsolute(plan.storageRoot, "content storageRoot");
+  const sourceRoot = trustedAbsolute(plan.sourceRoot, "content sourceRoot");
+  const preparedRoot = trustedAbsolute(plan.preparedRoot, "content preparedRoot");
+  const workspaceRoot = trustedAbsolute(plan.workspaceRoot, "content workspaceRoot");
+  const storeRoot = trustedAbsolute(plan.storeRoot, "content storeRoot");
+  const runRoot = trustedAbsolute(plan.runRoot, "content runRoot");
+  if (
+    isContained(storageRoot, sourceRoot)
+    || isContained(sourceRoot, storageRoot)
+    || !isStrictlyContained(storageRoot, preparedRoot)
+    || !isStrictlyContained(preparedRoot, workspaceRoot)
+    || !isStrictlyContained(preparedRoot, storeRoot)
+    || !isStrictlyContained(storeRoot, runRoot)
+  ) {
+    fail("unsafe-path", "The content plan roots are not the fixed disjoint private layout.");
+  }
+
+  const rawSources = plan.sources;
+  const rawBase = plan.base;
+  if (!Array.isArray(rawSources) || rawSources.length < 1
+    || rawSources.length > NATIVE_HARNESS_OUTPUT_LIMITS.maxSourceInputs
+    || typeof rawBase !== "object" || rawBase === null || Array.isArray(rawBase)
+    || !Array.isArray(rawBase.entries)) {
+    fail("source-unavailable", "The content plan source/base facts are not bounded.");
+  }
+  const sources: OwnedContentSource[] = [];
+  const sourceByPath = new Map<string, OwnedContentSource>();
+  let sourceTotal = 0;
+  for (const raw of rawSources) {
+    if (typeof raw !== "object" || raw === null) fail("source-unavailable", "A content source fact is unreadable.");
+    const relative = boundedRelative((raw as { path?: unknown }).path);
+    const bytes = (raw as { bytes?: unknown }).bytes;
+    const sha256 = (raw as { sha256?: unknown }).sha256;
+    if (
+      !Number.isSafeInteger(bytes)
+      || (bytes as number) < 0
+      || (bytes as number) > NATIVE_HARNESS_OUTPUT_LIMITS.maxSourceTotalBytes
+      || !hex64(sha256)
+      || sourceByPath.has(relative)
+    ) {
+      fail("source-unavailable", "A content source fact is not bounded or unique.");
+    }
+    sourceTotal += bytes as number;
+    if (sourceTotal > NATIVE_HARNESS_OUTPUT_LIMITS.maxSourceTotalBytes) {
+      fail("too-large", "The content source manifest exceeds its total byte bound.");
+    }
+    const fact = Object.freeze({ path: relative, bytes: bytes as number, sha256 });
+    sources.push(fact);
+    sourceByPath.set(relative, fact);
+  }
+
+  const snapshotRoot = trustedAbsolute(rawBase.root, "content base root");
+  const baseSourceRoot = trustedAbsolute(rawBase.sourceRoot, "content base sourceRoot");
+  if (
+    baseSourceRoot !== workspaceRoot
+    || path.dirname(snapshotRoot) !== runRoot
+    || !SNAPSHOT_DIRECTORY_PATTERN.test(path.basename(snapshotRoot))
+    || typeof rawBase.snapshotId !== "string"
+    || rawBase.snapshotId.length < 1
+    || rawBase.snapshotId.length > 256
+    || typeof rawBase.createdAt !== "string"
+    || rawBase.createdAt.length < 1
+    || rawBase.createdAt.length > 64
+    || !hex64(rawBase.manifestSha256)
+    || !hex64(rawBase.snapshotSha256)
+    || rawBase.entries.length !== sources.length
+  ) {
+    fail("source-unavailable", "The content plan base facts are not the fixed snapshot shape.");
+  }
+  const entries: OwnedContentBaseEntry[] = [];
+  const entryByPath = new Map<string, OwnedContentBaseEntry>();
+  for (const raw of rawBase.entries) {
+    if (typeof raw !== "object" || raw === null) fail("source-unavailable", "A base entry is unreadable.");
+    const relative = boundedRelative((raw as { path?: unknown }).path);
+    const bytes = (raw as { bytes?: unknown }).bytes;
+    const sha256 = (raw as { sha256?: unknown }).sha256;
+    const mode = (raw as { mode?: unknown }).mode;
+    const controllerHash = (raw as { controllerHash?: unknown }).controllerHash;
+    if (
+      !Number.isSafeInteger(bytes)
+      || (bytes as number) < 0
+      || (bytes as number) > NATIVE_HARNESS_OUTPUT_LIMITS.maxSourceTotalBytes
+      || !hex64(sha256)
+      || !Number.isSafeInteger(mode)
+      || (mode as number) < 0
+      || (mode as number) > 0o777
+      || !hex64(controllerHash)
+      || entryByPath.has(relative)
+    ) {
+      fail("source-unavailable", "A base entry is not bounded or unique.");
+    }
+    const entry = Object.freeze({
+      path: relative,
+      bytes: bytes as number,
+      sha256,
+      mode: mode as number,
+      controllerHash,
+    });
+    entries.push(entry);
+    entryByPath.set(relative, entry);
+  }
+  if (
+    entryByPath.size !== sourceByPath.size
+    || [...sourceByPath.keys()].some((relative) => {
+      const entry = entryByPath.get(relative);
+      const source = sourceByPath.get(relative)!;
+      return entry === undefined
+        || entry.bytes !== source.bytes
+        || entry.sha256 !== source.sha256;
+    })
+  ) {
+    fail("source-unavailable", "The content base entries do not exactly match the selected source manifest.");
+  }
+  const manifestEntries = [...sources]
+    .sort((left, right) => contentCompareCodeUnit(left.path, right.path))
+    .map((source) => [source.path, source.bytes, source.sha256]);
+  if (sha256Hex(JSON.stringify(manifestEntries)) !== rawBase.manifestSha256) {
+    fail("changed", "The content source manifest digest is inconsistent.");
+  }
+  const reconstructed = copyWitnessBase({
+    snapshotId: rawBase.snapshotId,
+    root: snapshotRoot,
+    sourceRoot: baseSourceRoot,
+    createdAt: rawBase.createdAt,
+    checked: entries.map((entry) => ({
+      path: entry.path,
+      size: entry.bytes,
+      mode: entry.mode,
+      contentSha256: entry.sha256,
+      controllerHash: entry.controllerHash,
+    })),
+    inputs: sources.map((source) => ({
+      relativePath: source.path,
+      bytes: source.bytes,
+      sha256: source.sha256,
+    })),
+    manifestSha256: rawBase.manifestSha256,
+  });
+  if (
+    reconstructed === null
+    || sha256Hex(contentCanonicalJson(reconstructed)) !== rawBase.snapshotSha256
+  ) {
+    fail("changed", "The content base snapshot digest is inconsistent.");
+  }
+
+  if (!Array.isArray(plan.stages) || plan.stages.length > MAX_CONTENT_STAGES) {
+    fail("source-unavailable", "The content stage plan exceeds its fixed bound.");
+  }
+  const stages: OwnedContentStage[] = [];
+  let solverCount = 0;
+  for (const raw of plan.stages) {
+    if (typeof raw !== "object" || raw === null) fail("source-unavailable", "A content stage fact is unreadable.");
+    const stage = (raw as { stage?: unknown }).stage;
+    const solver = (raw as { solver?: unknown }).solver;
+    const attempt = (raw as { attempt?: unknown }).attempt;
+    const cwd = trustedAbsolute((raw as { cwd?: unknown }).cwd, "content stage cwd");
+    const artifactDir = trustedAbsolute((raw as { artifactDir?: unknown }).artifactDir, "content artifactDir");
+    const eventsPath = trustedAbsolute((raw as { eventsPath?: unknown }).eventsPath, "content eventsPath");
+    const traceHash = (raw as { traceHash?: unknown }).traceHash;
+    const artifactHash = (raw as { artifactHash?: unknown }).artifactHash;
+    const terminalObservationKind = (raw as { terminalObservationKind?: unknown }).terminalObservationKind;
+    const parent = (raw as { parent?: unknown }).parent;
+    if (
+      typeof stage !== "string"
+      || !(STAGE_IDS as readonly string[]).includes(stage)
+      || typeof solver !== "boolean"
+      || solver !== (NATIVE_HARNESS_COMPLETION_SOLVER_IDS as readonly string[]).includes(stage)
+      || !Number.isSafeInteger(attempt)
+      || (attempt as number) < 1
+      || !hex64(traceHash)
+      || (solver ? !hex64(artifactHash) : artifactHash !== null)
+      || terminalObservationKind !== "runner-observation"
+      || artifactDir !== path.join(path.dirname(cwd), "artifacts")
+      || eventsPath !== path.join(artifactDir, "worker-events.jsonl")
+      || !contentStageLayoutMatches(runRoot, stage, attempt as number, cwd)
+    ) {
+      fail("source-unavailable", "A content stage fact is inconsistent with the fixed stage layout.");
+    }
+    if (solver) {
+      solverCount += 1;
+      if (solverCount > MAX_CONTENT_SOLVERS) {
+        fail("source-unavailable", "The content solver tree count exceeds its fixed bound.");
+      }
+    }
+    let parentFact: { readonly stage: string; readonly artifactHash: string } | null = null;
+    if (parent !== null) {
+      if (typeof parent !== "object" || Array.isArray(parent)) {
+        fail("source-unavailable", "A content parent fact is unreadable.");
+      }
+      const parentStage = (parent as { stage?: unknown }).stage;
+      const parentHash = (parent as { artifactHash?: unknown }).artifactHash;
+      if (
+        typeof parentStage !== "string"
+        || !(NATIVE_HARNESS_COMPLETION_SOLVER_IDS as readonly string[]).includes(parentStage)
+        || !hex64(parentHash)
+      ) {
+        fail("source-unavailable", "A content parent fact is not a completed solver reference.");
+      }
+      parentFact = Object.freeze({ stage: parentStage, artifactHash: parentHash });
+    }
+    stages.push(Object.freeze({
+      stage,
+      solver,
+      attempt: attempt as number,
+      cwd,
+      artifactDir,
+      eventsPath,
+      traceHash,
+      artifactHash: solver ? artifactHash as string : null,
+      terminalObservationKind,
+      parent: parentFact,
+    }));
+  }
+
+  return Object.freeze({
+    storageRoot,
+    sourceRoot,
+    preparedRoot,
+    workspaceRoot,
+    storeRoot,
+    runRoot,
+    sources: Object.freeze(sources),
+    base: Object.freeze({
+      snapshotId: rawBase.snapshotId,
+      root: snapshotRoot,
+      sourceRoot: baseSourceRoot,
+      createdAt: rawBase.createdAt,
+      manifestSha256: rawBase.manifestSha256,
+      snapshotSha256: rawBase.snapshotSha256,
+      entries: Object.freeze(entries),
+    }),
+    stages: Object.freeze(stages),
+  });
+}
+
+function declaredBaseOf(plan: OwnedContentPlan): DeclaredBase {
+  return {
+    entries: new Map(plan.base.entries.map((entry) => [
+      entry.path,
+      { path: entry.path, size: entry.bytes, mode: entry.mode, hash: entry.controllerHash },
+    ])),
+    inputs: new Map(plan.sources.map((source) => [
+      source.path,
+      { relativePath: source.path, bytes: source.bytes, sha256: source.sha256 },
+    ])),
+  };
+}
+
+function verifyContentBaseTree(plan: OwnedContentPlan, tree: TreeObservation): void {
+  if (tree.markerSignature !== null) {
+    failObserved("unsupported", "The base snapshot unexpectedly contains an origin marker.");
+  }
+  if (tree.fileCount !== plan.base.entries.length || tree.files.size !== plan.base.entries.length) {
+    failObserved("unsupported", "The base snapshot regular files do not exactly match the reconstructed manifest.");
+  }
+  const observedPaths = [...tree.files.keys()].sort(comparePaths);
+  const expectedPaths = plan.base.entries.map((entry) => entry.path).sort(comparePaths);
+  if (observedPaths.length !== expectedPaths.length
+    || observedPaths.some((value, index) => value !== expectedPaths[index])) {
+    failObserved("unsupported", "The base snapshot path set does not exactly match the reconstructed manifest.");
+  }
+  for (const entry of plan.base.entries) {
+    const file = tree.files.get(entry.path);
+    if (
+      file === undefined
+      || file.snapshot.file.bytes !== entry.bytes
+      || file.snapshot.file.sha256 !== entry.sha256
+      || sizeOf(file.signature) !== entry.bytes
+      || file.signature.mode !== entry.mode
+      || file.controllerHash !== entry.controllerHash
+    ) {
+      failObserved("changed", "A base snapshot input does not match the reconstructed source/manifest facts.");
+    }
+  }
+}
+
+function verifyContentSolverTree(
+  declared: DeclaredBase,
+  stage: OwnedContentStage,
+  tree: TreeObservation,
+): { readonly changes: ReturnType<typeof stageChanges>; readonly digest: string } {
+  const changes = stageChanges(declared, tree.files);
+  const digest = sha256Hex(JSON.stringify(changes));
+  if (digest !== stage.artifactHash) {
+    failObserved("changed", "A completed solver tree does not match its frozen artifact hash.");
+  }
+  return { changes, digest };
+}
+
+/**
+ * Rechecks the planned parent references against the actually verified solver
+ * artifact hashes, including refinement presence and a bounded acyclic chain.
+ */
+function verifyContentParentChain(stages: readonly OwnedContentStage[]): void {
+  const byStage = new Map(stages.map((stage) => [stage.stage, stage]));
+  for (const stage of stages) {
+    if (stage.parent === null) {
+      if (stage.stage === "refine") {
+        failObserved("changed", "A completed refine stage has no current completed solver parent.");
+      }
+      continue;
+    }
+    if (!stage.solver) {
+      failObserved("changed", "A non-solver content stage has an unexpected parent reference.");
+    }
+    const parent = byStage.get(stage.parent.stage);
+    if (
+      parent === undefined
+      || !parent.solver
+      || parent.artifactHash === null
+      || parent.artifactHash !== stage.parent.artifactHash
+    ) {
+      failObserved("changed", "A completed solver parent reference does not match an actual solver artifact.");
+    }
+    const visited = new Set<string>([stage.stage]);
+    let cursor = parent;
+    let depth = 1;
+    for (;;) {
+      if (visited.has(cursor.stage) || depth > MAX_CONTENT_SOLVERS) {
+        failObserved("changed", "The completed solver parent chain is cyclic or exceeds its bound.");
+      }
+      visited.add(cursor.stage);
+      if (cursor.parent === null) break;
+      const next = byStage.get(cursor.parent.stage);
+      if (
+        next === undefined
+        || !next.solver
+        || next.artifactHash === null
+        || next.artifactHash !== cursor.parent.artifactHash
+      ) {
+        failObserved("changed", "A completed solver parent chain does not match actual solver artifacts.");
+      }
+      cursor = next;
+      depth += 1;
+    }
+  }
+}
+
+async function observeContentSources(
+  ctx: Context,
+  plan: OwnedContentPlan,
+  charge: (bytes: number) => void,
+): Promise<Array<{
+  readonly fact: NativeHarnessReconciliationContentByteSourceFact;
+  readonly signature: FileSignature;
+  readonly relativePath: string;
+}>> {
+  const observations = [];
+  const accounting: ContentReadAccounting = {
+    charge,
+    maxFileBytes: NATIVE_HARNESS_OUTPUT_LIMITS.maxSourceTotalBytes,
+    maxTotalBytes: NATIVE_HARNESS_OUTPUT_LIMITS.maxSourceTotalBytes,
+    totalBytes: 0,
+  };
+  for (const source of [...plan.sources].sort((left, right) => comparePaths(left.path, right.path))) {
+    const observed = await observeTextFile(ctx, plan.sourceRoot, source.path, null, true, accounting);
+    if (
+      observed.snapshot.file.bytes !== source.bytes
+      || observed.snapshot.file.sha256 !== source.sha256
+    ) {
+      failObserved("changed", "A selected original source file no longer matches the source manifest.");
+    }
+    observations.push({
+      fact: Object.freeze({
+        path: source.path,
+        bytes: observed.snapshot.file.bytes,
+        sha256: observed.snapshot.file.sha256,
+        observedAt: observed.snapshot.file.observedAt,
+      }),
+      signature: observed.signature,
+      relativePath: source.path,
+    });
+  }
+  return observations;
+}
+
+async function recheckContentSources(
+  ctx: Context,
+  plan: OwnedContentPlan,
+  first: Awaited<ReturnType<typeof observeContentSources>>,
+  charge: (bytes: number) => void,
+): Promise<void> {
+  if (first.length !== plan.sources.length) {
+    failObserved("changed", "The selected source observation set changed between passes.");
+  }
+  const accounting: ContentReadAccounting = {
+    charge,
+    maxFileBytes: NATIVE_HARNESS_OUTPUT_LIMITS.maxSourceTotalBytes,
+    maxTotalBytes: NATIVE_HARNESS_OUTPUT_LIMITS.maxSourceTotalBytes,
+    totalBytes: 0,
+  };
+  for (let index = 0; index < first.length; index += 1) {
+    const expected = first[index]!;
+    const again = await observeTextFile(ctx, plan.sourceRoot, expected.relativePath, null, true, accounting);
+    if (
+      again.snapshot.file.bytes !== expected.fact.bytes
+      || again.snapshot.file.sha256 !== expected.fact.sha256
+      || !sameFileSignature(expected.signature, again.signature)
+    ) {
+      failObserved("changed", "A selected original source file changed during the content passes.");
+    }
+  }
+}
+
+interface ContentSolverObservation {
+  readonly stage: OwnedContentStage;
+  readonly tree: TreeObservation;
+  readonly changes: ReturnType<typeof stageChanges>;
+  readonly digest: string;
+}
+
+/**
+ * Host-only, non-issuing byte observation of the planned latest completed
+ * contents. It reuses this module's original bounded tree/trace readers but
+ * never calls `buildCapture`, `issuedOutputCaptures`, the issued completion
+ * gate or any capture-issue path. Every returned fact is provisional byte
+ * association; the outer files observation alone decides whether final
+ * primaries and pins still agree.
+ */
+export async function observeNativeHarnessReconciliationContentBytes(
+  plan: NativeHarnessReconciliationContentPlan,
+  controls: NativeHarnessReconciliationContentByteControls,
+): Promise<NativeHarnessReconciliationContentByteResult> {
+  const startedAt = performance.now();
+  const requestedLimit = controls.chargeLimitBytes;
+  const chargeLimitBytes = Number.isSafeInteger(requestedLimit) && requestedLimit >= 0
+    ? Math.min(requestedLimit, CONTENT_CHARGE_LIMIT_BYTES)
+    : CONTENT_CHARGE_LIMIT_BYTES;
+  let chargedBytes = 0;
+  let tracePassesStarted: 0 | 1 | 2 = 0;
+  const controlFailure: { value: OutputError | null } = { value: null };
+  const charge = (bytes: number): void => {
+    if (!Number.isSafeInteger(bytes) || bytes < 0) {
+      fail("io-failure", "A content byte charge was not a bounded observed size.");
+    }
+    if (bytes > chargeLimitBytes - chargedBytes) {
+      fail("too-large", "The content byte observation charge exceeds its fixed ceiling.");
+    }
+    chargedBytes += bytes;
+  };
+  try {
+    if (typeof controls !== "object" || controls === null
+      || typeof controls.guard !== "function"
+      || typeof AbortSignal === "undefined") {
+      fail("invalid-control", "The content byte observer requires its fixed guard and actual signal.");
+    }
+    readActualAborted(controls.signal);
+    if (controls.fileIo !== undefined) {
+      const candidate = controls.fileIo;
+      if (
+        typeof candidate !== "object" || candidate === null
+        || typeof candidate.O_RDONLY !== "number"
+        || typeof candidate.O_NOFOLLOW !== "number"
+        || typeof candidate.realpath !== "function"
+        || typeof candidate.lstat !== "function"
+        || typeof candidate.open !== "function"
+      ) {
+        fail("invalid-control", "The content file IO seam is not usable.");
+      }
+    }
+    const owned = readContentPlan(plan);
+    const closeError = { value: false };
+    const baseContext = {
+      guard: controls.guard,
+      signal: controls.signal,
+      startedAt,
+      contentControl: true as const,
+      checkpoint: null,
+      directories: new Map<string, DirectoryIdentity>(),
+      closeError,
+      controlFailure,
+    };
+    if (readActualAborted(baseContext.signal)) fail("aborted", "The content observation signal was already aborted.");
+    const ctx: Context = {
+      ...baseContext,
+      io: createGuardedIo(baseContext, controls.fileIo ?? nodeFileIo),
+    };
+    assertAuthority(ctx);
+
+    const preparedIdentity = await observeRoot(ctx, owned.preparedRoot, "content preparedRoot");
+    await registerAncestry(ctx, preparedIdentity, owned.workspaceRoot, "content workspaceRoot");
+    await observeRoot(ctx, owned.workspaceRoot, "content workspaceRoot");
+    await registerAncestry(ctx, preparedIdentity, owned.storeRoot, "content storeRoot");
+    await observeRoot(ctx, owned.storeRoot, "content storeRoot");
+    await registerAncestry(ctx, preparedIdentity, owned.runRoot, "content runRoot");
+    const runIdentity = await observeRoot(ctx, owned.runRoot, "content runRoot");
+    await observeRoot(ctx, owned.sourceRoot, "content sourceRoot");
+    await registerAncestry(ctx, runIdentity, owned.base.root, "content base root");
+    await observeRoot(ctx, owned.base.root, "content base root");
+    for (const stage of owned.stages) {
+      await registerAncestry(ctx, runIdentity, stage.cwd, `${stage.stage} cwd`);
+      await observeRoot(ctx, stage.cwd, `${stage.stage} cwd`);
+      await registerAncestry(ctx, runIdentity, stage.artifactDir, `${stage.stage} artifactDir`);
+      await observeRoot(ctx, stage.artifactDir, `${stage.stage} artifactDir`);
+    }
+
+    const declared = declaredBaseOf(owned);
+    const sourceFirst = await observeContentSources(ctx, owned, charge);
+    const baseFirst = await inventoryTree(ctx, {
+      root: owned.base.root,
+      label: "content base snapshot",
+      stage: null,
+      allowMarker: false,
+      expectedMarkerBytes: null,
+      maxOrdinaryFiles: NATIVE_HARNESS_OUTPUT_LIMITS.maxSourceInputs,
+      maxFileBytes: NATIVE_HARNESS_OUTPUT_LIMITS.maxSourceTotalBytes,
+      maxTotalBytes: NATIVE_HARNESS_OUTPUT_LIMITS.maxSourceTotalBytes,
+      readFiles: true,
+      charge,
+    });
+    verifyContentBaseTree(owned, baseFirst);
+
+    const solverFirst: ContentSolverObservation[] = [];
+    for (const stage of owned.stages) {
+      if (!stage.solver) continue;
+      const tree = await inventoryTree(ctx, {
+        root: stage.cwd,
+        label: `${stage.stage} content stage`,
+        stage: { candidate: stage.stage },
+        allowMarker: true,
+        expectedMarkerBytes: JSON.stringify({
+          snapshotId: owned.base.snapshotId,
+          destination: stage.cwd,
+        }),
+        maxOrdinaryFiles: NATIVE_HARNESS_OUTPUT_LIMITS.maxStageOrdinaryFiles,
+        maxFileBytes: NATIVE_HARNESS_OUTPUT_LIMITS.maxStageFileBytes,
+        maxTotalBytes: NATIVE_HARNESS_OUTPUT_LIMITS.maxStageTotalBytes,
+        readFiles: true,
+        charge,
+      });
+      if (tree.markerSignature === null) failObserved("missing", "A completed solver stage origin marker is missing.");
+      const verified = verifyContentSolverTree(declared, stage, tree);
+      solverFirst.push({
+        stage,
+        tree,
+        changes: verified.changes,
+        digest: verified.digest,
+      });
+    }
+    verifyContentParentChain(owned.stages);
+
+    tracePassesStarted = 1;
+    const traceFirst = new Map<string, TraceObservation>();
+    const firstTracePass: TracePass = { totalBytes: 0, charge };
+    for (const stage of owned.stages) {
+      const trace = await observeTrace(
+        ctx,
+        { candidate: stage.stage, attempt: stage.attempt, traceHash: stage.traceHash },
+        stage.artifactDir,
+        stage.eventsPath,
+        firstTracePass,
+      );
+      traceFirst.set(`${stage.stage}:${stage.attempt}`, trace);
+    }
+
+    await recheckContentSources(ctx, owned, sourceFirst, charge);
+    const baseSecond = await inventoryTree(ctx, {
+      root: owned.base.root,
+      label: "content base snapshot second pass",
+      stage: null,
+      allowMarker: false,
+      expectedMarkerBytes: null,
+      maxOrdinaryFiles: NATIVE_HARNESS_OUTPUT_LIMITS.maxSourceInputs,
+      maxFileBytes: NATIVE_HARNESS_OUTPUT_LIMITS.maxSourceTotalBytes,
+      maxTotalBytes: NATIVE_HARNESS_OUTPUT_LIMITS.maxSourceTotalBytes,
+      readFiles: true,
+      charge,
+    });
+    verifyContentBaseTree(owned, baseSecond);
+    if (!sameContentTree(baseFirst, baseSecond)) {
+      failObserved("changed", "The base snapshot bytes or metadata changed between content passes.");
+    }
+    for (const first of solverFirst) {
+      const second = await inventoryTree(ctx, {
+        root: first.stage.cwd,
+        label: `${first.stage.stage} content stage second pass`,
+        stage: { candidate: first.stage.stage },
+        allowMarker: true,
+        expectedMarkerBytes: JSON.stringify({
+          snapshotId: owned.base.snapshotId,
+          destination: first.stage.cwd,
+        }),
+        maxOrdinaryFiles: NATIVE_HARNESS_OUTPUT_LIMITS.maxStageOrdinaryFiles,
+        maxFileBytes: NATIVE_HARNESS_OUTPUT_LIMITS.maxStageFileBytes,
+        maxTotalBytes: NATIVE_HARNESS_OUTPUT_LIMITS.maxStageTotalBytes,
+        readFiles: true,
+        charge,
+      });
+      if (second.markerSignature === null) {
+        failObserved("missing", "A completed solver stage origin marker disappeared between passes.");
+      }
+      const verified = verifyContentSolverTree(declared, first.stage, second);
+      if (verified.digest !== first.digest || !sameContentTree(first.tree, second)) {
+        failObserved("changed", "A completed solver tree changed between content passes.");
+      }
+    }
+
+    tracePassesStarted = 2;
+    const secondTracePass: TracePass = { totalBytes: 0, charge };
+    for (const stage of owned.stages) {
+      const first = traceFirst.get(`${stage.stage}:${stage.attempt}`);
+      if (first === undefined) {
+        failObserved("changed", "A completed stage trace disappeared between content passes.");
+      }
+      const second = await observeTrace(
+        ctx,
+        { candidate: stage.stage, attempt: stage.attempt, traceHash: stage.traceHash },
+        stage.artifactDir,
+        stage.eventsPath,
+        secondTracePass,
+      );
+      if (
+        second.bytes !== first.bytes
+        || second.sha256 !== first.sha256
+        || !sameFileSignature(first.signature, second.signature)
+      ) {
+        failObserved("changed", "A completed stage trace changed between content passes.");
+      }
+    }
+
+    for (const [directoryPath, identity] of ctx.directories) {
+      const info = await lstatOrFail(ctx, directoryPath, "content directory");
+      if (
+        info.isSymbolicLink()
+        || !info.isDirectory()
+        || !sameDirectoryIdentity(identity, directoryIdentityOf(directoryPath, info))
+      ) {
+        fail("changed", "A content directory identity changed during observation.");
+      }
+    }
+    assertAuthority(ctx);
+    if (closeError.value) {
+      fail("io-failure", "A content file handle reported a close failure.");
+    }
+
+    const baseEntries: NativeHarnessReconciliationContentByteBaseEntryFact[] = [];
+    for (const entry of owned.base.entries) {
+      const file = baseFirst.files.get(entry.path);
+      if (file === undefined) fail("changed", "A verified base file disappeared before its summary.");
+      baseEntries.push(Object.freeze({
+        path: entry.path,
+        bytes: file.snapshot.file.bytes,
+        sha256: file.snapshot.file.sha256,
+        mode: file.signature.mode,
+        controllerHash: file.controllerHash,
+      }));
+    }
+    const stageFacts: NativeHarnessReconciliationContentByteStageFact[] = owned.stages.map((stage) => {
+      const trace = traceFirst.get(`${stage.stage}:${stage.attempt}`);
+      if (trace === undefined) fail("changed", "A verified stage trace disappeared before its summary.");
+      const solver = solverFirst.find((candidate) => candidate.stage.stage === stage.stage);
+      return Object.freeze({
+        stage: stage.stage,
+        solver: stage.solver,
+        attempt: stage.attempt,
+        artifactHash: stage.artifactHash,
+        changeManifestSha256: solver?.digest ?? null,
+        changeCount: solver?.changes.length ?? null,
+        ordinaryFileCount: solver?.tree.fileCount ?? null,
+        directoryCount: solver?.tree.directoryCount ?? null,
+        totalFileBytes: solver?.tree.totalFileBytes ?? null,
+        trace: Object.freeze({
+          bytes: trace.bytes,
+          sha256: trace.sha256,
+          observedAt: trace.observedAt,
+        }),
+        terminalObservationKind: stage.terminalObservationKind,
+        parent: stage.parent === null
+          ? null
+          : Object.freeze({ stage: stage.parent.stage, artifactHash: stage.parent.artifactHash }),
+      });
+    });
+    const observation: NativeHarnessReconciliationContentByteObservation = deepFreeze({
+      readOnly: true as const,
+      resumeAvailable: false as const,
+      processes: "not-inspected" as const,
+      artifacts: "latest-completed-bytes-checked" as const,
+      discardedAttemptContents: "not-verified-not-reused" as const,
+      status: "stable" as const,
+      observation: "two-pass" as const,
+      semanticAcceptance: "not-evaluated" as const,
+      sources: Object.freeze(sourceFirst.map((entry) => entry.fact)),
+      base: Object.freeze({
+        snapshotId: owned.base.snapshotId,
+        snapshotSha256: owned.base.snapshotSha256,
+        manifestSha256: owned.base.manifestSha256,
+        entries: Object.freeze(baseEntries),
+      }),
+      stages: Object.freeze(stageFacts),
+      chargedBytes,
+      chargeLimitBytes,
+      tracePasses: 2 as const,
+      limitations: CONTENT_LIMITATIONS,
+    });
+    if (Buffer.byteLength(JSON.stringify(observation), "utf8")
+      > NATIVE_HARNESS_OUTPUT_LIMITS.maxMetadataBytes) {
+      fail("too-large", "The retained content observation metadata exceeds its byte bound.");
+    }
+    return { ok: true, observation };
+  } catch (error) {
+    const failure = controlFailure.value !== null
+      ? issuedFailures.get(controlFailure.value)
+      : (error instanceof OutputError ? issuedFailures.get(error) : undefined);
+    if (failure !== undefined) {
+      return {
+        ...failureResult(failure),
+        chargedBytes,
+        chargeLimitBytes,
+        tracePassesStarted,
+      };
+    }
+    const nativeCode = readOwnString(error, "code");
+    if (nativeCode !== null && NATIVE_FILE_FAILURE_CODES.has(nativeCode)) {
+      const code: NativeHarnessOutputFailure = nativeCode === "invalid-path" ? "unsafe-path"
+        : nativeCode === "non-text" ? "unsupported"
+        : nativeCode as NativeHarnessOutputFailure;
+      return {
+        ok: false,
+        code,
+        reason: boundedReason(readOwnString(error, "message") ?? "A native content observation was refused."),
+        chargedBytes,
+        chargeLimitBytes,
+        tracePassesStarted,
+      };
+    }
+    return {
+      ok: false,
+      code: isErrno(error, "ENOENT") ? "missing" : isErrno(error, "ELOOP") ? "unsafe-path" : "io-failure",
+      reason: isErrno(error, "ENOENT")
+        ? "A content path disappeared during observation."
+        : isErrno(error, "ELOOP")
+          ? "A content path is a symbolic link."
+          : "The content observation failed without a serializable host error.",
+      chargedBytes,
+      chargeLimitBytes,
+      tracePassesStarted,
+    };
   }
 }
 

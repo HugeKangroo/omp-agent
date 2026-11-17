@@ -18,6 +18,22 @@ import {
   type NativeHarnessReconciliationResult,
 } from "./native-harness-reconciliation.ts";
 import {
+  NATIVE_HARNESS_RECONCILIATION_CONTENT_CHARGE_LIMIT_BYTES,
+  NATIVE_HARNESS_RECONCILIATION_CONTENT_DEADLINE_MS,
+  NATIVE_HARNESS_RECONCILIATION_CONTENT_MAX_METADATA_BYTES,
+  NATIVE_HARNESS_RECONCILIATION_CONTENT_SCHEMA,
+  planNativeHarnessReconciliationContent,
+  type NativeHarnessReconciliationContentReason,
+  type NativeHarnessReconciliationContentPlanResult,
+} from "./native-harness-reconciliation-content.ts";
+import {
+  createNativeHarnessContentControlFailure,
+  observeNativeHarnessReconciliationContentBytes,
+  type NativeHarnessOutputFailure,
+  type NativeHarnessReconciliationContentByteObservation,
+  type NativeHarnessReconciliationContentByteResult,
+} from "./native-harness-output.ts";
+import {
   NativeFileError,
   captureWorkspaceText,
   deepFreeze,
@@ -122,11 +138,13 @@ export interface NativeHarnessReconciliationFilesResult {
   readonly observation: "two-pass" | "partial";
   readonly reasons: readonly NativeHarnessReconciliationFilesReason[];
   readonly captures: readonly NativeHarnessReconciliationFileCapture[];
-  /** Sum of full per-file caps charged before each started capture. */
+  /** Sum of full primary per-file caps charged before each started capture. */
   readonly chargedBytes: number;
   readonly chargeLimitBytes: typeof NATIVE_HARNESS_RECONCILIATION_FILES_CHARGED_BYTES;
+  /** Primary-document capture handles only; content byte I/O is not counted. */
   readonly openedFiles: number;
   readonly maxConcurrentOpenedFiles: 1;
+  /** Primary-document capture closes only; content closes are internal. */
   readonly close: {
     readonly attempted: number;
     readonly settled: number;
@@ -149,6 +167,93 @@ export interface NativeHarnessReconciliationFilesResult {
   /** Present only after both passes and the seven final pins agree. */
   readonly metadata: NativeHarnessReconciliationResult | null;
   readonly metadataStatus: "not-observed" | "compatible" | "incompatible";
+}
+
+export type NativeHarnessReconciliationContentPresentationStatus =
+  | "stable"
+  | "different"
+  | "unavailable"
+  | "not-required"
+  | "not-observed"
+  | "aborted"
+  | "expired"
+  | "revoked";
+
+export interface NativeHarnessReconciliationContentFailureFact {
+  readonly code: NativeHarnessOutputFailure;
+  readonly reason: string;
+  /**
+   * Positive evidence that an observed/reconstructed fact differs. Its absence
+   * means unavailable/uncertain, never equality; legacy readers may report
+   * `changed` without this proof.
+   */
+  readonly observedMismatch?: true;
+}
+
+export interface NativeHarnessReconciliationContentFacts {
+  readonly status: NativeHarnessReconciliationContentPresentationStatus;
+  /** The plan/byte conclusion before the final primary and pin checks. */
+  readonly provisionalStatus: Exclude<NativeHarnessReconciliationContentPresentationStatus, "revoked">;
+  readonly revoked: boolean;
+  readonly revokedReasons: readonly NativeHarnessReconciliationFilesReason[];
+  readonly planner: "not-run" | "planned" | "not-required" | "unavailable" | "refused";
+  readonly planReasons: readonly NativeHarnessReconciliationContentReason[];
+  readonly failure: NativeHarnessReconciliationContentFailureFact | null;
+  /** Never retained as a stable nested observation once final files are refused. */
+  readonly observation: NativeHarnessReconciliationContentByteObservation | null;
+  /** Actual source/base/solver/tree/trace bytes; separate from primary caps. */
+  readonly chargedBytes: number;
+  /** Ceiling for those actual content bytes; not the primary-document cap. */
+  readonly chargeLimitBytes: number;
+  readonly tracePassesStarted: 0 | 1 | 2;
+}
+
+export interface NativeHarnessReconciliationContentObservationResult {
+  readonly schema: typeof NATIVE_HARNESS_RECONCILIATION_CONTENT_SCHEMA;
+  readonly readOnly: true;
+  readonly resumeAvailable: false;
+  readonly processes: "not-inspected";
+  readonly artifacts:
+    | "not-inspected"
+    | "latest-completed-bytes-checked"
+    | "partial-bytes-not-retained"
+    | "not-retained-after-primary-refusal";
+  /** Old attempt result/turn contents are never read or reused by this mode. */
+  readonly discardedAttemptContents: "not-verified-not-reused";
+  /** Original primary-document observation axis, independent of content bytes. */
+  readonly status: NativeHarnessReconciliationFilesStatus;
+  readonly observation: "two-pass" | "partial";
+  readonly reasons: readonly NativeHarnessReconciliationFilesReason[];
+  readonly captures: readonly NativeHarnessReconciliationFileCapture[];
+  /** Primary-document caps only; actual content bytes are under content. */
+  readonly chargedBytes: number;
+  readonly chargeLimitBytes: typeof NATIVE_HARNESS_RECONCILIATION_FILES_CHARGED_BYTES;
+  /** Primary-document capture handles only; content byte I/O is separate. */
+  readonly openedFiles: number;
+  readonly maxConcurrentOpenedFiles: 1;
+  /** Primary-document capture closes only; content closes are internal. */
+  readonly close: {
+    readonly attempted: number;
+    readonly settled: number;
+    readonly succeeded: number;
+  };
+  readonly pins: {
+    readonly directoryCount: 7;
+    readonly checkedAtEnd: boolean;
+    readonly stable: boolean;
+  };
+  readonly deadline: {
+    readonly budgetMs: typeof NATIVE_HARNESS_RECONCILIATION_CONTENT_DEADLINE_MS;
+    readonly deadlineAt: number;
+    readonly checkedAt: number;
+    readonly expired: boolean;
+    /** Soft observation window: actual I/O/close may finish later. */
+    readonly soft: true;
+    readonly cleanupMayExceedDeadline: true;
+  };
+  readonly metadata: NativeHarnessReconciliationResult | null;
+  readonly metadataStatus: "not-observed" | "compatible" | "incompatible";
+  readonly content: NativeHarnessReconciliationContentFacts;
 }
 
 export class NativeHarnessReconciliationFilesInputError extends Error {
@@ -236,6 +341,39 @@ interface OpenSignature {
   readonly size: bigint;
   readonly mtimeNs: bigint;
   readonly ctimeNs: bigint;
+}
+
+type ContentPresentationStatus = NativeHarnessReconciliationContentPresentationStatus;
+type ProvisionalContentStatus = Exclude<ContentPresentationStatus, "revoked">;
+
+interface MutableContentFacts {
+  planner: NativeHarnessReconciliationContentFacts["planner"];
+  status: ContentPresentationStatus;
+  provisionalStatus: ProvisionalContentStatus;
+  revoked: boolean;
+  revokedReasons: NativeHarnessReconciliationFilesReason[];
+  planReasons: NativeHarnessReconciliationContentReason[];
+  failure: NativeHarnessReconciliationContentFailureFact | null;
+  observation: NativeHarnessReconciliationContentByteObservation | null;
+  chargedBytes: number;
+  chargeLimitBytes: number;
+  tracePassesStarted: 0 | 1 | 2;
+}
+
+function initialContentFacts(): MutableContentFacts {
+  return {
+    planner: "not-run",
+    status: "not-observed",
+    provisionalStatus: "not-observed",
+    revoked: false,
+    revokedReasons: [],
+    planReasons: [],
+    failure: null,
+    observation: null,
+    chargedBytes: 0,
+    chargeLimitBytes: NATIVE_HARNESS_RECONCILIATION_CONTENT_CHARGE_LIMIT_BYTES,
+    tracePassesStarted: 0,
+  };
 }
 
 function inputFail(message: string): never {
@@ -1010,23 +1148,190 @@ function freezeCapture(capture: NativeHarnessReconciliationFileCapture): NativeH
   });
 }
 
+interface FixedModeFacts {
+  status: NativeHarnessReconciliationFilesStatus;
+  observation: "two-pass" | "partial";
+  reasons: NativeHarnessReconciliationFilesReason[];
+  captures: NativeHarnessReconciliationFileCapture[];
+  chargedBytes: number;
+  openedFiles: number;
+  closeAttempted: number;
+  closeSettled: number;
+  closeSucceeded: number;
+  pinsStable: boolean;
+  pinsCheckedAtEnd: boolean;
+  deadlineAt: number;
+  checkedAt: number;
+  metadata: NativeHarnessReconciliationResult | null;
+  metadataStatus: NativeHarnessReconciliationFilesResult["metadataStatus"];
+  content: MutableContentFacts;
+  /**
+   * Synchronous final control seal for the public wrapper's last await
+   * boundary. It reuses the one live deadline/signal, updates status and
+   * revokes any provisional content, and never adds a new window.
+   */
+  seal: () => FixedModeFacts;
+}
+
+interface ContentBetweenPassesOutcome {
+  readonly gate: ObservationGate | null;
+  readonly facts: MutableContentFacts;
+}
+
 /**
- * Observes the four exact original recovery primaries twice under one fixed
- * storage root. Invalid expectations/options are refused synchronously before
- * the first await or file-system call. Each file's full cap is charged before
- * its capture; a refusal stops all later captures with no refund or retry.
+ * Runs once between the two primary passes. The plan is pure and therefore
+ * selects no content path before all four first-pass texts exist. The byte
+ * observer shares the outer live guard, actual signal and one deadline; it is
+ * never an issued output capture.
  */
-export async function observeNativeHarnessReconciliationFiles(
+async function observeContentBetweenPasses(
+  live: Live,
+  options: OwnedOptions,
+  owned: OwnedExpectation,
+  firstPass: ReadonlyMap<NativeHarnessReconciliationFileKey, FirstPassFacts>,
+): Promise<ContentBetweenPassesOutcome> {
+  const facts = initialContentFacts();
+  let planResult: NativeHarnessReconciliationContentPlanResult;
+  try {
+    planResult = planNativeHarnessReconciliationContent({
+      runText: firstPass.get("run")!.text,
+      sourceText: firstPass.get("source")!.text,
+      inventoryText: firstPass.get("inventory")!.text,
+      ownerText: firstPass.get("owner")!.text,
+      expected: owned,
+      now: live.lastTime,
+    });
+  } catch {
+    facts.planner = "refused";
+    facts.status = "unavailable";
+    facts.provisionalStatus = "unavailable";
+    return { gate: null, facts };
+  }
+  if (planResult.status === "not-required") {
+    facts.planner = "not-required";
+    facts.status = "not-required";
+    facts.provisionalStatus = "not-required";
+    facts.planReasons = [...planResult.reasons];
+    return { gate: null, facts };
+  }
+  if (planResult.status === "unavailable") {
+    facts.planner = "unavailable";
+    facts.status = "unavailable";
+    facts.provisionalStatus = "unavailable";
+    facts.planReasons = [...planResult.reasons];
+    return { gate: null, facts };
+  }
+
+  facts.planner = "planned";
+  const guard = (): void => {
+    try {
+      liveCheck(live);
+    } catch (error) {
+      if (error instanceof ObservationGate) {
+        throw createNativeHarnessContentControlFailure(
+          error.reason === "aborted" ? "aborted" : "deadline-expired",
+        );
+      }
+      throw createNativeHarnessContentControlFailure("control-unavailable");
+    }
+  };
+  let signal: AbortSignal;
+  if (options.signal !== null) {
+    signal = options.signal;
+  } else if (typeof AbortController === "function") {
+    signal = new AbortController().signal;
+  } else {
+    facts.status = "unavailable";
+    facts.provisionalStatus = "unavailable";
+    facts.failure = {
+      code: "invalid-control",
+      reason: "A fixed content signal is unavailable.",
+    };
+    return { gate: null, facts };
+  }
+
+  let result: NativeHarnessReconciliationContentByteResult;
+  try {
+    result = await observeNativeHarnessReconciliationContentBytes(planResult.plan, {
+      guard,
+      signal,
+      chargeLimitBytes: NATIVE_HARNESS_RECONCILIATION_CONTENT_CHARGE_LIMIT_BYTES,
+      fileIo: options.io,
+    });
+  } catch {
+    facts.status = "unavailable";
+    facts.provisionalStatus = "unavailable";
+    facts.failure = {
+      code: "io-failure",
+      reason: "The content byte observation failed without a serializable host error.",
+    };
+    return { gate: null, facts };
+  }
+
+  if (result.ok) {
+    facts.status = "stable";
+    facts.provisionalStatus = "stable";
+    facts.observation = result.observation;
+    facts.chargedBytes = result.observation.chargedBytes;
+    facts.chargeLimitBytes = result.observation.chargeLimitBytes;
+    facts.tracePassesStarted = 2;
+    return { gate: null, facts };
+  }
+
+  facts.chargedBytes = result.chargedBytes;
+  facts.chargeLimitBytes = result.chargeLimitBytes;
+  facts.tracePassesStarted = result.tracePassesStarted;
+  facts.failure = {
+    code: result.code,
+    reason: result.reason,
+    ...(result.observedMismatch === true ? { observedMismatch: true as const } : {}),
+  };
+  if (result.code === "aborted") {
+    facts.status = "aborted";
+    facts.provisionalStatus = "aborted";
+    return { gate: new ObservationGate("aborted"), facts };
+  }
+  if (result.code === "deadline") {
+    facts.status = "expired";
+    facts.provisionalStatus = "expired";
+    return { gate: new ObservationGate("deadline-expired"), facts };
+  }
+  // Only explicit positive mismatch evidence is presented as a byte
+  // difference. A legacy reader code such as `changed` without that flag is an
+  // unavailable observation, not an asserted inequality.
+  if (result.observedMismatch === true) {
+    facts.status = "different";
+    facts.provisionalStatus = "different";
+  } else {
+    facts.status = "unavailable";
+    facts.provisionalStatus = "unavailable";
+  }
+  return { gate: null, facts };
+}
+
+/**
+ * One private fixed-mode loop for both public observations. It always reads
+ * the four exact original recovery primaries twice and rechecks all seven
+ * parent pins. The content mode additionally plans and byte-observes latest
+ * completed contents between the two primary passes. Invalid
+ * expectations/options are refused before the first await or file-system call;
+ * each primary's full cap is charged before its capture with no refund/retry.
+ */
+async function observeFixedMode(
   expectation: NativeHarnessReconciliationExpectation,
-  options: NativeHarnessReconciliationFileOptions = {},
-): Promise<NativeHarnessReconciliationFilesResult> {
+  options: NativeHarnessReconciliationFileOptions,
+  mode: "files" | "content",
+): Promise<FixedModeFacts> {
   const owned = readExpectation(expectation);
   const resolvedOptions = readOptions(options);
   const plan = buildPlan(owned);
+  const budgetMs = mode === "content"
+    ? NATIVE_HARNESS_RECONCILIATION_CONTENT_DEADLINE_MS
+    : NATIVE_HARNESS_RECONCILIATION_FILES_DEADLINE_MS;
   const startedAt = readClock(resolvedOptions.clock);
-  const deadlineAt = startedAt > Number.MAX_SAFE_INTEGER - NATIVE_HARNESS_RECONCILIATION_FILES_DEADLINE_MS
+  const deadlineAt = startedAt > Number.MAX_SAFE_INTEGER - budgetMs
     ? Number.MAX_SAFE_INTEGER
-    : startedAt + NATIVE_HARNESS_RECONCILIATION_FILES_DEADLINE_MS;
+    : startedAt + budgetMs;
   const live: Live = {
     clock: resolvedOptions.clock,
     signal: resolvedOptions.signal,
@@ -1073,130 +1378,157 @@ export async function observeNativeHarnessReconciliationFiles(
     }
   }
 
-  if (pinsInitial) {
-    for (let index = 0; index < plan.files.length * 2; index++) {
-      const pass: 1 | 2 = index < plan.files.length ? 1 : 2;
-      const spec = plan.files[index % plan.files.length]!;
-      let stopped = false;
-      try {
-        liveCheck(live);
-      } catch (error) {
-        if (error instanceof ObservationGate) {
-          gate = error;
-          addGateReason(reasons, error);
-        } else {
-          const failure = classifyCaptureError(error);
-          addReason(reasons, failure.reason);
-          unavailableFailure = true;
-        }
-        break;
-      }
-      chargedBytes += spec.capBytes;
-      const captureIo = createCaptureIo(live, resolvedOptions.io, pins, spec);
-      let snapshot: Awaited<ReturnType<typeof captureWorkspaceText>> | null = null;
-      let failure: ObservationGate | ObservationFailure | null = null;
-      try {
-        snapshot = await captureWorkspaceText(
-          owned.storageRoot,
-          spec.relativePath,
-          captureIo.io,
-          live.lastTime,
-        );
-      } catch (error) {
-        failure = captureIo.refusal() ?? classifyCaptureError(error);
-      }
+  const content = initialContentFacts();
 
-      const closeFacts = summarizeCloses(captureIo.closes);
-      openedFiles += captureIo.closes.length;
-      closeAttempted += captureIo.closes.filter((record) => record.attempted).length;
-      closeSettled += captureIo.closes.filter((record) => record.settled).length;
-      closeSucceeded += captureIo.closes.filter((record) => record.succeeded).length;
-      if (captureIo.closes.some((record) => record.attempted && (!record.settled || !record.succeeded))) {
-        closeFailure = true;
-        addReason(reasons, "close-failed");
-        if (!(failure instanceof ObservationGate)) {
-          failure = new ObservationFailure("close-failed");
+  if (pinsInitial) {
+    const runPass = async (pass: 1 | 2): Promise<boolean> => {
+      let stopped = false;
+      for (let index = 0; index < plan.files.length; index++) {
+        const spec = plan.files[index]!;
+        const ordinal = pass === 1 ? index + 1 : plan.files.length + index + 1;
+        try {
+          liveCheck(live);
+        } catch (error) {
+          if (error instanceof ObservationGate) {
+            gate = error;
+            addGateReason(reasons, error);
+          } else {
+            const failure = classifyCaptureError(error);
+            addReason(reasons, failure.reason);
+            unavailableFailure = true;
+          }
+          stopped = true;
+          break;
         }
-      }
-      const opened = captureIo.opened();
-      if (snapshot !== null && opened === null && failure === null) {
-        failure = new ObservationFailure("io-failed");
-      }
-      if (snapshot !== null && opened !== null && failure === null) {
-        const bytes = snapshot.file.bytes;
-        const sha256 = snapshot.file.sha256;
-        let matchesFirstPass: boolean | null = null;
-        if (pass === 1) {
-          firstPass.set(spec.key, { text: snapshot.text, bytes, sha256, opened });
-        } else {
-          const first = firstPass.get(spec.key);
-          matchesFirstPass = first !== undefined
-            && first.bytes === bytes
-            && first.sha256 === sha256
-            && sameSignature(first.opened, opened);
-          if (matchesFirstPass !== true) {
-            crossPassMismatch = true;
-            addReason(reasons, "changed");
+        chargedBytes += spec.capBytes;
+        const captureIo = createCaptureIo(live, resolvedOptions.io, pins, spec);
+        let snapshot: Awaited<ReturnType<typeof captureWorkspaceText>> | null = null;
+        let failure: ObservationGate | ObservationFailure | null = null;
+        try {
+          snapshot = await captureWorkspaceText(
+            owned.storageRoot,
+            spec.relativePath,
+            captureIo.io,
+            live.lastTime,
+          );
+        } catch (error) {
+          failure = captureIo.refusal() ?? classifyCaptureError(error);
+        }
+
+        const closeFacts = summarizeCloses(captureIo.closes);
+        openedFiles += captureIo.closes.length;
+        closeAttempted += captureIo.closes.filter((record) => record.attempted).length;
+        closeSettled += captureIo.closes.filter((record) => record.settled).length;
+        closeSucceeded += captureIo.closes.filter((record) => record.succeeded).length;
+        if (captureIo.closes.some((record) => record.attempted && (!record.settled || !record.succeeded))) {
+          closeFailure = true;
+          addReason(reasons, "close-failed");
+          if (!(failure instanceof ObservationGate)) {
+            failure = new ObservationFailure("close-failed");
           }
         }
-        captures.push(freezeCapture({
-          ordinal: index + 1,
-          pass,
-          file: spec.key,
-          chargedBytes: spec.capBytes,
-          outcome: "captured",
-          reason: null,
-          bytes,
-          sha256,
-          matchesFirstPass,
-          openedFiles: closeFacts.openedFiles,
-          close: {
-            attempted: closeFacts.attempted,
-            settled: closeFacts.settled,
-            succeeded: closeFacts.succeeded,
-          },
-        }));
-      }
-      if (failure !== null) {
-        const reason = failure.reason;
-        addReason(reasons, reason);
-        if (!(failure instanceof ObservationGate)) unavailableFailure = true;
-        captures.push(freezeCapture({
-          ordinal: index + 1,
-          pass,
-          file: spec.key,
-          chargedBytes: spec.capBytes,
-          outcome: "refused",
-          reason,
-          bytes: null,
-          sha256: null,
-          matchesFirstPass: null,
-          openedFiles: closeFacts.openedFiles,
-          close: {
-            attempted: closeFacts.attempted,
-            settled: closeFacts.settled,
-            succeeded: closeFacts.succeeded,
-          },
-        }));
-      }
-      try {
-        liveCheck(live);
-      } catch (error) {
-        if (error instanceof ObservationGate) {
-          gate = error;
-          addGateReason(reasons, error);
-        } else {
-          const terminal = classifyCaptureError(error);
-          addReason(reasons, terminal.reason);
-          unavailableFailure = true;
+        const opened = captureIo.opened();
+        if (snapshot !== null && opened === null && failure === null) {
+          failure = new ObservationFailure("io-failed");
+        }
+        if (snapshot !== null && opened !== null && failure === null) {
+          const bytes = snapshot.file.bytes;
+          const sha256 = snapshot.file.sha256;
+          let matchesFirstPass: boolean | null = null;
+          if (pass === 1) {
+            firstPass.set(spec.key, { text: snapshot.text, bytes, sha256, opened });
+          } else {
+            const first = firstPass.get(spec.key);
+            matchesFirstPass = first !== undefined
+              && first.bytes === bytes
+              && first.sha256 === sha256
+              && sameSignature(first.opened, opened);
+            if (matchesFirstPass !== true) {
+              crossPassMismatch = true;
+              addReason(reasons, "changed");
+            }
+          }
+          captures.push(freezeCapture({
+            ordinal,
+            pass,
+            file: spec.key,
+            chargedBytes: spec.capBytes,
+            outcome: "captured",
+            reason: null,
+            bytes,
+            sha256,
+            matchesFirstPass,
+            openedFiles: closeFacts.openedFiles,
+            close: {
+              attempted: closeFacts.attempted,
+              settled: closeFacts.settled,
+              succeeded: closeFacts.succeeded,
+            },
+          }));
+        }
+        if (failure !== null) {
+          const reason = failure.reason;
+          addReason(reasons, reason);
+          if (!(failure instanceof ObservationGate)) unavailableFailure = true;
+          captures.push(freezeCapture({
+            ordinal,
+            pass,
+            file: spec.key,
+            chargedBytes: spec.capBytes,
+            outcome: "refused",
+            reason,
+            bytes: null,
+            sha256: null,
+            matchesFirstPass: null,
+            openedFiles: closeFacts.openedFiles,
+            close: {
+              attempted: closeFacts.attempted,
+              settled: closeFacts.settled,
+              succeeded: closeFacts.succeeded,
+            },
+          }));
+        }
+        try {
+          liveCheck(live);
+        } catch (error) {
+          if (error instanceof ObservationGate) {
+            gate = error;
+            addGateReason(reasons, error);
+          } else {
+            const terminal = classifyCaptureError(error);
+            addReason(reasons, terminal.reason);
+            unavailableFailure = true;
+            stopped = true;
+          }
+        }
+        if (failure instanceof ObservationGate) {
+          gate = failure;
+          addGateReason(reasons, failure);
+        }
+        if (gate !== null || failure !== null || stopped || crossPassMismatch) {
           stopped = true;
+          break;
         }
       }
-      if (failure instanceof ObservationGate) {
-        gate = failure;
-        addGateReason(reasons, failure);
+      return stopped;
+    };
+
+    const stoppedFirst = await runPass(1);
+    if (!stoppedFirst) {
+      if (mode === "content") {
+        const outcome = await observeContentBetweenPasses(
+          live,
+          resolvedOptions,
+          owned,
+          firstPass,
+        );
+        Object.assign(content, outcome.facts);
+        if (outcome.gate !== null) {
+          gate = outcome.gate;
+          addGateReason(reasons, outcome.gate);
+        }
       }
-      if (gate !== null || failure !== null || stopped || crossPassMismatch) break;
+      if (gate === null) await runPass(2);
     }
 
     if (gate === null) {
@@ -1270,63 +1602,294 @@ export async function observeNativeHarnessReconciliationFiles(
     }
   }
 
-  let status: NativeHarnessReconciliationFilesStatus;
-  if (gate !== null) {
-    status = gate.reason === "aborted" ? "aborted" : "expired";
-  } else if (closeFailure) {
-    status = "unknown";
-  } else if (crossPassMismatch || pinsDifferent) {
-    status = "different";
-  } else if (unavailableFailure || pinsUnknown) {
-    status = "unavailable";
-  } else if (
-    pinsInitial
-    && pinsStable
-    && captures.length === plan.files.length * 2
-    && captures.every((capture) => capture.outcome === "captured")
-  ) {
-    status = "stable";
-  } else {
-    status = "unavailable";
-  }
+  const evaluateStatus = (): NativeHarnessReconciliationFilesStatus => {
+    if (gate !== null) return gate.reason === "aborted" ? "aborted" : "expired";
+    if (closeFailure) return "unknown";
+    if (crossPassMismatch || pinsDifferent) return "different";
+    if (unavailableFailure || pinsUnknown) return "unavailable";
+    if (
+      pinsInitial
+      && pinsStable
+      && captures.length === plan.files.length * 2
+      && captures.every((capture) => capture.outcome === "captured")
+    ) {
+      return "stable";
+    }
+    return "unavailable";
+  };
 
-  const checkedAt = live.lastTime;
+  const finalizeContent = (finalStatus: NativeHarnessReconciliationFilesStatus): void => {
+    if (mode !== "content") return;
+    const boundFacts = {
+      planner: content.planner,
+      status: content.status,
+      provisionalStatus: content.provisionalStatus,
+      revoked: content.revoked,
+      revokedReasons: content.revokedReasons,
+      planReasons: content.planReasons,
+      failure: content.failure,
+      observation: content.observation,
+      chargedBytes: content.chargedBytes,
+      chargeLimitBytes: content.chargeLimitBytes,
+      tracePassesStarted: content.tracePassesStarted,
+    };
+    if (Buffer.byteLength(JSON.stringify(boundFacts), "utf8")
+      > NATIVE_HARNESS_RECONCILIATION_CONTENT_MAX_METADATA_BYTES) {
+      content.observation = null;
+      content.status = "unavailable";
+      content.provisionalStatus = "unavailable";
+      content.revoked = false;
+      content.failure = {
+        code: "too-large",
+        reason: "The composed content facts exceed their fixed metadata byte bound.",
+      };
+    }
+    // Final primary/pin instability revokes any earlier stable or not-required
+    // conclusion. Byte charges and actual failure facts are retained; the
+    // nested stable observation is removed so no reusable claim survives.
+    if (finalStatus !== "stable" && (content.status === "stable" || content.status === "not-required")) {
+      content.status = "revoked";
+      content.revoked = true;
+      content.revokedReasons = [...reasons];
+      content.observation = null;
+    }
+  };
+
+  let status = evaluateStatus();
+  if (status !== "stable") {
+    metadata = null;
+    metadataStatus = "not-observed";
+  }
+  finalizeContent(status);
+
+  let facts!: FixedModeFacts;
+  const seal = (): FixedModeFacts => {
+    // This runs after the public wrapper's final await, synchronously before
+    // result assembly. It reuses the same clock/signal/deadline; a queued abort
+    // or crossed deadline after the last pin check still refuses the result.
+    try {
+      liveCheck(live);
+    } catch (error) {
+      if (error instanceof ObservationGate) {
+        gate = error;
+        addGateReason(reasons, error);
+      } else {
+        const failure = classifyCaptureError(error);
+        addReason(reasons, failure.reason);
+        unavailableFailure = true;
+      }
+    }
+    const sealedStatus = evaluateStatus();
+    if (sealedStatus !== "stable") {
+      metadata = null;
+      metadataStatus = "not-observed";
+    }
+    finalizeContent(sealedStatus);
+    facts.status = sealedStatus;
+    facts.checkedAt = live.lastTime;
+    facts.reasons = [...reasons];
+    facts.captures = [...captures];
+    facts.metadata = metadata;
+    facts.metadataStatus = metadataStatus;
+    facts.content = content;
+    return facts;
+  };
+
+  facts = {
+    status,
+    observation: captures.length === plan.files.length * 2
+      && captures.every((capture) => capture.outcome === "captured")
+      ? "two-pass"
+      : "partial",
+    reasons: [...reasons],
+    captures: [...captures],
+    chargedBytes,
+    openedFiles,
+    closeAttempted,
+    closeSettled,
+    closeSucceeded,
+    pinsStable,
+    pinsCheckedAtEnd,
+    deadlineAt,
+    checkedAt: live.lastTime,
+    metadata,
+    metadataStatus,
+    content,
+    seal,
+  };
+  return facts;
+}
+
+/**
+ * Observes the four exact original recovery primaries twice under one fixed
+ * storage root. Invalid expectations/options are refused synchronously before
+ * the first await or file-system call. Each file's full cap is charged before
+ * its capture; a refusal stops all later captures with no refund or retry.
+ */
+export async function observeNativeHarnessReconciliationFiles(
+  expectation: NativeHarnessReconciliationExpectation,
+  options: NativeHarnessReconciliationFileOptions = {},
+): Promise<NativeHarnessReconciliationFilesResult> {
+  const facts = (await observeFixedMode(expectation, options, "files")).seal();
   return deepFreeze({
     schema: NATIVE_HARNESS_RECONCILIATION_FILES_SCHEMA,
     readOnly: true,
     resumeAvailable: false,
     processes: "not-inspected",
     artifacts: "not-inspected",
-    status,
-    observation: captures.length === plan.files.length * 2
-      && captures.every((capture) => capture.outcome === "captured")
-      ? "two-pass"
-      : "partial",
-    reasons: Object.freeze([...reasons]),
-    captures: Object.freeze([...captures]),
-    chargedBytes,
+    status: facts.status,
+    observation: facts.observation,
+    reasons: Object.freeze([...facts.reasons]),
+    captures: Object.freeze([...facts.captures]),
+    chargedBytes: facts.chargedBytes,
     chargeLimitBytes: NATIVE_HARNESS_RECONCILIATION_FILES_CHARGED_BYTES,
-    openedFiles,
+    openedFiles: facts.openedFiles,
     maxConcurrentOpenedFiles: 1,
     close: Object.freeze({
-      attempted: closeAttempted,
-      settled: closeSettled,
-      succeeded: closeSucceeded,
+      attempted: facts.closeAttempted,
+      settled: facts.closeSettled,
+      succeeded: facts.closeSucceeded,
     }),
     pins: Object.freeze({
       directoryCount: 7 as const,
-      checkedAtEnd: pinsCheckedAtEnd,
-      stable: pinsStable,
+      checkedAtEnd: facts.pinsCheckedAtEnd,
+      stable: facts.pinsStable,
     }),
     deadline: Object.freeze({
       budgetMs: NATIVE_HARNESS_RECONCILIATION_FILES_DEADLINE_MS,
-      deadlineAt,
-      checkedAt,
-      expired: checkedAt >= deadlineAt,
+      deadlineAt: facts.deadlineAt,
+      checkedAt: facts.checkedAt,
+      expired: facts.checkedAt >= facts.deadlineAt,
       soft: true as const,
       cleanupMayExceedDeadline: true as const,
     }),
-    metadata,
-    metadataStatus,
+    metadata: facts.metadata,
+    metadataStatus: facts.metadataStatus,
   });
+}
+
+/**
+ * Composes the unchanged five-second files observation with one shared
+ * thirty-second window: the same four first-pass primary captures, a pure
+ * bounded content plan, the fixed non-issuing byte observer, then the same
+ * four second-pass captures and all seven final pins. A final primary/pin
+ * difference, refusal, abort or expiry revokes any earlier stable content.
+ */
+export async function observeNativeHarnessReconciliationContent(
+  expectation: NativeHarnessReconciliationExpectation,
+  options: NativeHarnessReconciliationFileOptions = {},
+): Promise<NativeHarnessReconciliationContentObservationResult> {
+  const facts = (await observeFixedMode(expectation, options, "content")).seal();
+  const content = facts.content;
+  const contentDraft = {
+    status: content.status,
+    provisionalStatus: content.provisionalStatus,
+    revoked: content.revoked,
+    revokedReasons: [...content.revokedReasons],
+    planner: content.planner,
+    planReasons: [...content.planReasons],
+    failure: content.failure === null
+      ? null
+      : {
+        code: content.failure.code,
+        reason: content.failure.reason,
+        ...(content.failure.observedMismatch === true ? { observedMismatch: true as const } : {}),
+      },
+    observation: content.observation,
+    chargedBytes: content.chargedBytes,
+    chargeLimitBytes: content.chargeLimitBytes,
+    tracePassesStarted: content.tracePassesStarted,
+  };
+  let metadataDraft = facts.metadata;
+  let metadataStatusDraft = facts.metadataStatus;
+  const artifactLabel = (): NativeHarnessReconciliationContentObservationResult["artifacts"] =>
+    contentDraft.observation !== null
+      ? "latest-completed-bytes-checked"
+      : contentDraft.revoked
+        ? "not-retained-after-primary-refusal"
+        : contentDraft.chargedBytes > 0 ? "partial-bytes-not-retained" : "not-inspected";
+  const build = (): NativeHarnessReconciliationContentObservationResult => ({
+    schema: NATIVE_HARNESS_RECONCILIATION_CONTENT_SCHEMA,
+    readOnly: true,
+    resumeAvailable: false,
+    processes: "not-inspected",
+    artifacts: artifactLabel(),
+    discardedAttemptContents: "not-verified-not-reused",
+    status: facts.status,
+    observation: facts.observation,
+    reasons: [...facts.reasons],
+    captures: [...facts.captures],
+    chargedBytes: facts.chargedBytes,
+    chargeLimitBytes: NATIVE_HARNESS_RECONCILIATION_FILES_CHARGED_BYTES,
+    openedFiles: facts.openedFiles,
+    maxConcurrentOpenedFiles: 1,
+    close: {
+      attempted: facts.closeAttempted,
+      settled: facts.closeSettled,
+      succeeded: facts.closeSucceeded,
+    },
+    pins: {
+      directoryCount: 7 as const,
+      checkedAtEnd: facts.pinsCheckedAtEnd,
+      stable: facts.pinsStable,
+    },
+    deadline: {
+      budgetMs: NATIVE_HARNESS_RECONCILIATION_CONTENT_DEADLINE_MS,
+      deadlineAt: facts.deadlineAt,
+      checkedAt: facts.checkedAt,
+      expired: facts.checkedAt >= facts.deadlineAt,
+      soft: true as const,
+      cleanupMayExceedDeadline: true as const,
+    },
+    metadata: metadataDraft,
+    metadataStatus: metadataStatusDraft,
+    content: contentDraft,
+  });
+  let result = build();
+  if (Buffer.byteLength(JSON.stringify(result), "utf8")
+    > NATIVE_HARNESS_RECONCILIATION_CONTENT_MAX_METADATA_BYTES) {
+    // Final plain-result projection bound. Drop the optional heavy observation
+    // and metadata, retain primary counts plus a bounded content failure
+    // summary, and never present the content as available.
+    contentDraft.observation = null;
+    contentDraft.status = "unavailable";
+    contentDraft.revoked = false;
+    contentDraft.revokedReasons = [];
+    contentDraft.failure = {
+      code: "too-large",
+      reason: "The composed content result exceeds its fixed metadata byte bound.",
+    };
+    metadataDraft = null;
+    metadataStatusDraft = "not-observed";
+    result = build();
+    if (Buffer.byteLength(JSON.stringify(result), "utf8")
+      > NATIVE_HARNESS_RECONCILIATION_CONTENT_MAX_METADATA_BYTES) {
+      // This fixed-size projection contains only counters, small enums and one
+      // bounded reason; it cannot exceed the bound.
+      result = {
+        ...result,
+        metadata: null,
+        metadataStatus: "not-observed",
+        reasons: [],
+        captures: [],
+        content: {
+          status: "unavailable",
+          provisionalStatus: contentDraft.provisionalStatus,
+          revoked: false,
+          revokedReasons: [],
+          planner: contentDraft.planner,
+          planReasons: [],
+          failure: {
+            code: "too-large",
+            reason: "The composed content result exceeds its fixed metadata byte bound.",
+          },
+          observation: null,
+          chargedBytes: contentDraft.chargedBytes,
+          chargeLimitBytes: contentDraft.chargeLimitBytes,
+          tracePassesStarted: contentDraft.tracePassesStarted,
+        },
+      };
+    }
+  }
+  return deepFreeze(result);
 }
