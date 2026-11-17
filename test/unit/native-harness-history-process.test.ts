@@ -3,15 +3,26 @@ import { EventEmitter } from "node:events";
 import path from "node:path";
 import {
   NATIVE_HARNESS_HISTORY_PROCESS_LIMITS,
+  NATIVE_HARNESS_HISTORY_RECOVERY_LIMITS,
+  bindNativeHarnessHistoryRecoveryWorker,
   classifyDarwinPsCompletion,
   createDarwinHistoryProcessObserver,
   decodeNativeHarnessHistoryProcessOwner,
   deriveNativeHarnessHistoryProcessTargets,
+  deriveNativeHarnessHistoryRecoveryTargets,
   parseDarwinPsOutput,
+  probeNativeHarnessHistoryRecoveryController,
+  probeNativeHarnessHistoryRecoveryGroup,
+  projectNativeHarnessHistoryRecoveryLifecycle,
   type NativeHarnessHistoryProcessChild,
   type NativeHarnessHistoryProcessOwnerText,
   type NativeHarnessHistoryProcessSpawn,
+  type NativeHarnessHistoryRecoveryAttemptSummaryInput,
+  type NativeHarnessHistoryRecoveryAttemptTarget,
+  type NativeHarnessHistoryRecoveryProjectionInput,
+  type NativeHarnessHistoryRecoveryRowInput,
 } from "../../src/native-harness-history-process.ts";
+import { sha256Hex } from "../../src/native-work.ts";
 
 const ROOT = "/tmp/omp-r1b3";
 const HARNESS = "omp-harness-abc123";
@@ -49,6 +60,116 @@ function workerOwner(overrides: Record<string, unknown> = {}): Record<string, un
     privateRuntimeRoot: "/tmp/omp-harness2-worker-abcdef",
     startedAt: STARTED_AT,
     ...overrides,
+  };
+}
+
+function recoveryNonce(value: number): string {
+  const hex = value.toString(16).padStart(12, "0");
+  return `00000000-1111-4111-8111-${hex}`;
+}
+
+function recoveryCwd(stage: string, attempt: number): string {
+  return path.join(ROOT, RUN_ROOT, "stages", stage, `attempt-${attempt}-${UUID}`, "workspace");
+}
+
+function recoveryRow(overrides: Partial<NativeHarnessHistoryRecoveryRowInput> = {}): NativeHarnessHistoryRecoveryRowInput {
+  const cwd = overrides.cwd ?? recoveryCwd("baseline", 2);
+  return {
+    ordinal: 1,
+    nonce: recoveryNonce(1),
+    stage: "baseline",
+    attempt: 2,
+    cwd,
+    artifactDir: path.join(path.dirname(cwd), "artifacts"),
+    state: "process-bound",
+    launchRuntimeRoot: "/tmp/omp-harness2-worker-abcdef",
+    pid: 4321,
+    pgid: 4321,
+    processIdentitySha256: "c".repeat(64),
+    cleanup: null,
+    ...overrides,
+  };
+}
+
+function recoveryAttempts(count: number): NativeHarnessHistoryRecoveryRowInput[] {
+  return Array.from({ length: count }, (_, index) => {
+    const attempt = index + 1;
+    return recoveryRow({
+      ordinal: attempt,
+      nonce: recoveryNonce(attempt),
+      attempt,
+      cwd: recoveryCwd("baseline", attempt),
+      artifactDir: path.join(path.dirname(recoveryCwd("baseline", attempt)), "artifacts"),
+    });
+  });
+}
+
+function recoveryTargets(rows: readonly NativeHarnessHistoryRecoveryRowInput[]) {
+  return deriveNativeHarnessHistoryRecoveryTargets(ROOT, RUN_ROOT, RUN_ID, rows);
+}
+
+function emptyProjectionAttempt(
+  groupComparison: NativeHarnessHistoryRecoveryAttemptSummaryInput["groupComparison"],
+  workerComparison: NativeHarnessHistoryRecoveryAttemptSummaryInput["workerComparison"],
+  coverage: NativeHarnessHistoryRecoveryAttemptSummaryInput["coverage"],
+): NativeHarnessHistoryRecoveryAttemptSummaryInput {
+  const target = recoveryTargets([recoveryRow()]).attempts[0]!;
+  return {
+    target,
+    round1Worker: null,
+    round2Worker: null,
+    binding1: null,
+    binding2: null,
+    group1: null,
+    group2: null,
+    workerComparison,
+    groupComparison,
+    coverage,
+  };
+}
+
+function projectionInput(
+  attempts: readonly NativeHarnessHistoryRecoveryAttemptSummaryInput[],
+  finalPrimaryStatus: NativeHarnessHistoryRecoveryProjectionInput["finalPrimaryStatus"],
+): NativeHarnessHistoryRecoveryProjectionInput {
+  return {
+    attempts,
+    controller: {
+      round1Owner: null,
+      round2Owner: null,
+      probe1: null,
+      probe2: null,
+      ownerComparison: "stable",
+      probeComparison: "stable",
+      lockDirectory1: "missing",
+      lockDirectory2: "missing",
+    },
+    cancel: {
+      round1: null,
+      round2: null,
+      status: "not-observed",
+      comparison: "stable",
+    },
+    inventoryRows: attempts.length,
+    auxAttemptsRound1: 0,
+    auxAttemptsRound2: 0,
+    auxChargedBytes: 0,
+    probesRound1: 0,
+    probesRound2: 0,
+    window: {
+      budgetMs: 5_000,
+      startedAt: 100,
+      deadlineAt: 5_100,
+      checkedAt: 200,
+      expired: false,
+      globalDeadlineAt: 30_100,
+      roundsStarted: 2,
+    },
+    gate: null,
+    prerequisiteFailure: null,
+    derivationProblems: [],
+    finalPrimaryStatus,
+    revokedReasons: finalPrimaryStatus === "stable" ? [] : ["changed"],
   };
 }
 
@@ -151,6 +272,214 @@ describe("bounded process targets and owner declarations", () => {
     });
     expect(oversized.state).toBe("invalid");
     expect(oversized.problem?.code).toBe("owner-decode-oversized");
+  });
+});
+
+describe("recovery lifecycle targets and fixed signal-0 probes", () => {
+  test("retains multiple attempts of the same stage by ordinal and nonce", () => {
+    const thirdCwd = recoveryCwd("baseline", 3);
+    const rows = [
+      recoveryRow({ ordinal: 1, nonce: recoveryNonce(1), attempt: 2 }),
+      recoveryRow({
+        ordinal: 2,
+        nonce: recoveryNonce(2),
+        attempt: 3,
+        cwd: thirdCwd,
+        artifactDir: path.join(path.dirname(thirdCwd), "artifacts"),
+      }),
+    ];
+    const targets = recoveryTargets(rows);
+    expect(targets.refused).toBe(false);
+    expect(targets.attempts).toHaveLength(2);
+    expect(targets.attempts[0]?.targetId).toBe(`attempt-1-${recoveryNonce(1)}`);
+    expect(targets.attempts[1]?.targetId).toBe(`attempt-2-${recoveryNonce(2)}`);
+    expect(targets.attempts[0]?.workerOwner?.relativePath).toContain("attempt-2-");
+    expect(targets.attempts[1]?.workerOwner?.relativePath).toContain("attempt-3-");
+  });
+
+  test("keeps exactly 32 attempts and refuses 33 before any target effect", () => {
+    const accepted = recoveryTargets(recoveryAttempts(32));
+    expect(accepted.refused).toBe(false);
+    expect(accepted.attempts).toHaveLength(32);
+    expect(accepted.workerOwnerTargets).toBe(32);
+    expect(accepted.auxTargetsPerRound).toBe(34);
+    expect(accepted.auxChargePerRound).toBe(540_736);
+    expect(accepted.auxChargeTotal).toBe(NATIVE_HARNESS_HISTORY_RECOVERY_LIMITS.auxChargeLimitBytes);
+    expect(accepted.auxChargeTotal).toBe(1_081_472);
+
+    const refused = recoveryTargets(recoveryAttempts(33));
+    expect(refused.refused).toBe(true);
+    expect(refused.attempts).toEqual([]);
+    expect(refused.inventoryRows).toBe(33);
+    expect(refused.workerOwnerTargets).toBe(0);
+    expect(refused.auxTargetsPerRound).toBe(0);
+    expect(refused.auxChargeTotal).toBe(0);
+    expect(refused.problems[0]?.code).toBe("recovery-attempt-limit");
+  });
+
+  test("queries every row group and one controller in each of two rounds without dedupe", () => {
+    const targets = recoveryTargets(recoveryAttempts(32));
+    const calls: Array<{ pid: number; signal: number }> = [];
+    const seam = (pid: number, signal: 0): void => {
+      calls.push({ pid, signal });
+    };
+    for (let round = 0; round < 2; round++) {
+      for (const attempt of targets.attempts) {
+        const fact = probeNativeHarnessHistoryRecoveryGroup(attempt, seam);
+        expect(fact.called).toBe(true);
+        expect(fact.presence).toBe("present");
+        expect(fact.signal).toBe(0);
+      }
+      const controller = probeNativeHarnessHistoryRecoveryController(9999, seam);
+      expect(controller.called).toBe(true);
+      expect(controller.presence).toBe("present");
+      expect(controller.signal).toBe(0);
+    }
+    expect(calls).toHaveLength(66);
+    expect(calls.filter((call) => call.pid < 0)).toHaveLength(64);
+    expect(calls.every((call) => call.signal === 0)).toBe(true);
+  });
+
+  test("refuses PGID <= 1 before the seam and classifies ESRCH, EPERM and unusable results", () => {
+    let calls = 0;
+    const seam = (): void => { calls += 1; };
+    const refusedTarget = recoveryTargets([recoveryRow({ pgid: 1, pid: 1 })]).attempts[0]!;
+    const refused = probeNativeHarnessHistoryRecoveryGroup(refusedTarget, seam);
+    expect(calls).toBe(0);
+    expect(refused.called).toBe(false);
+    expect(refused.refused).toBe(true);
+    expect(refused.problem?.code).toBe("probe-target-refused");
+
+    const target = recoveryTargets([recoveryRow()]).attempts[0]!;
+    const esrch = probeNativeHarnessHistoryRecoveryGroup(target, () => {
+      const error = new Error("gone");
+      Object.defineProperty(error, "code", { value: "ESRCH", enumerable: true });
+      throw error;
+    });
+    expect(esrch.called).toBe(true);
+    expect(esrch.presence).toBe("not-observed");
+
+    const eperm = probeNativeHarnessHistoryRecoveryGroup(target, () => {
+      const error = new Error("denied");
+      Object.defineProperty(error, "code", { value: "EPERM", enumerable: true });
+      throw error;
+    });
+    expect(eperm.presence).toBe("unknown");
+
+    const accessor = probeNativeHarnessHistoryRecoveryGroup(target, () => {
+      const error = {};
+      Object.defineProperty(error, "code", {
+        enumerable: true,
+        get() { throw new Error("descriptor trap"); },
+      });
+      throw error;
+    });
+    expect(accessor.presence).toBe("unknown");
+
+    const inherited = probeNativeHarnessHistoryRecoveryGroup(target, () => {
+      throw Object.create({ code: "ESRCH" });
+    });
+    expect(inherited.presence).toBe("unknown");
+
+    const asynchronous = probeNativeHarnessHistoryRecoveryGroup(
+      target,
+      (() => Promise.resolve()) as unknown as (pid: number, signal: 0) => void,
+    );
+    expect(asynchronous.called).toBe(true);
+    expect(asynchronous.presence).toBe("unknown");
+  });
+
+  test("recomputes the exact original runner association and reports mismatches", () => {
+    const runtimeRoot = "/tmp/omp-harness2-worker-abcdef";
+    const expected = sha256Hex(JSON.stringify({
+      pgid: 4321,
+      pid: 4321,
+      runId: RUN_ID,
+      runtimeRoot,
+      stage: "baseline",
+      startedAt: STARTED_AT,
+    }));
+    const target = recoveryTargets([
+      recoveryRow({ processIdentitySha256: expected }),
+    ]).attempts[0]!;
+    const decodedTarget = derive().stages[0]!.target!;
+    const read = decodeNativeHarnessHistoryProcessOwner(decodedTarget, RUN_ID, ownerText(workerOwner()));
+    const binding = bindNativeHarnessHistoryRecoveryWorker(target, RUN_ID, read);
+    expect(binding.state).toBe("matches");
+    expect(binding.associationSha256).toBe(expected);
+    expect(binding.declaredIdentitySha256).toBe(expected);
+
+    const wrongIdentity = bindNativeHarnessHistoryRecoveryWorker(
+      recoveryTargets([recoveryRow({ processIdentitySha256: "d".repeat(64) })]).attempts[0]!,
+      RUN_ID,
+      read,
+    );
+    expect(wrongIdentity.state).toBe("mismatch");
+
+    const wrongRuntime = bindNativeHarnessHistoryRecoveryWorker(
+      target,
+      RUN_ID,
+      decodeNativeHarnessHistoryProcessOwner(
+        decodedTarget,
+        RUN_ID,
+        ownerText(workerOwner({ privateRuntimeRoot: "/tmp/omp-harness2-worker-zzzzzz" })),
+      ),
+    );
+    expect(wrongRuntime.state).toBe("mismatch");
+
+    expect(bindNativeHarnessHistoryRecoveryWorker(target, RUN_ID, null).state).toBe("not-observed");
+    const launchOnly = recoveryTargets([
+      recoveryRow({ pid: null, pgid: null, processIdentitySha256: null }),
+    ]).attempts[0]!;
+    expect(bindNativeHarnessHistoryRecoveryWorker(launchOnly, RUN_ID, null).state).toBe("unknown");
+    const noProcess = recoveryTargets([
+      recoveryRow({ pid: null, pgid: null, launchRuntimeRoot: null, processIdentitySha256: null }),
+    ]).attempts[0]!;
+    expect(bindNativeHarnessHistoryRecoveryWorker(noProcess, RUN_ID, null).state).toBe("not-applicable");
+  });
+
+  test("reports empty attempt coverage as not-required and revokes stable groups on final refusal", () => {
+    const empty = projectNativeHarnessHistoryRecoveryLifecycle(projectionInput([], "stable"));
+    expect(empty.status).toBe("stable");
+    expect(empty.attempts).toEqual([]);
+    expect(empty.completeAttemptCoverage.status).toBe("not-required");
+    expect(empty.coverage.inventoryRows).toBe(0);
+
+    const emptyOneRound = projectNativeHarnessHistoryRecoveryLifecycle({
+      ...projectionInput([], "stable"),
+      window: { ...projectionInput([], "stable").window, roundsStarted: 1 },
+    });
+    expect(emptyOneRound.completeAttemptCoverage.status).toBe("not-required");
+
+    const invalidEmpty = projectNativeHarnessHistoryRecoveryLifecycle({
+      ...projectionInput([], "stable"),
+      prerequisiteFailure: {
+        code: "lifecycle-metadata-unavailable",
+        detail: "Invalid metadata must not look like a valid empty inventory.",
+      },
+    });
+    expect(invalidEmpty.completeAttemptCoverage.status).toBe("unavailable");
+    expect(invalidEmpty.status).toBe("unavailable");
+
+    const mixed = projectNativeHarnessHistoryRecoveryLifecycle(projectionInput(
+      [emptyProjectionAttempt("stable", "unavailable", "partial")],
+      "different",
+    ));
+    expect(mixed.provisionalStatus).toBe("unavailable");
+    expect(mixed.status).toBe("revoked");
+    expect(mixed.revoked).toBe(true);
+    expect(mixed.currentGroups.status).toBe("revoked");
+    expect(mixed.attempts[0]?.group.comparison).toBe("revoked");
+    // Missing controller owners stay not-observed rather than becoming a
+    // stable presentation; the raw comparisons are still revoked.
+    expect(mixed.controllerLease.ownerComparison).toBe("revoked");
+    expect(mixed.controllerLease.probeComparison).toBe("revoked");
+    expect(mixed.cancel.comparison).toBe("revoked");
+    expect(mixed.observationStability.workerAuxStable).toBeNull();
+    expect(mixed.observationStability.groupsStable).toBeNull();
+    expect(mixed.observationStability.controllerStable).toBeNull();
+    expect(mixed.observationStability.cancelStable).toBeNull();
+    expect(mixed.coverage.auxChargedBytes).toBe(0);
   });
 });
 

@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { linkSync, lstatSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import {
   appendFile,
   chmod,
@@ -44,6 +44,8 @@ import {
   type NativeHarnessReconciliationContentPlanResult,
 } from "../../src/native-harness-reconciliation-content.ts";
 import {
+  NATIVE_HARNESS_RECONCILIATION_LIFECYCLE_SCHEMA,
+  observeNativeHarnessReconciliation,
   observeNativeHarnessReconciliationContent,
 } from "../../src/native-harness-reconciliation-files.ts";
 import type { NativeHarnessReconciliationExpectation } from "../../src/native-harness-reconciliation.ts";
@@ -726,6 +728,94 @@ async function observeComposed(
     ...(options.signal === undefined ? {} : { signal: options.signal }),
     ...(options.now === undefined ? {} : { now: options.now }),
   });
+}
+
+interface LifecycleFixtureOptions {
+  readonly workers?: boolean;
+  readonly controller?: boolean;
+  readonly cancel?: string | null;
+  readonly alignAssociation?: boolean;
+  readonly startedAt?: string;
+}
+
+async function materializeLifecycleFixture(
+  fixture: ContentFixture,
+  options: LifecycleFixtureOptions = {},
+): Promise<void> {
+  const inventoryPath = path.join(fixture.runDir, NATIVE_HARNESS_DISPATCH_INVENTORY_FILE);
+  const inventory = JSON.parse(fixture.inventoryText) as Record<string, any>;
+  const startedAt = options.startedAt ?? CREATED_AT;
+  for (const row of inventory.dispatches as Array<Record<string, any>>) {
+    if (row.process === undefined || row.launch === undefined) continue;
+    // The original owner decoder requires the current worker-runtime basename
+    // shape. The content fixture's runtime label is deliberately constructed.
+    row.launch.runtimeRoot = path.join(
+      fixture.root,
+      "worker-runtime",
+      `omp-harness2-worker-${row.stage}-${row.ordinal}`,
+    );
+    if (options.alignAssociation !== false) {
+      row.process.identitySha256 = sha256Hex(JSON.stringify({
+        pgid: row.process.pgid,
+        pid: row.process.pid,
+        runId: row.runId,
+        runtimeRoot: row.launch.runtimeRoot,
+        stage: row.stage,
+        startedAt,
+      }));
+    }
+    if (options.workers !== false) {
+      await mkdir(row.artifactDir, { recursive: true, mode: 0o700 });
+      await writeFile(
+        path.join(row.artifactDir, "worker-owner.json"),
+        JSON.stringify({
+          schemaVersion: 1,
+          runId: row.runId,
+          stage: row.stage,
+          pid: row.process.pid,
+          pgid: row.process.pgid,
+          privateRuntimeRoot: row.launch.runtimeRoot,
+          startedAt,
+        }),
+        "utf8",
+      );
+    }
+  }
+  writeFileSync(inventoryPath, `${JSON.stringify(inventory)}\n`, "utf8");
+  if (options.controller !== false) {
+    const lockDir = path.join(fixture.runDir, ".run.lock");
+    await mkdir(lockDir, { mode: 0o700 });
+    await writeFile(
+      path.join(lockDir, "owner.json"),
+      JSON.stringify({ pid: 4242, token: "fixture-controller-token", createdAt: startedAt }),
+      "utf8",
+    );
+  }
+  if (options.cancel !== undefined && options.cancel !== null) {
+    await writeFile(path.join(fixture.runDir, "cancel.request"), options.cancel, "utf8");
+  }
+}
+
+async function observeLifecycle(
+  fixture: ContentFixture,
+  options: {
+    readonly fileIo?: NativeFileIo;
+    readonly signal?: AbortSignal;
+    readonly now?: () => number;
+    readonly signalQuery?: (pid: number, signal: 0) => void;
+  } = {},
+) {
+  const probes: Array<{ pid: number; signal: number }> = [];
+  const query = options.signalQuery ?? ((pid: number, signal: 0): void => {
+    probes.push({ pid, signal });
+  });
+  const result = await observeNativeHarnessReconciliation(fixture.expected, {
+    ...(options.fileIo === undefined ? {} : { fileIo: options.fileIo }),
+    ...(options.signal === undefined ? {} : { signal: options.signal }),
+    ...(options.now === undefined ? {} : { now: options.now }),
+    signalQuery: query,
+  });
+  return { result, probes };
 }
 
 describe("native harness reconciliation content", () => {
@@ -1834,5 +1924,512 @@ describe("native harness reconciliation content", () => {
     expect(invalidResult.content.chargedBytes).toBe(0);
     expect(invalidResult.artifacts).toBe("not-inspected");
     expect([...invalidCounted.opens.keys()].every((target) => invalidPrimaries.has(target))).toBe(true);
+  }, 30_000);
+
+  test("composes stable primaries, content and both lifecycle rounds with the final seal", async () => {
+    const fixture = await makeFixture();
+    await materializeLifecycleFixture(fixture, { cancel: "cancel\n" });
+    const { result, probes } = await observeLifecycle(fixture);
+
+    expect(result.schema).toBe(NATIVE_HARNESS_RECONCILIATION_LIFECYCLE_SCHEMA);
+    expect(result.readOnly).toBe(true);
+    expect(result.resumeAvailable).toBe(false);
+    expect(result.processes).toBe("two-round-signal0-observed");
+    expect(result.artifacts).toBe("auxiliary-owner-and-cancel-files-checked");
+    expect(result.status).toBe("stable");
+    expect(result.content.status).toBe("stable");
+    expect(result.lifecycle.status).toBe("stable");
+    expect(result.lifecycle.revoked).toBe(false);
+    expect(result.lifecycle.coverage.inventoryRows).toBe(10);
+    expect(result.lifecycle.coverage.attemptTargets).toBe(10);
+    expect(result.lifecycle.coverage.workerOwnerTargets).toBe(10);
+    expect(result.lifecycle.coverage.auxAttemptsRound1).toBe(12);
+    expect(result.lifecycle.coverage.auxAttemptsRound2).toBe(12);
+    expect(result.lifecycle.coverage.auxChargedBytes).toBe(360_576);
+    expect(result.lifecycle.coverage.probesRound1).toBe(10);
+    expect(result.lifecycle.coverage.probesRound2).toBe(10);
+    expect(probes).toHaveLength(20);
+    expect(probes.every((probe) => probe.signal === 0)).toBe(true);
+    expect(result.lifecycle.currentGroups.status).toBe("stable");
+    expect(result.lifecycle.currentGroups.absenceObservation).toBe("some-known-groups-present");
+    expect(result.lifecycle.controllerLease.status).toBe("stable");
+    expect(result.lifecycle.controllerLease.lockDirectoryRound1).toBe("present");
+    expect(result.lifecycle.cancel.status).toBe("requested");
+    expect(result.lifecycle.completeAttemptCoverage.status).toBe("complete");
+    expect(result.lifecycle.historicalCleanup.declaredCleanupObserved).toBe(9);
+    expect(result.lifecycle.historicalCleanup.unknown).toBe(1);
+    expect(result.lifecycle.window.budgetMs).toBe(5_000);
+    expect(result.lifecycle.window.constrainedByRemaining30s).toBe(true);
+    expect(result.deadline.budgetMs).toBe(NATIVE_HARNESS_RECONCILIATION_CONTENT_DEADLINE_MS);
+    expect(result.lifecycle.attempts.find((attempt) =>
+      attempt.dispatchState === "intended")?.coverage).toBe("complete");
+    expect(result.lifecycle.attempts.every((attempt) =>
+      attempt.worker.binding1 === null || attempt.worker.binding1.state !== "mismatch")).toBe(true);
+    expect(JSON.stringify(result)).not.toContain("fixture-controller-token");
+    expect(JSON.stringify(result)).not.toContain("omp-harness2-worker");
+    expect(Buffer.byteLength(JSON.stringify(result), "utf8"))
+      .toBeLessThanOrEqual(NATIVE_HARNESS_RECONCILIATION_CONTENT_MAX_METADATA_BYTES);
+  }, 30_000);
+
+  test("reports a zero-dispatch lifecycle as explicitly not-required without inventing attempts", async () => {
+    const fixture = await makeFixture();
+    await materializeLifecycleFixture(fixture, { workers: false, controller: true, cancel: "cancel\n" });
+    const paths = primaryPaths(fixture);
+    writeFileSync(
+      paths.run,
+      mutateJson(fixture.runText, (value) => {
+        delete value.snapshot;
+        value.stages = {};
+      }),
+      "utf8",
+    );
+    writeFileSync(
+      paths.inventory,
+      mutateJson(fixture.inventoryText, (value) => {
+        value.dispatches = [];
+      }),
+      "utf8",
+    );
+    const { result } = await observeLifecycle(fixture);
+    expect(result.status).toBe("stable");
+    expect(result.processes).toBe("two-round-signal0-observed");
+    expect(result.artifacts).toBe("auxiliary-owner-and-cancel-files-checked");
+    expect(result.content.planner).toBe("not-required");
+    expect(result.lifecycle.status).toBe("stable");
+    expect(result.lifecycle.coverage.inventoryRows).toBe(0);
+    expect(result.lifecycle.coverage.attemptTargets).toBe(0);
+    expect(result.lifecycle.attempts).toEqual([]);
+    expect(result.lifecycle.completeAttemptCoverage.status).toBe("not-required");
+    expect(result.lifecycle.currentGroups.absenceObservation).toBe("not-applicable");
+    expect(result.lifecycle.controllerLease.status).toBe("stable");
+    expect(result.lifecycle.cancel.status).toBe("requested");
+  }, 30_000);
+
+  test("distinguishes missing lock directory, missing lock owner and cancel existence", async () => {
+    const missingLock = await makeFixture();
+    await materializeLifecycleFixture(missingLock, { workers: false, controller: false, cancel: null });
+    const missing = await observeLifecycle(missingLock);
+    expect(missing.result.lifecycle.controllerLease.lockDirectoryRound1).toBe("missing");
+    expect(missing.result.lifecycle.controllerLease.ownerRound1?.state).toBe("lock-directory-missing");
+    expect(missing.result.lifecycle.controllerLease.probe1).toBeNull();
+    expect(missing.result.lifecycle.controllerLease.status).toBe("not-observed");
+    expect(missing.result.lifecycle.cancel.status).toBe("not-observed");
+
+    const missingOwner = await makeFixture();
+    await materializeLifecycleFixture(missingOwner, { workers: false, controller: false, cancel: null });
+    await mkdir(path.join(missingOwner.runDir, ".run.lock"), { mode: 0o700 });
+    const owner = await observeLifecycle(missingOwner);
+    expect(owner.result.lifecycle.controllerLease.lockDirectoryRound1).toBe("present");
+    expect(owner.result.lifecycle.controllerLease.ownerRound1?.state).toBe("missing");
+    expect(owner.result.lifecycle.controllerLease.probe1).toBeNull();
+    expect(owner.result.lifecycle.controllerLease.status).toBe("not-observed");
+
+    const invalidCancel = await makeFixture();
+    await materializeLifecycleFixture(invalidCancel, { workers: false, controller: false, cancel: "not-cancel\n" });
+    const invalid = await observeLifecycle(invalidCancel);
+    expect(invalid.result.lifecycle.cancel.status).toBe("requested");
+    expect(invalid.result.lifecycle.cancel.round1?.exists).toBe(true);
+    expect(invalid.result.lifecycle.cancel.round1?.state).toBe("observed");
+
+    const oversizedCancel = await makeFixture();
+    await materializeLifecycleFixture(oversizedCancel, {
+      workers: false,
+      controller: false,
+      cancel: "x".repeat(100),
+    });
+    const oversized = await observeLifecycle(oversizedCancel);
+    expect(oversized.result.lifecycle.cancel.status).toBe("requested");
+    expect(oversized.result.lifecycle.cancel.round1?.exists).toBe(true);
+    expect(oversized.result.lifecycle.cancel.round1?.state).toBe("too-large");
+
+    const grownCancel = await makeFixture();
+    await materializeLifecycleFixture(grownCancel, {
+      workers: false,
+      controller: false,
+      cancel: "ok\n",
+    });
+    const grownCancelPath = path.join(grownCancel.runDir, "cancel.request");
+    let grew = false;
+    let grownReads = 0;
+    let grownCloses = 0;
+    const growIo: NativeFileIo = {
+      ...nodeFileIo,
+      async open(target, flags) {
+        const handle = await nodeFileIo.open(target, flags);
+        if (target !== grownCancelPath || grew) return handle;
+        grew = true;
+        // The pre-open lstat was valid; grow past the fixed 64-byte opened cap
+        // only after the actual handle exists.
+        await writeFile(target, "x".repeat(100), "utf8");
+        return {
+          stat: (options) => handle.stat(options),
+          read(buffer, offset, length, position) {
+            grownReads += 1;
+            return handle.read(buffer, offset, length, position);
+          },
+          async close() {
+            grownCloses += 1;
+            await handle.close();
+          },
+        };
+      },
+    };
+    const grown = await observeLifecycle(grownCancel, { fileIo: growIo });
+    expect(grew).toBe(true);
+    expect(grownReads).toBe(0);
+    expect(grownCloses).toBe(1);
+    expect(grown.result.lifecycle.cancel.status).toBe("requested");
+    expect(grown.result.lifecycle.cancel.round1?.state).toBe("too-large");
+    expect(grown.result.lifecycle.cancel.round1?.openedFiles).toBe(1);
+    expect(grown.result.lifecycle.coverage.auxAttemptsRound1).toBe(12);
+    expect(grown.result.lifecycle.coverage.auxAttemptsRound2).toBe(12);
+    expect(grown.result.lifecycle.coverage.auxChargedBytes).toBe(360_576);
+
+    const unobservable = await makeFixture();
+    await materializeLifecycleFixture(unobservable, { workers: false, controller: false, cancel: "cancel\n" });
+    const cancelPath = path.join(unobservable.runDir, "cancel.request");
+    const eioIo: NativeFileIo = {
+      ...nodeFileIo,
+      async lstat(target, options) {
+        if (target === cancelPath) {
+          throw Object.assign(new Error("injected cancel EACCES"), { code: "EACCES" });
+        }
+        return nodeFileIo.lstat(target, options);
+      },
+    };
+    const unknown = await observeLifecycle(unobservable, { fileIo: eioIo });
+    expect(unknown.result.lifecycle.cancel.status).toBe("unknown");
+    expect(unknown.result.lifecycle.cancel.round1?.state).toBe("unavailable");
+    expect(unknown.result.lifecycle.cancel.round1?.exists).toBeNull();
+  }, 30_000);
+
+  test("detects a worker-owner reappearance between the two fixed rounds", async () => {
+    const fixture = await makeFixture();
+    await materializeLifecycleFixture(fixture, { cancel: "cancel\n" });
+    const ownerPath = path.join(fixture.stages.get("baseline")!.artifactDir, "worker-owner.json");
+    const ownerText = await readFile(ownerPath, "utf8");
+    await unlink(ownerPath);
+    const cancelPath = path.join(fixture.runDir, "cancel.request");
+    let restored = false;
+    const io: NativeFileIo = {
+      ...nodeFileIo,
+      async open(target, flags) {
+        const handle = await nodeFileIo.open(target, flags);
+        if (target !== cancelPath || restored) return handle;
+        return {
+          stat: (options) => handle.stat(options),
+          read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
+          async close() {
+            await handle.close();
+            if (!restored) {
+              restored = true;
+              await writeFile(ownerPath, ownerText, "utf8");
+            }
+          },
+        };
+      },
+    };
+    const { result } = await observeLifecycle(fixture, { fileIo: io });
+    expect(restored).toBe(true);
+    expect(result.status).toBe("stable");
+    expect(result.lifecycle.status).toBe("different");
+    expect(result.lifecycle.observationStability.workerAuxStable).toBe(false);
+    const baseline = result.lifecycle.attempts.find((attempt) =>
+      attempt.stage === "baseline" && attempt.attempt === 2);
+    expect(baseline?.worker.comparison).toBe("different");
+    expect(baseline?.worker.round1?.state).toBe("missing");
+    expect(baseline?.worker.round2?.state).toBe("observed");
+  }, 30_000);
+
+  test("detects nested parent replacement with an unchanged hardlinked owner file", async () => {
+    const fixture = await makeFixture();
+    await materializeLifecycleFixture(fixture, { cancel: "cancel\n" });
+    const targetDir = fixture.stages.get("baseline")!.artifactDir;
+    const ownerPath = path.join(targetDir, "worker-owner.json");
+    const siblingDir = path.join(
+      fixture.runDir,
+      "stages",
+      "baseline",
+      `attempt-99-${randomUUID()}`,
+      "artifacts",
+    );
+    mkdirSync(siblingDir, { recursive: true, mode: 0o700 });
+    linkSync(ownerPath, path.join(siblingDir, "worker-owner.json"));
+    const fileBefore = lstatSync(ownerPath, { bigint: true });
+    const dirBefore = lstatSync(targetDir, { bigint: true });
+    const cancelPath = path.join(fixture.runDir, "cancel.request");
+    let swapped = false;
+    const swapDirectories = (): void => {
+      const temporary = path.join(path.dirname(targetDir), `swap-${randomUUID()}`);
+      renameSync(targetDir, temporary);
+      renameSync(siblingDir, targetDir);
+      renameSync(temporary, siblingDir);
+    };
+    const io: NativeFileIo = {
+      ...nodeFileIo,
+      async open(target, flags) {
+        const handle = await nodeFileIo.open(target, flags);
+        if (target !== cancelPath || swapped) return handle;
+        return {
+          stat: (options) => handle.stat(options),
+          read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
+          async close() {
+            await handle.close();
+            if (!swapped) {
+              swapped = true;
+              swapDirectories();
+            }
+          },
+        };
+      },
+    };
+    const { result } = await observeLifecycle(fixture, { fileIo: io });
+    const fileAfter = lstatSync(ownerPath, { bigint: true });
+    const dirAfter = lstatSync(targetDir, { bigint: true });
+    expect(swapped).toBe(true);
+    expect(fileAfter.ino).toBe(fileBefore.ino);
+    expect(fileAfter.ctimeNs).toBe(fileBefore.ctimeNs);
+    expect(dirAfter.ino).not.toBe(dirBefore.ino);
+    expect(result.status).toBe("stable");
+    expect(result.lifecycle.status).toBe("different");
+    expect(result.processes).toBe("two-round-signal0-observed");
+    expect(result.artifacts).toBe("auxiliary-owner-and-cancel-files-checked");
+    expect(result.lifecycle.observationStability.workerAuxStable).toBe(false);
+    const baseline = result.lifecycle.attempts.find((attempt) =>
+      attempt.stage === "baseline" && attempt.attempt === 2);
+    expect(baseline?.worker.comparison).toBe("different");
+    expect(baseline?.worker.round1?.state).toBe("observed");
+    expect(baseline?.worker.round2?.state).toBe("observed");
+    expect(baseline?.worker.round1?.sha256).toBe(baseline?.worker.round2?.sha256);
+  }, 30_000);
+
+  test("final primary refusal revokes every nested stable lifecycle presentation", async () => {
+    const fixture = await makeFixture();
+    await materializeLifecycleFixture(fixture, { cancel: "cancel\n" });
+    const runPath = primaryPaths(fixture).run;
+    let mutated = false;
+    const io: NativeFileIo = {
+      ...nodeFileIo,
+      async open(target, flags) {
+        const handle = await nodeFileIo.open(target, flags);
+        if (!mutated && target === fixture.sourcePath) {
+          mutated = true;
+          writeFileSync(
+            runPath,
+            fixture.runText.replace("r2b2c1 content fixture task", "R2b2c1 content fixture task"),
+            "utf8",
+          );
+        }
+        return handle;
+      },
+    };
+    const { result } = await observeLifecycle(fixture, { fileIo: io });
+    expect(mutated).toBe(true);
+    expect(result.status).toBe("different");
+    expect(result.processes).toBe("not-retained-after-primary-refusal");
+    expect(result.artifacts).toBe("not-retained-after-primary-refusal");
+    expect(result.content.status).toBe("revoked");
+    expect(result.lifecycle.status).toBe("revoked");
+    expect(result.lifecycle.revoked).toBe(true);
+    expect(result.lifecycle.currentGroups.status).toBe("revoked");
+    expect(result.lifecycle.controllerLease.status).toBe("revoked");
+    expect(result.lifecycle.attempts[0]?.group.comparison).toBe("revoked");
+    expect(result.lifecycle.observationStability.groupsStable).toBeNull();
+  }, 30_000);
+
+  test("holds the second-round last cancel close past five seconds but within thirty", async () => {
+    const fixture = await makeFixture();
+    await materializeLifecycleFixture(fixture, { cancel: "cancel\n" });
+    const cancelPath = path.join(fixture.runDir, "cancel.request");
+    const startedAt = 1_700_000_000_000;
+    let time = startedAt;
+    let contentAdvanced = false;
+    let cancelCloses = 0;
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let closeStarted!: () => void;
+    const closeStartedPromise = new Promise<void>((resolve) => { closeStarted = resolve; });
+    const io: NativeFileIo = {
+      ...nodeFileIo,
+      async open(target, flags) {
+        const handle = await nodeFileIo.open(target, flags);
+        if (!contentAdvanced && target.endsWith("worker-events.jsonl")) {
+          // The content phase advances the shared clock before the lifecycle
+          // five-second window starts; this is not a window reset.
+          contentAdvanced = true;
+          time = startedAt + 1_000;
+        }
+        if (target !== cancelPath) return handle;
+        return {
+          stat: (options) => handle.stat(options),
+          read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
+          async close() {
+            await handle.close();
+            cancelCloses += 1;
+            if (cancelCloses === 1) {
+              // Round one settles before the lifecycle deadline.
+              time = startedAt + 2_000;
+              return;
+            }
+            if (cancelCloses === 2) {
+              // Round two's last cancel close crosses only the nested
+              // five-second deadline, never the outer thirty-second one.
+              time = startedAt + 7_000;
+              closeStarted();
+              await held;
+            }
+          },
+        };
+      },
+    };
+    let settled = false;
+    const pending = observeLifecycle(fixture, { fileIo: io, now: () => time }).then((observed) => {
+      settled = true;
+      return observed;
+    });
+    let assertionFailure: unknown = null;
+    try {
+      await closeStartedPromise;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(settled).toBe(false);
+      expect(cancelCloses).toBe(2);
+    } catch (error) {
+      assertionFailure = error;
+    } finally {
+      release();
+    }
+    const { result } = await pending;
+    if (assertionFailure !== null) throw assertionFailure;
+    expect(contentAdvanced).toBe(true);
+    expect(cancelCloses).toBe(2);
+    expect(result.status).toBe("stable");
+    expect(result.processes).toBe("two-round-signal0-observed");
+    expect(result.artifacts).toBe("partial-auxiliary-not-retained");
+    expect(result.lifecycle.status).toBe("expired");
+    expect(result.lifecycle.window.expired).toBe(true);
+    expect(result.lifecycle.window.deadlineAt).toBe(startedAt + 6_000);
+    expect(result.lifecycle.window.roundsStarted).toBe(2);
+    expect(result.lifecycle.coverage.auxAttemptsRound1).toBe(12);
+    expect(result.lifecycle.coverage.auxAttemptsRound2).toBe(12);
+    expect(result.lifecycle.coverage.auxChargedBytes).toBe(360_576);
+    expect(result.lifecycle.observationStability.status).not.toBe("stable");
+    expect(result.deadline.deadlineAt).toBe(startedAt + 30_000);
+  }, 30_000);
+
+  test("a clock failure after the first probe stops later lifecycle effects and retains counts", async () => {
+    const fixture = await makeFixture();
+    await materializeLifecycleFixture(fixture, { workers: false, controller: false, cancel: null });
+    const startedAt = 1_700_000_000_000;
+    let time = startedAt;
+    let probes = 0;
+    const seam = (): void => {
+      probes += 1;
+      if (probes === 1) time = startedAt - 1;
+    };
+    const { result } = await observeLifecycle(fixture, {
+      signalQuery: seam,
+      now: () => time,
+    });
+    expect(probes).toBe(1);
+    expect(result.lifecycle.coverage.probesRound1).toBe(1);
+    expect(result.lifecycle.coverage.auxAttemptsRound1).toBe(0);
+    expect(result.lifecycle.coverage.auxAttemptsRound2).toBe(0);
+    expect(result.lifecycle.coverage.auxChargedBytes).toBe(0);
+    expect(result.lifecycle.failure?.code).toBe("lifecycle-clock-unavailable");
+    expect(result.lifecycle.status).toBe("unavailable");
+    expect(result.processes).toBe("partial-signal0-observed");
+    expect(result.artifacts).toBe("not-inspected");
+    expect(result.status).toBe("unavailable");
+  }, 30_000);
+
+  test("a clock throw inside auxiliary IO stays sticky after recovery and retains the charge", async () => {
+    const fixture = await makeFixture();
+    await materializeLifecycleFixture(fixture, { controller: false, cancel: "cancel\n" });
+    const ownerPath = path.join(fixture.stages.get("baseline")!.artifactDir, "worker-owner.json");
+    const startedAt = 1_700_000_000_000;
+    let clockFailed = false;
+    let throwNextClock = false;
+    let opensAfterFailure = 0;
+    const io: NativeFileIo = {
+      ...nodeFileIo,
+      async open(target, flags) {
+        if (clockFailed) opensAfterFailure += 1;
+        const handle = await nodeFileIo.open(target, flags);
+        if (target === ownerPath && !clockFailed) {
+          clockFailed = true;
+          throwNextClock = true;
+        }
+        return handle;
+      },
+    };
+    const { result } = await observeLifecycle(fixture, {
+      fileIo: io,
+      now: () => {
+        if (throwNextClock) {
+          // One transient throw; later clock reads are valid again.
+          throwNextClock = false;
+          throw new Error("injected clock throw");
+        }
+        return startedAt;
+      },
+    });
+    expect(clockFailed).toBe(true);
+    expect(throwNextClock).toBe(false);
+    expect(opensAfterFailure).toBe(0);
+    expect(result.lifecycle.failure?.code).toBe("lifecycle-clock-unavailable");
+    expect(result.lifecycle.status).toBe("unavailable");
+    expect(result.status).toBe("unavailable");
+    expect(result.processes).toBe("partial-signal0-observed");
+    expect(result.artifacts).toBe("partial-auxiliary-not-retained");
+    expect(result.lifecycle.window.roundsStarted).toBe(1);
+    expect(result.lifecycle.coverage.probesRound1).toBe(9);
+    expect(result.lifecycle.coverage.probesRound2).toBe(0);
+    expect(result.lifecycle.coverage.auxAttemptsRound1).toBe(2);
+    expect(result.lifecycle.coverage.auxAttemptsRound2).toBe(0);
+    expect(result.lifecycle.coverage.auxChargedBytes).toBe(32_768);
+    expect(result.lifecycle.observationStability.status).not.toBe("stable");
+    const baseline = result.lifecycle.attempts.find((attempt) =>
+      attempt.stage === "baseline" && attempt.attempt === 2);
+    expect(baseline?.worker.round1?.state).toBe("unavailable");
+    expect(baseline?.worker.round1?.openedFiles).toBe(1);
+  }, 30_000);
+
+  test("an unconfirmed auxiliary close stops every later open without faking drain", async () => {
+    const fixture = await makeFixture();
+    await materializeLifecycleFixture(fixture, { controller: false, cancel: "cancel\n" });
+    const ownerPath = path.join(fixture.stages.get("baseline")!.artifactDir, "worker-owner.json");
+    let rejected = false;
+    let opensAfterRejectedClose = 0;
+    const io: NativeFileIo = {
+      ...nodeFileIo,
+      async open(target, flags) {
+        if (rejected) opensAfterRejectedClose += 1;
+        const handle = await nodeFileIo.open(target, flags);
+        if (target !== ownerPath || rejected) return handle;
+        return {
+          stat: (options) => handle.stat(options),
+          read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
+          async close() {
+            await handle.close();
+            rejected = true;
+            throw new Error("injected unconfirmed aux close");
+          },
+        };
+      },
+    };
+    const { result } = await observeLifecycle(fixture, { fileIo: io });
+    expect(rejected).toBe(true);
+    expect(opensAfterRejectedClose).toBe(0);
+    expect(result.status).toBe("unavailable");
+    expect(result.processes).toBe("partial-signal0-observed");
+    expect(result.artifacts).toBe("partial-auxiliary-not-retained");
+    expect(result.content.status).toBe("revoked");
+    expect(result.lifecycle.status).toBe("unavailable");
+    expect(result.lifecycle.failure?.code).toBe("lifecycle-close-unconfirmed");
+    expect(result.lifecycle.coverage.probesRound1).toBe(9);
+    expect(result.lifecycle.coverage.auxAttemptsRound1).toBe(2);
+    expect(result.lifecycle.coverage.auxAttemptsRound2).toBe(0);
+    expect(result.lifecycle.coverage.auxChargedBytes).toBe(32_768);
+    expect(result.lifecycle.observationStability.status).not.toBe("stable");
   }, 30_000);
 });

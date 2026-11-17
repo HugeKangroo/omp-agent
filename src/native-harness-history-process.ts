@@ -2,6 +2,7 @@ import { Buffer } from "node:buffer";
 import { spawn as nodeSpawn } from "node:child_process";
 import path from "node:path";
 import { readActualAbortSignal } from "./native-abort.ts";
+import { sha256Hex } from "./native-work.ts";
 
 /**
  * R1b3 bounded readonly process observation leaf.
@@ -268,6 +269,1153 @@ export function deriveNativeHarnessHistoryProcessTargets(
     stages: Object.freeze(rows),
     problems: Object.freeze(problems),
     targetCount,
+  });
+}
+
+/* ------------------------------------------------------------------------- */
+/* Recovery lifecycle targets, probes and factual projection                 */
+/* ------------------------------------------------------------------------- */
+
+export const NATIVE_HARNESS_HISTORY_RECOVERY_LIMITS = Object.freeze({
+  maxAttempts: 32,
+  maxProbesPerRound: 33,
+  maxProbes: 66,
+  maxAuxPerRound: 34,
+  maxAux: 68,
+  ownerCapBytes: 16 * 1024,
+  cancelCapBytes: 64,
+  auxChargeLimitBytes: 1_081_472,
+  lifecycleMs: 5_000,
+  maxResultBytes: 128 * 1024,
+});
+
+/**
+ * Narrow synchronous live-process seam. The signal is always the literal 0.
+ * The default discards `process.kill`'s boolean result; any non-undefined
+ * return or thenable is treated as an unusable observation, never presence.
+ */
+export type NativeHarnessHistorySignalQuery = (pid: number, signal: 0) => void;
+
+export const nativeHarnessHistorySignalQuery: NativeHarnessHistorySignalQuery = (pid) => {
+  // The OS signal is never taken from the caller or a mutable argument.
+  process.kill(pid, 0);
+};
+
+export type NativeHarnessHistoryRecoveryAuxKind = "worker-owner" | "controller-owner" | "cancel";
+
+export type NativeHarnessHistoryRecoveryAuxState =
+  | "observed"
+  | "missing"
+  | "lock-directory-missing"
+  | "ancestor-missing"
+  | "unsafe"
+  | "too-large"
+  | "unavailable"
+  | "not-attempted"
+  | "aborted"
+  | "expired";
+
+export type NativeHarnessHistoryRecoveryAuxMissingAt = "target" | "ancestor" | "lock-directory";
+
+export interface NativeHarnessHistoryRecoveryCleanupInputRunner {
+  readonly observationKind: "runner-observation";
+  readonly spawnAttempted: boolean;
+  readonly closeSeen: boolean;
+  readonly groupObservation: "not-observed" | "present" | "unknown";
+  readonly hostWorkSettled: boolean;
+  readonly approvalWorkSettled: boolean;
+  readonly logFlush: "success" | "failure";
+}
+
+export interface NativeHarnessHistoryRecoveryCleanupInputSynthetic {
+  readonly observationKind: "synthetic-fixture";
+}
+
+export type NativeHarnessHistoryRecoveryCleanupInput =
+  | NativeHarnessHistoryRecoveryCleanupInputRunner
+  | NativeHarnessHistoryRecoveryCleanupInputSynthetic;
+
+export interface NativeHarnessHistoryRecoveryRowInput {
+  readonly ordinal: number;
+  readonly nonce: string;
+  readonly stage: string;
+  readonly attempt: number;
+  readonly cwd: string;
+  readonly artifactDir: string;
+  readonly state: string;
+  readonly launchRuntimeRoot: string | null;
+  readonly pid: number | null;
+  readonly pgid: number | null;
+  readonly processIdentitySha256: string | null;
+  readonly cleanup: NativeHarnessHistoryRecoveryCleanupInput | null;
+}
+
+export interface NativeHarnessHistoryRecoveryAuxTarget {
+  readonly targetId: string;
+  readonly kind: NativeHarnessHistoryRecoveryAuxKind;
+  /** Storage-root-relative POSIX path. */
+  readonly relativePath: string;
+  /** Fixed bounded ancestors between the storage root and the target parent. */
+  readonly ancestorRelativePaths: readonly string[];
+  readonly capBytes: number;
+}
+
+export type NativeHarnessHistoryRecoveryHistoricalCleanupDeclaration =
+  | "recorded-no-launch"
+  | "declared-cleanup-observed"
+  | "synthetic-fixture-not-proof"
+  | "no-cleanup-recorded"
+  | "unknown";
+
+export interface NativeHarnessHistoryRecoveryHistoricalCleanup {
+  readonly declaration: NativeHarnessHistoryRecoveryHistoricalCleanupDeclaration;
+  readonly spawnAttempted: boolean | null;
+  readonly closeSeen: boolean | null;
+  readonly groupObservation: "not-observed" | "present" | "unknown" | null;
+  readonly hostWorkSettled: boolean | null;
+  readonly approvalWorkSettled: boolean | null;
+  readonly logFlush: "success" | "failure" | null;
+}
+
+export interface NativeHarnessHistoryRecoveryAttemptTarget {
+  readonly targetId: string;
+  readonly ordinal: number;
+  readonly nonce: string;
+  readonly stage: string;
+  readonly attempt: number;
+  readonly dispatchState: string;
+  readonly pid: number | null;
+  readonly pgid: number | null;
+  readonly processIdentitySha256: string | null;
+  readonly launchRuntimeRoot: string | null;
+  readonly workerOwner: NativeHarnessHistoryRecoveryAuxTarget | null;
+  readonly historicalCleanup: NativeHarnessHistoryRecoveryHistoricalCleanup;
+  readonly problem: NativeHarnessHistoryProcessReason | null;
+}
+
+export interface NativeHarnessHistoryRecoveryTargets {
+  readonly attempts: readonly NativeHarnessHistoryRecoveryAttemptTarget[];
+  readonly controllerOwner: NativeHarnessHistoryRecoveryAuxTarget;
+  readonly cancel: NativeHarnessHistoryRecoveryAuxTarget;
+  readonly problems: readonly NativeHarnessHistoryProcessReason[];
+  readonly workerOwnerTargets: number;
+  readonly auxTargetsPerRound: number;
+  readonly auxChargePerRound: number;
+  readonly auxChargeTotal: number;
+  /** True when the whole lifecycle target set was refused before any effect. */
+  readonly refused: boolean;
+  readonly inventoryRows: number;
+}
+
+function historicalCleanupFor(
+  state: string,
+  cleanup: NativeHarnessHistoryRecoveryCleanupInput | null,
+): NativeHarnessHistoryRecoveryHistoricalCleanup {
+  if (cleanup !== null && cleanup.observationKind === "synthetic-fixture") {
+    return Object.freeze({
+      declaration: "synthetic-fixture-not-proof" as const,
+      spawnAttempted: null,
+      closeSeen: null,
+      groupObservation: null,
+      hostWorkSettled: null,
+      approvalWorkSettled: null,
+      logFlush: null,
+    });
+  }
+  if (cleanup !== null) {
+    return Object.freeze({
+      declaration: cleanup.spawnAttempted
+        ? "declared-cleanup-observed" as const
+        : "recorded-no-launch" as const,
+      spawnAttempted: cleanup.spawnAttempted,
+      closeSeen: cleanup.closeSeen,
+      groupObservation: cleanup.groupObservation,
+      hostWorkSettled: cleanup.hostWorkSettled,
+      approvalWorkSettled: cleanup.approvalWorkSettled,
+      logFlush: cleanup.logFlush,
+    });
+  }
+  // An intended row and a launch gap without a process bound have no real
+  // no-spawn receipt. They stay unknown rather than becoming cleanup proof.
+  if (state === "intended" || state === "launch-pending") {
+    return Object.freeze({
+      declaration: "unknown" as const,
+      spawnAttempted: null,
+      closeSeen: null,
+      groupObservation: null,
+      hostWorkSettled: null,
+      approvalWorkSettled: null,
+      logFlush: null,
+    });
+  }
+  return Object.freeze({
+    declaration: "no-cleanup-recorded" as const,
+    spawnAttempted: null,
+    closeSeen: null,
+    groupObservation: null,
+    hostWorkSettled: null,
+    approvalWorkSettled: null,
+    logFlush: null,
+  });
+}
+
+function recoveryAuxTarget(
+  targetId: string,
+  kind: NativeHarnessHistoryRecoveryAuxKind,
+  relativePath: string,
+  ancestorRelativePaths: readonly string[],
+  capBytes: number,
+): NativeHarnessHistoryRecoveryAuxTarget {
+  return Object.freeze({
+    targetId,
+    kind,
+    relativePath,
+    ancestorRelativePaths: Object.freeze([...ancestorRelativePaths]),
+    capBytes,
+  });
+}
+
+/**
+ * Pure recovery target derivation over the already decoded inventory v2 rows.
+ * Unlike the original R1 target list it never deduplicates by stage: every
+ * ordinal+nonce attempt identity is retained, up to the inventory's 32-row
+ * bound. Invalid layout rows keep their process/historical facts but receive
+ * no worker-owner path.
+ */
+export function deriveNativeHarnessHistoryRecoveryTargets(
+  storageRoot: string,
+  runRelativeRoot: string,
+  runId: string,
+  rows: readonly NativeHarnessHistoryRecoveryRowInput[],
+): NativeHarnessHistoryRecoveryTargets {
+  const problems: NativeHarnessHistoryProcessReason[] = [];
+  const attempts: NativeHarnessHistoryRecoveryAttemptTarget[] = [];
+  const controllerOwner = recoveryAuxTarget(
+    "controller-owner",
+    "controller-owner",
+    `${runRelativeRoot}/.run.lock/owner.json`,
+    [`${runRelativeRoot}/.run.lock`],
+    NATIVE_HARNESS_HISTORY_RECOVERY_LIMITS.ownerCapBytes,
+  );
+  const cancel = recoveryAuxTarget(
+    "cancel",
+    "cancel",
+    `${runRelativeRoot}/cancel.request`,
+    [],
+    NATIVE_HARNESS_HISTORY_RECOVERY_LIMITS.cancelCapBytes,
+  );
+  if (rows.length > NATIVE_HARNESS_HISTORY_RECOVERY_LIMITS.maxAttempts) {
+    // Admission is all-or-nothing: never truncate to a plausible subset.
+    return Object.freeze({
+      attempts: Object.freeze([]),
+      controllerOwner,
+      cancel,
+      problems: Object.freeze([processReason(
+        "recovery-attempt-limit",
+        `More than ${NATIVE_HARNESS_HISTORY_RECOVERY_LIMITS.maxAttempts} inventory rows were supplied; lifecycle observation was refused before any auxiliary read or probe.`,
+      )]),
+      workerOwnerTargets: 0,
+      auxTargetsPerRound: 0,
+      auxChargePerRound: 0,
+      auxChargeTotal: 0,
+      refused: true,
+      inventoryRows: rows.length,
+    });
+  }
+  for (const row of rows) {
+    if (!isPositiveSafeInteger(row.ordinal) || !UUID_PATTERN.test(row.nonce)) {
+      const problem = processReason(
+        "recovery-attempt-identity",
+        "An inventory row does not carry a positive ordinal and canonical nonce identity.",
+      );
+      problems.push(problem);
+      continue;
+    }
+    const targetId = `attempt-${row.ordinal}-${row.nonce}`;
+    let problem: NativeHarnessHistoryProcessReason | null = null;
+    let workerOwner: NativeHarnessHistoryRecoveryAuxTarget | null = null;
+    if (!isPositiveSafeInteger(row.attempt)) {
+      problem = processReason(
+        "recovery-attempt-invalid",
+        "An inventory row attempt is not a positive safe integer.",
+      );
+    } else {
+      const layout = stageCwdLayout(
+        storageRoot,
+        runRelativeRoot,
+        runId,
+        row.stage,
+        row.attempt,
+        row.cwd,
+      );
+      if (!layout.ok) {
+        problem = layout.problem;
+      } else {
+        const expectedArtifactDir = path.join(
+          storageRoot,
+          runRelativeRoot,
+          "stages",
+          row.stage,
+          layout.attemptDirectory,
+          "artifacts",
+        );
+        if (row.artifactDir !== expectedArtifactDir) {
+          problem = processReason(
+            "recovery-artifact-dir-mismatch",
+            "An inventory row artifact directory is not the exact selected-run/stage/attempt sibling.",
+          );
+        } else {
+          const artifactRelativePath = `${runRelativeRoot}/stages/${row.stage}/${layout.attemptDirectory}/artifacts`;
+          workerOwner = recoveryAuxTarget(
+            `${targetId}-worker-owner`,
+            "worker-owner",
+            `${artifactRelativePath}/worker-owner.json`,
+            [
+              `${runRelativeRoot}/stages`,
+              `${runRelativeRoot}/stages/${row.stage}`,
+              `${runRelativeRoot}/stages/${row.stage}/${layout.attemptDirectory}`,
+              artifactRelativePath,
+            ],
+            NATIVE_HARNESS_HISTORY_RECOVERY_LIMITS.ownerCapBytes,
+          );
+        }
+      }
+    }
+    if (problem !== null) problems.push(problem);
+    attempts.push(Object.freeze({
+      targetId,
+      ordinal: row.ordinal,
+      nonce: row.nonce,
+      stage: row.stage,
+      attempt: row.attempt,
+      dispatchState: row.state,
+      pid: row.pid,
+      pgid: row.pgid,
+      processIdentitySha256: row.processIdentitySha256,
+      launchRuntimeRoot: row.launchRuntimeRoot,
+      workerOwner,
+      historicalCleanup: historicalCleanupFor(row.state, row.cleanup),
+      problem,
+    }));
+  }
+  const workerOwnerTargets = attempts.filter((attempt) => attempt.workerOwner !== null).length;
+  const auxTargetsPerRound = workerOwnerTargets + 2;
+  const auxChargePerRound = attempts.reduce(
+    (sum, attempt) => sum + (attempt.workerOwner?.capBytes ?? 0),
+    controllerOwner.capBytes + cancel.capBytes,
+  );
+  return Object.freeze({
+    attempts: Object.freeze(attempts),
+    controllerOwner,
+    cancel,
+    problems: Object.freeze(problems),
+    workerOwnerTargets,
+    auxTargetsPerRound,
+    auxChargePerRound,
+    auxChargeTotal: auxChargePerRound * 2,
+    refused: false,
+    inventoryRows: rows.length,
+  });
+}
+
+/* ------------------------------------------------------------------------- */
+/* Fixed synchronous signal-0 probes                                         */
+/* ------------------------------------------------------------------------- */
+
+export interface NativeHarnessHistoryRecoveryProbeFact {
+  readonly kind: "process-group" | "controller-pid";
+  readonly targetId: string;
+  readonly ordinal: number | null;
+  readonly nonce: string | null;
+  readonly stage: string | null;
+  readonly attempt: number | null;
+  readonly pid: number | null;
+  readonly pgid: number | null;
+  /** Positive PID or negative PGID actually passed to the seam. */
+  readonly queryPid: number | null;
+  readonly signal: 0;
+  readonly applicable: boolean;
+  readonly called: boolean;
+  readonly presence: NativeHarnessHistoryProcessPresence;
+  readonly refused: boolean;
+  readonly problem: NativeHarnessHistoryProcessReason | null;
+}
+
+function refusedProbe(
+  base: Omit<NativeHarnessHistoryRecoveryProbeFact, "signal" | "applicable" | "called" | "presence" | "refused" | "problem" | "queryPid">,
+  detail: string,
+): NativeHarnessHistoryRecoveryProbeFact {
+  return Object.freeze({
+    ...base,
+    queryPid: null,
+    signal: 0 as const,
+    applicable: false,
+    called: false,
+    presence: "unknown" as const,
+    refused: true,
+    problem: processReason("probe-target-refused", detail),
+  });
+}
+
+function runSignalProbe(
+  base: Omit<NativeHarnessHistoryRecoveryProbeFact, "signal" | "called" | "presence" | "refused" | "problem" | "queryPid">,
+  targetPid: number,
+  seam: NativeHarnessHistorySignalQuery,
+): NativeHarnessHistoryRecoveryProbeFact {
+  let result: unknown;
+  try {
+    result = (seam as (pid: number, signal: 0) => unknown)(targetPid, 0);
+  } catch (error) {
+    let code: string | null = null;
+    try {
+      if (typeof error === "object" && error !== null) {
+        const descriptor = Object.getOwnPropertyDescriptor(error, "code");
+        if (descriptor !== undefined && "value" in descriptor && typeof descriptor.value === "string") {
+          code = descriptor.value;
+        }
+      }
+    } catch {
+      code = null;
+    }
+    if (code === "ESRCH") {
+      return Object.freeze({
+        ...base,
+        queryPid: targetPid,
+        signal: 0 as const,
+        called: true,
+        presence: "not-observed" as const,
+        refused: false,
+        problem: processReason(
+          "probe-not-observed",
+          "The fixed signal-0 query returned ESRCH in this round; this is an interval observation, never proof about a later process.",
+        ),
+      });
+    }
+    return Object.freeze({
+      ...base,
+      queryPid: targetPid,
+      signal: 0 as const,
+      called: true,
+      presence: "unknown" as const,
+      refused: false,
+      problem: processReason(
+        "probe-unknown",
+        code === "EPERM" || code === "EINVAL"
+          ? "The fixed signal-0 query was refused; presence and absence are unknown."
+          : "The fixed signal-0 query failed or was unusable; presence and absence are unknown.",
+      ),
+    });
+  }
+  if (result !== undefined) {
+    return Object.freeze({
+      ...base,
+      queryPid: targetPid,
+      signal: 0 as const,
+      called: true,
+      presence: "unknown" as const,
+      refused: false,
+      problem: processReason(
+        "probe-seam-unusable",
+        "The fixed signal-0 seam returned a non-void or asynchronous result; it is not treated as presence.",
+      ),
+    });
+  }
+  return Object.freeze({
+    ...base,
+    queryPid: targetPid,
+    signal: 0 as const,
+    called: true,
+    presence: "present" as const,
+    refused: false,
+    problem: null,
+  });
+}
+
+/**
+ * One fresh inventory-PGID query. PGID <= 1 is refused before the seam is
+ * invoked; no leader-PID query is substituted for group observation.
+ */
+export function probeNativeHarnessHistoryRecoveryGroup(
+  attempt: NativeHarnessHistoryRecoveryAttemptTarget,
+  seam: NativeHarnessHistorySignalQuery,
+): NativeHarnessHistoryRecoveryProbeFact {
+  const base = {
+    kind: "process-group" as const,
+    targetId: attempt.targetId,
+    ordinal: attempt.ordinal,
+    nonce: attempt.nonce,
+    stage: attempt.stage,
+    attempt: attempt.attempt,
+    pid: attempt.pid,
+    pgid: attempt.pgid,
+  };
+  if (attempt.pgid === null) {
+    return Object.freeze({
+      ...base,
+      queryPid: null,
+      signal: 0 as const,
+      applicable: false,
+      called: false,
+      presence: "unknown" as const,
+      refused: false,
+      problem: processReason("probe-no-process-group", "The inventory row has no recorded process PGID."),
+    });
+  }
+  if (!isPositiveSafeInteger(attempt.pgid) || attempt.pgid <= 1) {
+    return refusedProbe(base, "The recorded process PGID is not greater than 1; no query was made.");
+  }
+  return runSignalProbe({ ...base, applicable: true }, -attempt.pgid, seam);
+}
+
+export function probeNativeHarnessHistoryRecoveryController(
+  pid: number,
+  seam: NativeHarnessHistorySignalQuery,
+): NativeHarnessHistoryRecoveryProbeFact {
+  const base = {
+    kind: "controller-pid" as const,
+    targetId: "controller-owner",
+    ordinal: null,
+    nonce: null,
+    stage: null,
+    attempt: null,
+    pid,
+    pgid: null,
+  };
+  if (!isPositiveSafeInteger(pid)) {
+    return refusedProbe(base, "The observed controller owner PID is not a positive safe integer.");
+  }
+  return runSignalProbe({ ...base, applicable: true }, pid, seam);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Declared worker association                                               */
+/* ------------------------------------------------------------------------- */
+
+export type NativeHarnessHistoryRecoveryBindingState =
+  | "matches"
+  | "mismatch"
+  | "not-observed"
+  | "not-applicable"
+  | "unknown";
+
+export interface NativeHarnessHistoryRecoveryWorkerBinding {
+  readonly state: NativeHarnessHistoryRecoveryBindingState;
+  /** Recomputed original Runner association; never a process-birth proof. */
+  readonly associationSha256: string | null;
+  readonly declaredIdentitySha256: string | null;
+  readonly problem: NativeHarnessHistoryProcessReason | null;
+}
+
+function bindingProblem(state: NativeHarnessHistoryRecoveryBindingState, detail: string): NativeHarnessHistoryRecoveryWorkerBinding {
+  return Object.freeze({
+    state,
+    associationSha256: null,
+    declaredIdentitySha256: null,
+    problem: processReason(`worker-binding-${state}`, detail),
+  });
+}
+
+/**
+ * Recomputes the original Runner association over key-sorted canonical JSON of
+ * {runId,stage,runtimeRoot,pid,pgid,startedAt} with no trailing LF. The owner's
+ * privateRuntimeRoot supplies runtimeRoot. Owner JSON, nonce and attempt are
+ * never hashed or added.
+ */
+export function bindNativeHarnessHistoryRecoveryWorker(
+  attempt: NativeHarnessHistoryRecoveryAttemptTarget,
+  runId: string,
+  read: NativeHarnessHistoryProcessOwnerRead | null,
+): NativeHarnessHistoryRecoveryWorkerBinding {
+  if (attempt.pid === null && attempt.pgid === null) {
+    if (attempt.launchRuntimeRoot !== null) {
+      return bindingProblem(
+        "unknown",
+        "A launch was recorded without a process-bound PID/PGID; the process association remains unknown.",
+      );
+    }
+    return bindingProblem("not-applicable", "The inventory row has no process-bound association.");
+  }
+  if (read === null || read.state === "not-attempted" || read.state === "missing") {
+    return bindingProblem(
+      "not-observed",
+      "The worker owner record is absent or was not attempted; this remains missing, not dead.",
+    );
+  }
+  if (read.state !== "observed" || read.declaration === null) {
+    return bindingProblem(
+      "unknown",
+      read.problem?.detail ?? "The worker owner record could not be decoded for association.",
+    );
+  }
+  const declaration = read.declaration;
+  if (declaration.kind !== "worker") {
+    return bindingProblem("mismatch", "The worker target decoded a non-worker owner declaration.");
+  }
+  if (
+    attempt.pid === null
+    || attempt.pgid === null
+    || attempt.launchRuntimeRoot === null
+    || declaration.runId !== runId
+    || declaration.stage !== attempt.stage
+    || declaration.pid !== attempt.pid
+    || declaration.pgid !== attempt.pgid
+    || declaration.privateRuntimeRoot !== attempt.launchRuntimeRoot
+  ) {
+    return bindingProblem(
+      "mismatch",
+      "The worker owner run/stage/PID/PGID/runtime facts do not match the inventory row.",
+    );
+  }
+  const associationPayload = JSON.stringify({
+    pgid: declaration.pgid,
+    pid: declaration.pid,
+    runId: declaration.runId,
+    runtimeRoot: declaration.privateRuntimeRoot,
+    stage: declaration.stage,
+    startedAt: declaration.startedAt,
+  });
+  const associationSha256 = sha256Hex(associationPayload);
+  if (attempt.processIdentitySha256 === null) {
+    return Object.freeze({
+      state: "unknown" as const,
+      associationSha256,
+      declaredIdentitySha256: null,
+      problem: processReason(
+        "worker-binding-identity-missing",
+        "The inventory row does not carry a recorded association digest for comparison.",
+      ),
+    });
+  }
+  if (attempt.processIdentitySha256 !== associationSha256) {
+    return Object.freeze({
+      state: "mismatch" as const,
+      associationSha256,
+      declaredIdentitySha256: attempt.processIdentitySha256,
+      problem: processReason(
+        "worker-binding-digest-mismatch",
+        "The recomputed Runner association does not match the inventory row identity; this is not process-birth authentication.",
+      ),
+    });
+  }
+  return Object.freeze({
+    state: "matches" as const,
+    associationSha256,
+    declaredIdentitySha256: attempt.processIdentitySha256,
+    problem: null,
+  });
+}
+
+/* ------------------------------------------------------------------------- */
+/* Factual lifecycle projection                                              */
+/* ------------------------------------------------------------------------- */
+
+export interface NativeHarnessHistoryRecoveryAuxFact {
+  readonly kind: NativeHarnessHistoryRecoveryAuxKind;
+  readonly state: NativeHarnessHistoryRecoveryAuxState;
+  readonly exists: boolean | null;
+  readonly bytes: number | null;
+  readonly sha256: string | null;
+  readonly openedFiles: 0 | 1;
+  readonly closeAttempted: boolean;
+  readonly closeSettled: boolean;
+  readonly closeSucceeded: boolean;
+  readonly missingAt: NativeHarnessHistoryRecoveryAuxMissingAt | null;
+  readonly ownerState: NativeHarnessHistoryProcessOwnerState | null;
+  readonly ownerPid: number | null;
+  readonly ownerPgid: number | null;
+  readonly ownerSha256: string | null;
+  readonly problem: NativeHarnessHistoryProcessReason | null;
+}
+
+export type NativeHarnessHistoryRecoveryComparison =
+  | "stable"
+  | "different"
+  | "unavailable"
+  | "not-attempted"
+  | "revoked";
+
+export type NativeHarnessHistoryRecoveryStatus =
+  | "stable"
+  | "different"
+  | "unavailable"
+  | "not-observed"
+  | "aborted"
+  | "expired"
+  | "revoked";
+
+export interface NativeHarnessHistoryRecoveryAttemptSummaryInput {
+  readonly target: NativeHarnessHistoryRecoveryAttemptTarget;
+  readonly round1Worker: NativeHarnessHistoryRecoveryAuxFact | null;
+  readonly round2Worker: NativeHarnessHistoryRecoveryAuxFact | null;
+  readonly binding1: NativeHarnessHistoryRecoveryWorkerBinding | null;
+  readonly binding2: NativeHarnessHistoryRecoveryWorkerBinding | null;
+  readonly group1: NativeHarnessHistoryRecoveryProbeFact | null;
+  readonly group2: NativeHarnessHistoryRecoveryProbeFact | null;
+  readonly workerComparison: NativeHarnessHistoryRecoveryComparison;
+  readonly groupComparison: NativeHarnessHistoryRecoveryComparison;
+  readonly coverage: "complete" | "partial" | "unavailable";
+}
+
+export interface NativeHarnessHistoryRecoveryControllerSummaryInput {
+  readonly round1Owner: NativeHarnessHistoryRecoveryAuxFact | null;
+  readonly round2Owner: NativeHarnessHistoryRecoveryAuxFact | null;
+  readonly probe1: NativeHarnessHistoryRecoveryProbeFact | null;
+  readonly probe2: NativeHarnessHistoryRecoveryProbeFact | null;
+  readonly ownerComparison: NativeHarnessHistoryRecoveryComparison;
+  readonly probeComparison: NativeHarnessHistoryRecoveryComparison;
+  readonly lockDirectory1: "present" | "missing" | "unsafe" | "unknown" | "not-attempted";
+  readonly lockDirectory2: "present" | "missing" | "unsafe" | "unknown" | "not-attempted";
+}
+
+export interface NativeHarnessHistoryRecoveryCancelSummaryInput {
+  readonly round1: NativeHarnessHistoryRecoveryAuxFact | null;
+  readonly round2: NativeHarnessHistoryRecoveryAuxFact | null;
+  readonly status: "requested" | "not-observed" | "unknown" | "not-attempted";
+  readonly comparison: NativeHarnessHistoryRecoveryComparison;
+}
+
+export interface NativeHarnessHistoryRecoveryWindowInput {
+  readonly budgetMs: 5_000;
+  readonly startedAt: number;
+  readonly deadlineAt: number;
+  readonly checkedAt: number;
+  readonly expired: boolean;
+  readonly globalDeadlineAt: number;
+  readonly roundsStarted: 0 | 1 | 2;
+}
+
+export interface NativeHarnessHistoryRecoveryProjectionInput {
+  readonly attempts: readonly NativeHarnessHistoryRecoveryAttemptSummaryInput[];
+  readonly controller: NativeHarnessHistoryRecoveryControllerSummaryInput;
+  readonly cancel: NativeHarnessHistoryRecoveryCancelSummaryInput;
+  readonly inventoryRows: number;
+  readonly auxAttemptsRound1: number;
+  readonly auxAttemptsRound2: number;
+  readonly auxChargedBytes: number;
+  readonly probesRound1: number;
+  readonly probesRound2: number;
+  readonly window: NativeHarnessHistoryRecoveryWindowInput;
+  readonly gate: "aborted" | "deadline-expired" | null;
+  readonly prerequisiteFailure: NativeHarnessHistoryProcessReason | null;
+  readonly derivationProblems: readonly NativeHarnessHistoryProcessReason[];
+  readonly finalPrimaryStatus: NativeHarnessReconciliationFilesStatusInput;
+  readonly revokedReasons: readonly string[];
+}
+
+/** Mirrors the collector's final primary status without a runtime import cycle. */
+export type NativeHarnessReconciliationFilesStatusInput =
+  | "stable"
+  | "different"
+  | "unavailable"
+  | "unknown"
+  | "aborted"
+  | "expired";
+
+export interface NativeHarnessHistoryRecoveryAttemptProjection {
+  readonly targetId: string;
+  readonly ordinal: number;
+  readonly nonce: string;
+  readonly stage: string;
+  readonly attempt: number;
+  readonly dispatchState: string;
+  readonly pid: number | null;
+  readonly pgid: number | null;
+  readonly inventoryIdentitySha256: string | null;
+  readonly historicalCleanup: NativeHarnessHistoryRecoveryHistoricalCleanup;
+  readonly worker: {
+    readonly round1: NativeHarnessHistoryRecoveryAuxFact | null;
+    readonly round2: NativeHarnessHistoryRecoveryAuxFact | null;
+    readonly comparison: NativeHarnessHistoryRecoveryComparison;
+    readonly binding1: NativeHarnessHistoryRecoveryWorkerBinding | null;
+    readonly binding2: NativeHarnessHistoryRecoveryWorkerBinding | null;
+  };
+  readonly group: {
+    readonly round1: NativeHarnessHistoryRecoveryProbeFact | null;
+    readonly round2: NativeHarnessHistoryRecoveryProbeFact | null;
+    readonly comparison: NativeHarnessHistoryRecoveryComparison;
+  };
+  readonly coverage: "complete" | "partial" | "unavailable";
+}
+
+export interface NativeHarnessHistoryRecoveryLifecycleFacts {
+  readonly status: NativeHarnessHistoryRecoveryStatus;
+  readonly provisionalStatus: Exclude<NativeHarnessHistoryRecoveryStatus, "revoked">;
+  readonly revoked: boolean;
+  readonly revokedReasons: readonly string[];
+  readonly failure: NativeHarnessHistoryProcessReason | null;
+  readonly rounds: 2;
+  readonly coverage: {
+    readonly inventoryRows: number;
+    readonly attemptTargets: number;
+    readonly workerOwnerTargets: number;
+    readonly completeAttempts: number;
+    readonly auxAttemptsRound1: number;
+    readonly auxAttemptsRound2: number;
+    readonly auxChargedBytes: number;
+    readonly auxChargeLimitBytes: 1_081_472;
+    readonly auxTargetLimitPerRound: 34;
+    readonly probesRound1: number;
+    readonly probesRound2: number;
+    readonly probeLimitPerRound: 33;
+    readonly maxOpenedFiles: 1;
+  };
+  readonly completeAttemptCoverage: {
+    readonly status: "complete" | "incomplete" | "unavailable" | "not-required";
+    readonly detail: string;
+  };
+  readonly attempts: readonly NativeHarnessHistoryRecoveryAttemptProjection[];
+  readonly currentGroups: {
+    readonly status: NativeHarnessHistoryRecoveryStatus;
+    readonly round1: {
+      readonly present: number;
+      readonly notObserved: number;
+      readonly unknown: number;
+      readonly refused: number;
+    };
+    readonly round2: {
+      readonly present: number;
+      readonly notObserved: number;
+      readonly unknown: number;
+      readonly refused: number;
+    };
+    readonly absenceObservation:
+      | "not-applicable"
+      | "all-known-groups-not-observed-in-both-rounds"
+      | "some-known-groups-present"
+      | "unknown";
+    readonly claim: "interval-observation-only-never-future-permission";
+  };
+  readonly controllerLease: {
+    readonly status: NativeHarnessHistoryRecoveryStatus;
+    readonly lockDirectoryRound1: "present" | "missing" | "unsafe" | "unknown" | "not-attempted";
+    readonly lockDirectoryRound2: "present" | "missing" | "unsafe" | "unknown" | "not-attempted";
+    readonly ownerRound1: NativeHarnessHistoryRecoveryAuxFact | null;
+    readonly ownerRound2: NativeHarnessHistoryRecoveryAuxFact | null;
+    readonly ownerComparison: NativeHarnessHistoryRecoveryComparison;
+    readonly probe1: NativeHarnessHistoryRecoveryProbeFact | null;
+    readonly probe2: NativeHarnessHistoryRecoveryProbeFact | null;
+    readonly probeComparison: NativeHarnessHistoryRecoveryComparison;
+    readonly ownerPid: number | null;
+    readonly claim: "lock-owner-declaration-and-interval-presence-only";
+  };
+  readonly cancel: {
+    readonly status: "requested" | "not-observed" | "unknown" | "not-attempted";
+    readonly round1: NativeHarnessHistoryRecoveryAuxFact | null;
+    readonly round2: NativeHarnessHistoryRecoveryAuxFact | null;
+    readonly comparison: NativeHarnessHistoryRecoveryComparison;
+    readonly claim: "existence-only-no-generation-or-clear";
+  };
+  readonly historicalCleanup: {
+    readonly recordedNoLaunch: number;
+    readonly declaredCleanupObserved: number;
+    readonly syntheticFixtureNotProof: number;
+    readonly noCleanupRecorded: number;
+    readonly unknown: number;
+    readonly claim: "declared-inventory-facts-not-fresh-os-proof";
+  };
+  readonly observationStability: {
+    readonly status: NativeHarnessHistoryRecoveryStatus;
+    readonly workerAuxStable: boolean | null;
+    readonly groupsStable: boolean | null;
+    readonly controllerStable: boolean | null;
+    readonly cancelStable: boolean | null;
+    readonly reasons: readonly string[];
+  };
+  readonly window: {
+    readonly budgetMs: 5_000;
+    readonly startedAt: number;
+    readonly deadlineAt: number;
+    readonly checkedAt: number;
+    readonly expired: boolean;
+    readonly constrainedByRemaining30s: boolean;
+    readonly roundsStarted: 0 | 1 | 2;
+    readonly soft: true;
+  };
+}
+
+function comparisonOf(...values: readonly NativeHarnessHistoryRecoveryComparison[]): NativeHarnessHistoryRecoveryComparison {
+  if (values.includes("different")) return "different";
+  if (values.includes("unavailable")) return "unavailable";
+  if (values.includes("not-attempted")) return "not-attempted";
+  return "stable";
+}
+
+function statusForComparison(comparison: NativeHarnessHistoryRecoveryComparison): NativeHarnessHistoryRecoveryStatus {
+  if (comparison === "stable") return "stable";
+  if (comparison === "different") return "different";
+  if (comparison === "not-attempted") return "not-observed";
+  return "unavailable";
+}
+
+function countProbeRound(
+  attempts: readonly NativeHarnessHistoryRecoveryAttemptSummaryInput[],
+  round: 1 | 2,
+): NativeHarnessHistoryRecoveryLifecycleFacts["currentGroups"]["round1"] {
+  let present = 0;
+  let notObserved = 0;
+  let unknown = 0;
+  let refused = 0;
+  for (const attempt of attempts) {
+    const fact = round === 1 ? attempt.group1 : attempt.group2;
+    if (fact === null) continue;
+    if (fact.refused) refused += 1;
+    if (fact.presence === "present") present += 1;
+    else if (fact.presence === "not-observed") notObserved += 1;
+    else unknown += 1;
+  }
+  return Object.freeze({ present, notObserved, unknown, refused });
+}
+
+/**
+ * Projects already-observed round facts into separate factual axes. No
+ * allStopped/recoverable/eligible/authority boolean is produced. A final
+ * primary refusal changes any provisional stable lifecycle presentation to
+ * revoked while retaining bounded counters and per-attempt facts.
+ */
+export function projectNativeHarnessHistoryRecoveryLifecycle(
+  input: NativeHarnessHistoryRecoveryProjectionInput,
+): NativeHarnessHistoryRecoveryLifecycleFacts {
+  const attemptComparisons = input.attempts.flatMap((attempt) => [
+    attempt.workerComparison,
+    attempt.groupComparison,
+  ]);
+  const controllerComparisons = [input.controller.ownerComparison, input.controller.probeComparison];
+  const cancelComparison = input.cancel.comparison;
+  const allComparisons = [...attemptComparisons, ...controllerComparisons, cancelComparison];
+  let provisional: Exclude<NativeHarnessHistoryRecoveryStatus, "revoked">;
+  let failure: NativeHarnessHistoryProcessReason | null = input.prerequisiteFailure;
+  if (input.prerequisiteFailure !== null) {
+    provisional = "unavailable";
+  } else if (input.gate === "aborted") {
+    provisional = "aborted";
+    failure = processReason("lifecycle-aborted", "The host signal aborted the fixed lifecycle window.");
+  } else if (input.gate === "deadline-expired" || input.window.expired) {
+    provisional = "expired";
+    failure = processReason("lifecycle-expired", "The fixed lifecycle window expired; no later phases were started.");
+  } else if (input.derivationProblems.length !== 0) {
+    provisional = "unavailable";
+    failure = input.derivationProblems[0]!;
+  } else if (allComparisons.includes("different")) {
+    provisional = "different";
+  } else if (input.window.roundsStarted < 2) {
+    provisional = "unavailable";
+    failure = processReason("lifecycle-rounds-incomplete", "Fewer than two lifecycle rounds were started.");
+  } else if (
+    allComparisons.includes("unavailable")
+    || allComparisons.includes("not-attempted")
+    || input.attempts.some((attempt) => attempt.coverage !== "complete")
+  ) {
+    provisional = "unavailable";
+    failure = failure ?? processReason("lifecycle-coverage-incomplete", "One or more lifecycle facts were unavailable.");
+  } else {
+    provisional = "stable";
+  }
+
+  const primaryRefused = input.finalPrimaryStatus !== "stable";
+  // Any control/time refusal after the lifecycle phase started is sticky for
+  // presentation purposes even when the whole lifecycle was already
+  // unavailable. Failures before the first round cannot leave a stable nested
+  // presentation, so they are not "refusals" of observed facts.
+  const controlRefused = input.gate !== null
+    || (input.prerequisiteFailure !== null && input.window.roundsStarted > 0);
+  const finalRefused = primaryRefused || controlRefused;
+  const workerComparisons = input.attempts.map((attempt) => attempt.workerComparison);
+  const groupComparisons = input.attempts.map((attempt) => attempt.groupComparison);
+  const workerAuxComparison = comparisonOf(...workerComparisons);
+  const groupsComparison = comparisonOf(...groupComparisons);
+  const controllerComparison = comparisonOf(...controllerComparisons);
+  const hadStablePresentation = provisional === "stable"
+    || attemptComparisons.includes("stable")
+    || workerAuxComparison === "stable"
+    || groupsComparison === "stable"
+    || controllerComparison === "stable"
+    || cancelComparison === "stable";
+  const revoked = finalRefused && hadStablePresentation;
+  const status: NativeHarnessHistoryRecoveryStatus = primaryRefused && revoked ? "revoked" : provisional;
+  const revokedReasons = revoked ? Object.freeze([...input.revokedReasons]) : Object.freeze([] as string[]);
+  const presentedComparison = (comparison: NativeHarnessHistoryRecoveryComparison): NativeHarnessHistoryRecoveryComparison =>
+    finalRefused && comparison === "stable" ? "revoked" : comparison;
+
+  const attempts: NativeHarnessHistoryRecoveryAttemptProjection[] = input.attempts.map((attempt) =>
+    Object.freeze({
+      targetId: attempt.target.targetId,
+      ordinal: attempt.target.ordinal,
+      nonce: attempt.target.nonce,
+      stage: attempt.target.stage,
+      attempt: attempt.target.attempt,
+      dispatchState: attempt.target.dispatchState,
+      pid: attempt.target.pid,
+      pgid: attempt.target.pgid,
+      inventoryIdentitySha256: attempt.target.processIdentitySha256,
+      historicalCleanup: attempt.target.historicalCleanup,
+      worker: Object.freeze({
+        round1: attempt.round1Worker,
+        round2: attempt.round2Worker,
+        comparison: presentedComparison(attempt.workerComparison),
+        binding1: attempt.binding1,
+        binding2: attempt.binding2,
+      }),
+      group: Object.freeze({
+        round1: attempt.group1,
+        round2: attempt.group2,
+        comparison: presentedComparison(attempt.groupComparison),
+      }),
+      coverage: attempt.coverage,
+    }),
+  );
+
+  const groupsStatus = statusForComparison(groupsComparison);
+  const controllerMissingBoth = input.controller.lockDirectory1 === "missing"
+    && input.controller.lockDirectory2 === "missing";
+  const controllerStatus = input.controller.ownerComparison === "stable"
+    && input.controller.round1Owner?.state === "missing"
+    && input.controller.round2Owner?.state === "missing"
+    ? "not-observed" as const
+    : controllerMissingBoth
+      ? "not-observed" as const
+      : statusForComparison(controllerComparison);
+
+  const round1Counts = countProbeRound(input.attempts, 1);
+  const round2Counts = countProbeRound(input.attempts, 2);
+  const anyPresence = round1Counts.present + round2Counts.present > 0;
+  const allKnownAbsent = input.attempts.length > 0
+    && input.attempts.every((attempt) =>
+      attempt.target.pgid !== null
+      && attempt.group1?.presence === "not-observed"
+      && attempt.group2?.presence === "not-observed");
+  const absenceObservation = input.attempts.every((attempt) => attempt.target.pgid === null)
+    ? "not-applicable" as const
+    : anyPresence
+      ? "some-known-groups-present" as const
+      : allKnownAbsent
+        ? "all-known-groups-not-observed-in-both-rounds" as const
+        : "unknown" as const;
+
+  const historicalCounts = {
+    recordedNoLaunch: 0,
+    declaredCleanupObserved: 0,
+    syntheticFixtureNotProof: 0,
+    noCleanupRecorded: 0,
+    unknown: 0,
+  };
+  for (const attempt of input.attempts) {
+    switch (attempt.target.historicalCleanup.declaration) {
+      case "recorded-no-launch": historicalCounts.recordedNoLaunch += 1; break;
+      case "declared-cleanup-observed": historicalCounts.declaredCleanupObserved += 1; break;
+      case "synthetic-fixture-not-proof": historicalCounts.syntheticFixtureNotProof += 1; break;
+      case "no-cleanup-recorded": historicalCounts.noCleanupRecorded += 1; break;
+      default: historicalCounts.unknown += 1; break;
+    }
+  }
+
+  const completeAttempts = input.attempts.filter((attempt) => attempt.coverage === "complete").length;
+  const zeroAttempts = input.attempts.length === 0;
+  const coverageComplete = input.prerequisiteFailure === null
+    && input.window.roundsStarted === 2
+    && !allComparisons.includes("not-attempted")
+    && completeAttempts === input.attempts.length;
+  const completeAttemptCoverageStatus = input.prerequisiteFailure !== null
+    ? "unavailable" as const
+    : zeroAttempts
+      // A valid empty inventory needs no attempt observation. This does not
+      // stand in for controller/cancel coverage or for stopped-process proof.
+      ? "not-required" as const
+      : coverageComplete
+        ? "complete" as const
+        : "incomplete" as const;
+
+  const stabilityStatus: NativeHarnessHistoryRecoveryStatus = revoked
+    ? "revoked"
+    : comparisonOf(workerAuxComparison, groupsComparison, controllerComparison, cancelComparison) === "stable"
+      && coverageComplete
+      ? "stable"
+      : statusForComparison(comparisonOf(workerAuxComparison, groupsComparison, controllerComparison, cancelComparison));
+  const stabilityReasons = Object.freeze([
+    ...input.derivationProblems.map((problem) => problem.detail),
+    ...(revoked ? input.revokedReasons : []),
+  ]);
+
+  return Object.freeze({
+    status,
+    provisionalStatus: provisional,
+    revoked,
+    revokedReasons,
+    failure,
+    rounds: 2 as const,
+    coverage: Object.freeze({
+      inventoryRows: input.inventoryRows,
+      attemptTargets: input.attempts.length,
+      workerOwnerTargets: input.attempts.filter((attempt) => attempt.target.workerOwner !== null).length,
+      completeAttempts,
+      auxAttemptsRound1: input.auxAttemptsRound1,
+      auxAttemptsRound2: input.auxAttemptsRound2,
+      auxChargedBytes: input.auxChargedBytes,
+      auxChargeLimitBytes: 1_081_472 as const,
+      auxTargetLimitPerRound: 34 as const,
+      probesRound1: input.probesRound1,
+      probesRound2: input.probesRound2,
+      probeLimitPerRound: 33 as const,
+      maxOpenedFiles: 1 as const,
+    }),
+    completeAttemptCoverage: Object.freeze({
+      status: completeAttemptCoverageStatus,
+      detail: completeAttemptCoverageStatus === "not-required"
+        ? "No inventory attempts were recorded; the attempt axis is explicitly empty and controller/cancel axes remain separate."
+        : completeAttemptCoverageStatus === "complete"
+          ? "Every inventory attempt was targeted in both fixed rounds."
+          : input.prerequisiteFailure?.detail
+            ?? "One or more inventory attempts lacked a complete two-round observation.",
+    }),
+    attempts: Object.freeze(attempts),
+    currentGroups: Object.freeze({
+      status: finalRefused && groupsStatus === "stable" ? "revoked" as const : groupsStatus,
+      round1: round1Counts,
+      round2: round2Counts,
+      absenceObservation,
+      claim: "interval-observation-only-never-future-permission" as const,
+    }),
+    controllerLease: Object.freeze({
+      status: finalRefused && controllerStatus === "stable" ? "revoked" as const : controllerStatus,
+      lockDirectoryRound1: input.controller.lockDirectory1,
+      lockDirectoryRound2: input.controller.lockDirectory2,
+      ownerRound1: input.controller.round1Owner,
+      ownerRound2: input.controller.round2Owner,
+      ownerComparison: presentedComparison(input.controller.ownerComparison),
+      probe1: input.controller.probe1,
+      probe2: input.controller.probe2,
+      probeComparison: presentedComparison(input.controller.probeComparison),
+      ownerPid: input.controller.round1Owner?.ownerPid ?? null,
+      claim: "lock-owner-declaration-and-interval-presence-only" as const,
+    }),
+    cancel: Object.freeze({
+      status: input.cancel.status,
+      round1: input.cancel.round1,
+      round2: input.cancel.round2,
+      comparison: presentedComparison(cancelComparison),
+      claim: "existence-only-no-generation-or-clear" as const,
+    }),
+    historicalCleanup: Object.freeze({
+      ...historicalCounts,
+      claim: "declared-inventory-facts-not-fresh-os-proof" as const,
+    }),
+    observationStability: Object.freeze({
+      status: stabilityStatus,
+      workerAuxStable: finalRefused ? null : workerAuxComparison === "stable",
+      groupsStable: finalRefused ? null : groupsComparison === "stable",
+      controllerStable: finalRefused ? null : controllerComparison === "stable",
+      cancelStable: finalRefused ? null : cancelComparison === "stable",
+      reasons: stabilityReasons,
+    }),
+    window: Object.freeze({
+      budgetMs: 5_000 as const,
+      startedAt: input.window.startedAt,
+      deadlineAt: input.window.deadlineAt,
+      checkedAt: input.window.checkedAt,
+      expired: input.window.expired,
+      constrainedByRemaining30s: input.window.deadlineAt < input.window.globalDeadlineAt,
+      roundsStarted: input.window.roundsStarted,
+      soft: true as const,
+    }),
   });
 }
 
