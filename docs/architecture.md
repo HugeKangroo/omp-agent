@@ -305,6 +305,67 @@ Accounting retains the original allocation and a cumulative highwater. Occupancy
 
 No schema value or identifier grants current intent, lease, stop or dispatch authority. No actual backend/Controller/Slot continuation, recovered completion provenance, runtime entry wiring, resume or default change is added. C2a storage is implemented; C1b leased current-intent/observation and C2b runtime same-run continuation remain open. All six deliverables remain OPEN; G5 precedes G4, G6/G7 are canceled and the real human C3 trial remains mandatory. Verification: [Testing](testing.md#same-owner-accounting-continuation-foundations-r2-c2a); release record: [Release notes](release-notes.md#same-owner-accounting-continuation-foundations-r2-c2a).
 
+### Controller-owned existing-run inspection (R2-C1b1)
+
+R2-C1b1 is accepted only as a bounded host-only readonly inspection of one existing original Harness run under that run's Store lease. It is not recovery, resume eligibility, cancellation, a full leased current-intent/observation join, stop proof, accounting continuation or a product pass. `NativeHarnessBackendHost.inspectExisting?` remains optional so existing host fakes stay valid; `createNativeHarnessBackend` always supplies the actual method and its return type makes it nonoptional. The backend still registers no entry or tool, creates no run or prepared root and starts no worker or provider call.
+
+| Surface | Exact contract |
+| --- | --- |
+| Target | One exact plain own-data `{runId, ownerId, selectorSha256, preparedRelativeRoot}`; `runId`/`ownerId` are lowercase UUIDs, `selectorSha256` is 64 lowercase hex characters, and `preparedRelativeRoot` is `omp-harness-` plus six ASCII alphanumerics. This is the existing B2-supported locator; no broader persistence or source format changes. |
+| Control | One exact plain own-data `{signal, guard}`. `signal` must be an actual host `AbortSignal` read through the intrinsic brand; `guard` must return `undefined` synchronously. A Promise/thenable guard result refuses, and a foreign thenable is never invoked. |
+| Context | One own-data `cwd` string, copied before the first await, normalized as a canonical absolute path. Other context fields establish no authority and are not used. |
+| Directories | The host storage root, direct-child prepared root, prepared workspace, prepared store and source root are each validated as actual non-link directories with matching resolved paths. |
+| Controller view | Frozen `{runId, ownerSha256, assertCurrent}` only. No lease handle, token, Store, mutable record, release function or commit is exposed; the view refuses after release. |
+| Inspector return | `void`, or one ordinary same-realm `Promise<void>` settled through the captured intrinsic `then`. Subclasses, custom/cross-realm prototypes, own `then`/`constructor`, accessor shadows and foreign thenables refuse before inherited species/accessor lookup or a foreign `then` call. |
+| Success | Frozen `{ok:true, diagnostic:{schema:"omp-agent.native-harness-existing-inspection.v1", readOnly:true, resumeAvailable:false, runId, leaseOwnerSha256, observation}}`, at most 128 KiB of UTF-8 JSON including the wrapper. |
+| Refusal | Bounded `{ok:false, reason}` with normalized printable ASCII of at most 320 characters and no diagnostic. |
+
+**Call order.** The implementation fixes this order so caller mutation cannot redirect a call:
+
+1. The factory captures and freezes host configuration; `inspectExisting` copies the target, control and context `cwd` before its first await.
+2. Target fields are read as exact own data and validated; unknown keys, accessors, symbols, unsupported prototypes and malformed UUIDs/SHA/root names refuse.
+3. Control fields are read and validated; the signal brand is checked intrinsically and an already-aborted signal refuses.
+4. The context path is normalized and required to be canonical absolute; no other context field is consulted.
+5. The storage root and the direct-child prepared, workspace, store and source roots are checked as actual non-link directories.
+6. The fixed observer and the original `HarnessController` are constructed; an own-data function inspector is captured once when present, while an inherited-only option is ignored.
+7. `inspectWithRecoveryLease` requires the actual signal and acquires the original Store lease once.
+8. The Controller checks signal and `assertCurrent`, invokes the inspector, accepts only the fixed return protocol, and checks signal and currentness again.
+9. The backend observer runs the existing B2 lifecycle under the lease, with the expected target, roots and build sourceId captured.
+10. The Controller always releases the lease; the backend then performs the post-release guard, clock and signal gates and publishes only a still-current wire.
+
+| Refusal class | Observed boundary |
+| --- | --- |
+| Malformed target/context/control | Exact own data, field types, UUID/SHA shape and root-name pattern are checked before observer IO. |
+| Invalid directory | Missing, symlink, non-directory, non-canonical or link-traversing storage/prepared/workspace/store/source refuses before the lease. |
+| Missing inspector | `inspectWithRecoveryLease` refuses before acquiring a lease when no own inspector was configured; an inherited-only option is not selected. |
+| Bad signal or guard | A fake/already-aborted signal, non-synchronous guard result, thrown guard or Promise/thenable guard result refuses; a thenable is never invoked. |
+| Controller callback shape | Thrown observer, non-void non-Promise result, subclass/custom-prototype/own-`then` Promise or foreign thenable refuses after acquisition and still releases. |
+| B2 pre-lifecycle refusal | Metadata incompatibility, incomplete coverage or build/source mismatch can stop before owner rounds; the wire is a bounded refusal, not a synthetic owner proof. |
+| Owner proof unavailable | Either owner round missing/unreadable or raw SHA mismatch refuses even if primary bytes are stable. |
+| Primary/lifecycle instability | Fewer or malformed captures, failed close, second-pass mismatch, unstable pins, expired window or unstable lifecycle refuses. |
+| Final gate | Guard failure, signal abort, unreadable signal, backward clock, expired deadline or oversized wire refuses after release and publishes no diagnostic. |
+
+At construction, `HarnessController` reads only an own `recoveryInspector` descriptor. An absent property or own `undefined` value means no inspector configured; a data descriptor with a function is captured once; an accessor descriptor or a non-function own value refuses. An inherited inspector is not selected: the constructor does not reject it, and `inspectWithRecoveryLease` later fails as unconfigured when there is no own inspector. `inspectWithRecoveryLease(runId, signal)` requires an actual intrinsic `AbortSignal` and calls the original Store's `acquireWithContext` exactly once. It invokes the fixed inspector under that lease and always reaches `lease.release()` in a `finally`; a failure or rejected inspector still releases. The Controller returns only after release, and the captured view then refuses. The Promise protocol above bounds a trusted-host callback shape; it is not a general defense against arbitrary mutation of the realm's `Promise.prototype`.
+
+Under the lease the Controller invokes the backend observer once. That observer directly runs the existing B2 `observeNativeHarnessReconciliation` lifecycle for the captured target with the actual lease signal and backend clock. It requires two controller-owner rounds whose raw owner SHA-256 values both equal `view.ownerSha256`; eight primary captures each with one actually opened file, a settled successful close and a matching second pass; stable final pins; two lifecycle rounds inside a live window; complete or valid zero-attempt `not-required` coverage; and compatible metadata, run/source/prepared/store identity and build sourceId. A present own controller PID is expected diagnostic data; presence or unknown state of older workers remains a readonly fact, not stopped proof.
+
+Existing B2 may refuse before the lifecycle phase, including metadata incompatibility, incomplete coverage and build/source mismatch. The inspection then refuses with a specific bounded reason because owner proof is unavailable; it never fabricates owner proof or reads a substitute owner to turn the refusal into success. After the Controller has released the lease, the backend runs the host guard and actual signal check, samples a finite nonbackward clock no earlier than the B2 `checkedAt` and before the original B2 deadline, builds and freezes the wire, and checks the actual signal again after the clock and wire. No diagnostic is published after a failed final gate.
+
+The only filesystem effect is the original run-lock acquire/release lifecycle. The path adds no new run, prepared root, dispatch inventory, accounting owner, reserve, claim, conditional interrupted commit, cancel marker, execute, resume or worker. Marked execute and resume gates remain closed. A future continuation must reacquire and observe from scratch; a historical diagnostic is never authority. The result carries no JSON permission or token and establishes no host identity, current native work, session authorization, stop proof or resume eligibility.
+
+Limits: acquisition inherits the original legacy initial read and regular-file validation, so this package does not make every original Store read bounded and claims no hard whole-call timeout. The existing B2 30-second soft window and 5-second lifecycle window are unchanged; lease acquisition or release may stall. Zero-attempt/no-snapshot content `not-required` does not verify the initial prepared input bytes; the next C1b2 step must add the original eight-file check with 256 KiB per file and 256 KiB total bounds. No actual cross-parent worker stop, provider/model run, semantic quality, recovered completion provenance or recovery acceptance is claimed.
+
+**Not established by this increment:**
+
+- A full leased current-intent/observation join, including current explicit user intent, current native work or session authorization.
+- Prepared-input byte verification (`C1b2`), same-run runtime accounting continuation (`C2b`) or recovered completion provenance.
+- Verified stopped proof, old-worker adoption, cross-parent worker termination or a cancellation request treated as a stop.
+- New-run creation, inventory, accounting-owner mutation, reserve, claim, conditional interrupted commit, execute, resume or worker dispatch.
+- Actual OMP target-worker execution, provider/model behavior, semantic quality or artifact acceptance.
+- Any historical-diagnostic authority to continue, resume or reuse a run after this call.
+
+Verification: [Testing](testing.md#controller-owned-existing-run-inspection-r2-c1b1); release record: [Release notes](release-notes.md#controller-owned-existing-run-inspection-r2-c1b1).
+
 ### Historical evidence sections below
 
 The per-increment sections below record the frozen source, accepted or failed evidence and limits at that increment. They remain historical evidence. Their “next” statements and status summaries describe their own point in time unless repeated in this current section.

@@ -9,6 +9,10 @@
  * RunStore is exported.
  */
 export { HarnessController } from "./upstream/src/controller.ts";
+export type {
+  HarnessRecoveryInspectionView,
+  HarnessRecoveryInspector,
+} from "./upstream/src/controller.ts";
 export { decodeRunEventsText, decodeRunHistoryText, decodeRunRecoveryOriginText } from "./upstream/src/store.ts";
 export { OmpRpcRunner, probeRpcCapabilities } from "./upstream/src/runner.ts";
 export type { OmpRpcRunnerOptions } from "./upstream/src/runner.ts";

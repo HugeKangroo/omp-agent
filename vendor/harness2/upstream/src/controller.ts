@@ -1,7 +1,7 @@
 import { randomUUID, createHash } from "node:crypto";
 import { mkdir, readFile, writeFile, copyFile, lstat, unlink } from "node:fs/promises";
 import path from "node:path";
-import { RunStore, LibraryStore, readRegular } from "./store.ts";
+import { RunStore, LibraryStore, readRegular, StoreConflictError } from "./store.ts";
 import { captureSnapshot, materializeSnapshot, materializeCandidate, diffWorkspace, applyWorkspace } from "./workspace.ts";
 import { baseHarness, makeHarness, parseHarness, parseJsonResponse, parseLesson, ValidationError } from "./surface.ts";
 import { proposalPrompt, composePrompt, selectorPrompt, reflectionPrompt } from "./prompts.ts";
@@ -33,6 +33,90 @@ const DEFAULTS: Omit<RunConfig, "model" | "improverModel"> = {
 };
 
 interface RecoveryCreation { readonly recoverySeedText: string }
+
+/**
+ * Readonly view of one actual run lease. It contains no release function,
+ * token, Store, mutable record or commit operation; the controller still owns
+ * the underlying lease and releases it once after the fixed inspector settles.
+ */
+export interface HarnessRecoveryInspectionView {
+  readonly runId: string;
+  readonly ownerSha256: string;
+  assertCurrent(): Promise<void>;
+}
+export type HarnessRecoveryInspector = (
+  view: HarnessRecoveryInspectionView,
+  signal: AbortSignal,
+) => void | Promise<void>;
+
+const SIGNAL_ABORTED_GETTER = typeof AbortSignal === "undefined"
+  ? undefined
+  : Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get;
+const NATIVE_PROMISE_PROTOTYPE = typeof Promise === "undefined" ? undefined : Promise.prototype;
+const NATIVE_PROMISE_THEN = typeof Promise === "undefined"
+  ? undefined
+  : Object.getOwnPropertyDescriptor(Promise.prototype, "then")?.value;
+
+/** Intrinsic getter only; a shadowed `aborted` property or duck type refuses. */
+function readActualSignal(signal: AbortSignal): boolean {
+  if (SIGNAL_ABORTED_GETTER === undefined) throw new Error("Recovery inspection requires an actual AbortSignal");
+  let value: unknown;
+  try { value = Reflect.apply(SIGNAL_ABORTED_GETTER, signal, []); }
+  catch { throw new Error("Recovery inspection requires an actual AbortSignal"); }
+  if (typeof value !== "boolean") throw new Error("Recovery inspection requires an actual AbortSignal");
+  return value;
+}
+/**
+ * Settles only a same-realm Promise whose direct prototype is the captured
+ * original Promise.prototype, through the captured intrinsic then. Ordinary
+ * promises and controlled async returns qualify; a subclass or other custom
+ * prototype, cross-realm promise, caller-shadowed own `then`/`constructor` or
+ * foreign thenable is refused before any inherited constructor/species lookup.
+ * The returned promise is a fresh native value, so awaiting it cannot read a
+ * caller-shadowed `then` or `constructor` on the original. This bounds the
+ * trusted-host callback protocol; it does not defend against mutation of the
+ * realm's Promise.prototype.
+ */
+function settleNativePromise(value: unknown): Promise<unknown> | null {
+  if (NATIVE_PROMISE_THEN === undefined || NATIVE_PROMISE_PROTOTYPE === undefined) return null;
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return null;
+  // Reject a subclass, custom prototype or cross-realm shape before the
+  // intrinsic then can consult an inherited `constructor` or species getter.
+  let prototype: unknown;
+  try { prototype = Object.getPrototypeOf(value); }
+  catch { return null; }
+  if (prototype !== NATIVE_PROMISE_PROTOTYPE) return null;
+  // A normal native Promise has no own `then` or `constructor`. A caller
+  // shadow shape is refused by descriptor without invoking its accessor; no
+  // foreign `then` is ever read or called.
+  for (const key of ["then", "constructor"] as const) {
+    let descriptor: PropertyDescriptor | undefined;
+    try { descriptor = Object.getOwnPropertyDescriptor(value, key); }
+    catch { return null; }
+    if (descriptor !== undefined) return null;
+  }
+  try {
+    return Reflect.apply(NATIVE_PROMISE_THEN, value, [
+      (resolved: unknown) => resolved,
+      (error: unknown) => { throw error; },
+    ]) as Promise<unknown>;
+  } catch { return null; }
+}
+
+/** Own-data-only inspector capture; accessors and prototypes are refused. */
+function ownedRecoveryInspector(options: object): HarnessRecoveryInspector | undefined {
+  let descriptor: PropertyDescriptor | undefined;
+  try { descriptor = Object.getOwnPropertyDescriptor(options, "recoveryInspector"); }
+  catch { throw new Error("Recovery inspector descriptor is unreadable"); }
+  if (descriptor === undefined) return undefined;
+  if (!("value" in descriptor) || descriptor.get !== undefined || descriptor.set !== undefined) {
+    throw new Error("Recovery inspector must be one own-data host function");
+  }
+  const value: unknown = descriptor.value;
+  if (value === undefined) return undefined;
+  if (typeof value !== "function") throw new Error("Recovery inspector must be one trusted host function");
+  return value as HarnessRecoveryInspector;
+}
 
 function ownedRecoverySeedText(creation: RecoveryCreation | undefined): string | undefined {
   if (creation === undefined) return undefined;
@@ -84,7 +168,9 @@ export class HarnessController {
   readonly capabilities: CapabilityRegistry;
   readonly approvals: ApprovalChannel;
   private readonly approval: ApprovalHandler | undefined;
-  constructor(options: { workspace: string; storeRoot?: string; runner?: Runner; approval?: ApprovalHandler }) {
+  private readonly recoveryInspector: HarnessRecoveryInspector | undefined;
+  constructor(options: { workspace: string; storeRoot?: string; runner?: Runner; approval?: ApprovalHandler; recoveryInspector?: HarnessRecoveryInspector }) {
+    const recoveryInspector = ownedRecoveryInspector(options);
     this.workspace = path.resolve(options.workspace);
     this.storeRoot = path.resolve(options.storeRoot ?? path.join(this.workspace, ".harness2"));
     this.store = new RunStore(path.join(this.storeRoot, "runs"));
@@ -93,6 +179,7 @@ export class HarnessController {
     this.approvals = new ApprovalChannel(path.join(this.storeRoot, "approvals"));
     this.approval = options.approval;
     this.runner = options.runner ?? new OmpRpcRunner();
+    this.recoveryInspector = recoveryInspector;
   }
 
   async create(task: string, options: Partial<RunConfig> & { model: string }, creation?: RecoveryCreation): Promise<RunRecord> {
@@ -186,6 +273,51 @@ export class HarnessController {
       await this.save(record);
       return await this.executeLocked(record);
     } finally { await release(); }
+  }
+
+  /**
+   * Readonly inspection under the original run lease. The controller owns the
+   * only lease handle, exposes no authority through the view and returns only
+   * after releasing it. This never creates, resumes, claims or continues a run.
+   */
+  async inspectWithRecoveryLease(id: string, signal: AbortSignal): Promise<void> {
+    const inspector = this.recoveryInspector;
+    const store = this.store;
+    if (inspector === undefined) throw new Error("Recovery inspection is not configured; no lease was acquired");
+    if (typeof id !== "string") throw new Error("Recovery inspection requires a run id string");
+    if (readActualSignal(signal)) throw new Error("Recovery inspection signal is already aborted; no lease was acquired");
+    const lease = await store.acquireWithContext(id);
+    let closed = false;
+    const view: HarnessRecoveryInspectionView = Object.freeze({
+      runId: id,
+      ownerSha256: lease.ownerSha256,
+      assertCurrent: async (): Promise<void> => {
+        if (closed) throw new StoreConflictError(`Recovery inspection lease is no longer active: ${id}`);
+        await lease.assertCurrent();
+        if (closed) throw new StoreConflictError(`Recovery inspection lease is no longer active: ${id}`);
+      },
+    });
+    try {
+      if (readActualSignal(signal)) throw new Error("Recovery inspection signal aborted before observation");
+      await view.assertCurrent();
+      if (readActualSignal(signal)) throw new Error("Recovery inspection signal aborted before observation");
+      const result: unknown = inspector(view, signal);
+      if (result !== undefined) {
+        const settledPromise = settleNativePromise(result);
+        if (settledPromise === null) {
+          throw new Error("Recovery inspector must return undefined or a genuine native Promise<void>");
+        }
+        const settled: unknown = await settledPromise;
+        if (settled !== undefined) throw new Error("Recovery inspector Promise must resolve undefined");
+      }
+      if (readActualSignal(signal)) throw new Error("Recovery inspection signal aborted during observation");
+      await view.assertCurrent();
+      if (readActualSignal(signal)) throw new Error("Recovery inspection signal aborted during observation");
+    } finally {
+      closed = true;
+      await lease.release();
+    }
+    if (readActualSignal(signal)) throw new Error("Recovery inspection signal aborted after lease release");
   }
 
   private async executeLocked(record: RunRecord): Promise<RunRecord> {

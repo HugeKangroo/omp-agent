@@ -708,6 +708,57 @@ Retained failures remain part of the record: typecheck 01 compile errors; tests 
 
 C1b leased current-intent/observation and C2b runtime same-run accounting continuation, recovered completion provenance and R3 actual qualification remain open. Original budgets, deadlines and unknown reservations are not reset or refunded. All six deliverables remain OPEN; G5 precedes G4, G6/G7 are canceled and the real human C3 trial remains mandatory. No suite was rerun for this documentation update.
 
+### Controller-owned existing-run inspection (R2-C1b1)
+
+The final focused inspection selection passed 19 tests/175 assertions in 1,339 ms (1,348 ms capture); the package selection passed 5 tests/392 assertions in 505 ms (514 ms capture); `typecheck` exited 0 in 2,819 ms. Earlier backend/origin/lease selections passed 96 tests/845 assertions in 4,670 ms and the B2 files+content selection 42/677 in 1,376 ms. These focused selections overlap the root suite and are not additive; the final root suite covers the final candidate.
+
+| Check | Result |
+| --- | --- |
+| Frozen root check | Exit 0 in 83,885 ms; `typecheck` 0; 1,697 unit tests across 76 files (45,696 assertions, 79.02 s); 15 simulated human-review tests (155 assertions, 2.02 s); 232 executable files stable. |
+| Root raw log | 371,857 bytes, SHA-256 `b1394648b3dd3d1d72025304459096ae3d49020e62cad52fb1c919feaf60e503`. |
+| Freeze | SHA-256 `3a0b2d86335d806a27785de34e8f86b50a2c3b304c942030d3f4f73ea9b4028d`. |
+| Independent root probe | Exit 0 in 188 ms; 232 stable files; raw 55,966 bytes, SHA-256 `746a9ad560d190d81b0138bf1d37d4ee191f25345a132cecac6cc2ef8ae6a0e1`. |
+
+| Final changed file | Bytes | SHA-256 |
+| --- | ---: | --- |
+| `src/native-harness-backend.ts` | 139,348 | `a76958ef44492914c8d33fe315cf616b76cc8b7aab6bc7fd7ddc05b912a028ce` |
+| `vendor/harness2/upstream/src/controller.ts` | 45,773 | `836aaf432f322e09aef88cb07cff4a3fed8ba5d2d14da415276270cdc75ccbe7` |
+| `test/unit/native-harness-existing-inspection.test.ts` | 36,794 | `756a388e3f8e8041a24e472daa08bc6b511d1498c3101d3276b9149ce85a89b8` |
+
+The vendored build `sourceId` is `3fb7578d73e0bdfe22d53c839b80076f53c9c750180334fd1d77cbabbc6eee1c`. It remains a build-compatibility label, not executable authentication or cross-build migration.
+
+Cases cover:
+
+- One actual issued original lease; two controller-owner rounds equal to `leaseOwnerSha256`; release before the caller acknowledges the wire; four primary documents, cancel state, revision and source tree unchanged.
+- Own-data inspector capture once at Controller construction, accessor refusal, missing observer before any lease, and invalid target/context/control refusal before observer IO.
+- A frozen minimal view that refuses after release, with no lease handle, token, Store, record or commit exposed.
+- Inspector failure, non-void return, foreign thenable, actual abort, fake signal, shadowed Promise `then`/`constructor`, genuine async success and async rejection, each releasing the original lease.
+- A pending Promise subclass refused before species or foreign `then` access; a separate test covers ordinary async success and rejection.
+- Primary-byte change during B2, abort during B2, guard loss before observation, guard-driven abort after release, and backward or expired final clock; all refuse and release the lease.
+- Metadata incompatibility as a specific bounded refusal, with all four primary documents and lease state unchanged and no diagnostic returned.
+- Post-call mutation of target, context, control and host config cannot retarget an in-flight call; the original A target/tree remains the inspected one and B stays untouched.
+- A foreign active lease remains owned by the foreign holder until its own release; inspection does not delete or adopt it.
+- Adverse inspection leaves marked execute and resume refused with zero Runner calls.
+
+The independent root actual-module probe used a real V2 owner reserve→prepare→actual Controller create/bind setup with actual source/prepared filesystem trees and local Git. The inspection Runner count was zero. Its four cases covered the direct original lease, A→B retarget during actual IO, actual guard abort, and foreign active-lease preservation. Trusted host currentness/session seams were explicit fixtures; this is not actual OMP target-worker or process-recovery qualification.
+
+The unchanged Promise probe was a genuine RED before the prototype gate: a pending Promise subclass species produced a foreign thenable, the callback was falsely acknowledged and the lease released while the original Promise was pending (species 1/then 1/runner 0, exit 1, 28 ms, raw 1,413 bytes, SHA-256 `968efe74ab25910b5201269b3109c53af16f3cf036b1973347dccad0b8d7945b`). After the prototype gate, the unchanged probe was GREEN in 26 ms (species 0/then 0/refused, actual lease gone, runner 0, raw 211 bytes, SHA-256 `46b5329f03d027dede34653466cf1705d906540389acda8faf36295333831308`). This is Controller callback-protocol evidence, not full B2 or process-recovery evidence.
+
+Retained author history is not relabeled: `inspection02` was RED at 16 pass/1 fail because the fake `AbortSignal` fixture lacked the configured inspector and received the earlier not-configured refusal; the fixture was corrected, not the gate weakened. Five earlier direct piped author runs retain only partial stdout without a trustworthy Bun exit (three red fragments, then two green fragments) and are not counted as captured passes. No exhaustive 128 KiB wire-boundary or release-awaited-stall dynamic qualification is claimed.
+
+| Claim | Current evidence level |
+| --- | --- |
+| Controller-owned readonly inspection under the original Store lease | Accepted in bounded unit and actual-module scope; focused and frozen root checks passed. |
+| Two owner rounds and original B2 primary/lifecycle coverage | Covered on actual temporary files with actual Store/Controller and a zero-call inspection Runner. |
+| Promise callback protocol and lease release | Actual RED/GREEN probe plus public unit cases for async success/rejection, subclass, foreign thenable and post-release view refusal. |
+| A→B retarget resistance | Actual-module probe and unit case; copied target/context/control/host facts keep the in-flight inspection on A. |
+| Actual OMP target-worker or process-recovery qualification | Not covered. The fixture supplies trusted currentness seams and never starts an OMP target worker or real provider call. |
+| Prepared-input byte verification (C1b2) | Not implemented. Zero-attempt/no-snapshot content `not-required` is not an input-byte check. |
+| Full C1b current-intent/observation join and C2b accounting continuation | Not implemented. |
+| R3 restart/interruption, general quality, install/upgrade/rollback and a real human trial | Open; none is closed by this increment. |
+
+Accepted boundary: readonly host inspection under the original lease only. C1b2 must add the original eight prepared input files with 256 KiB per-file and 256 KiB total verification; full C1b current-intent/observation joining, C2b same-run runtime accounting continuation, recovered completion provenance, actual cross-parent worker stop/provider qualification, R3, general quality, install/upgrade/rollback and a real human trial remain open. The historical diagnostic is never continuation authority.
+
 ## Commands
 
 ```sh

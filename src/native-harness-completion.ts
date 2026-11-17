@@ -18,7 +18,7 @@ export const NATIVE_HARNESS_COMPLETION_ORIGIN = "harness2-native" as const;
  * runtime file-integrity check occurred for this execution.
  */
 export const NATIVE_HARNESS_COMPLETION_SOURCE_ID =
-  "194f9801d9262d0194bd7075aa9d47d91bdeddb756791841687eb16162223072" as const;
+  "3fb7578d73e0bdfe22d53c839b80076f53c9c750180334fd1d77cbabbc6eee1c" as const;
 export const NATIVE_HARNESS_COMPLETION_SOURCE_INTEGRITY = "build-label-only" as const;
 
 /** Frozen solver candidate set from the vendored Harness2 types contract. */

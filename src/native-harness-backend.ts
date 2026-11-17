@@ -5,6 +5,7 @@ import {
   HarnessController,
   OmpRpcRunner,
   decodeRunRecoveryOriginText,
+  type HarnessRecoveryInspectionView,
   type OmpProfileAuth,
   type RunConfig,
   type RunRecord,
@@ -93,7 +94,14 @@ import {
   deepFreeze,
   sha256Hex,
   validateRelativePath,
+  type NativeFileIo,
 } from "./native-work.ts";
+import {
+  observeNativeHarnessReconciliation,
+  type NativeHarnessReconciliationLifecycleOptions,
+  type NativeHarnessReconciliationLifecycleResult,
+} from "./native-harness-reconciliation-files.ts";
+import type { NativeHarnessHistorySignalQuery } from "./native-harness-history-process.ts";
 
 /**
  * Host-only composition of the frozen 2A delegation coordinator with the
@@ -117,6 +125,8 @@ const NUMERIC_EPSILON = 1e-9;
 const MODEL_PATTERN = /^([a-z0-9][a-z0-9-]*)\/([^\s,:@]+)$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const HEX_64_PATTERN = /^[0-9a-f]{64}$/;
+/** Existing B2 inspection locator shape; not the recovery-source format. */
+const PREPARED_ROOT_PATTERN = /^omp-harness-[A-Za-z0-9]{6}$/;
 const EXPECTED_ADAPTATION = Object.freeze({
   capabilities: "fixed" as const,
   reuse: false,
@@ -156,8 +166,46 @@ export interface NativeHarnessBackendDiagnostic {
 export interface NativeHarnessBackendHost {
   readonly runner: Runner;
   prepare(request: NativeHarnessPrepareRequest, context: NativeContext): Promise<NativeHarnessPrepareResult>;
+  /** Optional so existing host fakes remain valid; the actual factory always supplies it. */
+  inspectExisting?(
+    target: NativeHarnessExistingInspectionTarget,
+    context: NativeContext,
+    control: NativeHarnessExistingInspectionControl,
+  ): Promise<NativeHarnessExistingInspectionResult>;
   inspect(): readonly NativeHarnessBackendDiagnostic[];
 }
+
+export const NATIVE_HARNESS_EXISTING_INSPECTION_SCHEMA =
+  "omp-agent.native-harness-existing-inspection.v1" as const;
+export const NATIVE_HARNESS_EXISTING_INSPECTION_MAX_BYTES = 128 * 1024;
+
+/** Exact locator only; it is not authority and never selects a new worker. */
+export interface NativeHarnessExistingInspectionTarget {
+  readonly runId: string;
+  readonly ownerId: string;
+  readonly selectorSha256: string;
+  readonly preparedRelativeRoot: string;
+}
+
+/** Trusted host current-read assertion plus the actual host signal. */
+export interface NativeHarnessExistingInspectionControl {
+  readonly signal: AbortSignal;
+  readonly guard: () => void;
+}
+
+/** Bounded readonly diagnostic; it never carries a lease, claim or commit. */
+export interface NativeHarnessExistingInspectionDiagnostic {
+  readonly schema: typeof NATIVE_HARNESS_EXISTING_INSPECTION_SCHEMA;
+  readonly readOnly: true;
+  readonly resumeAvailable: false;
+  readonly runId: string;
+  readonly leaseOwnerSha256: string;
+  readonly observation: NativeHarnessReconciliationLifecycleResult;
+}
+
+export type NativeHarnessExistingInspectionResult =
+  | { readonly ok: true; readonly diagnostic: NativeHarnessExistingInspectionDiagnostic }
+  | { readonly ok: false; readonly reason: string };
 
 /**
  * Test-only seams. Production callers must omit this argument; the default
@@ -175,6 +223,19 @@ export interface NativeHarnessBackendTestOptions {
   readonly mutateWorkerRequest?: (request: WorkerRequest) => void;
   /** Test-only inventory read/write observation seams; production omits this. */
   readonly dispatchInventoryTestOptions?: NativeHarnessDispatchInventoryTestOptions;
+  /**
+   * Test-only B2 file and signal-query seams for leased inspection. The
+   * actual AbortSignal always comes from the inspection control, never here.
+   */
+  readonly recoveryInspectionOptions?: {
+    readonly fileIo?: NativeFileIo;
+    readonly signalQuery?: NativeHarnessHistorySignalQuery;
+  };
+}
+
+interface RecoveryInspectionTestOptions {
+  readonly fileIo: NativeFileIo | null;
+  readonly signalQuery: NativeHarnessHistorySignalQuery | null;
 }
 
 interface NormalizedTestOptions {
@@ -186,6 +247,7 @@ interface NormalizedTestOptions {
   }) => void | Promise<void>) | null;
   readonly mutateWorkerRequest: ((request: WorkerRequest) => void) | null;
   readonly dispatchInventoryTestOptions: NativeHarnessDispatchInventoryTestOptions | null;
+  readonly recoveryInspectionOptions: RecoveryInspectionTestOptions | null;
 }
 
 interface RetainedRecord {
@@ -526,6 +588,38 @@ function readRunner(value: unknown, label: string): Runner {
   return value as unknown as Runner;
 }
 
+function readRecoveryInspectionTestOptions(value: unknown): RecoveryInspectionTestOptions | null {
+  if (value === undefined) return null;
+  const fields = readStrictFields(value, ["fileIo", "signalQuery"], []);
+  if (fields === null) throw new Error("recoveryInspectionOptions must be an exact plain object");
+  const ioValue = fields.get("fileIo");
+  let fileIo: NativeFileIo | null = null;
+  if (ioValue !== undefined) {
+    if (typeof ioValue !== "object" || ioValue === null) {
+      throw new Error("recoveryInspectionOptions.fileIo must be a native file IO seam");
+    }
+    const candidate = ioValue as NativeFileIo;
+    if (
+      typeof candidate.O_RDONLY !== "number"
+      || typeof candidate.O_NOFOLLOW !== "number"
+      || typeof candidate.realpath !== "function"
+      || typeof candidate.lstat !== "function"
+      || typeof candidate.open !== "function"
+    ) {
+      throw new Error("recoveryInspectionOptions.fileIo must be a native file IO seam");
+    }
+    fileIo = candidate;
+  }
+  const signalQueryValue = fields.get("signalQuery");
+  if (signalQueryValue !== undefined && typeof signalQueryValue !== "function") {
+    throw new Error("recoveryInspectionOptions.signalQuery must be a narrow synchronous function");
+  }
+  return Object.freeze({
+    fileIo,
+    signalQuery: signalQueryValue === undefined ? null : signalQueryValue as NativeHarnessHistorySignalQuery,
+  });
+}
+
 function readTestOptions(value: unknown): NormalizedTestOptions {
   if (value === undefined) {
     return {
@@ -534,11 +628,12 @@ function readTestOptions(value: unknown): NormalizedTestOptions {
       beforeBaseInputCheck: null,
       mutateWorkerRequest: null,
       dispatchInventoryTestOptions: null,
+      recoveryInspectionOptions: null,
     };
   }
   const fields = readStrictFields(
     value,
-    ["deterministicRunner", "now", "beforeBaseInputCheck", "mutateWorkerRequest", "dispatchInventoryTestOptions"],
+    ["deterministicRunner", "now", "beforeBaseInputCheck", "mutateWorkerRequest", "dispatchInventoryTestOptions", "recoveryInspectionOptions"],
     [],
   );
   if (fields === null) throw new Error("test options must be an exact plain object");
@@ -561,6 +656,7 @@ function readTestOptions(value: unknown): NormalizedTestOptions {
     dispatchInventoryTestOptions: fields.get("dispatchInventoryTestOptions") === undefined
       ? null
       : fields.get("dispatchInventoryTestOptions") as NativeHarnessDispatchInventoryTestOptions,
+    recoveryInspectionOptions: readRecoveryInspectionTestOptions(fields.get("recoveryInspectionOptions")),
   };
 }
 
@@ -585,6 +681,180 @@ function signalAborted(signal: unknown): boolean | null {
   } catch {
     return null;
   }
+}
+
+interface OwnedExistingInspectionTarget {
+  readonly runId: string;
+  readonly ownerId: string;
+  readonly selectorSha256: string;
+  readonly preparedRelativeRoot: string;
+}
+
+interface OwnedExistingInspectionControl {
+  readonly signal: AbortSignal;
+  readonly guard: () => void;
+}
+
+function readExistingInspectionTarget(value: unknown): OwnedExistingInspectionTarget {
+  const fields = readStrictFields(
+    value,
+    ["runId", "ownerId", "selectorSha256", "preparedRelativeRoot"],
+    ["runId", "ownerId", "selectorSha256", "preparedRelativeRoot"],
+  );
+  if (fields === null) {
+    throw new Error("existing inspection target must be an exact plain own-data object");
+  }
+  const runId = fields.get("runId");
+  if (typeof runId !== "string" || !UUID_PATTERN.test(runId)) {
+    throw new Error("existing inspection target.runId must be a lowercase UUID");
+  }
+  const ownerId = fields.get("ownerId");
+  if (typeof ownerId !== "string" || !UUID_PATTERN.test(ownerId)) {
+    throw new Error("existing inspection target.ownerId must be a lowercase UUID");
+  }
+  const selectorSha256 = fields.get("selectorSha256");
+  if (typeof selectorSha256 !== "string" || !HEX_64_PATTERN.test(selectorSha256)) {
+    throw new Error("existing inspection target.selectorSha256 must be 64 lowercase hexadecimal characters");
+  }
+  let preparedRelativeRoot: string;
+  try {
+    preparedRelativeRoot = validateRelativePath(fields.get("preparedRelativeRoot"));
+  } catch {
+    throw new Error("existing inspection target.preparedRelativeRoot must be a safe relative POSIX path");
+  }
+  if (!PREPARED_ROOT_PATTERN.test(preparedRelativeRoot)) {
+    throw new Error(
+      "existing inspection target.preparedRelativeRoot must be omp-harness- plus six ASCII alphanumerics",
+    );
+  }
+  return Object.freeze({ runId, ownerId, selectorSha256, preparedRelativeRoot });
+}
+
+function readExistingInspectionControl(value: unknown): OwnedExistingInspectionControl {
+  const fields = readStrictFields(value, ["signal", "guard"], ["signal", "guard"]);
+  if (fields === null) {
+    throw new Error("existing inspection control must be an exact plain own-data object");
+  }
+  const signal = fields.get("signal");
+  const aborted = signalAborted(signal);
+  if (aborted === null) {
+    throw new Error("existing inspection control.signal must be an actual host AbortSignal");
+  }
+  if (aborted) throw new Error("existing inspection control.signal is already aborted");
+  const guard = fields.get("guard");
+  if (typeof guard !== "function") {
+    throw new Error("existing inspection control.guard must be a function");
+  }
+  return Object.freeze({ signal: signal as AbortSignal, guard: guard as () => void });
+}
+
+function inspectionSignalCheck(control: OwnedExistingInspectionControl): void {
+  const aborted = signalAborted(control.signal);
+  if (aborted === null) throw new Error("existing inspection signal became unreadable");
+  if (aborted) throw new Error("existing inspection signal is aborted");
+}
+
+function inspectionControlCheck(control: OwnedExistingInspectionControl): void {
+  const result: unknown = control.guard();
+  if (result !== undefined) {
+    // Consume a genuine native Promise rejection; never consult a foreign then.
+    observeNativePromiseSettlement(result);
+    throw new Error("existing inspection guard must return undefined synchronously");
+  }
+  inspectionSignalCheck(control);
+}
+
+/** One fixed directory operation followed by the host's current-read check. */
+async function checkedInspectionDirectory(
+  target: string,
+  label: string,
+  control: OwnedExistingInspectionControl,
+): Promise<string> {
+  const resolved = await realDirectoryExact(target, label);
+  inspectionControlCheck(control);
+  return resolved;
+}
+
+function existingInspectionOwnerRoundsMatch(
+  observation: NativeHarnessReconciliationLifecycleResult,
+  leaseOwnerSha256: string,
+): "match" | "unavailable" | "mismatch" {
+  const lease = observation.lifecycle.controllerLease;
+  const first = lease.ownerRound1;
+  const second = lease.ownerRound2;
+  if (
+    first === null
+    || second === null
+    || lease.lockDirectoryRound1 !== "present"
+    || lease.lockDirectoryRound2 !== "present"
+    || first.state !== "observed"
+    || second.state !== "observed"
+    || first.ownerState !== "observed"
+    || second.ownerState !== "observed"
+  ) return "unavailable";
+  return first.sha256 === leaseOwnerSha256 && second.sha256 === leaseOwnerSha256
+    ? "match"
+    : "mismatch";
+}
+
+/**
+ * Returns a bounded refusal reason, or null only when the B2 lifecycle result
+ * itself contains the exact two-round controller-owner proof. A stable primary
+ * byte observation never substitutes for that proof.
+ */
+function existingInspectionRefusal(
+  observation: NativeHarnessReconciliationLifecycleResult,
+  leaseOwnerSha256: string,
+): string | null {
+  if (observation.metadataStatus === "incompatible") {
+    const code = observation.lifecycle.failure?.code ?? "metadata-incompatible";
+    return `existing inspection refused: metadata-incompatible/${code}`;
+  }
+  const failureCode = observation.lifecycle.failure?.code;
+  const suffix = failureCode === undefined ? "" : `/${failureCode}`;
+  if (observation.status !== "stable" || observation.observation !== "two-pass") {
+    return `existing inspection refused: observation-${observation.status}${suffix}`;
+  }
+  if (observation.metadataStatus !== "compatible") {
+    return `existing inspection refused: metadata-${observation.metadataStatus}${suffix}`;
+  }
+  if (
+    observation.captures.length !== 8
+    || observation.captures.some((capture) =>
+      capture.outcome !== "captured"
+      || capture.openedFiles !== 1
+      || !capture.close.attempted
+      || !capture.close.settled
+      || !capture.close.succeeded)
+    || observation.captures.some((capture) => capture.pass === 2 && capture.matchesFirstPass !== true)
+    || !observation.pins.stable
+    || !observation.pins.checkedAtEnd
+    || observation.deadline.expired
+  ) {
+    return `existing inspection refused: primary-window-unstable${suffix}`;
+  }
+  if (observation.lifecycle.window.roundsStarted !== 2 || observation.lifecycle.window.expired) {
+    return `existing inspection refused: lifecycle-window-${observation.lifecycle.window.roundsStarted}${suffix}`;
+  }
+  if (observation.lifecycle.revoked || observation.lifecycle.status !== "stable") {
+    return `existing inspection refused: lifecycle-${observation.lifecycle.status}${suffix}`;
+  }
+  if (
+    observation.lifecycle.completeAttemptCoverage.status !== "complete"
+    && observation.lifecycle.completeAttemptCoverage.status !== "not-required"
+  ) {
+    return `existing inspection refused: attempt-coverage-${observation.lifecycle.completeAttemptCoverage.status}${suffix}`;
+  }
+  if (
+    observation.lifecycle.controllerLease.status !== "stable"
+    || observation.lifecycle.controllerLease.ownerComparison !== "stable"
+  ) {
+    return `existing inspection refused: controller-lease-${observation.lifecycle.controllerLease.status}${suffix}`;
+  }
+  const owners = existingInspectionOwnerRoundsMatch(observation, leaseOwnerSha256);
+  if (owners === "unavailable") return `existing inspection refused: owner-rounds-unavailable${suffix}`;
+  if (owners === "mismatch") return `existing inspection refused: owner-rounds-mismatch${suffix}`;
+  return null;
 }
 
 function isThenable(value: unknown): boolean {
@@ -2771,7 +3041,13 @@ function makeBackend(
 export function createNativeHarnessBackend(
   hostConfig: NativeHarnessBackendHostConfig,
   testOptions?: NativeHarnessBackendTestOptions,
-): NativeHarnessBackendHost {
+): NativeHarnessBackendHost & {
+  readonly inspectExisting: (
+    target: NativeHarnessExistingInspectionTarget,
+    context: NativeContext,
+    control: NativeHarnessExistingInspectionControl,
+  ) => Promise<NativeHarnessExistingInspectionResult>;
+} {
   const host = readHostConfig(hostConfig);
   const options = readTestOptions(testOptions);
   const runner = options.deterministicRunner ?? new OmpRpcRunner();
@@ -3014,9 +3290,128 @@ export function createNativeHarnessBackend(
     }
   }
 
+  async function inspectExisting(
+    targetValue: NativeHarnessExistingInspectionTarget,
+    context: NativeContext,
+    controlValue: NativeHarnessExistingInspectionControl,
+  ): Promise<NativeHarnessExistingInspectionResult> {
+    try {
+      // Own every caller value before the first await. The target is only a
+      // locator; the original lease, observer and source root remain fixed.
+      const target = readExistingInspectionTarget(targetValue);
+      const control = readExistingInspectionControl(controlValue);
+      const cwd = readOwnData(context, "cwd");
+      if (!cwd.readable || typeof cwd.value !== "string") {
+        throw new Error("existing inspection context.cwd must be one own string");
+      }
+      const sourceRootInput = readAbsolutePath(cwd.value, "context.cwd");
+      if (path.normalize(sourceRootInput) !== sourceRootInput) {
+        throw new Error("existing inspection context.cwd must be a canonical absolute path");
+      }
+      inspectionControlCheck(control);
+
+      const storageRoot = await checkedInspectionDirectory(host.storageRoot, "host storage root", control);
+      const preparedRoot = path.join(storageRoot, target.preparedRelativeRoot);
+      if (path.dirname(preparedRoot) !== storageRoot) {
+        throw new Error("existing inspection prepared root must be a direct child of the host storage root");
+      }
+      await checkedInspectionDirectory(preparedRoot, "prepared root", control);
+      const workspaceRoot = path.join(preparedRoot, "workspace");
+      const storeRoot = path.join(preparedRoot, "store");
+      await checkedInspectionDirectory(workspaceRoot, "prepared workspace", control);
+      await checkedInspectionDirectory(storeRoot, "prepared store", control);
+      const sourceRoot = await checkedInspectionDirectory(sourceRootInput, "inspection source root", control);
+
+      const expected = Object.freeze({
+        runId: target.runId,
+        ownerId: target.ownerId,
+        selectorSha256: target.selectorSha256,
+        storageRoot,
+        sourceRoot,
+        preparedRelativeRoot: target.preparedRelativeRoot,
+        backendBuildSourceId: NATIVE_HARNESS_COMPLETION_SOURCE_ID,
+      });
+      const seams = options.recoveryInspectionOptions;
+      const observationOptions = (signal: AbortSignal): NativeHarnessReconciliationLifecycleOptions => ({
+        signal,
+        now,
+        ...(seams?.fileIo === null || seams?.fileIo === undefined ? {} : { fileIo: seams.fileIo }),
+        ...(seams?.signalQuery === null || seams?.signalQuery === undefined ? {} : { signalQuery: seams.signalQuery }),
+      });
+      const captured: {
+        observation: NativeHarnessReconciliationLifecycleResult | null;
+        leaseOwnerSha256: string | null;
+      } = { observation: null, leaseOwnerSha256: null };
+      const inspector = async (
+        view: HarnessRecoveryInspectionView,
+        signal: AbortSignal,
+      ): Promise<void> => {
+        inspectionControlCheck(control);
+        await view.assertCurrent();
+        inspectionControlCheck(control);
+        const observation = await observeNativeHarnessReconciliation(expected, observationOptions(signal));
+        inspectionControlCheck(control);
+        await view.assertCurrent();
+        inspectionControlCheck(control);
+        captured.observation = observation;
+        captured.leaseOwnerSha256 = view.ownerSha256;
+      };
+      const controller = new HarnessController({
+        workspace: workspaceRoot,
+        storeRoot,
+        runner,
+        recoveryInspector: inspector,
+      });
+      inspectionControlCheck(control);
+      await controller.inspectWithRecoveryLease(target.runId, control.signal);
+
+      // The Controller's lease is released. The host guard runs before the
+      // final clock callback; the actual signal is then read again after the
+      // clock and after the pure wire build, immediately before return.
+      inspectionControlCheck(control);
+      const finalNow = readNow(now);
+      const observation = captured.observation;
+      const ownerSha256 = captured.leaseOwnerSha256;
+      if (observation === null || ownerSha256 === null) {
+        return { ok: false, reason: "existing inspection refused: no leased observation" };
+      }
+      if (!HEX_64_PATTERN.test(ownerSha256)) {
+        return { ok: false, reason: "existing inspection refused: lease-owner-unreadable" };
+      }
+      if (finalNow < observation.deadline.checkedAt) {
+        return { ok: false, reason: "existing inspection refused: final-clock-backward" };
+      }
+      if (finalNow >= observation.deadline.deadlineAt) {
+        return { ok: false, reason: "existing inspection refused: final-clock-expired" };
+      }
+      const refusal = existingInspectionRefusal(observation, ownerSha256);
+      if (refusal !== null) return { ok: false, reason: boundedReason(refusal) };
+      const diagnostic: NativeHarnessExistingInspectionDiagnostic = deepFreeze({
+        schema: NATIVE_HARNESS_EXISTING_INSPECTION_SCHEMA,
+        readOnly: true as const,
+        resumeAvailable: false as const,
+        runId: target.runId,
+        leaseOwnerSha256: ownerSha256,
+        observation,
+      });
+      const wire = deepFreeze({ ok: true as const, diagnostic });
+      if (
+        Buffer.byteLength(JSON.stringify(wire), "utf8")
+        > NATIVE_HARNESS_EXISTING_INSPECTION_MAX_BYTES
+      ) {
+        return { ok: false, reason: "existing inspection refused: result-exceeds-128KiB" };
+      }
+      inspectionSignalCheck(control);
+      return wire;
+    } catch (error) {
+      return { ok: false, reason: boundedReason(error) };
+    }
+  }
+
   return Object.freeze({
     runner,
     prepare,
+    inspectExisting,
     inspect(): readonly NativeHarnessBackendDiagnostic[] {
       return deepFreeze(records.map(diagnosticOf));
     },

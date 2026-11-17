@@ -12,7 +12,7 @@
     "distributionPath": "relative to the omp-agent package root",
     "upstreamPath": "relative to the upstream repository root"
   },
-  "sourceId": "194f9801d9262d0194bd7075aa9d47d91bdeddb756791841687eb16162223072",
+  "sourceId": "3fb7578d73e0bdfe22d53c839b80076f53c9c750180334fd1d77cbabbc6eee1c",
   "sourceIdAlgorithm": "sha256 over UTF-8 canonical JSON with object keys sorted recursively, arrays in stored order, and no insignificant whitespace, of {schemaVersion, upstreamRepository, baseCommit, files:[{distributionPath, bundledSha256}]}; files are every distributed content file except vendor/harness2/SOURCE.json, sorted by distributionPath; SOURCE.json is excluded to avoid self-referential metadata hashing.",
   "license": {
     "upstreamLicensePath": "LICENSE",
@@ -37,10 +37,10 @@
       "upstreamPath": null,
       "kind": "wrapper",
       "originalSha256": null,
-      "bundledSha256": "23004075a541a20d4a79b680e956951910d0e7da2c711e0c28dbe07c210832fd",
-      "bytes": 1229,
+      "bundledSha256": "5f962cef44d2fc6ff0687472a6e568a273010c78b2595cb8162d848bd659718e",
+      "bytes": 1343,
       "modified": false,
-      "note": "Authored host-only library entry. Re-exports HarnessController, the actual OmpRpcRunner, the credential-free capability probe, the pure bounded run/events history decoders, the pure bounded creation-origin text decoder and the minimal public types; no writable RunStore, OMP extension, CLI, bin, or HTTP entry, and importing it starts no process."
+      "note": "Authored host-only library entry. Re-exports HarnessController, the readonly recovery inspection view/inspector types, the actual OmpRpcRunner, the credential-free capability probe, the pure bounded run/events history decoders, the pure bounded creation-origin text decoder and the minimal public types; no writable RunStore, OMP extension, CLI, bin, or HTTP entry, and importing it starts no process."
     },
     {
       "distributionPath": "vendor/harness2/upstream/LICENSE",
@@ -107,10 +107,10 @@
       "upstreamPath": "src/controller.ts",
       "kind": "upstream-source",
       "originalSha256": "711967e2e61220953e00412dbfcf3dac623202f0cd01d9e1fcfd002113582d92",
-      "bundledSha256": "49eaffead8ce5b56f6268622650538fc7cb223d5023a94a982d6bb325ef100a3",
-      "bytes": 38881,
+      "bundledSha256": "836aaf432f322e09aef88cb07cff4a3fed8ba5d2d14da415276270cdc75ccbe7",
+      "bytes": 45773,
       "modified": true,
-      "note": "Strict optional-property adaptation: approval uses an explicit undefined union; undefined evolution execution, worker auth and missing lesson properties are omitted or deleted. Existing default consumers read equivalent values and JSON serialization is unchanged; own-property reflection is observably different and is not promised equivalent for custom consumers. Adds an inline create() third parameter limited to one own-data recoverySeedText string of at most 4096 UTF-8 bytes; it is read once before the first await and forwarded only to createWithRecoveryOrigin, while two-argument creation remains the unchanged unmarked store.create path. Also routes marked cancellation to the Store's fresh-generation operation and closes marked continuation in this build: marked resume refuses before cancel clear/save/execution, and marked execute permits only the original queued/revision-0/empty-stages/no-snapshot record, with completed/applied remaining non-executing observations. Initial marked create/execute and unmarked behavior remain on the original paths; no resume tool, work reference or execution wiring is added."
+      "note": "Strict optional-property adaptation: approval uses an explicit undefined union; undefined evolution execution, worker auth and missing lesson properties are omitted or deleted. Existing default consumers read equivalent values and JSON serialization is unchanged; own-property reflection is observably different and is not promised equivalent for custom consumers. Adds an inline create() third parameter limited to one own-data recoverySeedText string of at most 4096 UTF-8 bytes; it is read once before the first await and forwarded only to createWithRecoveryOrigin, while two-argument creation remains the unchanged unmarked store.create path. Also routes marked cancellation to the Store's fresh-generation operation and closes marked continuation in this build: marked resume refuses before cancel clear/save/execution, and marked execute permits only the original queued/revision-0/empty-stages/no-snapshot record, with completed/applied remaining non-executing observations. Initial marked create/execute and unmarked behavior remain on the original paths; no resume tool, work reference or execution wiring is added. Adds a fixed optional own-data recoveryInspector captured once at construction and inspectWithRecoveryLease(): the original Store lease is acquired once, a frozen view exposes only runId/ownerSha256/assertCurrent, the inspector return must be undefined or a native Promise resolving undefined, and the lease is released exactly once in finally with a final intrinsic signal check. The method returns only void and does not unlock execute/resume or authorize continuation."
     },
     {
       "distributionPath": "vendor/harness2/upstream/src/conversation.ts",
