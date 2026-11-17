@@ -4,6 +4,7 @@ import {
   atomicWrite,
   decodeRunHistoryText,
   decodeRunRecoveryOriginText,
+  StoreConflictError,
   StoreCorruptionError,
   withWriteLock,
 } from "../vendor/harness2/upstream/src/store.ts";
@@ -245,8 +246,12 @@ export type NativeHarnessDispatchInventoryErrorCode =
 export class NativeHarnessDispatchInventoryError extends Error {
   override name = "NativeHarnessDispatchInventoryError";
 
-  constructor(message: string, readonly code: NativeHarnessDispatchInventoryErrorCode) {
-    super(message);
+  constructor(
+    message: string,
+    readonly code: NativeHarnessDispatchInventoryErrorCode,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
   }
 }
 
@@ -558,6 +563,23 @@ type BaseRowFacts = Omit<NativeHarnessDispatchRow, "state" | "launch" | "process
 
 function fail(code: NativeHarnessDispatchInventoryErrorCode, message: string): never {
   throw new NativeHarnessDispatchInventoryError(message, code);
+}
+
+/**
+ * `withWriteLock` can refuse to release a lock whose directory identity was
+ * replaced after the pinned run directory moved. That release failure replaces
+ * any earlier pre-write refusal, so the inventory boundary re-expresses it as
+ * `changed` and keeps the actual Store conflict as the cause. This applies only
+ * before any write: post-write lock uncertainty remains `ambiguous` at its
+ * existing call sites.
+ */
+function failPrewriteStoreConflict(error: unknown): never {
+  if (!(error instanceof StoreConflictError)) throw error;
+  throw new NativeHarnessDispatchInventoryError(
+    "The original Store reported a lock identity conflict before an inventory write; inspect the cause for details.",
+    "changed",
+    { cause: error },
+  );
 }
 
 function isErrno(error: unknown, code: string): boolean {
@@ -2220,7 +2242,7 @@ function makeHandle(
         return checkpoint;
       });
     } catch (error) {
-      if (!writeAttempted) throw error;
+      if (!writeAttempted) failPrewriteStoreConflict(error);
       poisoned = true;
       if (error instanceof NativeHarnessDispatchInventoryError && error.code === "ambiguous") throw error;
       const detail = error instanceof Error ? error.message : "lock release failed";
@@ -2404,7 +2426,7 @@ export async function createNativeHarnessDispatchInventory(
       }
     });
   } catch (error) {
-    if (!writeAttempted) throw error;
+    if (!writeAttempted) failPrewriteStoreConflict(error);
     if (error instanceof NativeHarnessDispatchInventoryError && error.code === "ambiguous") throw error;
     const detail = error instanceof Error ? error.message : "lock release failed";
     fail("ambiguous", `Initial dispatch inventory write or lock release is ambiguous: ${detail}`);

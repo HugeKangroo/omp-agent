@@ -12,7 +12,7 @@
     "distributionPath": "relative to the omp-agent package root",
     "upstreamPath": "relative to the upstream repository root"
   },
-  "sourceId": "159a6ebd4d657dad6b09419cbd8ec35eb30b0b317eae9848e799956c81a0e551",
+  "sourceId": "194f9801d9262d0194bd7075aa9d47d91bdeddb756791841687eb16162223072",
   "sourceIdAlgorithm": "sha256 over UTF-8 canonical JSON with object keys sorted recursively, arrays in stored order, and no insignificant whitespace, of {schemaVersion, upstreamRepository, baseCommit, files:[{distributionPath, bundledSha256}]}; files are every distributed content file except vendor/harness2/SOURCE.json, sorted by distributionPath; SOURCE.json is excluded to avoid self-referential metadata hashing.",
   "license": {
     "upstreamLicensePath": "LICENSE",
@@ -107,10 +107,10 @@
       "upstreamPath": "src/controller.ts",
       "kind": "upstream-source",
       "originalSha256": "711967e2e61220953e00412dbfcf3dac623202f0cd01d9e1fcfd002113582d92",
-      "bundledSha256": "339089bcd5e259a5352283d84fac986d4a8790bef7ad2843e98fa4f0fdc33f32",
-      "bytes": 37557,
+      "bundledSha256": "49eaffead8ce5b56f6268622650538fc7cb223d5023a94a982d6bb325ef100a3",
+      "bytes": 38881,
       "modified": true,
-      "note": "Strict optional-property adaptation: approval uses an explicit undefined union; undefined evolution execution, worker auth and missing lesson properties are omitted or deleted. Existing default consumers read equivalent values and JSON serialization is unchanged; own-property reflection is observably different and is not promised equivalent for custom consumers. Adds an inline create() third parameter limited to one own-data recoverySeedText string of at most 4096 UTF-8 bytes; it is read once before the first await and forwarded only to createWithRecoveryOrigin, while two-argument creation remains the unchanged unmarked store.create path."
+      "note": "Strict optional-property adaptation: approval uses an explicit undefined union; undefined evolution execution, worker auth and missing lesson properties are omitted or deleted. Existing default consumers read equivalent values and JSON serialization is unchanged; own-property reflection is observably different and is not promised equivalent for custom consumers. Adds an inline create() third parameter limited to one own-data recoverySeedText string of at most 4096 UTF-8 bytes; it is read once before the first await and forwarded only to createWithRecoveryOrigin, while two-argument creation remains the unchanged unmarked store.create path. Also routes marked cancellation to the Store's fresh-generation operation and closes marked continuation in this build: marked resume refuses before cancel clear/save/execution, and marked execute permits only the original queued/revision-0/empty-stages/no-snapshot record, with completed/applied remaining non-executing observations. Initial marked create/execute and unmarked behavior remain on the original paths; no resume tool, work reference or execution wiring is added."
     },
     {
       "distributionPath": "vendor/harness2/upstream/src/conversation.ts",
@@ -267,10 +267,10 @@
       "upstreamPath": "src/store.ts",
       "kind": "upstream-source",
       "originalSha256": "d3cc63d6a8a5dd10e073987927febac1fa69f076b9beeba9e08c2e198df472c8",
-      "bundledSha256": "682eebd4d7e2ab3577f96f0040cd6c7f64e556863667ec41088fc78c96afdb03",
-      "bytes": 41818,
+      "bundledSha256": "8a69e2523a6d0d6a0c158fbf728ece9e7e9bb66fab330abb342837bcd6160c36",
+      "bytes": 71125,
       "modified": true,
-      "note": "Upstream store with the existing pure readonly run/events decoders plus a fixed-shape creation-bound recovery codec, an explicit createWithRecoveryOrigin method, an immutable embedded origin and protected-identity save gate, and refusal to roll a marked or origin-declaring primary back from backup. Seeds are capped at 4096 bytes and origins at 8192 bytes before parse or embedded acceptance; initial marked runs are capped at 256 KiB. Existing ordinary Controller creation remains unmarked. Ordinary save also pins the caller-supplied ID/revision before its first await; this local save ownership correction prevents later caller mutation from retargeting an unmarked save. Other ordinary read/write behavior remains unchanged except for the explicit new method and marker gates."
+      "note": "Upstream store with the existing pure readonly run/events decoders plus a fixed-shape creation-bound recovery codec, an explicit createWithRecoveryOrigin method, an immutable embedded origin and protected-identity save gate, and refusal to roll a marked or origin-declaring primary back from backup. Seeds are capped at 4096 bytes and origins at 8192 bytes before parse or embedded acceptance; initial marked runs are capped at 256 KiB. Adds RunStore.acquireWithContext with an identity-bound frozen lease context and an acquire compatibility wrapper over the original atomic .run.lock algorithm, bounded no-follow owner/primary/cancel reads, a generation-aware marked cancellation request using the original short write lock, and one conditional commitRecoveryInterrupted transition. That transition rechecks the issued lease, raw primary SHA plus file identity, original revision/origin/deadlines, actual AbortSignal, and bounded host currentness at publication and consumption frontiers; it reuses the extracted already-write-locked save body, bounds the serialized next record at 256 KiB, consumes only the exact matched cancel generation, and never executes work. These primitives do not prove user intent, stopped workers, artifact validity, accounting admission or same-build compatibility. The conditional transition binds its lock, reads, backup, primary, cancel and directory sync to the issued lease's captured run directory, so a later runtime store.root mutation cannot retarget it; saveLocked accepts that internal captured directory only for this path, and acquireWithContext captures its root and run directory before its first await. The final intrinsic signal/original-deadline seal runs only after withWriteLock has fully released the short lock, and a post-publication seal failure reports committed state without rollback. Ordinary save behavior is unchanged; marked cancellation writes cancel:<uuid> plus LF (at most 64 bytes) while the original unmarked cancel request remains Controller-owned."
     },
     {
       "distributionPath": "vendor/harness2/upstream/src/surface.ts",

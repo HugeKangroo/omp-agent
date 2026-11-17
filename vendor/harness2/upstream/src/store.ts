@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
-import { chmod, lstat, mkdir, open, readdir, rename, rm } from "node:fs/promises";
+import { chmod, lstat, mkdir, open, readdir, rename, rm, unlink } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { CANDIDATE_IDS, STAGE_IDS, type HarnessBundle, type LibraryEntry, type RunEvent, type RunRecord, type RunRecoveryOrigin, type RunRecoverySeed } from "./types.ts";
 import { validateAdaptationPolicy } from "./adaptation";
@@ -39,6 +39,9 @@ const RECOVERY_ORIGIN_MAX_BYTES = 8192;
 const RECOVERY_RUN_MAX_BYTES = 256 * 1024;
 const RECOVERY_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const RECOVERY_SHA256 = /^[a-f0-9]{64}$/;
+const RECOVERY_CANCEL = /^cancel:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\n$/;
+const LOCK_OWNER_MAX_BYTES = 16 * 1024;
+const CANCEL_REQUEST_MAX_BYTES = 64;
 const RECOVERY_SEED_KEYS = Object.freeze([
   "accountingOwnerId",
   "accountingOwnerRevision",
@@ -291,16 +294,104 @@ export async function readRegular(path: string): Promise<string | undefined> {
     return await file.readFile("utf8");
   } finally { await file.close(); }
 }
-export async function atomicWrite(path: string, contents: string): Promise<void> {
+
+interface PathIdentity { readonly dev: number; readonly ino: number }
+interface BoundedRegularFile {
+  readonly bytes: Buffer;
+  readonly text: string;
+  readonly sha256: string;
+  readonly identity: PathIdentity;
+}
+/**
+ * Bounded, no-follow, regular-file read. The fstat size cap is checked before
+ * allocation and the actual read is capped as well, so a growing file cannot
+ * cause an unbounded allocation. The handle is closed on every path.
+ */
+async function readBoundedRegularFile(path: string, maxBytes: number): Promise<BoundedRegularFile | undefined> {
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 1024 * 1024) throw new RangeError("Invalid bounded read limit");
+  let file;
+  try { file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
+  catch (error) {
+    if (isMissing(error)) return undefined;
+    if ((error as NodeJS.ErrnoException).code === "ELOOP") throw new StoreCorruptionError(`Symlink is not a regular store file: ${path}`);
+    throw error;
+  }
+  let result: BoundedRegularFile;
+  try {
+    const info = await file.stat();
+    if (!info.isFile()) throw new StoreCorruptionError(`Not a regular store file: ${path}`);
+    if (info.size > maxBytes) throw new StoreCorruptionError(`Store file exceeds ${maxBytes} bytes: ${path}`);
+    const buffer = Buffer.allocUnsafe(maxBytes + 1);
+    let offset = 0;
+    while (offset < buffer.length) {
+      const { bytesRead } = await file.read(buffer, offset, buffer.length - offset, offset);
+      if (bytesRead === 0) break;
+      offset += bytesRead;
+    }
+    if (offset > maxBytes) throw new StoreCorruptionError(`Store file exceeds ${maxBytes} bytes: ${path}`);
+    const after = await file.stat();
+    if (!after.isFile() || after.dev !== info.dev || after.ino !== info.ino || after.size !== offset) {
+      throw new StoreConflictError(`Store file changed while reading: ${path}`);
+    }
+    const bytes = buffer.subarray(0, offset);
+    result = {
+      bytes,
+      text: bytes.toString("utf8"),
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      identity: { dev: info.dev, ino: info.ino },
+    };
+  } catch (error) {
+    try { await file.close(); }
+    catch (closeError) {
+      throw new Error(`Bounded read failed (${(error as Error).message}) and close failed (${(closeError as Error).message})`);
+    }
+    throw error;
+  }
+  // Exactly one close attempt. A rejected close is a real failure, not a
+  // reason to retry, drain or continue with the observed bytes.
+  await file.close();
+  // Return only after the close and a current pathname check. This does not
+  // make the read OS-atomic; it refuses a path replaced during read/close.
+  await assertBoundedPathCurrent(path, result.identity);
+  return result;
+}
+async function assertBoundedPathCurrent(path: string, identity: PathIdentity): Promise<void> {
+  const info = await lstat(path).catch(error => {
+    if (isMissing(error)) throw new StoreConflictError(`Store file disappeared after read: ${path}`);
+    throw error;
+  });
+  if (!info.isFile() || info.isSymbolicLink() || info.dev !== identity.dev || info.ino !== identity.ino) {
+    throw new StoreConflictError(`Store file was replaced after read: ${path}`);
+  }
+}
+async function pathIdentity(path: string, label: string): Promise<PathIdentity> {
+  const info = await lstat(path).catch(error => {
+    if (isMissing(error)) throw new StoreConflictError(`Missing ${label}: ${path}`);
+    throw error;
+  });
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new StoreCorruptionError(`Invalid ${label}: ${path}`);
+  return { dev: info.dev, ino: info.ino };
+}
+async function assertPathIdentity(path: string, expected: PathIdentity, label: string): Promise<void> {
+  const current = await pathIdentity(path, label);
+  if (current.dev !== expected.dev || current.ino !== expected.ino) {
+    throw new StoreConflictError(`${label} was replaced: ${path}`);
+  }
+}
+async function syncDirectory(path: string): Promise<void> {
+  const dir = await open(path, "r");
+  try { await dir.sync(); } finally { await dir.close(); }
+}
+export async function atomicWrite(path: string, contents: string, beforeRename?: () => Promise<void>): Promise<void> {
   const temporary = `${path}.${randomUUID()}.tmp`;
   const file = await open(temporary, "wx", 0o600);
   try { await file.writeFile(contents, "utf8"); await file.sync(); }
   catch (error) { await rm(temporary, { force: true }); throw error; }
   finally { await file.close(); }
   try {
+    if (beforeRename !== undefined) await beforeRename();
     await rename(temporary, path);
-    const dir = await open(dirname(path), "r");
-    try { await dir.sync(); } finally { await dir.close(); }
+    await syncDirectory(dirname(path));
   } finally { await rm(temporary, { force: true }); }
 }
 function serialize(value: unknown): string { return `${JSON.stringify(value, null, 2)}\n`; }
@@ -390,10 +481,19 @@ async function serialized<T>(key: string, fn: () => Promise<T>): Promise<T> {
 }
 
 interface LockOwner { pid: number; token: string; createdAt: string }
+interface AcquiredLock {
+  readonly path: string;
+  readonly owner: LockOwner;
+  readonly ownerText: string;
+  readonly ownerSha256: string;
+  readonly ownerIdentity: PathIdentity;
+  readonly identity: PathIdentity;
+  release(): Promise<void>;
+}
 async function lockOwner(path: string): Promise<LockOwner | undefined> {
-  const raw = await readRegular(join(path, "owner.json"));
-  if (raw === undefined) return undefined;
-  return parse<LockOwner>(raw, path, value => {
+  const file = await readBoundedRegularFile(join(path, "owner.json"), LOCK_OWNER_MAX_BYTES);
+  if (file === undefined) return undefined;
+  return parse<LockOwner>(file.text, path, value => {
     invariant(object(value) && Number.isSafeInteger(value.pid) && (value.pid as number) > 0 && nonempty(value.token) && timestamp(value.createdAt), "lock owner");
   });
 }
@@ -401,23 +501,74 @@ function alive(pid: number): boolean {
   try { process.kill(pid, 0); return true; }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; return true; }
 }
+/**
+ * Cleanup is allowed only while the path is still the directory this process
+ * created and it either has no owner yet or still has our exact owner bytes.
+ * Unknown or replaced paths are left for inspection instead of recursively
+ * deleting whatever now occupies the lock name.
+ */
+async function cleanupInitializingLock(path: string, identity: PathIdentity, ownerText: string): Promise<void> {
+  try {
+    const info = await lstat(path);
+    if (!info.isDirectory() || info.isSymbolicLink() || info.dev !== identity.dev || info.ino !== identity.ino) return;
+    const owner = await readBoundedRegularFile(join(path, "owner.json"), LOCK_OWNER_MAX_BYTES);
+    if (owner !== undefined && owner.text !== ownerText) return;
+    // Recheck after the owner read: a same-owner hardlink under a replaced
+    // directory must not be deleted by cleanup.
+    const final = await lstat(path);
+    if (!final.isDirectory() || final.isSymbolicLink() || final.dev !== identity.dev || final.ino !== identity.ino) return;
+    await rm(path, { recursive: true });
+  } catch { /* Preserve an unknown path rather than claim cleanup. */ }
+}
 /** Atomic mkdir lock. Only a valid, demonstrably dead PID can be reclaimed. */
-async function acquireLock(path: string): Promise<() => Promise<void>> {
+async function acquireLock(path: string): Promise<AcquiredLock> {
   for (let attempt = 0; attempt < 4; attempt++) {
-    try {
-      await mkdir(path, { mode: 0o700 });
-      const owner: LockOwner = { pid: process.pid, token: randomUUID(), createdAt: new Date().toISOString() };
-      try { await atomicWrite(join(path, "owner.json"), serialize(owner)); }
-      catch (error) { await rm(path, { recursive: true, force: true }); throw error; }
-      let released = false;
-      return async () => {
-        if (released) return;
-        const current = await lockOwner(path);
-        if (current?.token !== owner.token) throw new RunLockedError(`Lock ownership changed: ${path}`);
-        await rm(path, { recursive: true }); released = true;
-      };
-    } catch (error) {
+    let created = false;
+    try { await mkdir(path, { mode: 0o700 }); created = true; }
+    catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    }
+    if (created) {
+      const createdIdentity = await pathIdentity(path, "lock directory");
+      const owner: LockOwner = { pid: process.pid, token: randomUUID(), createdAt: new Date().toISOString() };
+      const ownerText = `${JSON.stringify(owner, null, 2)}\n`;
+      const ownerSha256 = createHash("sha256").update(ownerText, "utf8").digest("hex");
+      try {
+        await atomicWrite(join(path, "owner.json"), ownerText);
+        const ownerIdentity = (await readBoundedRegularFile(join(path, "owner.json"), LOCK_OWNER_MAX_BYTES))?.identity;
+        if (ownerIdentity === undefined) throw new StoreCorruptionError(`Lock owner disappeared after write: ${path}`);
+        const identity = await pathIdentity(path, "lock directory");
+        if (identity.dev !== createdIdentity.dev || identity.ino !== createdIdentity.ino) {
+          throw new StoreConflictError(`Lock directory was replaced during initialization: ${path}`);
+        }
+        let released = false;
+        return {
+          path,
+          owner,
+          ownerText,
+          ownerSha256,
+          ownerIdentity,
+          identity,
+          release: async () => {
+            if (released) return;
+            await assertPathIdentity(path, identity, "lock directory");
+            const current = await readBoundedRegularFile(join(path, "owner.json"), LOCK_OWNER_MAX_BYTES);
+            if (current === undefined
+              || current.identity.dev !== ownerIdentity.dev
+              || current.identity.ino !== ownerIdentity.ino
+              || current.text !== ownerText
+              || current.sha256 !== ownerSha256) {
+              throw new RunLockedError(`Lock ownership changed: ${path}`);
+            }
+            await assertPathIdentity(path, identity, "lock directory");
+            await rm(path, { recursive: true });
+            released = true;
+          },
+        };
+      } catch (error) {
+        await cleanupInitializingLock(path, createdIdentity, ownerText);
+        throw error;
+      }
     }
     const info = await lstat(path).catch(error => { if (isMissing(error)) return undefined; throw error; });
     if (!info) continue;
@@ -447,9 +598,114 @@ export async function withWriteLock<T>(directory: string, fn: () => Promise<T>):
   return serialized(directory, async () => {
     await privateDirectory(dirname(directory));
     await privateDirectory(directory);
-    const release = await acquireLock(join(directory, ".write.lock"));
-    try { return await fn(); } finally { await release(); }
+    const lock = await acquireLock(join(directory, ".write.lock"));
+    try { return await fn(); } finally { await lock.release(); }
   });
+}
+
+/**
+ * Store-issued run lease context. The object is identity-bound through a
+ * private WeakMap entry; copied objects, lookalikes and contexts from another
+ * Store or run are not authority. It observes the actual `.run.lock`; it does
+ * not prove user intent, worker death, artifact validity or budget admission.
+ */
+export interface RunStoreLease {
+  readonly ownerSha256: string;
+  assertCurrent(): Promise<void>;
+  release(): Promise<void>;
+}
+interface SaveLockedOptions {
+  readonly maxBytes?: number;
+  readonly beforePrimaryWrite?: () => Promise<void>;
+  readonly beforePrimaryRename?: () => Promise<void>;
+  /**
+   * Internal captured run directory already bound to a Store-issued lease.
+   * Only the conditional lease-owned transition supplies this; ordinary save
+   * and every caller-facing path keep the default `this.runDir(id)`.
+   */
+  readonly targetDirectory?: string;
+}
+interface LeaseState {
+  readonly store: RunStore;
+  readonly runId: string;
+  readonly root: string;
+  readonly runDir: string;
+  readonly lockPath: string;
+  readonly rootIdentity: PathIdentity;
+  readonly runIdentity: PathIdentity;
+  readonly lockIdentity: PathIdentity;
+  readonly ownerText: string;
+  readonly ownerSha256: string;
+  readonly ownerIdentity: PathIdentity;
+  active: boolean;
+  busy: boolean;
+}
+const leaseStates = new WeakMap<RunStoreLease, LeaseState>();
+const ABORTED_GETTER = typeof AbortSignal === "undefined"
+  ? undefined
+  : Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get;
+/** Intrinsic getter call: prototype spoofing and shadowed `aborted` fail closed. */
+function readSignalAborted(signal: AbortSignal): boolean {
+  if (ABORTED_GETTER === undefined) throw new StoreConflictError("Recovery transition requires an actual AbortSignal");
+  let value: unknown;
+  try { value = ABORTED_GETTER.call(signal); }
+  catch { throw new StoreConflictError("Recovery transition requires an actual AbortSignal"); }
+  if (typeof value !== "boolean") throw new StoreConflictError("Recovery transition requires an actual AbortSignal");
+  return value;
+}
+async function assertLeaseCurrent(state: LeaseState): Promise<void> {
+  if (!state.active) throw new StoreConflictError(`Run lease is no longer active: ${state.runId}`);
+  const assertScope = async (): Promise<void> => {
+    if (!state.active) throw new StoreConflictError(`Run lease is no longer active: ${state.runId}`);
+    await assertPathIdentity(state.root, state.rootIdentity, "store root");
+    await assertPathIdentity(state.runDir, state.runIdentity, "run directory");
+    await assertPathIdentity(state.lockPath, state.lockIdentity, "run lease");
+  };
+  const assertOwner = async (): Promise<void> => {
+    const owner = await readBoundedRegularFile(join(state.lockPath, "owner.json"), LOCK_OWNER_MAX_BYTES);
+    if (owner === undefined
+      || owner.identity.dev !== state.ownerIdentity.dev
+      || owner.identity.ino !== state.ownerIdentity.ino
+      || owner.text !== state.ownerText
+      || owner.sha256 !== state.ownerSha256) {
+      throw new RunLockedError(`Run lease ownership changed: ${state.runId}`);
+    }
+  };
+  await assertScope();
+  await assertOwner();
+  // The opened owner descriptor alone is not proof: recheck the scope, the
+  // current path and owner bytes, then seal root/run/lock identities again
+  // after the last owner read/close. A completed concurrent release cannot
+  // leave this assertion current.
+  await assertScope();
+  await assertOwner();
+  await assertScope();
+  if (!state.active) throw new StoreConflictError(`Run lease is no longer active: ${state.runId}`);
+}
+function recoveryDeadline(record: RunRecord): number {
+  const origin = record.recoveryOrigin;
+  if (origin === undefined) throw new StoreConflictError(`Run ${record.id} is not a marked recovery run`);
+  const createdAt = Date.parse(record.createdAt);
+  const maxDurationMs = record.config.maxDurationMs;
+  const outer = origin.seed.deadlineAt;
+  const inner = createdAt + maxDurationMs;
+  if (!Number.isSafeInteger(createdAt) || !Number.isSafeInteger(outer)
+    || !Number.isFinite(maxDurationMs) || maxDurationMs < 0 || !Number.isSafeInteger(inner)) {
+    throw new StoreCorruptionError(`Recovery deadline for ${record.id} is not a finite safe value`);
+  }
+  return Math.min(outer, inner);
+}
+function assertRecoveryDeadline(record: RunRecord, now: number = Date.now()): void {
+  const origin = record.recoveryOrigin;
+  if (origin === undefined) throw new StoreConflictError(`Run ${record.id} is not a marked recovery run`);
+  if (!Number.isSafeInteger(now) || now <= 0) {
+    throw new StoreConflictError(`Recovery clock for ${record.id} is not a safe positive time`);
+  }
+  if (now < origin.seed.admittedAt) {
+    throw new StoreConflictError(`Recovery clock for ${record.id} predates original admission`);
+  }
+  const deadline = recoveryDeadline(record);
+  if (now >= deadline) throw new StoreConflictError(`Original recovery deadline expired for ${record.id}`);
 }
 
 /** Local-filesystem store. Mutations serialize in-process and use cross-process
@@ -537,32 +793,51 @@ export class RunStore {
     }
     return records.sort((a, b) => b.createdAt.localeCompare(a.createdAt) || a.id.localeCompare(b.id));
   }
-  async save(record: RunRecord, expectedRevision: number): Promise<RunRecord> {
-    validateRun(record); const next = structuredClone(record);
-    // Own the admitted ID/revision before the first await; later caller
-    // mutation cannot retarget this operation's lock, CAS or writes.
+  /**
+   * Already-write-locked CAS/identity/write body. Callers must own `next` and
+   * already hold the original short write lock; this method never acquires
+   * `withWriteLock` and never falls back to an unbounded reread.
+   */
+  private async saveLocked(next: RunRecord, current: RunRecord | undefined, expectedRevision: number, options?: SaveLockedOptions): Promise<RunRecord> {
     const id = next.id;
     const admittedRevision = next.revision;
+    if (!current || current.revision !== expectedRevision || admittedRevision !== expectedRevision) throw new StoreConflictError(`Revision conflict for ${id}: expected ${expectedRevision}, found ${current?.revision ?? "missing"}`);
+    if (current.revision >= Number.MAX_SAFE_INTEGER) throw new StoreConflictError("Revision counter exhausted");
+    if (current.recoveryOrigin !== undefined || next.recoveryOrigin !== undefined) {
+      if (current.recoveryOrigin === undefined || next.recoveryOrigin === undefined) {
+        throw new StoreConflictError(`Recovery origin cannot be added to or removed from run ${id}`);
+      }
+      if (canonical(current.recoveryOrigin) !== canonical(next.recoveryOrigin)) {
+        throw new StoreConflictError(`Recovery origin is immutable for run ${id}`);
+      }
+      if (buildRecoveryRecordIdentity(current) !== buildRecoveryRecordIdentity(next)) {
+        throw new StoreConflictError(`Protected run identity cannot change for marked run ${id}`);
+      }
+      next.recoveryOrigin = current.recoveryOrigin;
+    }
+    next.revision = current.revision + 1; next.updatedAt = new Date().toISOString();
+    next.createdAt = current.createdAt;
+    const backupText = serialize(current);
+    const nextText = serialize(next);
+    if (options?.maxBytes !== undefined) {
+      if (Buffer.byteLength(backupText, "utf8") > options.maxBytes || Buffer.byteLength(nextText, "utf8") > options.maxBytes) {
+        throw new RangeError(`Recovery record exceeds the ${options.maxBytes}-byte profile.`);
+      }
+    }
+    if (options?.beforePrimaryWrite !== undefined) await options.beforePrimaryWrite();
+    const directory = options?.targetDirectory ?? this.runDir(id);
+    await atomicWrite(join(directory, "run.json.bak"), backupText);
+    await atomicWrite(join(directory, "run.json"), nextText, options?.beforePrimaryRename);
+    return next;
+  }
+  async save(record: RunRecord, expectedRevision: number): Promise<RunRecord> {
+    validateRun(record); const next = structuredClone(record);
+    // Own the admitted ID before the first await; later caller mutation cannot
+    // retarget this operation's lock, CAS or writes.
+    const id = next.id;
     return withWriteLock(this.runDir(id), async () => {
       const current = await this.get(id);
-      if (!current || current.revision !== expectedRevision || admittedRevision !== expectedRevision) throw new StoreConflictError(`Revision conflict for ${id}: expected ${expectedRevision}, found ${current?.revision ?? "missing"}`);
-      if (current.revision >= Number.MAX_SAFE_INTEGER) throw new StoreConflictError("Revision counter exhausted");
-      if (current.recoveryOrigin !== undefined || next.recoveryOrigin !== undefined) {
-        if (current.recoveryOrigin === undefined || next.recoveryOrigin === undefined) {
-          throw new StoreConflictError(`Recovery origin cannot be added to or removed from run ${id}`);
-        }
-        if (canonical(current.recoveryOrigin) !== canonical(next.recoveryOrigin)) {
-          throw new StoreConflictError(`Recovery origin is immutable for run ${id}`);
-        }
-        if (buildRecoveryRecordIdentity(current) !== buildRecoveryRecordIdentity(next)) {
-          throw new StoreConflictError(`Protected run identity cannot change for marked run ${id}`);
-        }
-        next.recoveryOrigin = current.recoveryOrigin;
-      }
-      next.revision = current.revision + 1; next.updatedAt = new Date().toISOString();
-      next.createdAt = current.createdAt;
-      await atomicWrite(join(this.runDir(id), "run.json.bak"), serialize(current));
-      await atomicWrite(join(this.runDir(id), "run.json"), serialize(next)); return next;
+      return this.saveLocked(next, current, expectedRevision);
     });
   }
   async appendEvent(event: RunEvent): Promise<void> {
@@ -584,9 +859,309 @@ export class RunStore {
     if (!raw.endsWith("\n")) throw new StoreCorruptionError(`Incomplete event log: ${path}`);
     return raw.slice(0, -1).split("\n").map((line, i) => parse<RunEvent>(line, `${path}:${i + 1}`, value => validateEvent(value, id)));
   }
+  /**
+   * Original whole-run lease, now with an identity-bound observation context.
+   * Stale-lock reclamation remains the original policy: only a valid,
+   * demonstrably dead owner can be reclaimed; a missing owner refuses.
+   */
+  async acquireWithContext(id: string): Promise<RunStoreLease> {
+    // `readonly` is a compile-time property only. Capture the root and run
+    // directory before the first await so validation and issuance cannot be
+    // split between two trees by a runtime assignment to store.root.
+    const root = this.root;
+    const directory = join(root, validId(id));
+    if (!(await existingDirectory(root)) || !(await existingDirectory(directory))) {
+      throw new StoreConflictError(`Unknown run: ${id}`);
+    }
+    const primaryPath = join(directory, "run.json");
+    const raw = await readRegular(primaryPath);
+    if (raw === undefined) {
+      if (await readRegular(`${primaryPath}.bak`) !== undefined) {
+        throw new StoreCorruptionError(`Missing ${primaryPath}; backup exists. Use recover(id) explicitly.`);
+      }
+      throw new StoreConflictError(`Unknown run: ${id}`);
+    }
+    parse<RunRecord>(raw, primaryPath, value => validateRun(value, id));
+    const rootIdentity = await pathIdentity(root, "store root");
+    const runIdentity = await pathIdentity(directory, "run directory");
+    const lock = await acquireLock(join(directory, ".run.lock"));
+    try {
+      await assertPathIdentity(root, rootIdentity, "store root");
+      await assertPathIdentity(directory, runIdentity, "run directory");
+      const state: LeaseState = {
+        store: this,
+        runId: id,
+        root,
+        runDir: directory,
+        lockPath: lock.path,
+        rootIdentity,
+        runIdentity,
+        lockIdentity: lock.identity,
+        ownerText: lock.ownerText,
+        ownerSha256: lock.ownerSha256,
+        ownerIdentity: lock.ownerIdentity,
+        active: true,
+        busy: false,
+      };
+      const context: RunStoreLease = Object.freeze({
+        ownerSha256: lock.ownerSha256,
+        assertCurrent: async () => { await assertLeaseCurrent(state); },
+        release: async () => {
+          if (!state.active) return;
+          if (state.busy) throw new StoreConflictError(`Run lease is busy: ${id}`);
+          state.busy = true;
+          try {
+            // Cooperating Store writers honor this pathname lease. The final
+            // check and recursive rm are not one OS-atomic operation; this
+            // protocol does not claim resistance to arbitrary external
+            // replacement in that narrow non-cooperating window.
+            await assertLeaseCurrent(state);
+            await rm(lock.path, { recursive: true });
+            state.active = false;
+          } finally { state.busy = false; }
+        },
+      });
+      leaseStates.set(context, state);
+      return context;
+    } catch (error) {
+      await lock.release().catch(() => {});
+      throw error;
+    }
+  }
+  /** Compatibility wrapper: the original acquire() release is the context release. */
   async acquire(id: string): Promise<() => Promise<void>> {
-    if (!(await this.get(id))) throw new StoreConflictError(`Unknown run: ${id}`);
-    return acquireLock(join(this.runDir(id), ".run.lock"));
+    return (await this.acquireWithContext(id)).release;
+  }
+  /**
+   * Generation-aware cancellation for an already-marked run. Every accepted
+   * request replaces the marker with a fresh random generation under the
+   * original short write lock. The returned facts are observations only.
+   */
+  async requestMarkedCancellation(id: string): Promise<{
+    readonly status: "requested" | "noop";
+    readonly generation: string | null;
+    readonly generationSha256: string | null;
+  }> {
+    validId(id);
+    // Capture the operation target before the first await. A later runtime
+    // mutation of store.root must not retarget the short lock, the primary
+    // read or the generation write.
+    const directory = this.runDir(id);
+    return withWriteLock(directory, async () => {
+      const primaryPath = join(directory, "run.json");
+      const primary = await readBoundedRegularFile(primaryPath, RECOVERY_RUN_MAX_BYTES);
+      if (primary === undefined) throw new StoreConflictError(`Unknown run: ${id}`);
+      const record = parse<RunRecord>(primary.text, primaryPath, value => validateRun(value, id));
+      if (record.recoveryOrigin === undefined) throw new StoreConflictError(`Run ${id} is not a marked recovery run`);
+      if (record.status === "completed" || record.status === "applied") {
+        return { status: "noop" as const, generation: null, generationSha256: null };
+      }
+      const cancelPath = join(directory, "cancel.request");
+      const existing = await readBoundedRegularFile(cancelPath, CANCEL_REQUEST_MAX_BYTES);
+      if (existing !== undefined && !RECOVERY_CANCEL.test(existing.text)) {
+        throw new StoreCorruptionError(`Corrupt cancellation request: ${cancelPath}`);
+      }
+      const generation = `cancel:${randomUUID()}\n`;
+      if (Buffer.byteLength(generation, "utf8") > CANCEL_REQUEST_MAX_BYTES) throw new RangeError("Cancellation generation exceeds the 64-byte profile.");
+      await atomicWrite(cancelPath, generation);
+      return {
+        status: "requested" as const,
+        generation,
+        generationSha256: createHash("sha256").update(generation, "utf8").digest("hex"),
+      };
+    });
+  }
+  /**
+   * Conditional interrupted-state transition for one marked run. This never
+   * executes work and never proves resume eligibility: it only converts the
+   * exact observed record to `interrupted` under the original short write
+   * lock, then consumes the exact matched cancellation generation.
+   */
+  async commitRecoveryInterrupted(
+    lease: RunStoreLease,
+    runId: string,
+    expectedRevision: number,
+    expectedPrimarySha256: string,
+    expectedCancelSha256: string | null,
+    signal: AbortSignal,
+    currentness: () => void | Promise<void>,
+  ): Promise<RunRecord> {
+    if (typeof runId !== "string") throw new StoreConflictError("Recovery run ID must be a string");
+    validId(runId);
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) throw new StoreConflictError("Recovery revision must be a safe nonnegative integer");
+    if (typeof expectedPrimarySha256 !== "string" || !RECOVERY_SHA256.test(expectedPrimarySha256)) throw new StoreConflictError("Recovery primary SHA must be 64 lowercase hex characters");
+    if (expectedCancelSha256 !== null && (typeof expectedCancelSha256 !== "string" || !RECOVERY_SHA256.test(expectedCancelSha256))) throw new StoreConflictError("Recovery cancel SHA must be null or 64 lowercase hex characters");
+    if (typeof AbortSignal === "undefined" || !(signal instanceof AbortSignal)) throw new StoreConflictError("Recovery transition requires an actual AbortSignal");
+    if (typeof currentness !== "function") throw new StoreConflictError("Recovery transition requires a host currentness assertion");
+    const state = leaseStates.get(lease);
+    if (state === undefined || state.store !== this || state.runId !== runId) {
+      throw new StoreConflictError(`Run lease was not issued by this Store for ${runId}`);
+    }
+    if (!state.active) throw new StoreConflictError(`Run lease is no longer active: ${runId}`);
+    if (state.busy) throw new StoreConflictError(`Run lease is busy: ${runId}`);
+    // Bind this operation to the issued lease's original run directory before
+    // the first await. A later runtime mutation of store.root must not
+    // retarget the lock, reads, backup, primary, cancel or directory sync.
+    const directory = state.runDir;
+    // Own every scalar/reference before the first await. The host callback is
+    // captured once and must not become a JSON permission or a thenable.
+    const signalRef = signal;
+    readSignalAborted(signalRef);
+    const hostCheck = currentness;
+    const startedClock = Date.now();
+    if (!Number.isSafeInteger(startedClock) || startedClock <= 0) {
+      throw new StoreConflictError("Recovery clock is not a safe positive time");
+    }
+    state.busy = true;
+    let lastClock: number | undefined = startedClock;
+    const assertClock = (record: RunRecord): void => {
+      const now = Date.now();
+      if (!Number.isSafeInteger(now) || now <= 0) {
+        throw new StoreConflictError(`Recovery clock for ${record.id} is not a safe positive time`);
+      }
+      if (lastClock !== undefined && now < lastClock) {
+        throw new StoreConflictError(`Recovery clock moved backwards during transition for ${record.id}`);
+      }
+      lastClock = now;
+      assertRecoveryDeadline(record, now);
+    };
+    const assertCurrent = async (): Promise<void> => {
+      if (readSignalAborted(signalRef)) throw new Error("Cancellation requested");
+      await assertLeaseCurrent(state);
+      if (readSignalAborted(signalRef)) throw new Error("Cancellation requested");
+    };
+    // Synchronous control seal, used only after a frontier's final await.
+    const seal = (record: RunRecord): void => {
+      if (readSignalAborted(signalRef)) throw new Error("Cancellation requested");
+      assertClock(record);
+      if (readSignalAborted(signalRef)) throw new Error("Cancellation requested");
+    };
+    const checkHost = async (record: RunRecord | undefined): Promise<void> => {
+      const result: unknown = hostCheck();
+      if (result !== undefined) {
+        if (!(result instanceof Promise)) throw new StoreConflictError("Host currentness assertion must return void or a Promise<void>");
+        const value: unknown = await result;
+        if (value !== undefined) throw new StoreConflictError("Host currentness assertion resolved to a non-void value");
+      }
+      await assertCurrent();
+      if (record !== undefined) assertClock(record);
+    };
+    try {
+      await assertCurrent();
+      await checkHost(undefined);
+      const committed = await withWriteLock(directory, async () => {
+        const primaryPath = join(directory, "run.json");
+        await assertCurrent();
+        const primary = await readBoundedRegularFile(primaryPath, RECOVERY_RUN_MAX_BYTES);
+        if (primary === undefined) throw new StoreConflictError(`Missing primary run record: ${runId}`);
+        if (primary.sha256 !== expectedPrimarySha256) throw new StoreConflictError(`Primary run record changed: ${runId}`);
+        const record = parse<RunRecord>(primary.text, primaryPath, value => validateRun(value, runId));
+        if (record.revision !== expectedRevision) throw new StoreConflictError(`Revision conflict for ${runId}: expected ${expectedRevision}, found ${record.revision}`);
+        if (record.recoveryOrigin === undefined) throw new StoreConflictError(`Run ${runId} is not a marked recovery run`);
+        if (record.status === "completed" || record.status === "applied") throw new StoreConflictError(`Run ${runId} is already terminal`);
+        assertClock(record);
+        await assertCurrent();
+        await checkHost(record);
+        const assertPrimaryUnchanged = async (): Promise<void> => {
+          // The host hook may have yielded arbitrary time. Re-read the actual
+          // bounded primary and require both raw bytes and file identity.
+          const current = await readBoundedRegularFile(primaryPath, RECOVERY_RUN_MAX_BYTES);
+          if (current === undefined
+            || current.sha256 !== expectedPrimarySha256
+            || current.identity.dev !== primary.identity.dev
+            || current.identity.ino !== primary.identity.ino) {
+            throw new StoreConflictError(`Primary run record changed before publication: ${runId}`);
+          }
+        };
+        const cancelPath = join(directory, "cancel.request");
+        const cancel = await readBoundedRegularFile(cancelPath, CANCEL_REQUEST_MAX_BYTES);
+        if (expectedCancelSha256 === null) {
+          if (cancel !== undefined) throw new StoreConflictError(`Unexpected cancellation request for ${runId}`);
+        } else {
+          if (cancel === undefined) throw new StoreConflictError(`Matched cancellation request is missing for ${runId}`);
+          if (!RECOVERY_CANCEL.test(cancel.text)) throw new StoreCorruptionError(`Corrupt cancellation request: ${cancelPath}`);
+          if (cancel.sha256 !== expectedCancelSha256) throw new StoreConflictError(`Cancellation generation changed for ${runId}`);
+        }
+        const matchedCancel = cancel;
+        await assertCurrent();
+        assertClock(record);
+        await assertPrimaryUnchanged();
+        seal(record);
+        const next = structuredClone(record);
+        next.status = "interrupted";
+        validateRun(next);
+        const beforePublication = async (): Promise<void> => {
+          // Host work may spend arbitrary time. Re-run it, then re-read the
+          // actual bounded primary, then synchronously seal signal/clock
+          // before the caller proceeds to backup or primary publication.
+          await checkHost(record);
+          await assertPrimaryUnchanged();
+          seal(record);
+        };
+        const saved = await this.saveLocked(next, record, expectedRevision, {
+          maxBytes: RECOVERY_RUN_MAX_BYTES,
+          beforePrimaryWrite: beforePublication,
+          beforePrimaryRename: beforePublication,
+          targetDirectory: directory,
+        });
+        const savedText = serialize(saved);
+        const published = await readBoundedRegularFile(primaryPath, RECOVERY_RUN_MAX_BYTES);
+        if (published === undefined || published.text !== savedText) {
+          throw new StoreConflictError(`Published recovery record changed: ${runId}`);
+        }
+        if (expectedCancelSha256 !== null) {
+          if (matchedCancel === undefined) throw new StoreConflictError(`Matched cancellation request is missing for ${runId}`);
+          // The host hook is an awaited boundary: re-read and match after it,
+          // then run the pre-consumption guard without another host call.
+          await checkHost(saved);
+          const current = await readBoundedRegularFile(cancelPath, CANCEL_REQUEST_MAX_BYTES);
+          if (current === undefined
+            || current.sha256 !== expectedCancelSha256
+            || !current.bytes.equals(matchedCancel.bytes)
+            || current.identity.dev !== matchedCancel.identity.dev
+            || current.identity.ino !== matchedCancel.identity.ino) {
+            throw new StoreConflictError(`Cancellation request changed before consumption: ${runId}`);
+          }
+          await assertCurrent();
+          assertClock(record);
+          // No callback runs between this final byte/identity match and unlink.
+          const confirmed = await readBoundedRegularFile(cancelPath, CANCEL_REQUEST_MAX_BYTES);
+          if (confirmed === undefined
+            || confirmed.sha256 !== expectedCancelSha256
+            || !confirmed.bytes.equals(matchedCancel.bytes)
+            || confirmed.identity.dev !== matchedCancel.identity.dev
+            || confirmed.identity.ino !== matchedCancel.identity.ino) {
+            throw new StoreConflictError(`Cancellation request changed before consumption: ${runId}`);
+          }
+          seal(record);
+          await unlink(cancelPath);
+          await syncDirectory(directory);
+        }
+        // When absence was expected, a newly appeared marker is a newer request:
+        // it is never unlinked here and remains visible to the next observer.
+        await checkHost(saved);
+        const finalPrimary = await readBoundedRegularFile(primaryPath, RECOVERY_RUN_MAX_BYTES);
+        if (finalPrimary === undefined
+          || finalPrimary.sha256 !== published.sha256
+          || finalPrimary.identity.dev !== published.identity.dev
+          || finalPrimary.identity.ino !== published.identity.ino) {
+          throw new StoreConflictError(`Published recovery record changed before success: ${runId}`);
+        }
+        await assertCurrent();
+        seal(saved);
+        return saved;
+      });
+      // `withWriteLock` has fully returned, including its short-lock release
+      // IO. No host callback may run here: one final synchronous intrinsic
+      // signal + monotone original-deadline seal only. A newer cancellation
+      // request remains unread and unconsumed.
+      try { seal(committed); }
+      catch (error) {
+        const reason = error instanceof Error ? error.message : String(error);
+        throw new StoreConflictError(`Recovery record ${runId} was committed, but the final signal/deadline seal failed: ${reason}`);
+      }
+      return committed;
+    } finally { state.busy = false; }
   }
   /** Explicit recovery only: preserve damaged bytes, restore the validated previous
    * revision, and advance past the interrupted revision to invalidate old CAS tokens. */

@@ -137,14 +137,35 @@ export class HarnessController {
   private cancelPath(id: string): string { return path.join(this.store.runDir(id), "cancel.request"); }
   async cancel(id: string): Promise<void> {
     const record = await this.required(id);
+    // Marked runs need a fresh generation for every request, including a
+    // currently cancelled run, so a simultaneous later resume cannot coalesce
+    // an older request with a newer one.
+    if (record.recoveryOrigin !== undefined) {
+      await this.store.requestMarkedCancellation(id);
+      return;
+    }
     if (["completed", "applied", "cancelled"].includes(record.status)) return;
     await writeFile(this.cancelPath(id), "cancel\n", { flag: "wx", mode: 0o600 }).catch(error => { if (error.code !== "EEXIST") throw error; });
+  }
+  private initialMarkedRecord(record: RunRecord): boolean {
+    return record.recoveryOrigin !== undefined
+      && record.status === "queued"
+      && record.revision === 0
+      && Object.keys(record.stages).length === 0
+      && record.snapshot === undefined;
   }
   async execute(id: string): Promise<RunRecord> {
     await this.required(id);
     const release = await this.store.acquire(id);
     try {
       const record = await this.required(id);
+      if (record.recoveryOrigin !== undefined) {
+        // Completed/applied remains a non-executing observation, as before.
+        if (["completed", "applied"].includes(record.status)) return record;
+        if (!this.initialMarkedRecord(record)) {
+          throw new Error("Marked recovery run is not at its original initial record; guarded continuation is not enabled in this build");
+        }
+      }
       if (record.status === "cancelled") throw new Error("Run is cancelled; use resume explicitly");
       return await this.executeLocked(record);
     } finally { await release(); }
@@ -155,6 +176,11 @@ export class HarnessController {
     try {
       const record = await this.required(id);
       if (["completed", "applied"].includes(record.status)) return record;
+      // Refuse before clearing the cancellation marker, saving or dispatching.
+      // The admission that could authorize same-run continuation arrives later.
+      if (record.recoveryOrigin !== undefined) {
+        throw new Error("Marked recovery runs cannot resume in this build; guarded continuation is not enabled");
+      }
       await unlink(this.cancelPath(id)).catch(error => { if (error.code !== "ENOENT") throw error; });
       record.status = "interrupted";
       await this.save(record);

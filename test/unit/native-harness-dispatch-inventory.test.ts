@@ -27,7 +27,7 @@ import {
   createNativeHarnessDispatchInventory,
   openNativeHarnessDispatchInventory,
 } from "../../src/native-harness-dispatch-inventory.ts";
-import { RunStore } from "../../vendor/harness2/upstream/src/store.ts";
+import { RunStore, StoreConflictError } from "../../vendor/harness2/upstream/src/store.ts";
 import type {
   RunRecord,
   RunRecoveryOrigin,
@@ -981,14 +981,15 @@ describe("dispatch inventory sidecar isolation", () => {
     await mkdir(substitute);
     await writeFile(path.join(substitute, NATIVE_HARNESS_DISPATCH_INVENTORY_FILE), valid);
     let fired = false;
+    let ownerText = "";
     const handle = await openInventory(run, {
       testAfterPrimaryRead: async () => {
         if (fired) return;
         fired = true;
         await rename(run.runDir, moved);
-        const lockOwner = await readFile(path.join(moved, ".write.lock", "owner.json"), "utf8");
+        ownerText = await readFile(path.join(moved, ".write.lock", "owner.json"), "utf8");
         await mkdir(path.join(substitute, ".write.lock"));
-        await writeFile(path.join(substitute, ".write.lock", "owner.json"), lockOwner);
+        await writeFile(path.join(substitute, ".write.lock", "owner.json"), ownerText);
         await symlink(substitute, run.runDir);
       },
     });
@@ -996,11 +997,17 @@ describe("dispatch inventory sidecar isolation", () => {
       path.join(substitute, NATIVE_HARNESS_DISPATCH_INVENTORY_FILE),
       "utf8",
     );
-    await expectCode(handle.intend(baseIntent(run, 1), noop), "changed");
+    const error = await rejection(handle.intend(baseIntent(run, 1), noop));
+    expect(error).toBeInstanceOf(NativeHarnessDispatchInventoryError);
+    expect((error as NativeHarnessDispatchInventoryError).code).toBe("changed");
+    expect((error as NativeHarnessDispatchInventoryError).cause).toBeInstanceOf(StoreConflictError);
     expect(await readFile(path.join(substitute, NATIVE_HARNESS_DISPATCH_INVENTORY_FILE), "utf8"))
       .toBe(beforeSubstitute);
     expect(await readFile(path.join(moved, NATIVE_HARNESS_DISPATCH_INVENTORY_FILE), "utf8"))
       .toBe(valid);
+    expect(ownerText).not.toBe("");
+    expect(await readFile(path.join(substitute, ".write.lock", "owner.json"), "utf8")).toBe(ownerText);
+    expect(await readFile(path.join(moved, ".write.lock", "owner.json"), "utf8")).toBe(ownerText);
     expect(handle.snapshot().revision).toBe(0);
   });
 });
