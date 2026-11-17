@@ -25,8 +25,14 @@ import {
   type NativeHarnessAccountingOwnerLocator,
   type NativeHarnessAccountingSession,
   type NativeHarnessAccountingSessionConfirmation,
+  type NativeHarnessAccountingSessionOptions,
   type NativeHarnessAccountingSessionResult,
 } from "../../src/native-harness-accounting-session.ts";
+import {
+  NATIVE_HARNESS_ACCOUNTING_SCHEMA,
+  NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2,
+  createNativeHarnessRecoveryAccountingOwner,
+} from "../../src/native-harness-accounting.ts";
 import type { NativeHarnessDelegationLimits } from "../../src/native-harness-delegation.ts";
 import { sha256Hex } from "../../src/native-work.ts";
 
@@ -82,6 +88,7 @@ interface FixtureOptions {
   readonly isOwnerCurrent?: (context: unknown, state: FixtureState) => boolean;
   readonly now?: () => number;
   readonly limitsText?: string;
+  readonly recoveryAccounting?: boolean;
 }
 
 interface Fixture {
@@ -98,6 +105,7 @@ interface Fixture {
   readonly namespace: string;
   readonly ownerDir: string;
   readonly ownerFile: string;
+  readonly appendEntry: (customType: string, data?: unknown) => void;
   newLeaf(): NativeHarnessAccountingSession;
   write(): void;
   ownerId(): string | null;
@@ -246,6 +254,7 @@ function makeFixture(options: FixtureOptions = {}): Fixture {
     appendEntry,
     isOwnerCurrent: (context: unknown) => options.isOwnerCurrent?.(context, state) ?? true,
     now: options.now ?? (() => Date.now()),
+    ...(options.recoveryAccounting === undefined ? {} : { recoveryAccounting: options.recoveryAccounting }),
   });
 
   const fixture: Fixture = {
@@ -266,6 +275,7 @@ function makeFixture(options: FixtureOptions = {}): Fixture {
     namespace,
     ownerDir,
     ownerFile,
+    appendEntry,
     newLeaf,
     write,
     ownerId() {
@@ -1258,5 +1268,642 @@ describe("native accounting-owner session association", () => {
     expect(final.identity.ownerId).toBe(stored!);
     expect(fixture.state.appendCalls).toBe(1);
     expect(readdirSync(fixture.namespace)).toHaveLength(1);
+  });
+});
+
+function ownerSchema(fixture: Fixture): string | null {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(fixture.ownerFile, "utf8"));
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const schema = (parsed as Record<string, unknown>).schema;
+    return typeof schema === "string" ? schema : null;
+  } catch {
+    return null;
+  }
+}
+
+function newLeafWith(
+  fixture: Fixture,
+  extra: Partial<NativeHarnessAccountingSessionOptions> = {},
+): NativeHarnessAccountingSession {
+  return createNativeHarnessAccountingSession({
+    storageRoot: fixture.root,
+    limitsText: LIMITS_TEXT,
+    appendEntry: fixture.appendEntry,
+    isOwnerCurrent: () => true,
+    now: () => Date.now(),
+    ...extra,
+  });
+}
+
+async function createRecoveryOwner(fixture: Fixture, ownerId = OWNER): Promise<void> {
+  const handle = await createNativeHarnessRecoveryAccountingOwner({
+    storageRoot: fixture.storageRoot,
+    selectorSha256: fixture.selector,
+    ownerId,
+    createdAt: 1_700_000_000_000,
+    limitsText: LIMITS_TEXT,
+  });
+  handle.close();
+}
+
+function appendMemoryLocator(fixture: Fixture, ownerId: string): void {
+  fixture.state.sequence += 1;
+  const id = `manual-locator-${fixture.state.sequence}`;
+  fixture.state.entries.push({
+    id,
+    parentId: fixture.state.leafId,
+    type: "custom",
+    customType: NATIVE_HARNESS_ACCOUNTING_OWNER_LOCATOR_CUSTOM_TYPE,
+    data: locatorData(ownerId, fixture.selector),
+  });
+  fixture.state.leafId = id;
+}
+
+function observeExisting(
+  leaf: NativeHarnessAccountingSession,
+  fixture: Fixture,
+  expectedIdentity: { readonly ownerId: string; readonly selectorSha256: string },
+  overrides: {
+    readonly context?: unknown;
+    readonly signal?: unknown;
+    readonly deadlineAt?: number;
+  } = {},
+): Promise<NativeHarnessAccountingSessionResult> {
+  return leaf.observeExisting(
+    overrides.context ?? fixture.context,
+    expectedIdentity,
+    overrides.signal ?? mainSignal(),
+    overrides.deadlineAt ?? Date.now() + 60_000,
+  );
+}
+
+describe("native accounting-owner recovery opt-in and existing-only view", () => {
+  test("default ensure still creates V1 while the fixed opt-in creates explicit V2", async () => {
+    const v1Fixture = makeFixture();
+    const v1Result = confirmed(await ensure(v1Fixture.newLeaf(), v1Fixture));
+    expect(v1Result.created).toBe(true);
+    expect(ownerSchema(v1Fixture)).toBe(NATIVE_HARNESS_ACCOUNTING_SCHEMA);
+
+    const v2Fixture = makeFixture({ recoveryAccounting: true });
+    const v2Result = confirmed(await ensure(v2Fixture.newLeaf(), v2Fixture));
+    expect(v2Result.created).toBe(true);
+    expect(v2Result.confirmation).toBe("observed-only");
+    expect(ownerSchema(v2Fixture)).toBe(NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2);
+  });
+
+  test("opt-in reuses an existing V1 owner without migration, upgrade or rewrite", async () => {
+    const fixture = makeFixture({ recoveryAccounting: true });
+    await createOwner(fixture);
+    const before = readFileSync(fixture.ownerFile);
+    const result = confirmed(await ensure(fixture.newLeaf(), fixture));
+    expect(result.created).toBe(false);
+    expect(ownerSchema(fixture)).toBe(NATIVE_HARNESS_ACCOUNTING_SCHEMA);
+    expect(readFileSync(fixture.ownerFile).equals(before)).toBe(true);
+    expect(fixture.state.appendCalls).toBe(1);
+  });
+
+  test("a genuine V2 association is read as created:false with zero ensure or append", async () => {
+    const fixture = makeFixture({ recoveryAccounting: true });
+    const first = confirmed(await ensure(fixture.newLeaf(), fixture));
+    expect(first.created).toBe(true);
+    expect(ownerSchema(fixture)).toBe(NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2);
+
+    const ownerBefore = readFileSync(fixture.ownerFile);
+    const journalBefore = readFileSync(fixture.sessionFile);
+    const ensureCalls = fixture.state.ensureCalls;
+    const appendCalls = fixture.state.appendCalls;
+    const observed = confirmed(await observeExisting(
+      fixture.newLeaf(),
+      fixture,
+      { ownerId: first.identity.ownerId, selectorSha256: fixture.selector },
+    ));
+    expect(observed.created).toBe(false);
+    expect(observed.confirmation).toBe("observed-only");
+    expect(observed.identity.ownerId).toBe(first.identity.ownerId);
+    expect(observed.identity.selectorSha256).toBe(fixture.selector);
+    expect(observed.locator).toEqual(first.locator);
+    expect(observed.locatorEntryIds).toEqual(first.locatorEntryIds);
+    expect(fixture.state.ensureCalls).toBe(ensureCalls);
+    expect(fixture.state.appendCalls).toBe(appendCalls);
+    expect(readFileSync(fixture.ownerFile).equals(ownerBefore)).toBe(true);
+    expect(readFileSync(fixture.sessionFile).equals(journalBefore)).toBe(true);
+  });
+
+  test("a disconnected final branch after the owner read cannot confirm existing-only", async () => {
+    const fixture = makeFixture({ recoveryAccounting: true });
+    const first = confirmed(await ensure(fixture.newLeaf(), fixture));
+    expect(first.created).toBe(true);
+    expect(ownerSchema(fixture)).toBe(NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2);
+    const expected = { ownerId: first.identity.ownerId, selectorSha256: fixture.selector };
+    const ownerBefore = readFileSync(fixture.ownerFile);
+    const journalBefore = readFileSync(fixture.sessionFile);
+    const ensureCalls = fixture.state.ensureCalls;
+    const appendCalls = fixture.state.appendCalls;
+    const leafBefore = fixture.state.leafId;
+    expect(leafBefore).not.toBeNull();
+
+    // Calibrate the actual getBranch read count for a healthy existing-only
+    // confirmation on this exact V2 owner and persisted journal.
+    const originalBranch = fixture.manager.getBranch as (this: unknown) => unknown;
+    let branchReads = 0;
+    fixture.manager.getBranch = function (this: unknown): unknown {
+      branchReads += 1;
+      return Reflect.apply(originalBranch, fixture.manager, []);
+    };
+    const healthy = confirmed(await observeExisting(fixture.newLeaf(), fixture, expected));
+    expect(healthy.created).toBe(false);
+    const healthyReads = branchReads;
+    expect(healthyReads).toBeGreaterThan(0);
+
+    // The last actual getBranch read supplies a disconnected branch while the
+    // unchanged leaf is still set. The owner read has already succeeded.
+    let adverseReads = 0;
+    let adverseSupplied = false;
+    fixture.manager.getBranch = function (this: unknown): unknown {
+      adverseReads += 1;
+      if (adverseReads === healthyReads) {
+        adverseSupplied = true;
+        return [];
+      }
+      return Reflect.apply(originalBranch, fixture.manager, []);
+    };
+    const result = await observeExisting(fixture.newLeaf(), fixture, expected);
+    expect(adverseSupplied).toBe(true);
+    expect(adverseReads).toBe(healthyReads);
+    expect(result.state).toBe("unavailable");
+    if (result.state === "unavailable") expect(result.reasons[0]?.code).toBe("branch");
+    expect(fixture.state.leafId).toBe(leafBefore);
+    expect(fixture.state.ensureCalls).toBe(ensureCalls);
+    expect(fixture.state.appendCalls).toBe(appendCalls);
+    expect(readFileSync(fixture.ownerFile).equals(ownerBefore)).toBe(true);
+    expect(readFileSync(fixture.sessionFile).equals(journalBefore)).toBe(true);
+
+    // The same owner and journal bytes still confirm once the actual branch is
+    // consistent again, without ensure or append.
+    fixture.manager.getBranch = originalBranch;
+    const recovered = confirmed(await observeExisting(fixture.newLeaf(), fixture, expected));
+    expect(recovered.created).toBe(false);
+    expect(recovered.locator).toEqual(first.locator);
+    expect(fixture.state.ensureCalls).toBe(ensureCalls);
+    expect(fixture.state.appendCalls).toBe(appendCalls);
+    expect(readFileSync(fixture.ownerFile).equals(ownerBefore)).toBe(true);
+    expect(readFileSync(fixture.sessionFile).equals(journalBefore)).toBe(true);
+  });
+
+  test("a final branch id accessor cannot run or replace the manager", async () => {
+    const fixture = makeFixture({ recoveryAccounting: true });
+    const first = confirmed(await ensure(fixture.newLeaf(), fixture));
+    expect(first.created).toBe(true);
+    const expected = { ownerId: first.identity.ownerId, selectorSha256: fixture.selector };
+    const ownerBefore = readFileSync(fixture.ownerFile);
+    const journalBefore = readFileSync(fixture.sessionFile);
+    const ensureCalls = fixture.state.ensureCalls;
+    const appendCalls = fixture.state.appendCalls;
+    const leafBefore = fixture.state.leafId;
+    expect(leafBefore).not.toBeNull();
+
+    // Calibrate the actual final getBranch read count on this exact V2 owner.
+    const originalBranch = fixture.manager.getBranch as (this: unknown) => unknown;
+    let branchReads = 0;
+    fixture.manager.getBranch = function (this: unknown): unknown {
+      branchReads += 1;
+      return Reflect.apply(originalBranch, fixture.manager, []);
+    };
+    const healthy = confirmed(await observeExisting(fixture.newLeaf(), fixture, expected));
+    expect(healthy.created).toBe(false);
+    const healthyReads = branchReads;
+    expect(healthyReads).toBeGreaterThan(0);
+
+    // The final read's last entry is otherwise valid, but its own id is an
+    // accessor. Invoking it would replace the context manager mid-seal.
+    const captured = Reflect.apply(originalBranch, fixture.manager, []) as TestEntry[];
+    const adverseEntry = captured[captured.length - 1]!;
+    let idReads = 0;
+    let adverseReads = 0;
+    let adverseSupplied = false;
+    fixture.manager.getBranch = function (this: unknown): unknown {
+      adverseReads += 1;
+      if (adverseReads !== healthyReads) {
+        return Reflect.apply(originalBranch, fixture.manager, []);
+      }
+      adverseSupplied = true;
+      return [
+        ...captured.slice(0, -1),
+        {
+          parentId: adverseEntry.parentId,
+          type: adverseEntry.type,
+          get id() {
+            idReads += 1;
+            fixture.context.sessionManager = replacementManager(fixture);
+            return adverseEntry.id;
+          },
+        },
+      ];
+    };
+    const result = await observeExisting(fixture.newLeaf(), fixture, expected);
+    expect(adverseSupplied).toBe(true);
+    expect(adverseReads).toBe(healthyReads);
+    expect(idReads).toBe(0);
+    expect(result.state).toBe("unavailable");
+    if (result.state === "unavailable") expect(result.reasons[0]?.code).toBe("branch");
+    expect(fixture.context.sessionManager).toBe(fixture.manager);
+    expect(fixture.state.leafId).toBe(leafBefore);
+    expect(fixture.state.ensureCalls).toBe(ensureCalls);
+    expect(fixture.state.appendCalls).toBe(appendCalls);
+    expect(readFileSync(fixture.ownerFile).equals(ownerBefore)).toBe(true);
+    expect(readFileSync(fixture.sessionFile).equals(journalBefore)).toBe(true);
+
+    // The same owner and journal bytes still confirm once the actual branch is
+    // plain data again, without ensure or append.
+    fixture.manager.getBranch = originalBranch;
+    const recovered = confirmed(await observeExisting(fixture.newLeaf(), fixture, expected));
+    expect(recovered.created).toBe(false);
+    expect(recovered.locator).toEqual(first.locator);
+    expect(fixture.state.ensureCalls).toBe(ensureCalls);
+    expect(fixture.state.appendCalls).toBe(appendCalls);
+    expect(readFileSync(fixture.ownerFile).equals(ownerBefore)).toBe(true);
+    expect(readFileSync(fixture.sessionFile).equals(journalBefore)).toBe(true);
+  });
+
+  test("an existing V1 owner refuses existing-only observation without writes", async () => {
+    const fixture = makeFixture();
+    const first = confirmed(await ensure(fixture.newLeaf(), fixture));
+    expect(ownerSchema(fixture)).toBe(NATIVE_HARNESS_ACCOUNTING_SCHEMA);
+    const ownerBefore = readFileSync(fixture.ownerFile);
+    const journalBefore = readFileSync(fixture.sessionFile);
+    const ensureCalls = fixture.state.ensureCalls;
+    const appendCalls = fixture.state.appendCalls;
+    const result = await observeExisting(
+      fixture.newLeaf(),
+      fixture,
+      { ownerId: first.identity.ownerId, selectorSha256: fixture.selector },
+    );
+    expect(result.state).toBe("unavailable");
+    if (result.state === "unavailable") expect(result.reasons[0]?.code).toBe("schema");
+    expect(ownerSchema(fixture)).toBe(NATIVE_HARNESS_ACCOUNTING_SCHEMA);
+    expect(readFileSync(fixture.ownerFile).equals(ownerBefore)).toBe(true);
+    expect(readFileSync(fixture.sessionFile).equals(journalBefore)).toBe(true);
+    expect(fixture.state.ensureCalls).toBe(ensureCalls);
+    expect(fixture.state.appendCalls).toBe(appendCalls);
+  });
+
+  test("missing locator, absent file, memory-only and wrong identities refuse without writes", async () => {
+    // A current V2 owner without any persisted locator is not an association.
+    const missingFixture = makeFixture({ recoveryAccounting: true });
+    await createRecoveryOwner(missingFixture);
+    const missingJournal = readFileSync(missingFixture.sessionFile);
+    const missingOwner = readFileSync(missingFixture.ownerFile);
+    const missing = await observeExisting(
+      missingFixture.newLeaf(),
+      missingFixture,
+      { ownerId: OWNER, selectorSha256: missingFixture.selector },
+    );
+    expect(missing.state).toBe("unavailable");
+    expect(missingFixture.state.ensureCalls).toBe(0);
+    expect(missingFixture.state.appendCalls).toBe(0);
+    expect(readFileSync(missingFixture.sessionFile).equals(missingJournal)).toBe(true);
+    expect(readFileSync(missingFixture.ownerFile).equals(missingOwner)).toBe(true);
+
+    // An absent actual session journal is never created by the read.
+    const absentFixture = makeFixture({ missingFile: true, recoveryAccounting: true });
+    await createRecoveryOwner(absentFixture);
+    expect(existsSync(absentFixture.sessionFile)).toBe(false);
+    const absent = await observeExisting(
+      absentFixture.newLeaf(),
+      absentFixture,
+      { ownerId: OWNER, selectorSha256: absentFixture.selector },
+    );
+    expect(absent.state).toBe("unavailable");
+    expect(existsSync(absentFixture.sessionFile)).toBe(false);
+    expect(absentFixture.state.ensureCalls).toBe(0);
+    expect(absentFixture.state.appendCalls).toBe(0);
+
+    // A memory-only locator is never confirmed or persisted by this method.
+    const memoryFixture = makeFixture({ recoveryAccounting: true });
+    await createRecoveryOwner(memoryFixture);
+    appendMemoryLocator(memoryFixture, OWNER);
+    const memoryJournal = readFileSync(memoryFixture.sessionFile);
+    const memory = await observeExisting(
+      memoryFixture.newLeaf(),
+      memoryFixture,
+      { ownerId: OWNER, selectorSha256: memoryFixture.selector },
+    );
+    expect(memory.state).toBe("pending");
+    if (memory.state === "pending") expect(memory.reasons[0]?.code).toBe("locator-unconfirmed");
+    expect(memoryFixture.state.ensureCalls).toBe(0);
+    expect(memoryFixture.state.appendCalls).toBe(0);
+    expect(readFileSync(memoryFixture.sessionFile).equals(memoryJournal)).toBe(true);
+
+    // A persisted locator whose owner id differs from the expectation refuses.
+    const wrongOwnerFixture = makeFixture({ recoveryAccounting: true });
+    await createRecoveryOwner(wrongOwnerFixture, OTHER_OWNER);
+    appendMemoryLocator(wrongOwnerFixture, OWNER);
+    wrongOwnerFixture.write();
+    const wrongOwnerJournal = readFileSync(wrongOwnerFixture.sessionFile);
+    const wrongOwner = await observeExisting(
+      wrongOwnerFixture.newLeaf(),
+      wrongOwnerFixture,
+      { ownerId: OWNER, selectorSha256: wrongOwnerFixture.selector },
+    );
+    expect(wrongOwner.state).toBe("unavailable");
+    expect(wrongOwnerFixture.state.ensureCalls).toBe(0);
+    expect(wrongOwnerFixture.state.appendCalls).toBe(0);
+    expect(readFileSync(wrongOwnerFixture.sessionFile).equals(wrongOwnerJournal)).toBe(true);
+
+    // A selector that does not derive from the captured main session refuses.
+    const selectorFixture = makeFixture({ recoveryAccounting: true });
+    const selectorFirst = confirmed(await ensure(selectorFixture.newLeaf(), selectorFixture));
+    const selectorOwner = readFileSync(selectorFixture.ownerFile);
+    const selectorJournal = readFileSync(selectorFixture.sessionFile);
+    const selectorEnsureCalls = selectorFixture.state.ensureCalls;
+    const selectorAppendCalls = selectorFixture.state.appendCalls;
+    const wrongSelector = await observeExisting(
+      selectorFixture.newLeaf(),
+      selectorFixture,
+      { ownerId: selectorFirst.identity.ownerId, selectorSha256: sha256Hex("another-session") },
+    );
+    expect(wrongSelector.state).toBe("unavailable");
+    expect(selectorFixture.state.ensureCalls).toBe(selectorEnsureCalls);
+    expect(selectorFixture.state.appendCalls).toBe(selectorAppendCalls);
+    expect(readFileSync(selectorFixture.ownerFile).equals(selectorOwner)).toBe(true);
+    expect(readFileSync(selectorFixture.sessionFile).equals(selectorJournal)).toBe(true);
+
+    // A branch that conflicts with the actual session refuses before any write.
+    const branchFixture = makeFixture({ recoveryAccounting: true });
+    const branchFirst = confirmed(await ensure(branchFixture.newLeaf(), branchFixture));
+    const branchJournal = readFileSync(branchFixture.sessionFile);
+    const branchEnsureCalls = branchFixture.state.ensureCalls;
+    const branchAppendCalls = branchFixture.state.appendCalls;
+    branchFixture.manager.getBranch = () => [];
+    const conflictingBranch = await observeExisting(
+      branchFixture.newLeaf(),
+      branchFixture,
+      { ownerId: branchFirst.identity.ownerId, selectorSha256: branchFixture.selector },
+    );
+    expect(conflictingBranch.state).toBe("unavailable");
+    expect(branchFixture.state.ensureCalls).toBe(branchEnsureCalls);
+    expect(branchFixture.state.appendCalls).toBe(branchAppendCalls);
+    expect(readFileSync(branchFixture.sessionFile).equals(branchJournal)).toBe(true);
+  });
+
+  test("missing and partial owner directories refuse without creation or repair", async () => {
+    const missingFixture = makeFixture({ recoveryAccounting: true });
+    const first = confirmed(await ensure(missingFixture.newLeaf(), missingFixture));
+    rmSync(missingFixture.ownerDir, { recursive: true, force: true });
+    const missingResult = await observeExisting(
+      missingFixture.newLeaf(),
+      missingFixture,
+      { ownerId: first.identity.ownerId, selectorSha256: missingFixture.selector },
+    );
+    expect(missingResult.state).toBe("unavailable");
+    expect(existsSync(missingFixture.ownerDir)).toBe(false);
+    expect(missingFixture.state.appendCalls).toBe(1);
+
+    const partialFixture = makeFixture({ recoveryAccounting: true });
+    const partialFirst = confirmed(await ensure(partialFixture.newLeaf(), partialFixture));
+    rmSync(partialFixture.ownerFile);
+    const partialResult = await observeExisting(
+      partialFixture.newLeaf(),
+      partialFixture,
+      { ownerId: partialFirst.identity.ownerId, selectorSha256: partialFixture.selector },
+    );
+    expect(partialResult.state).toBe("unavailable");
+    expect(existsSync(partialFixture.ownerFile)).toBe(false);
+    expect(partialFixture.state.appendCalls).toBe(1);
+  });
+
+  test("pending append is never confirmed or repaired by the existing-only read", async () => {
+    const fixture = makeFixture({ appendMode: "noop" });
+    const leaf = fixture.newLeaf();
+    const pending = await ensure(leaf, fixture);
+    expect(pending.state).toBe("pending");
+    expect(fixture.state.appendCalls).toBe(1);
+    const ensureCalls = fixture.state.ensureCalls;
+    const result = await observeExisting(
+      leaf,
+      fixture,
+      { ownerId: OWNER, selectorSha256: fixture.selector },
+    );
+    expect(result.state).toBe("pending");
+    if (result.state === "pending") expect(result.reasons[0]?.code).toBe("append-unknown");
+    expect(fixture.state.appendCalls).toBe(1);
+    expect(fixture.state.ensureCalls).toBe(ensureCalls);
+  });
+
+  test("constructor rejects accessor/invalid opt-in and later mutation is ignored", async () => {
+    const fixture = makeFixture();
+    const base = {
+      storageRoot: fixture.root,
+      limitsText: LIMITS_TEXT,
+      appendEntry: fixture.appendEntry,
+      isOwnerCurrent: () => true,
+      now: () => Date.now(),
+    };
+    expect(() => createNativeHarnessAccountingSession({
+      ...base,
+      get recoveryAccounting() {
+        return true;
+      },
+    })).toThrow();
+    expect(() => createNativeHarnessAccountingSession({
+      ...base,
+      recoveryAccounting: "yes" as unknown as boolean,
+    })).toThrow();
+
+    const options: {
+      storageRoot: string;
+      limitsText: string;
+      appendEntry: (customType: string, data?: unknown) => void;
+      isOwnerCurrent: () => boolean;
+      now: () => number;
+      recoveryAccounting: boolean;
+    } = { ...base, recoveryAccounting: true };
+    const leaf = createNativeHarnessAccountingSession(options);
+    options.recoveryAccounting = false;
+    const result = confirmed(await ensure(leaf, fixture));
+    expect(result.created).toBe(true);
+    expect(ownerSchema(fixture)).toBe(NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2);
+  });
+
+  test("existing-only expected identity rejects extras, accessors and prototypes before I/O", async () => {
+    const fixture = makeFixture({ recoveryAccounting: true });
+    const leaf = fixture.newLeaf();
+    const journalBefore = readFileSync(fixture.sessionFile);
+    const accessor = Object.defineProperty({}, "ownerId", {
+      enumerable: true,
+      get() {
+        return OWNER;
+      },
+    });
+    Object.defineProperty(accessor, "selectorSha256", {
+      enumerable: true,
+      value: fixture.selector,
+    });
+    const inherited = Object.create({
+      ownerId: OWNER,
+      selectorSha256: fixture.selector,
+    });
+    const cases: unknown[] = [
+      null,
+      {},
+      { ownerId: OWNER, selectorSha256: fixture.selector, extra: true },
+      inherited,
+      accessor,
+      { ownerId: OTHER_OWNER, selectorSha256: "bad" },
+    ];
+    for (const expected of cases) {
+      const result = await leaf.observeExisting(
+        fixture.context,
+        expected as { readonly ownerId: string; readonly selectorSha256: string },
+        mainSignal(),
+        Date.now() + 60_000,
+      );
+      expect(result.state).toBe("invalidated");
+    }
+    expect(fixture.state.ensureCalls).toBe(0);
+    expect(fixture.state.appendCalls).toBe(0);
+    expect(existsSync(fixture.ownerDir)).toBe(false);
+    expect(readFileSync(fixture.sessionFile).equals(journalBefore)).toBe(true);
+  });
+
+  test("mutated expected identity cannot retarget after the call starts", async () => {
+    const fixture = makeFixture({ recoveryAccounting: true });
+    const first = confirmed(await ensure(fixture.newLeaf(), fixture));
+    const expected = {
+      ownerId: first.identity.ownerId,
+      selectorSha256: fixture.selector,
+    };
+    let mutated = false;
+    const leaf = newLeafWith(fixture, {
+      now: () => {
+        if (!mutated) {
+          mutated = true;
+          expected.ownerId = OTHER_OWNER;
+          expected.selectorSha256 = sha256Hex("retarget");
+        }
+        return Date.now();
+      },
+    });
+    const result = confirmed(await observeExisting(leaf, fixture, expected));
+    expect(mutated).toBe(true);
+    expect(result.identity.ownerId).toBe(first.identity.ownerId);
+    expect(result.identity.selectorSha256).toBe(fixture.selector);
+  });
+
+  test("manager replacement, dispose, abort and deadline after a callback refuse", async () => {
+    const replacementFixture = makeFixture({ recoveryAccounting: true });
+    const replacementFirst = confirmed(await ensure(replacementFixture.newLeaf(), replacementFixture));
+    const replacementContext = {
+      cwd: replacementFixture.cwd,
+      agent: { kind: "main" },
+      sessionManager: replacementFixture.manager,
+    };
+    let replacementCalls = 0;
+    const replacementLeaf = newLeafWith(replacementFixture, {
+      isOwnerCurrent: () => {
+        replacementCalls += 1;
+        if (replacementCalls === 2) {
+          replacementContext.sessionManager = replacementManager(replacementFixture);
+        }
+        return true;
+      },
+    });
+    const replaced = await observeExisting(
+      replacementLeaf,
+      replacementFixture,
+      { ownerId: replacementFirst.identity.ownerId, selectorSha256: replacementFixture.selector },
+      { context: replacementContext },
+    );
+    expect(replaced.state).toBe("invalidated");
+    expect(replacementFixture.state.appendCalls).toBe(1);
+
+    const disposeFixture = makeFixture({ recoveryAccounting: true });
+    const disposeFirst = confirmed(await ensure(disposeFixture.newLeaf(), disposeFixture));
+    let disposeLeaf!: NativeHarnessAccountingSession;
+    let disposeCalls = 0;
+    disposeLeaf = newLeafWith(disposeFixture, {
+      isOwnerCurrent: () => {
+        disposeCalls += 1;
+        if (disposeCalls === 2) disposeLeaf.dispose();
+        return true;
+      },
+    });
+    const disposed = await observeExisting(
+      disposeLeaf,
+      disposeFixture,
+      { ownerId: disposeFirst.identity.ownerId, selectorSha256: disposeFixture.selector },
+    );
+    expect(disposed.state).toBe("invalidated");
+
+    const abortFixture = makeFixture({ recoveryAccounting: true });
+    const abortFirst = confirmed(await ensure(abortFixture.newLeaf(), abortFixture));
+    const controller = new AbortController();
+    let abortCalls = 0;
+    const abortLeaf = newLeafWith(abortFixture, {
+      isOwnerCurrent: () => {
+        abortCalls += 1;
+        if (abortCalls === 2) controller.abort();
+        return true;
+      },
+    });
+    const aborted = await observeExisting(
+      abortLeaf,
+      abortFixture,
+      { ownerId: abortFirst.identity.ownerId, selectorSha256: abortFixture.selector },
+      { signal: controller.signal },
+    );
+    expect(aborted.state).toBe("invalidated");
+
+    const deadlineFixture = makeFixture({ recoveryAccounting: true });
+    const deadlineFirst = confirmed(await ensure(deadlineFixture.newLeaf(), deadlineFixture));
+    const deadlineAt = Date.now() + 60_000;
+    let deadlineCalls = 0;
+    const deadlineLeaf = newLeafWith(deadlineFixture, {
+      now: () => {
+        deadlineCalls += 1;
+        return deadlineCalls === 1 ? Date.now() : deadlineAt + 1;
+      },
+    });
+    const expired = await observeExisting(
+      deadlineLeaf,
+      deadlineFixture,
+      { ownerId: deadlineFirst.identity.ownerId, selectorSha256: deadlineFixture.selector },
+      { deadlineAt },
+    );
+    expect(expired.state).toBe("invalidated");
+  });
+
+  test("the shared operation latch serializes ensure and existing-only observation", async () => {
+    const fixture = makeFixture({
+      recoveryAccounting: true,
+      ensurePlan: (call) => (call === 1 ? "defer" : "write"),
+    });
+    const leaf = fixture.newLeaf();
+    const firstPromise = ensure(leaf, fixture);
+    expect(fixture.state.ensureCalls).toBe(1);
+    const overlapObserve = await observeExisting(
+      leaf,
+      fixture,
+      { ownerId: OWNER, selectorSha256: fixture.selector },
+    );
+    expect(overlapObserve.state).toBe("pending");
+    expect(fixture.state.ensureCalls).toBe(1);
+    fixture.state.releaseEnsure?.();
+    const first = confirmed(await firstPromise);
+    expect(fixture.state.appendCalls).toBe(1);
+    const ensureCallsAfterAssociation = fixture.state.ensureCalls;
+
+    const observing = observeExisting(
+      leaf,
+      fixture,
+      { ownerId: first.identity.ownerId, selectorSha256: fixture.selector },
+    );
+    const overlapEnsure = await ensure(leaf, fixture);
+    expect(overlapEnsure.state).toBe("pending");
+    const observed = confirmed(await observing);
+    expect(observed.created).toBe(false);
+    expect(fixture.state.ensureCalls).toBe(ensureCallsAfterAssociation);
+    expect(fixture.state.appendCalls).toBe(1);
   });
 });

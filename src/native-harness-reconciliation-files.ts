@@ -47,17 +47,23 @@ import {
   type NativeHarnessReconciliationResult,
 } from "./native-harness-reconciliation.ts";
 import {
+  NATIVE_HARNESS_INITIAL_INPUTS_MAX_CHARGED_BYTES,
   NATIVE_HARNESS_RECONCILIATION_CONTENT_CHARGE_LIMIT_BYTES,
   NATIVE_HARNESS_RECONCILIATION_CONTENT_DEADLINE_MS,
   NATIVE_HARNESS_RECONCILIATION_CONTENT_MAX_METADATA_BYTES,
   NATIVE_HARNESS_RECONCILIATION_CONTENT_SCHEMA,
+  planNativeHarnessInitialInputs,
   planNativeHarnessReconciliationContent,
+  type NativeHarnessInitialInputsPlanResult,
   type NativeHarnessReconciliationContentReason,
   type NativeHarnessReconciliationContentPlanResult,
 } from "./native-harness-reconciliation-content.ts";
 import {
   createNativeHarnessContentControlFailure,
+  observeNativeHarnessInitialInputsBytes,
   observeNativeHarnessReconciliationContentBytes,
+  type NativeHarnessInitialInputsByteObservation,
+  type NativeHarnessInitialInputsByteResult,
   type NativeHarnessOutputFailure,
   type NativeHarnessReconciliationContentByteObservation,
   type NativeHarnessReconciliationContentByteResult,
@@ -237,6 +243,53 @@ export interface NativeHarnessReconciliationContentFacts {
   readonly tracePassesStarted: 0 | 1 | 2;
 }
 
+export type NativeHarnessReconciliationInitialInputsPresentationStatus =
+  | "stable"
+  | "different"
+  | "unavailable"
+  | "not-applicable"
+  | "not-observed"
+  | "aborted"
+  | "expired"
+  | "revoked";
+
+export interface NativeHarnessReconciliationInitialInputsFacts {
+  readonly status: NativeHarnessReconciliationInitialInputsPresentationStatus;
+  readonly provisionalStatus: Exclude<
+    NativeHarnessReconciliationInitialInputsPresentationStatus,
+    "revoked"
+  >;
+  readonly revoked: boolean;
+  readonly revokedReasons: readonly NativeHarnessReconciliationFilesReason[];
+  readonly planner: "not-run" | "planned" | "not-applicable" | "unavailable" | "refused";
+  readonly planReasons: readonly NativeHarnessReconciliationContentReason[];
+  readonly failure: NativeHarnessReconciliationContentFailureFact | null;
+  /** Present only for a confirmed stable two-pass observation. */
+  readonly observation: NativeHarnessInitialInputsByteObservation | null;
+  readonly runId: string | null;
+  readonly sourceSha256: string | null;
+  readonly manifestSha256: string | null;
+  readonly chargedBytes: number;
+  readonly chargeLimitBytes: number;
+  readonly captureStarts: number;
+  readonly passesStarted: 0 | 1 | 2;
+  readonly openedFiles: number;
+  readonly close: {
+    readonly attempted: number;
+    readonly settled: number;
+    readonly succeeded: number;
+  };
+  readonly excluded: {
+    readonly path: ".git";
+    readonly kind: "directory";
+    readonly contents: "not-enumerated-not-hashed";
+    readonly git: "not-started";
+  };
+  readonly readOnly: true;
+  readonly resumeAvailable: false;
+  readonly semanticAcceptance: "not-evaluated";
+}
+
 export interface NativeHarnessReconciliationContentObservationResult {
   readonly schema: typeof NATIVE_HARNESS_RECONCILIATION_CONTENT_SCHEMA;
   readonly readOnly: true;
@@ -297,6 +350,13 @@ export interface NativeHarnessReconciliationLifecycleOptions extends NativeHarne
    * authority.
    */
   readonly signalQuery?: NativeHarnessHistorySignalQuery;
+  /**
+   * Lifecycle-only enhanced inspection of the actual zero-attempt prepared
+   * inputs. Omitted or false performs no added input I/O and adds no result
+   * field. It cannot be supplied to the files/content observers or by model
+   * or target input.
+   */
+  readonly verifyInitialPreparedInputs?: boolean;
 }
 
 export interface NativeHarnessReconciliationLifecycleResult {
@@ -346,6 +406,8 @@ export interface NativeHarnessReconciliationLifecycleResult {
   readonly metadata: NativeHarnessReconciliationResult | null;
   readonly metadataStatus: "not-observed" | "compatible" | "incompatible";
   readonly content: NativeHarnessReconciliationContentFacts;
+  /** Present only when the lifecycle option explicitly required initial-input verification. */
+  readonly initialInputs?: NativeHarnessReconciliationInitialInputsFacts;
   readonly lifecycle: NativeHarnessHistoryRecoveryLifecycleFacts;
 }
 
@@ -385,6 +447,7 @@ interface OwnedOptions {
   readonly io: NativeFileIo;
   readonly clock: () => number;
   readonly signalQuery: NativeHarnessHistorySignalQuery;
+  readonly verifyInitialPreparedInputs: boolean;
 }
 
 interface FileSpec {
@@ -467,6 +530,55 @@ function initialContentFacts(): MutableContentFacts {
     chargedBytes: 0,
     chargeLimitBytes: NATIVE_HARNESS_RECONCILIATION_CONTENT_CHARGE_LIMIT_BYTES,
     tracePassesStarted: 0,
+  };
+}
+
+type InitialPresentationStatus = NativeHarnessReconciliationInitialInputsPresentationStatus;
+type ProvisionalInitialStatus = Exclude<InitialPresentationStatus, "revoked">;
+
+interface MutableInitialFacts {
+  planner: NativeHarnessReconciliationInitialInputsFacts["planner"];
+  status: InitialPresentationStatus;
+  provisionalStatus: ProvisionalInitialStatus;
+  revoked: boolean;
+  revokedReasons: NativeHarnessReconciliationFilesReason[];
+  planReasons: NativeHarnessReconciliationContentReason[];
+  failure: NativeHarnessReconciliationContentFailureFact | null;
+  observation: NativeHarnessInitialInputsByteObservation | null;
+  runId: string | null;
+  sourceSha256: string | null;
+  manifestSha256: string | null;
+  chargedBytes: number;
+  chargeLimitBytes: number;
+  captureStarts: number;
+  passesStarted: 0 | 1 | 2;
+  openedFiles: number;
+  closeAttempted: number;
+  closeSettled: number;
+  closeSucceeded: number;
+}
+
+function initialInitialFacts(): MutableInitialFacts {
+  return {
+    planner: "not-run",
+    status: "not-observed",
+    provisionalStatus: "not-observed",
+    revoked: false,
+    revokedReasons: [],
+    planReasons: [],
+    failure: null,
+    observation: null,
+    runId: null,
+    sourceSha256: null,
+    manifestSha256: null,
+    chargedBytes: 0,
+    chargeLimitBytes: NATIVE_HARNESS_INITIAL_INPUTS_MAX_CHARGED_BYTES,
+    captureStarts: 0,
+    passesStarted: 0,
+    openedFiles: 0,
+    closeAttempted: 0,
+    closeSettled: 0,
+    closeSucceeded: 0,
   };
 }
 
@@ -613,7 +725,7 @@ function readExpectation(value: unknown): OwnedExpectation {
 
 function readOptions(value: unknown, mode: "files" | "content" | "lifecycle"): OwnedOptions {
   const allowed = mode === "lifecycle"
-    ? ["signal", "fileIo", "now", "signalQuery"]
+    ? ["signal", "fileIo", "now", "signalQuery", "verifyInitialPreparedInputs"]
     : ["signal", "fileIo", "now"];
   const fields = readPlainFields(value ?? {}, allowed, "reconciliation files options");
   const signalValue = fields.get("signal");
@@ -649,11 +761,19 @@ function readOptions(value: unknown, mode: "files" | "content" | "lifecycle"): O
   if (signalQueryValue !== undefined && typeof signalQueryValue !== "function") {
     inputFail("options.signalQuery must be a narrow synchronous function.");
   }
+  const verifyInitialPreparedInputs = fields.get("verifyInitialPreparedInputs");
+  if (
+    verifyInitialPreparedInputs !== undefined
+    && typeof verifyInitialPreparedInputs !== "boolean"
+  ) {
+    inputFail("options.verifyInitialPreparedInputs must be an exact boolean.");
+  }
   return Object.freeze({
     signal,
     io,
     clock: (nowValue ?? Date.now) as () => number,
     signalQuery: (signalQueryValue ?? nativeHarnessHistorySignalQuery) as NativeHarnessHistorySignalQuery,
+    verifyInitialPreparedInputs: mode === "lifecycle" && verifyInitialPreparedInputs === true,
   });
 }
 
@@ -1317,6 +1437,8 @@ interface FixedModeFacts {
   metadata: NativeHarnessReconciliationResult | null;
   metadataStatus: NativeHarnessReconciliationFilesResult["metadataStatus"];
   content: MutableContentFacts;
+  initialInputs: MutableInitialFacts;
+  verifyInitialPreparedInputs: boolean;
   lifecycle: MutableLifecycleFacts;
   /**
    * Synchronous final control seal for the public wrapper's last await
@@ -2080,6 +2202,7 @@ async function observeLifecycleBetweenPasses(
   outcome: ContentBetweenPassesOutcome | null,
   mutable: MutableLifecycleFacts,
   globalGate: ObservationGate | null,
+  entryHalt: NativeHarnessHistoryProcessReason | null = null,
 ): Promise<{ readonly gate: ObservationGate | null; readonly halt: NativeHarnessHistoryProcessReason | null }> {
   const globalDeadlineAt = live.deadlineAt;
   let startedAt = live.lastTime;
@@ -2143,6 +2266,21 @@ async function observeLifecycleBetweenPasses(
       gate: entryGate,
     });
     return { gate: null, halt: null };
+  }
+  if (entryHalt !== null) {
+    // The initial-input phase already refused a later effect. Preserve its
+    // unconfirmed close as the halt reason; no auxiliary, probe, round or
+    // final-primary path is started, and no abort/deadline label is invented.
+    mutable.raw = Object.freeze({
+      ...base,
+      window: Object.freeze({
+        ...base.window,
+        checkedAt: live.lastTime,
+        expired: live.lastTime >= deadlineAt,
+      }),
+      prerequisiteFailure: entryHalt,
+    });
+    return { gate: null, halt: entryHalt };
   }
   if (entryControlFailure !== null) {
     mutable.raw = Object.freeze({
@@ -2512,6 +2650,163 @@ async function observeContentBetweenPasses(
 }
 
 /**
+ * Enhanced lifecycle-only initial-input observation. It uses the exact four
+ * first-pass texts: a present snapshot is not-applicable, any stage/dispatch
+ * without a snapshot stays unavailable, and only the actual zero-attempt
+ * branch runs the two source/prepared byte passes. It shares the outer live
+ * guard, actual signal and deadline and never issues authority.
+ */
+async function observeInitialInputsBetweenPasses(
+  live: Live,
+  options: OwnedOptions,
+  owned: OwnedExpectation,
+  firstPass: ReadonlyMap<NativeHarnessReconciliationFileKey, FirstPassFacts>,
+  facts: MutableInitialFacts,
+): Promise<{ readonly gate: ObservationGate | null; readonly halt: NativeHarnessHistoryProcessReason | null }> {
+  let planResult: NativeHarnessInitialInputsPlanResult;
+  try {
+    planResult = planNativeHarnessInitialInputs({
+      runText: firstPass.get("run")!.text,
+      sourceText: firstPass.get("source")!.text,
+      inventoryText: firstPass.get("inventory")!.text,
+      ownerText: firstPass.get("owner")!.text,
+      expected: owned,
+      now: live.lastTime,
+    });
+  } catch {
+    facts.planner = "refused";
+    facts.status = "unavailable";
+    facts.provisionalStatus = "unavailable";
+    return { gate: null, halt: null };
+  }
+  if (planResult.status === "not-applicable") {
+    facts.planner = "not-applicable";
+    facts.status = "not-applicable";
+    facts.provisionalStatus = "not-applicable";
+    return { gate: null, halt: null };
+  }
+  if (planResult.status === "unavailable") {
+    facts.planner = "unavailable";
+    facts.status = "unavailable";
+    facts.provisionalStatus = "unavailable";
+    facts.planReasons = [...planResult.reasons];
+    return { gate: null, halt: null };
+  }
+
+  facts.planner = "planned";
+  facts.runId = planResult.plan.runId;
+  facts.sourceSha256 = planResult.plan.sourceSha256;
+  facts.manifestSha256 = planResult.plan.manifestSha256;
+  const guard = (): void => {
+    try {
+      liveCheck(live);
+    } catch (error) {
+      if (error instanceof ObservationGate) {
+        throw createNativeHarnessContentControlFailure(
+          error.reason === "aborted" ? "aborted" : "deadline-expired",
+        );
+      }
+      throw createNativeHarnessContentControlFailure("control-unavailable");
+    }
+  };
+  let signal: AbortSignal;
+  if (options.signal !== null) {
+    signal = options.signal;
+  } else if (typeof AbortController === "function") {
+    signal = new AbortController().signal;
+  } else {
+    facts.status = "unavailable";
+    facts.provisionalStatus = "unavailable";
+    facts.failure = {
+      code: "invalid-control",
+      reason: "A fixed initial-input signal is unavailable.",
+    };
+    return { gate: null, halt: null };
+  }
+
+  let result: NativeHarnessInitialInputsByteResult;
+  try {
+    result = await observeNativeHarnessInitialInputsBytes(planResult.plan, {
+      guard,
+      signal,
+      chargeLimitBytes: NATIVE_HARNESS_INITIAL_INPUTS_MAX_CHARGED_BYTES,
+      fileIo: options.io,
+    });
+  } catch {
+    facts.status = "unavailable";
+    facts.provisionalStatus = "unavailable";
+    facts.failure = {
+      code: "io-failure",
+      reason: "The initial-input byte observation failed without a serializable host error.",
+    };
+    return { gate: null, halt: null };
+  }
+
+  if (result.ok) {
+    const observation = result.observation;
+    facts.status = "stable";
+    facts.provisionalStatus = "stable";
+    facts.observation = observation;
+    facts.chargedBytes = observation.chargedBytes;
+    facts.chargeLimitBytes = observation.chargeLimitBytes;
+    facts.captureStarts = observation.captureStarts;
+    facts.passesStarted = observation.passes;
+    facts.openedFiles = observation.openedFiles;
+    facts.closeAttempted = observation.close.attempted;
+    facts.closeSettled = observation.close.settled;
+    facts.closeSucceeded = observation.close.succeeded;
+    return { gate: null, halt: null };
+  }
+  facts.chargedBytes = result.chargedBytes;
+  facts.chargeLimitBytes = result.chargeLimitBytes;
+  facts.captureStarts = result.captureStarts;
+  facts.passesStarted = result.passesStarted;
+  facts.openedFiles = result.openedFiles;
+  facts.closeAttempted = result.close.attempted;
+  facts.closeSettled = result.close.settled;
+  facts.closeSucceeded = result.close.succeeded;
+  facts.failure = {
+    code: result.code,
+    reason: result.reason,
+    ...(result.observedMismatch === true ? { observedMismatch: true as const } : {}),
+  };
+  // A failure that did not confirm exactly one settled, successful close for
+  // every opened handle stops the original fixed-mode run here. The real close
+  // state of a rejected handle is unknown, so the counters are retained and no
+  // later lifecycle auxiliary or final-primary open is permitted. This reuses
+  // the existing lifecycle halt pattern rather than relabeling abort/deadline
+  // or inventing an auxiliary failure.
+  const closeUnconfirmed = result.closeFailed === true
+    || result.openedFiles !== result.close.attempted
+    || result.close.attempted !== result.close.settled
+    || result.close.settled !== result.close.succeeded;
+  const halt = closeUnconfirmed
+    ? processReason(
+      "initial-inputs-close-unconfirmed",
+      "The initial-input observation did not confirm a successful close for every opened handle; no later lifecycle auxiliary or final-primary open was started.",
+    )
+    : null;
+  if (result.code === "aborted") {
+    facts.status = "aborted";
+    facts.provisionalStatus = "aborted";
+    return { gate: new ObservationGate("aborted"), halt };
+  }
+  if (result.code === "deadline") {
+    facts.status = "expired";
+    facts.provisionalStatus = "expired";
+    return { gate: new ObservationGate("deadline-expired"), halt };
+  }
+  if (result.observedMismatch === true) {
+    facts.status = "different";
+    facts.provisionalStatus = "different";
+  } else {
+    facts.status = "unavailable";
+    facts.provisionalStatus = "unavailable";
+  }
+  return { gate: null, halt };
+}
+
+/**
  * One private fixed-mode loop for both public observations. It always reads
  * the four exact original recovery primaries twice and rechecks all seven
  * parent pins. The content mode additionally plans and byte-observes latest
@@ -2548,6 +2843,7 @@ async function observeFixedMode(
   let gate: ObservationGate | null = null;
   let unavailableFailure = false;
   let lifecycleHalt: NativeHarnessHistoryProcessReason | null = null;
+  let initialHalt: NativeHarnessHistoryProcessReason | null = null;
   let closeFailure = false;
   let crossPassMismatch = false;
   let chargedBytes = 0;
@@ -2584,6 +2880,7 @@ async function observeFixedMode(
   }
 
   const content = initialContentFacts();
+  const initialInputs = initialInitialFacts();
   const lifecycle = initialLifecycleFacts();
 
   if (pinsInitial) {
@@ -2734,6 +3031,21 @@ async function observeFixedMode(
         addGateReason(reasons, contentOutcome.gate);
       }
     }
+    if (!stoppedFirst && gate === null && mode === "lifecycle"
+      && resolvedOptions.verifyInitialPreparedInputs) {
+      const initialOutcome = await observeInitialInputsBetweenPasses(
+        live,
+        resolvedOptions,
+        owned,
+        firstPass,
+        initialInputs,
+      );
+      if (initialOutcome.gate !== null) {
+        gate = initialOutcome.gate;
+        addGateReason(reasons, initialOutcome.gate);
+      }
+      if (initialOutcome.halt !== null) initialHalt = initialOutcome.halt;
+    }
     if (mode === "lifecycle") {
       const lifecycleOutcome = await observeLifecycleBetweenPasses(
         live,
@@ -2744,6 +3056,7 @@ async function observeFixedMode(
         contentOutcome,
         lifecycle,
         gate,
+        initialHalt,
       );
       if (lifecycleOutcome.gate !== null) {
         gate = lifecycleOutcome.gate;
@@ -2881,6 +3194,19 @@ async function observeFixedMode(
     }
   };
 
+  const finalizeInitialInputs = (finalStatus: NativeHarnessReconciliationFilesStatus): void => {
+    if (mode !== "lifecycle" || !resolvedOptions.verifyInitialPreparedInputs) return;
+    // A final primary/pin/clock/signal or late seal failure removes every
+    // stable initial byte proof. Partial counters, refusal data and the
+    // provisional conclusion are retained; later projection cannot restore it.
+    if (finalStatus !== "stable" && initialInputs.status === "stable") {
+      initialInputs.status = "revoked";
+      initialInputs.revoked = true;
+      initialInputs.revokedReasons = [...reasons];
+      initialInputs.observation = null;
+    }
+  };
+
   const finalizeLifecycle = (finalStatus: NativeHarnessReconciliationFilesStatus): void => {
     if (mode !== "lifecycle") return;
     const fallbackWindow = {
@@ -2937,6 +3263,7 @@ async function observeFixedMode(
     metadataStatus = "not-observed";
   }
   finalizeContent(status);
+  finalizeInitialInputs(status);
   finalizeLifecycle(status);
 
   let facts!: FixedModeFacts;
@@ -2962,6 +3289,7 @@ async function observeFixedMode(
       metadataStatus = "not-observed";
     }
     finalizeContent(sealedStatus);
+    finalizeInitialInputs(sealedStatus);
     finalizeLifecycle(sealedStatus);
     facts.status = sealedStatus;
     facts.checkedAt = live.lastTime;
@@ -2970,6 +3298,8 @@ async function observeFixedMode(
     facts.metadata = metadata;
     facts.metadataStatus = metadataStatus;
     facts.content = content;
+    facts.initialInputs = initialInputs;
+    facts.verifyInitialPreparedInputs = resolvedOptions.verifyInitialPreparedInputs;
     facts.lifecycle = lifecycle;
     return facts;
   };
@@ -2994,6 +3324,8 @@ async function observeFixedMode(
     metadata,
     metadataStatus,
     content,
+    initialInputs,
+    verifyInitialPreparedInputs: resolvedOptions.verifyInitialPreparedInputs,
     lifecycle,
     seal,
   };
@@ -3188,6 +3520,48 @@ export async function observeNativeHarnessReconciliation(
   const facts = (await observeFixedMode(expectation, options, "lifecycle")).seal();
   const lifecycle = facts.lifecycle.projected!;
   const content = facts.content;
+  const initial = facts.initialInputs;
+  const initialDraft: NativeHarnessReconciliationInitialInputsFacts | null =
+    facts.verifyInitialPreparedInputs
+      ? {
+        status: initial.status,
+        provisionalStatus: initial.provisionalStatus,
+        revoked: initial.revoked,
+        revokedReasons: [...initial.revokedReasons],
+        planner: initial.planner,
+        planReasons: [...initial.planReasons],
+        failure: initial.failure === null
+          ? null
+          : {
+            code: initial.failure.code,
+            reason: initial.failure.reason,
+            ...(initial.failure.observedMismatch === true ? { observedMismatch: true as const } : {}),
+          },
+        observation: initial.observation,
+        runId: initial.runId,
+        sourceSha256: initial.sourceSha256,
+        manifestSha256: initial.manifestSha256,
+        chargedBytes: initial.chargedBytes,
+        chargeLimitBytes: initial.chargeLimitBytes,
+        captureStarts: initial.captureStarts,
+        passesStarted: initial.passesStarted,
+        openedFiles: initial.openedFiles,
+        close: {
+          attempted: initial.closeAttempted,
+          settled: initial.closeSettled,
+          succeeded: initial.closeSucceeded,
+        },
+        excluded: {
+          path: ".git" as const,
+          kind: "directory" as const,
+          contents: "not-enumerated-not-hashed" as const,
+          git: "not-started" as const,
+        },
+        readOnly: true as const,
+        resumeAvailable: false as const,
+        semanticAcceptance: "not-evaluated" as const,
+      }
+      : null;
   const contentDraft: NativeHarnessReconciliationContentFacts = {
     status: content.status,
     provisionalStatus: content.provisionalStatus,
@@ -3274,6 +3648,7 @@ export async function observeNativeHarnessReconciliation(
     metadata: facts.metadata,
     metadataStatus: facts.metadataStatus,
     content: contentDraft,
+    ...(initialDraft === null ? {} : { initialInputs: initialDraft }),
     lifecycle,
   });
   let result = build();
@@ -3340,6 +3715,25 @@ export async function observeNativeHarnessReconciliation(
       },
       observation: null,
     };
+    // Fixed shape: UUID, two 64-char hashes, one constant reason, counters,
+    // close facts and fixed labels. It adds under 2 KiB to this small
+    // projection, so the whole compact result remains well below 128 KiB.
+    const compactInitial: NativeHarnessReconciliationInitialInputsFacts | null =
+      initialDraft === null
+        ? null
+        : {
+          ...initialDraft,
+          status: "unavailable",
+          provisionalStatus: "unavailable",
+          revoked: false,
+          revokedReasons: [],
+          planReasons: [],
+          failure: {
+            code: "too-large",
+            reason: "The composed reconciliation result exceeded its fixed byte bound; initial-input proof was not retained.",
+          },
+          observation: null,
+        };
     result = {
       schema: NATIVE_HARNESS_RECONCILIATION_LIFECYCLE_SCHEMA,
       readOnly: true,
@@ -3377,6 +3771,7 @@ export async function observeNativeHarnessReconciliation(
       metadata: null,
       metadataStatus: "not-observed",
       content: compactContent,
+      ...(compactInitial === null ? {} : { initialInputs: compactInitial }),
       lifecycle: compactLifecycle,
     };
   }

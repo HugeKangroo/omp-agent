@@ -45,6 +45,14 @@ export const NATIVE_HARNESS_RECONCILIATION_CONTENT_PLAN_SCHEMA =
   "omp-agent.native-harness-reconciliation-content-plan.v1" as const;
 export const NATIVE_HARNESS_RECONCILIATION_CONTENT_DEADLINE_MS = 30_000 as const;
 export const NATIVE_HARNESS_RECONCILIATION_CONTENT_MAX_METADATA_BYTES = 128 * 1024;
+export const NATIVE_HARNESS_INITIAL_INPUTS_PLAN_SCHEMA =
+  "omp-agent.native-harness-initial-prepared-inputs-plan.v1" as const;
+export const NATIVE_HARNESS_INITIAL_INPUTS_MAX_FILES = 8 as const;
+export const NATIVE_HARNESS_INITIAL_INPUTS_MAX_FILE_BYTES = 262_144 as const;
+export const NATIVE_HARNESS_INITIAL_INPUTS_MAX_TOTAL_BYTES = 262_144 as const;
+export const NATIVE_HARNESS_INITIAL_INPUTS_MAX_CAPTURES = 32 as const;
+export const NATIVE_HARNESS_INITIAL_INPUTS_MAX_CHARGED_BYTES = 1_048_576 as const;
+export const NATIVE_HARNESS_INITIAL_INPUTS_PREPARED_MODE = 0o600 as const;
 
 const KIB = 1024;
 const MIB = 1024 * KIB;
@@ -216,6 +224,60 @@ export type NativeHarnessReconciliationContentPlanResult =
     readonly metadata: NativeHarnessReconciliationResult;
   };
 
+export interface NativeHarnessInitialInputsPlanSourceFact {
+  readonly path: string;
+  readonly bytes: number;
+  readonly sha256: string;
+}
+
+export interface NativeHarnessInitialInputsPlan {
+  readonly schema: typeof NATIVE_HARNESS_INITIAL_INPUTS_PLAN_SCHEMA;
+  readonly readOnly: true;
+  readonly resumeAvailable: false;
+  readonly semanticAcceptance: "not-evaluated";
+  readonly processes: "not-inspected";
+  readonly storageRoot: string;
+  readonly sourceRoot: string;
+  readonly preparedRoot: string;
+  readonly workspaceRoot: string;
+  readonly storeRoot: string;
+  readonly runRoot: string;
+  readonly runId: string;
+  /** Exact first-pass run.json text digest; not a new run record. */
+  readonly runSha256: string;
+  /** Exact recovery-source document digest; no newer source is substituted. */
+  readonly sourceSha256: string;
+  readonly sourceBytes: number;
+  readonly manifestSha256: string;
+  readonly preparedMode: typeof NATIVE_HARNESS_INITIAL_INPUTS_PREPARED_MODE;
+  readonly sources: readonly NativeHarnessInitialInputsPlanSourceFact[];
+  /** Fixed top-level boundary, never walked, hashed or used to start Git. */
+  readonly excluded: {
+    readonly path: ".git";
+    readonly kind: "directory";
+    readonly contents: "not-enumerated-not-hashed";
+    readonly git: "not-started";
+  };
+}
+
+export type NativeHarnessInitialInputsPlanResult =
+  | {
+    readonly status: "planned";
+    readonly reasons: readonly [];
+    readonly metadata: NativeHarnessReconciliationResult;
+    readonly plan: NativeHarnessInitialInputsPlan;
+  }
+  | {
+    readonly status: "not-applicable";
+    readonly reasons: readonly [];
+    readonly metadata: NativeHarnessReconciliationResult;
+  }
+  | {
+    readonly status: "unavailable";
+    readonly reasons: readonly NativeHarnessReconciliationContentReason[];
+    readonly metadata: NativeHarnessReconciliationResult;
+  };
+
 export type NativeHarnessReconciliationContentPlanInputErrorCode =
   | "invalid-input"
   | "too-large";
@@ -257,10 +319,15 @@ function addReason(
   if (!reasons.includes(reason)) reasons.push(reason);
 }
 
+type NativeHarnessReconciliationContentUnavailableResult = Extract<
+  NativeHarnessReconciliationContentPlanResult,
+  { readonly status: "unavailable" }
+>;
+
 function unavailable(
   metadata: NativeHarnessReconciliationResult,
   reasons: readonly NativeHarnessReconciliationContentReason[],
-): NativeHarnessReconciliationContentPlanResult {
+): NativeHarnessReconciliationContentUnavailableResult {
   return deepFreeze({
     status: "unavailable" as const,
     reasons: Object.freeze([...new Set(reasons)]),
@@ -723,15 +790,27 @@ function copyOwnedInput(value: unknown): OwnedContentInput {
   });
 }
 
+interface OwnedReconciliationFoundation {
+  readonly metadata: NativeHarnessReconciliationResult;
+  readonly run: RunRecord;
+  readonly source: NativeHarnessRecoverySourceDocument;
+  readonly inventory: NativeHarnessDispatchInventoryV2;
+  readonly preparedRoot: string;
+  readonly workspaceRoot: string;
+  readonly storeRoot: string;
+  readonly runRoot: string;
+}
+
+type FoundationOutcome =
+  | { readonly ok: true; readonly foundation: OwnedReconciliationFoundation }
+  | { readonly ok: false; readonly result: NativeHarnessReconciliationContentUnavailableResult };
+
 /**
- * Plans only latest completed stage contents. Invalid metadata, incomplete
- * coverage, unsupported profiles, bad source/base joins or any required stage
- * mismatch refuse before any content path is selected.
+ * Shared bounded metadata/source/inventory/layout/manifest join. It performs
+ * no filesystem effect and never reads the caller input twice; both planners
+ * consume the same owned snapshot.
  */
-export function planNativeHarnessReconciliationContent(
-  input: NativeHarnessReconciliationContentInput,
-): NativeHarnessReconciliationContentPlanResult {
-  const owned = copyOwnedInput(input);
+function decodeOwnedFoundation(owned: OwnedContentInput): FoundationOutcome {
   let metadata: NativeHarnessReconciliationResult;
   try {
     metadata = reconcileNativeHarnessMetadata(owned);
@@ -750,7 +829,7 @@ export function planNativeHarnessReconciliationContent(
   if (metadata.run === null || metadata.source === null || metadata.owner === null) {
     addReason(preliminary, "profile-unsupported");
   }
-  if (preliminary.length !== 0) return unavailable(metadata, preliminary);
+  if (preliminary.length !== 0) return { ok: false, result: unavailable(metadata, preliminary) };
 
   let run: RunRecord;
   let source: NativeHarnessRecoverySourceDocument;
@@ -766,11 +845,11 @@ export function planNativeHarnessReconciliationContent(
       runId: owned.expected.runId,
     });
     if (decoded.schema !== NATIVE_HARNESS_DISPATCH_INVENTORY_SCHEMA_V2) {
-      return unavailable(metadata, ["profile-unsupported"]);
+      return { ok: false, result: unavailable(metadata, ["profile-unsupported"]) };
     }
     inventory = decoded;
   } catch {
-    return unavailable(metadata, ["source-invalid"]);
+    return { ok: false, result: unavailable(metadata, ["source-invalid"]) };
   }
 
   if (
@@ -779,7 +858,7 @@ export function planNativeHarnessReconciliationContent(
     || run.config.mode !== "product"
     || run.config.domain !== "generic"
   ) {
-    return unavailable(metadata, ["profile-unsupported"]);
+    return { ok: false, result: unavailable(metadata, ["profile-unsupported"]) };
   }
 
   const preparedRoot = path.join(owned.expected.storageRoot, source.workspace.preparedRelativeRoot);
@@ -794,13 +873,13 @@ export function planNativeHarnessReconciliationContent(
     || !isStrictlyContained(storeRoot, runRoot)
     || !isContained(owned.expected.storageRoot, preparedRoot)
   ) {
-    return unavailable(metadata, ["profile-unsupported"]);
+    return { ok: false, result: unavailable(metadata, ["profile-unsupported"]) };
   }
 
   if (source.inputs.length < 1
     || source.inputs.length > MAX_SOURCE_FILES
     || new Set(source.inputs.map((entry) => entry.relativePath)).size !== source.inputs.length) {
-    return unavailable(metadata, ["source-manifest-mismatch"]);
+    return { ok: false, result: unavailable(metadata, ["source-manifest-mismatch"]) };
   }
   let sourceTotalBytes = 0;
   for (const entry of source.inputs) {
@@ -811,16 +890,52 @@ export function planNativeHarnessReconciliationContent(
       || entry.bytes > MAX_SOURCE_FILE_BYTES
       || !hex64(entry.sha256)
     ) {
-      return unavailable(metadata, ["source-manifest-mismatch"]);
+      return { ok: false, result: unavailable(metadata, ["source-manifest-mismatch"]) };
     }
     sourceTotalBytes += entry.bytes;
   }
   if (sourceTotalBytes > MAX_SOURCE_TOTAL_BYTES) {
-    return unavailable(metadata, ["source-manifest-mismatch"]);
+    return { ok: false, result: unavailable(metadata, ["source-manifest-mismatch"]) };
   }
   if (sourceManifestDigest(source) !== source.inputManifestSha256) {
-    return unavailable(metadata, ["source-manifest-digest-mismatch"]);
+    return { ok: false, result: unavailable(metadata, ["source-manifest-digest-mismatch"]) };
   }
+  return {
+    ok: true,
+    foundation: {
+      metadata,
+      run,
+      source,
+      inventory,
+      preparedRoot,
+      workspaceRoot,
+      storeRoot,
+      runRoot,
+    },
+  };
+}
+
+/**
+ * Plans only latest completed stage contents. Invalid metadata, incomplete
+ * coverage, unsupported profiles, bad source/base joins or any required stage
+ * mismatch refuse before any content path is selected.
+ */
+export function planNativeHarnessReconciliationContent(
+  input: NativeHarnessReconciliationContentInput,
+): NativeHarnessReconciliationContentPlanResult {
+  const owned = copyOwnedInput(input);
+  const decoded = decodeOwnedFoundation(owned);
+  if (!decoded.ok) return decoded.result;
+  const {
+    metadata,
+    run,
+    source,
+    inventory,
+    preparedRoot,
+    workspaceRoot,
+    storeRoot,
+    runRoot,
+  } = decoded.foundation;
 
   const snapshot = run.snapshot;
   const anyStageRecord = STAGE_IDS.some((stage) => run.stages[stage] !== undefined);
@@ -945,6 +1060,82 @@ export function planNativeHarnessReconciliationContent(
       entries: Object.freeze(baseEntries),
     }),
     stages: Object.freeze(stages),
+  });
+  return deepFreeze({
+    status: "planned" as const,
+    reasons: Object.freeze([] as const),
+    metadata,
+    plan,
+  });
+}
+
+/**
+ * Plans only the actual zero-attempt initial prepared-input branch: no
+ * snapshot, no stage record and no dispatch. A present snapshot is
+ * not-applicable here; any stage/dispatch without a snapshot stays refused.
+ * This is a readonly byte-association plan, never resume authority.
+ */
+export function planNativeHarnessInitialInputs(
+  input: NativeHarnessReconciliationContentInput,
+): NativeHarnessInitialInputsPlanResult {
+  const owned = copyOwnedInput(input);
+  const decoded = decodeOwnedFoundation(owned);
+  if (!decoded.ok) return decoded.result;
+  const {
+    metadata,
+    run,
+    source,
+    inventory,
+    preparedRoot,
+    workspaceRoot,
+    storeRoot,
+    runRoot,
+  } = decoded.foundation;
+
+  if (run.snapshot !== undefined) {
+    return deepFreeze({
+      status: "not-applicable" as const,
+      reasons: Object.freeze([] as const),
+      metadata,
+    });
+  }
+  const anyStageRecord = STAGE_IDS.some((stage) => run.stages[stage] !== undefined);
+  if (anyStageRecord || inventory.dispatches.length > 0) {
+    return unavailable(metadata, ["snapshot-missing"]);
+  }
+
+  const sources = [...source.inputs]
+    .map((entry) => Object.freeze({
+      path: entry.relativePath,
+      bytes: entry.bytes,
+      sha256: entry.sha256,
+    }))
+    .sort((left, right) => compareCodeUnit(left.path, right.path));
+  const plan = deepFreeze({
+    schema: NATIVE_HARNESS_INITIAL_INPUTS_PLAN_SCHEMA,
+    readOnly: true as const,
+    resumeAvailable: false as const,
+    semanticAcceptance: "not-evaluated" as const,
+    processes: "not-inspected" as const,
+    storageRoot: owned.expected.storageRoot,
+    sourceRoot: owned.expected.sourceRoot,
+    preparedRoot,
+    workspaceRoot,
+    storeRoot,
+    runRoot,
+    runId: owned.expected.runId,
+    runSha256: sha256Hex(owned.runText),
+    sourceSha256: source.sha256,
+    sourceBytes: source.bytes,
+    manifestSha256: source.inputManifestSha256,
+    preparedMode: NATIVE_HARNESS_INITIAL_INPUTS_PREPARED_MODE,
+    sources: Object.freeze(sources),
+    excluded: Object.freeze({
+      path: ".git" as const,
+      kind: "directory" as const,
+      contents: "not-enumerated-not-hashed" as const,
+      git: "not-started" as const,
+    }),
   });
   return deepFreeze({
     status: "planned" as const,

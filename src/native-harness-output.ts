@@ -14,6 +14,7 @@ import {
   type NativeHarnessBackendCompletion,
   type NativeHarnessCompletionSelection,
 } from "./native-harness-completion.ts";
+import { NATIVE_HARNESS_RECOVERY_SOURCE_MAX_BYTES } from "./native-harness-recovery-source.ts";
 import { STAGE_IDS } from "../vendor/harness2/upstream/src/types.ts";
 import {
   NativeFileError,
@@ -27,7 +28,17 @@ import {
   type NativeFileStats,
   type NativeWorkspaceTextSnapshot,
 } from "./native-work.ts";
-import type { NativeHarnessReconciliationContentPlan } from "./native-harness-reconciliation-content.ts";
+import {
+  NATIVE_HARNESS_INITIAL_INPUTS_MAX_CAPTURES,
+  NATIVE_HARNESS_INITIAL_INPUTS_MAX_CHARGED_BYTES,
+  NATIVE_HARNESS_INITIAL_INPUTS_MAX_FILES,
+  NATIVE_HARNESS_INITIAL_INPUTS_MAX_FILE_BYTES,
+  NATIVE_HARNESS_INITIAL_INPUTS_MAX_TOTAL_BYTES,
+  NATIVE_HARNESS_INITIAL_INPUTS_PLAN_SCHEMA,
+  NATIVE_HARNESS_INITIAL_INPUTS_PREPARED_MODE,
+  type NativeHarnessInitialInputsPlan,
+  type NativeHarnessReconciliationContentPlan,
+} from "./native-harness-reconciliation-content.ts";
 
 /**
  * Host-only, bounded observation of the complete supported regular-file change
@@ -545,6 +556,11 @@ interface TreeObservation {
   readonly entries: readonly TreeEntry[];
   readonly files: ReadonlyMap<string, ObservedTextFile>;
   readonly markerSignature: FileSignature | null;
+  /** Initial-prepared mode only: pinned top-level `.git`, contents never walked. */
+  readonly excludedDirectory: {
+    readonly path: string;
+    readonly identity: DirectoryIdentity;
+  } | null;
   readonly fileCount: number;
   readonly directoryCount: number;
   readonly totalFileBytes: number;
@@ -821,6 +837,14 @@ interface TreeOptions {
   readonly readFiles: boolean;
   /** Fixed content mode only: charge validated observed size before read. */
   readonly charge?: (bytes: number) => void;
+  /**
+   * Private initial-prepared mode: exactly the top-level `.git` directory is
+   * recorded as an excluded boundary and never walked. Ordinary files must be
+   * mode 0600. No other call site sets this.
+   */
+  readonly initialPrepared?: boolean;
+  /** Counts one actual ordinary-file capture start before the reader. */
+  readonly onFileCapture?: () => void;
 }
 
 interface ContentReadAccounting {
@@ -957,6 +981,7 @@ async function inventoryTree(ctx: Context, options: TreeOptions): Promise<TreeOb
   const entries: TreeEntry[] = [];
   const files = new Map<string, ObservedTextFile>();
   let markerSignature: FileSignature | null = null;
+  let excludedDirectory: TreeObservation["excludedDirectory"] = null;
   let directoryCount = 1;
   let fileCount = 0;
   let totalFileBytes = 0;
@@ -988,6 +1013,20 @@ async function inventoryTree(ctx: Context, options: TreeOptions): Promise<TreeOb
       if (info.isSymbolicLink()) failObserved("unsafe-path", `Symbolic links are not supported: ${relativePath}`);
       const signature = signatureOf(info);
 
+      if (options.initialPrepared === true && relativeDirectory === "" && name === ".git") {
+        if (!info.isDirectory()) {
+          failObserved("unsupported", "The prepared workspace .git path is not a real directory.");
+        }
+        const excludedIdentity = await observeRoot(ctx, absolute, "prepared workspace .git");
+        directoryCount += 1;
+        if (directoryCount > NATIVE_HARNESS_OUTPUT_LIMITS.maxDirectories) {
+          fail("too-large", "A trusted tree exceeds the directory bound.");
+        }
+        entries.push({ relativePath: ".git", kind: "directory", signature });
+        excludedDirectory = Object.freeze({ path: absolute, identity: excludedIdentity });
+        continue;
+      }
+
       if (info.isDirectory()) {
         const bounded = boundedRelative(relativePath);
         assertNoReservedSegment(bounded);
@@ -1002,6 +1041,12 @@ async function inventoryTree(ctx: Context, options: TreeOptions): Promise<TreeOb
 
       if (!info.isFile()) {
         failObserved("unsupported", `A special file is not supported: ${relativePath}`);
+      }
+      if (
+        options.initialPrepared === true
+        && (signature.rawMode & 0o7777n) !== BigInt(NATIVE_HARNESS_INITIAL_INPUTS_PREPARED_MODE)
+      ) {
+        fail("unsupported", `The prepared input file mode is not exactly 0600: ${relativePath}`);
       }
 
       const markerName = name.toLowerCase() === ORIGIN_MARKER;
@@ -1075,6 +1120,7 @@ async function inventoryTree(ctx: Context, options: TreeOptions): Promise<TreeOb
       }
       entries.push({ relativePath: bounded, kind: "file", signature });
       if (options.readFiles) {
+        options.onFileCapture?.();
         // The reader reserves its own pre-read lstat size and binds any larger
         // actual opened size to the charge, per-file cap and aggregate cap
         // before allocation/read.
@@ -1092,12 +1138,16 @@ async function inventoryTree(ctx: Context, options: TreeOptions): Promise<TreeOb
   };
 
   await walk("", 0);
+  if (options.initialPrepared === true && excludedDirectory === null) {
+    failObserved("missing", "The prepared workspace top-level .git directory is missing.");
+  }
   return {
     root: options.root,
     identity,
     entries,
     files,
     markerSignature,
+    excludedDirectory,
     fileCount,
     directoryCount,
     totalFileBytes: contentAccounting?.totalBytes ?? totalFileBytes,
@@ -1112,6 +1162,11 @@ function sameTree(left: TreeObservation, right: TreeObservation): boolean {
   if ((left.markerSignature === null) !== (right.markerSignature === null)) return false;
   if (left.markerSignature !== null && right.markerSignature !== null
     && !sameFileSignature(left.markerSignature, right.markerSignature)) return false;
+  if ((left.excludedDirectory === null) !== (right.excludedDirectory === null)) return false;
+  if (left.excludedDirectory !== null && right.excludedDirectory !== null) {
+    if (left.excludedDirectory.path !== right.excludedDirectory.path) return false;
+    if (!sameDirectoryIdentity(left.excludedDirectory.identity, right.excludedDirectory.identity)) return false;
+  }
   for (let index = 0; index < left.entries.length; index += 1) {
     const before = left.entries[index]!;
     const after = right.entries[index]!;
@@ -2579,6 +2634,899 @@ export async function observeNativeHarnessReconciliationContentBytes(
       chargedBytes,
       chargeLimitBytes,
       tracePassesStarted,
+    };
+  }
+}
+
+export interface NativeHarnessInitialInputsByteFileFact {
+  readonly path: string;
+  readonly bytes: number;
+  readonly sha256: string;
+  readonly observedAt: number;
+}
+
+export interface NativeHarnessInitialInputsBytePreparedFileFact
+  extends NativeHarnessInitialInputsByteFileFact {
+  readonly mode: number;
+}
+
+export interface NativeHarnessInitialInputsByteObservation {
+  readonly readOnly: true;
+  readonly resumeAvailable: false;
+  readonly semanticAcceptance: "not-evaluated";
+  readonly processes: "not-inspected";
+  readonly status: "stable";
+  readonly observation: "two-pass";
+  readonly runId: string;
+  readonly runSha256: string;
+  readonly sourceSha256: string;
+  readonly sourceBytes: number;
+  readonly manifestSha256: string;
+  readonly source: {
+    readonly root: string;
+    readonly files: readonly NativeHarnessInitialInputsByteFileFact[];
+    readonly totalBytes: number;
+    readonly captureStarts: number;
+  };
+  readonly prepared: {
+    readonly root: string;
+    readonly mode: 0o600;
+    readonly files: readonly NativeHarnessInitialInputsBytePreparedFileFact[];
+    readonly totalBytes: number;
+    readonly captureStarts: number;
+    readonly excluded: {
+      readonly path: ".git";
+      readonly kind: "directory";
+      readonly contents: "not-enumerated-not-hashed";
+      readonly git: "not-started";
+      readonly identity: "pinned-before-between-after";
+    };
+  };
+  readonly passes: 2;
+  readonly captureStarts: number;
+  readonly chargedBytes: number;
+  readonly chargeLimitBytes: number;
+  readonly openedFiles: number;
+  readonly maxConcurrentOpenedFiles: number;
+  readonly close: {
+    readonly attempted: number;
+    readonly settled: number;
+    readonly succeeded: number;
+  };
+  readonly limitations: readonly string[];
+}
+
+export interface NativeHarnessInitialInputsByteFailure extends NativeHarnessOutputFailureResult {
+  readonly captureStarts: number;
+  readonly chargedBytes: number;
+  readonly chargeLimitBytes: number;
+  readonly passesStarted: 0 | 1 | 2;
+  readonly openedFiles: number;
+  readonly close: {
+    readonly attempted: number;
+    readonly settled: number;
+    readonly succeeded: number;
+  };
+  /** A file or directory close did not settle successfully. */
+  readonly closeFailed?: true;
+}
+
+export type NativeHarnessInitialInputsByteResult =
+  | { readonly ok: true; readonly observation: NativeHarnessInitialInputsByteObservation }
+  | NativeHarnessInitialInputsByteFailure;
+
+const INITIAL_INPUT_LIMITATIONS = Object.freeze([
+  "Selected original inputs were read as UTF-8 text bytes and matched to the original manifest; unrelated source files were not inspected.",
+  "The prepared workspace contained exactly the manifest ordinary files at mode 0600; the top-level .git directory was pinned as an excluded boundary and its contents were not enumerated, hashed or queried.",
+  "Two actual byte passes were compared; a change wholly between observations is not excluded and later writes are not prevented.",
+  "No worker, model, resume permission, completion witness, claim, conditional commit or execution is provided.",
+]);
+
+interface OwnedInitialPlan {
+  readonly storageRoot: string;
+  readonly sourceRoot: string;
+  readonly preparedRoot: string;
+  readonly workspaceRoot: string;
+  readonly storeRoot: string;
+  readonly runRoot: string;
+  readonly runId: string;
+  readonly runSha256: string;
+  readonly sourceSha256: string;
+  readonly sourceBytes: number;
+  readonly manifestSha256: string;
+  readonly sources: readonly {
+    readonly path: string;
+    readonly bytes: number;
+    readonly sha256: string;
+  }[];
+}
+
+const INITIAL_RUN_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const INITIAL_PREPARED_ROOT_PATTERN = /^omp-harness-[A-Za-z0-9]{6}$/;
+
+function initialOwnField(
+  value: unknown,
+  key: string,
+  label: string,
+  code: NativeHarnessOutputFailure = "source-unavailable",
+): unknown {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(value, key);
+  } catch {
+    fail(code, `${label}.${key} could not be inspected.`);
+  }
+  if (
+    descriptor === undefined
+    || !("value" in descriptor)
+    || descriptor.get !== undefined
+    || descriptor.set !== undefined
+    || descriptor.enumerable !== true
+  ) {
+    fail(code, `${label}.${key} must be an enumerable own data field.`);
+  }
+  return descriptor.value;
+}
+
+function initialOwnFields(
+  value: unknown,
+  allowed: readonly string[],
+  label: string,
+  code: NativeHarnessOutputFailure = "source-unavailable",
+): ReadonlyMap<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    fail(code, `${label} must be an exact plain object.`);
+  }
+  let prototype: object | null;
+  let keys: (string | symbol)[];
+  try {
+    prototype = Object.getPrototypeOf(value);
+    keys = Reflect.ownKeys(value);
+  } catch {
+    fail(code, `${label} could not be inspected.`);
+  }
+  if (prototype !== Object.prototype && prototype !== null) {
+    fail(code, `${label} must be an exact plain object.`);
+  }
+  if (keys.some((key) => typeof key !== "string" || !allowed.includes(key))) {
+    fail(code, `${label} contains an unsupported field.`);
+  }
+  const fields = new Map<string, unknown>();
+  for (const key of keys as string[]) fields.set(key, initialOwnField(value, key, label, code));
+  return fields;
+}
+
+function initialExactOwnObject(
+  value: unknown,
+  keys: readonly string[],
+  label: string,
+): ReadonlyMap<string, unknown> {
+  const fields = initialOwnFields(value, keys, label);
+  if (fields.size !== keys.length) {
+    fail("source-unavailable", `${label} must contain exactly its fixed fields.`);
+  }
+  return fields;
+}
+
+function initialOwnSlots(
+  value: unknown,
+  label: string,
+  min: number,
+  max: number,
+): readonly unknown[] {
+  if (!Array.isArray(value)) {
+    fail("source-unavailable", `${label} must be an exact dense array.`);
+  }
+  let prototype: object | null;
+  let keys: (string | symbol)[];
+  try {
+    prototype = Object.getPrototypeOf(value);
+    keys = Reflect.ownKeys(value);
+  } catch {
+    fail("source-unavailable", `${label} could not be inspected.`);
+  }
+  if (prototype !== Array.prototype && prototype !== null) {
+    fail("source-unavailable", `${label} must be an exact dense array.`);
+  }
+  const lengthDescriptor = Object.getOwnPropertyDescriptor(value, "length");
+  if (
+    lengthDescriptor === undefined
+    || !("value" in lengthDescriptor)
+    || !Number.isSafeInteger(lengthDescriptor.value)
+    || lengthDescriptor.value < min
+    || lengthDescriptor.value > max
+  ) {
+    fail("source-unavailable", `${label} is outside its fixed slot bound.`);
+  }
+  const length = lengthDescriptor.value as number;
+  if (keys.length !== length + 1) {
+    fail("source-unavailable", `${label} must be a dense array with no extra properties.`);
+  }
+  const slots: unknown[] = [];
+  for (let index = 0; index < length; index += 1) {
+    const key = String(index);
+    if (!keys.includes(key)) {
+      fail("source-unavailable", `${label} must not contain holes.`);
+    }
+    slots.push(initialOwnField(value, key, label));
+  }
+  for (const key of keys) {
+    if (typeof key !== "string" || (key !== "length" && !/^(0|[1-9][0-9]*)$/.test(key))) {
+      fail("source-unavailable", `${label} contains an unsupported slot.`);
+    }
+  }
+  return slots;
+}
+
+function readInitialInputsPlan(value: unknown): OwnedInitialPlan {
+  const fields = initialExactOwnObject(value, [
+    "schema",
+    "readOnly",
+    "resumeAvailable",
+    "semanticAcceptance",
+    "processes",
+    "storageRoot",
+    "sourceRoot",
+    "preparedRoot",
+    "workspaceRoot",
+    "storeRoot",
+    "runRoot",
+    "runId",
+    "runSha256",
+    "sourceSha256",
+    "sourceBytes",
+    "manifestSha256",
+    "preparedMode",
+    "sources",
+    "excluded",
+  ], "initial inputs plan");
+  const schema = fields.get("schema");
+  const readOnly = fields.get("readOnly");
+  const resumeAvailable = fields.get("resumeAvailable");
+  const semanticAcceptance = fields.get("semanticAcceptance");
+  const processes = fields.get("processes");
+  const preparedMode = fields.get("preparedMode");
+  if (
+    schema !== NATIVE_HARNESS_INITIAL_INPUTS_PLAN_SCHEMA
+    || readOnly !== true
+    || resumeAvailable !== false
+    || semanticAcceptance !== "not-evaluated"
+    || processes !== "not-inspected"
+    || preparedMode !== NATIVE_HARNESS_INITIAL_INPUTS_PREPARED_MODE
+  ) {
+    fail("source-unavailable", "The initial inputs plan does not have the expected fixed schema.");
+  }
+  const storageRoot = trustedAbsolute(fields.get("storageRoot"), "initial storageRoot");
+  const sourceRoot = trustedAbsolute(fields.get("sourceRoot"), "initial sourceRoot");
+  const preparedRoot = trustedAbsolute(fields.get("preparedRoot"), "initial preparedRoot");
+  const workspaceRoot = trustedAbsolute(fields.get("workspaceRoot"), "initial workspaceRoot");
+  const storeRoot = trustedAbsolute(fields.get("storeRoot"), "initial storeRoot");
+  const runRoot = trustedAbsolute(fields.get("runRoot"), "initial runRoot");
+  const runId = fields.get("runId");
+  if (
+    typeof runId !== "string"
+    || !INITIAL_RUN_ID_PATTERN.test(runId)
+    || !INITIAL_PREPARED_ROOT_PATTERN.test(path.basename(preparedRoot))
+  ) {
+    fail("source-unavailable", "The initial inputs plan run or prepared-root identity is not the fixed shape.");
+  }
+  if (
+    isContained(storageRoot, sourceRoot)
+    || isContained(sourceRoot, storageRoot)
+    || path.dirname(preparedRoot) !== storageRoot
+    || workspaceRoot !== path.join(preparedRoot, "workspace")
+    || storeRoot !== path.join(preparedRoot, "store")
+    || runRoot !== path.join(storeRoot, "runs", runId)
+  ) {
+    fail("unsafe-path", "The initial inputs plan roots are not the exact original prepared layout.");
+  }
+  const runSha256 = fields.get("runSha256");
+  const sourceSha256 = fields.get("sourceSha256");
+  const manifestSha256 = fields.get("manifestSha256");
+  const sourceBytes = fields.get("sourceBytes");
+  if (
+    !hex64(runSha256)
+    || !hex64(sourceSha256)
+    || !hex64(manifestSha256)
+    || !Number.isSafeInteger(sourceBytes)
+    || (sourceBytes as number) < 0
+    || (sourceBytes as number) > NATIVE_HARNESS_RECOVERY_SOURCE_MAX_BYTES
+  ) {
+    fail("source-unavailable", "The initial inputs plan identity or source size is not bounded.");
+  }
+  const excluded = initialExactOwnObject(fields.get("excluded"), [
+    "path",
+    "kind",
+    "contents",
+    "git",
+  ], "initial excluded boundary");
+  if (
+    excluded.get("path") !== ".git"
+    || excluded.get("kind") !== "directory"
+    || excluded.get("contents") !== "not-enumerated-not-hashed"
+    || excluded.get("git") !== "not-started"
+  ) {
+    fail("source-unavailable", "The initial inputs plan does not declare the fixed .git exclusion.");
+  }
+  const rawSources = initialOwnSlots(
+    fields.get("sources"),
+    "initial sources",
+    1,
+    NATIVE_HARNESS_INITIAL_INPUTS_MAX_FILES,
+  );
+  const sources: Array<{ readonly path: string; readonly bytes: number; readonly sha256: string }> = [];
+  const seen = new Set<string>();
+  let total = 0;
+  for (const raw of rawSources) {
+    const source = initialExactOwnObject(raw, ["path", "bytes", "sha256"], "initial source fact");
+    const relative = boundedRelative(source.get("path"));
+    const bytes = source.get("bytes");
+    const sha256 = source.get("sha256");
+    if (
+      !Number.isSafeInteger(bytes)
+      || (bytes as number) < 0
+      || (bytes as number) > NATIVE_HARNESS_INITIAL_INPUTS_MAX_FILE_BYTES
+      || !hex64(sha256)
+      || seen.has(relative)
+    ) {
+      fail("source-unavailable", "An initial input source fact is not bounded or unique.");
+    }
+    seen.add(relative);
+    total += bytes as number;
+    if (total > NATIVE_HARNESS_INITIAL_INPUTS_MAX_TOTAL_BYTES) {
+      fail("too-large", "The initial input manifest exceeds its total byte bound.");
+    }
+    sources.push(Object.freeze({ path: relative, bytes: bytes as number, sha256 }));
+  }
+  const expectedManifest = [...sources]
+    .sort((left, right) => comparePaths(left.path, right.path))
+    .map((source) => [source.path, source.bytes, source.sha256]);
+  if (sha256Hex(JSON.stringify(expectedManifest)) !== manifestSha256) {
+    fail("changed", "The initial input manifest digest is inconsistent.");
+  }
+  return Object.freeze({
+    storageRoot,
+    sourceRoot,
+    preparedRoot,
+    workspaceRoot,
+    storeRoot,
+    runRoot,
+    runId,
+    runSha256,
+    sourceSha256,
+    sourceBytes: sourceBytes as number,
+    manifestSha256,
+    sources: Object.freeze(
+      [...sources].sort((left, right) => comparePaths(left.path, right.path)),
+    ),
+  });
+}
+
+interface OwnedInitialControls {
+  readonly guard: () => void;
+  readonly signal: AbortSignal;
+  readonly chargeLimitBytes: number | null;
+  readonly fileIo: NativeFileIo | null;
+}
+
+function readInitialControls(value: unknown): OwnedInitialControls {
+  const fields = initialOwnFields(
+    value,
+    ["guard", "signal", "chargeLimitBytes", "fileIo"],
+    "initial-input controls",
+    "invalid-control",
+  );
+  const guard = fields.get("guard");
+  const signal = fields.get("signal");
+  if (typeof guard !== "function") {
+    fail("invalid-control", "The initial-input observer requires a guard function.");
+  }
+  const rawLimit = fields.get("chargeLimitBytes");
+  let chargeLimitBytes: number | null = null;
+  if (rawLimit !== undefined) {
+    if (!Number.isSafeInteger(rawLimit) || (rawLimit as number) < 0) {
+      fail("invalid-control", "The initial-input charge limit is not a bounded non-negative integer.");
+    }
+    chargeLimitBytes = rawLimit as number;
+  }
+  const rawFileIo = fields.get("fileIo");
+  let fileIo: NativeFileIo | null = null;
+  if (rawFileIo !== undefined) {
+    if (
+      typeof rawFileIo !== "object" || rawFileIo === null
+      || typeof (rawFileIo as NativeFileIo).O_RDONLY !== "number"
+      || typeof (rawFileIo as NativeFileIo).O_NOFOLLOW !== "number"
+      || typeof (rawFileIo as NativeFileIo).realpath !== "function"
+      || typeof (rawFileIo as NativeFileIo).lstat !== "function"
+      || typeof (rawFileIo as NativeFileIo).open !== "function"
+    ) {
+      fail("invalid-control", "The initial-input file IO seam is not usable.");
+    }
+    fileIo = rawFileIo as NativeFileIo;
+  }
+  readActualAborted(signal);
+  return Object.freeze({
+    guard: guard as () => void,
+    signal: signal as AbortSignal,
+    chargeLimitBytes,
+    fileIo,
+  });
+}
+
+interface InitialInputCounters {
+  captureStarts: number;
+  chargedBytes: number;
+  openedFiles: number;
+  activeFiles: number;
+  maxConcurrentOpenedFiles: number;
+  closeAttempted: number;
+  closeSettled: number;
+  closeSucceeded: number;
+  closeFailed: boolean;
+}
+
+function initialCountingIo(base: NativeFileIo, counters: InitialInputCounters): NativeFileIo {
+  return {
+    O_RDONLY: base.O_RDONLY,
+    O_NOFOLLOW: base.O_NOFOLLOW,
+    realpath: (target) => base.realpath(target),
+    lstat: (target, options) => base.lstat(target, options),
+    async open(target: string, flags: number): Promise<NativeFileHandle> {
+      const handle = await base.open(target, flags);
+      counters.openedFiles += 1;
+      counters.activeFiles += 1;
+      if (counters.activeFiles > counters.maxConcurrentOpenedFiles) {
+        counters.maxConcurrentOpenedFiles = counters.activeFiles;
+      }
+      // One actual close attempt per handle: a duplicate wrapper close reuses
+      // the first settled promise and can never call the host handle again.
+      let closePromise: Promise<void> | null = null;
+      return {
+        stat: (options) => handle.stat(options),
+        read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
+        close(): Promise<void> {
+          if (closePromise !== null) return closePromise;
+          counters.closeAttempted += 1;
+          closePromise = (async () => {
+            try {
+              await handle.close();
+              // A failed close leaves the real descriptor state unknown; it is
+              // never counted as a released handle.
+              counters.closeSucceeded += 1;
+              counters.activeFiles -= 1;
+            } catch (error) {
+              counters.closeFailed = true;
+              throw error;
+            } finally {
+              counters.closeSettled += 1;
+            }
+          })();
+          return closePromise;
+        },
+      };
+    },
+  };
+}
+
+/**
+ * Initial-only sticky effect guard. Once any initial file close fails, every
+ * later initial capture start, open, lstat or realpath is refused immediately;
+ * the already-open handles are still allowed to close. It never applies to the
+ * issued capture/content paths.
+ */
+function initialEffectIo(
+  base: NativeFileIo,
+  halted: () => void,
+): NativeFileIo {
+  return {
+    O_RDONLY: base.O_RDONLY,
+    O_NOFOLLOW: base.O_NOFOLLOW,
+    async realpath(target: string): Promise<string> {
+      halted();
+      const resolved = await base.realpath(target);
+      halted();
+      return resolved;
+    },
+    async lstat(target: string, options: { bigint: true }): Promise<NativeFileStats> {
+      halted();
+      const info = await base.lstat(target, options);
+      halted();
+      return info;
+    },
+    async open(target: string, flags: number): Promise<NativeFileHandle> {
+      halted();
+      const handle = await base.open(target, flags);
+      try {
+        halted();
+      } catch (error) {
+        try {
+          await handle.close();
+        } catch {
+          // The sticky halt remains the reported failure; the fresh handle is
+          // still closed through its single wrapper attempt.
+        }
+        throw error;
+      }
+      return {
+        stat: (options) => handle.stat(options),
+        read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
+        close: () => handle.close(),
+      };
+    },
+  };
+}
+
+function initialFailureCounters(
+  counters: InitialInputCounters,
+  chargeLimitBytes: number,
+  passesStarted: 0 | 1 | 2,
+  closeError: boolean,
+): Pick<
+  NativeHarnessInitialInputsByteFailure,
+  | "captureStarts"
+  | "chargedBytes"
+  | "chargeLimitBytes"
+  | "passesStarted"
+  | "openedFiles"
+  | "close"
+  | "closeFailed"
+> {
+  return {
+    captureStarts: counters.captureStarts,
+    chargedBytes: counters.chargedBytes,
+    chargeLimitBytes,
+    passesStarted,
+    openedFiles: counters.openedFiles,
+    close: {
+      attempted: counters.closeAttempted,
+      settled: counters.closeSettled,
+      succeeded: counters.closeSucceeded,
+    },
+    ...(counters.closeFailed || closeError ? { closeFailed: true as const } : {}),
+  };
+}
+
+function preparedInitialTreeOptions(
+  plan: OwnedInitialPlan,
+  charge: (bytes: number) => void,
+  startCapture: () => void,
+): TreeOptions {
+  return {
+    root: plan.workspaceRoot,
+    label: "initial prepared workspace",
+    stage: null,
+    allowMarker: false,
+    expectedMarkerBytes: null,
+    maxOrdinaryFiles: NATIVE_HARNESS_INITIAL_INPUTS_MAX_FILES,
+    maxFileBytes: NATIVE_HARNESS_INITIAL_INPUTS_MAX_FILE_BYTES,
+    maxTotalBytes: NATIVE_HARNESS_INITIAL_INPUTS_MAX_TOTAL_BYTES,
+    readFiles: true,
+    charge,
+    initialPrepared: true,
+    onFileCapture: startCapture,
+  };
+}
+
+async function observeInitialSources(
+  ctx: Context,
+  plan: OwnedInitialPlan,
+  charge: (bytes: number) => void,
+  startCapture: () => void,
+): Promise<Array<NativeHarnessInitialInputsByteFileFact & { readonly signature: FileSignature }>> {
+  const accounting: ContentReadAccounting = {
+    charge,
+    maxFileBytes: NATIVE_HARNESS_INITIAL_INPUTS_MAX_FILE_BYTES,
+    maxTotalBytes: NATIVE_HARNESS_INITIAL_INPUTS_MAX_TOTAL_BYTES,
+    totalBytes: 0,
+  };
+  const observedFacts = [];
+  for (const source of plan.sources) {
+    startCapture();
+    const observed = await observeTextFile(ctx, plan.sourceRoot, source.path, null, true, accounting);
+    if (
+      observed.snapshot.file.bytes !== source.bytes
+      || observed.snapshot.file.sha256 !== source.sha256
+    ) {
+      failObserved("changed", "A selected original source file no longer matches the source manifest.");
+    }
+    observedFacts.push(Object.freeze({
+      path: source.path,
+      bytes: observed.snapshot.file.bytes,
+      sha256: observed.snapshot.file.sha256,
+      observedAt: observed.snapshot.file.observedAt,
+      signature: observed.signature,
+    }));
+  }
+  return observedFacts;
+}
+
+async function recheckInitialSources(
+  ctx: Context,
+  plan: OwnedInitialPlan,
+  first: Awaited<ReturnType<typeof observeInitialSources>>,
+  charge: (bytes: number) => void,
+  startCapture: () => void,
+): Promise<void> {
+  if (first.length !== plan.sources.length) {
+    failObserved("changed", "The selected source observation set changed between passes.");
+  }
+  const accounting: ContentReadAccounting = {
+    charge,
+    maxFileBytes: NATIVE_HARNESS_INITIAL_INPUTS_MAX_FILE_BYTES,
+    maxTotalBytes: NATIVE_HARNESS_INITIAL_INPUTS_MAX_TOTAL_BYTES,
+    totalBytes: 0,
+  };
+  for (let index = 0; index < first.length; index += 1) {
+    const expected = first[index]!;
+    startCapture();
+    const again = await observeTextFile(ctx, plan.sourceRoot, expected.path, null, true, accounting);
+    if (
+      again.snapshot.file.bytes !== expected.bytes
+      || again.snapshot.file.sha256 !== expected.sha256
+      || !sameFileSignature(expected.signature, again.signature)
+    ) {
+      failObserved("changed", "A selected original source file changed between initial-input passes.");
+    }
+  }
+}
+
+function verifyInitialPreparedTree(plan: OwnedInitialPlan, tree: TreeObservation): void {
+  if (tree.markerSignature !== null) {
+    failObserved("unsupported", "The initial prepared workspace unexpectedly contains an origin marker.");
+  }
+  if (tree.excludedDirectory === null) {
+    failObserved("missing", "The initial prepared workspace .git directory is missing.");
+  }
+  if (tree.fileCount !== plan.sources.length || tree.files.size !== plan.sources.length) {
+    failObserved("unsupported", "The initial prepared regular files do not exactly match the input manifest.");
+  }
+  for (const source of plan.sources) {
+    const file = tree.files.get(source.path);
+    if (file === undefined) {
+      failObserved("changed", "An initial prepared input is missing or extra ordinary files are present.");
+    }
+    if (
+      file.snapshot.file.bytes !== source.bytes
+      || file.snapshot.file.sha256 !== source.sha256
+      || sizeOf(file.signature) !== source.bytes
+      || file.signature.mode !== NATIVE_HARNESS_INITIAL_INPUTS_PREPARED_MODE
+    ) {
+      failObserved("changed", "An initial prepared input does not match its manifest bytes or mode 0600.");
+    }
+  }
+}
+
+/**
+ * Reads the selected original inputs and the exact initial prepared workspace
+ * twice: source pass 1, prepared pass 1, source pass 2, prepared pass 2. It
+ * pins the layout and the excluded top-level `.git` directory without walking
+ * it, and never calls the snapshot/base/stage capture generators.
+ */
+export async function observeNativeHarnessInitialInputsBytes(
+  plan: NativeHarnessInitialInputsPlan,
+  controls: NativeHarnessReconciliationContentByteControls,
+): Promise<NativeHarnessInitialInputsByteResult> {
+  const startedAt = performance.now();
+  let chargeLimitBytes: number = NATIVE_HARNESS_INITIAL_INPUTS_MAX_CHARGED_BYTES;
+  const counters: InitialInputCounters = {
+    captureStarts: 0,
+    chargedBytes: 0,
+    openedFiles: 0,
+    activeFiles: 0,
+    maxConcurrentOpenedFiles: 0,
+    closeAttempted: 0,
+    closeSettled: 0,
+    closeSucceeded: 0,
+    closeFailed: false,
+  };
+  let passesStarted: 0 | 1 | 2 = 0;
+  const controlFailure: { value: OutputError | null } = { value: null };
+  const closeError = { value: false };
+  const halt = (): void => {
+    if (counters.closeFailed || closeError.value) {
+      fail(
+        "io-failure",
+        "An initial-input file handle did not confirm a successful close; no later initial-input effect was started.",
+      );
+    }
+  };
+  const charge = (bytes: number): void => {
+    if (!Number.isSafeInteger(bytes) || bytes < 0) {
+      fail("io-failure", "An initial-input byte charge was not a bounded observed size.");
+    }
+    if (bytes > chargeLimitBytes - counters.chargedBytes) {
+      fail("too-large", "The initial-input observation charge exceeds its fixed ceiling.");
+    }
+    counters.chargedBytes += bytes;
+  };
+  const startCapture = (): void => {
+    halt();
+    if (counters.captureStarts >= NATIVE_HARNESS_INITIAL_INPUTS_MAX_CAPTURES) {
+      fail("too-large", "The initial-input observation exceeds its fixed capture-start bound.");
+    }
+    counters.captureStarts += 1;
+  };
+  try {
+    if (typeof AbortSignal === "undefined") {
+      fail("invalid-control", "The initial-input observer requires its fixed guard and actual signal.");
+    }
+    // Capture every control field once, before any plan read, callback or
+    // await. Later caller mutation cannot replace the guard, signal or IO.
+    const ownedControls = readInitialControls(controls);
+    if (ownedControls.chargeLimitBytes !== null) {
+      chargeLimitBytes = Math.min(
+        ownedControls.chargeLimitBytes,
+        NATIVE_HARNESS_INITIAL_INPUTS_MAX_CHARGED_BYTES,
+      );
+    }
+    if (readActualAborted(ownedControls.signal)) {
+      fail("aborted", "The initial-input observation signal was already aborted.");
+    }
+    const owned = readInitialInputsPlan(plan);
+    const baseContext = {
+      guard: ownedControls.guard,
+      signal: ownedControls.signal,
+      startedAt,
+      contentControl: true as const,
+      checkpoint: null,
+      directories: new Map<string, DirectoryIdentity>(),
+      closeError,
+      controlFailure,
+    };
+    const countingIo = initialCountingIo(ownedControls.fileIo ?? nodeFileIo, counters);
+    const ctx: Context = {
+      ...baseContext,
+      io: createGuardedIo(baseContext, initialEffectIo(countingIo, halt)),
+    };
+    assertAuthority(ctx);
+
+    const storageIdentity = await observeRoot(ctx, owned.storageRoot, "initial storageRoot");
+    await registerAncestry(ctx, storageIdentity, owned.preparedRoot, "initial preparedRoot");
+    const preparedIdentity = await observeRoot(ctx, owned.preparedRoot, "initial preparedRoot");
+    await registerAncestry(ctx, preparedIdentity, owned.workspaceRoot, "initial workspaceRoot");
+    await observeRoot(ctx, owned.workspaceRoot, "initial workspaceRoot");
+    await registerAncestry(ctx, preparedIdentity, owned.storeRoot, "initial storeRoot");
+    await observeRoot(ctx, owned.storeRoot, "initial storeRoot");
+    await registerAncestry(ctx, preparedIdentity, owned.runRoot, "initial runRoot");
+    await observeRoot(ctx, owned.runRoot, "initial runRoot");
+    await observeRoot(ctx, owned.sourceRoot, "initial sourceRoot");
+
+    passesStarted = 1;
+    const sourceFirst = await observeInitialSources(ctx, owned, charge, startCapture);
+    const preparedFirst = await inventoryTree(
+      ctx,
+      preparedInitialTreeOptions(owned, charge, startCapture),
+    );
+    verifyInitialPreparedTree(owned, preparedFirst);
+
+    passesStarted = 2;
+    await recheckInitialSources(ctx, owned, sourceFirst, charge, startCapture);
+    const preparedSecond = await inventoryTree(
+      ctx,
+      preparedInitialTreeOptions(owned, charge, startCapture),
+    );
+    verifyInitialPreparedTree(owned, preparedSecond);
+    if (!sameContentTree(preparedFirst, preparedSecond)) {
+      failObserved("changed", "The initial prepared workspace changed between byte passes.");
+    }
+
+    for (const [directoryPath, identity] of ctx.directories) {
+      const info = await lstatOrFail(ctx, directoryPath, "initial-input directory");
+      if (
+        info.isSymbolicLink()
+        || !info.isDirectory()
+        || !sameDirectoryIdentity(identity, directoryIdentityOf(directoryPath, info))
+      ) {
+        fail("changed", "An initial-input directory identity changed during observation.");
+      }
+    }
+    assertAuthority(ctx);
+    if (closeError.value || counters.closeFailed || counters.activeFiles !== 0) {
+      fail("io-failure", "An initial-input file handle reported a close failure or remained open.");
+    }
+
+    const preparedFiles = owned.sources.map((source) => {
+      const file = preparedSecond.files.get(source.path);
+      if (file === undefined) fail("changed", "A verified initial prepared file disappeared before its summary.");
+      return Object.freeze({
+        path: source.path,
+        bytes: file.snapshot.file.bytes,
+        sha256: file.snapshot.file.sha256,
+        mode: file.signature.mode,
+        observedAt: file.snapshot.file.observedAt,
+      });
+    });
+    const sourceTotalBytes = sourceFirst.reduce((sum, fact) => sum + fact.bytes, 0);
+    const preparedTotalBytes = preparedFiles.reduce((sum, fact) => sum + fact.bytes, 0);
+    const sourceCaptureStarts = sourceFirst.length * 2;
+    const preparedCaptureStarts = preparedFirst.files.size + preparedSecond.files.size;
+    const observation: NativeHarnessInitialInputsByteObservation = deepFreeze({
+      readOnly: true as const,
+      resumeAvailable: false as const,
+      semanticAcceptance: "not-evaluated" as const,
+      processes: "not-inspected" as const,
+      status: "stable" as const,
+      observation: "two-pass" as const,
+      runId: owned.runId,
+      runSha256: owned.runSha256,
+      sourceSha256: owned.sourceSha256,
+      sourceBytes: owned.sourceBytes,
+      manifestSha256: owned.manifestSha256,
+      source: Object.freeze({
+        root: owned.sourceRoot,
+        files: Object.freeze(sourceFirst.map((fact) => Object.freeze({
+          path: fact.path,
+          bytes: fact.bytes,
+          sha256: fact.sha256,
+          observedAt: fact.observedAt,
+        }))),
+        totalBytes: sourceTotalBytes,
+        captureStarts: sourceCaptureStarts,
+      }),
+      prepared: Object.freeze({
+        root: owned.workspaceRoot,
+        mode: NATIVE_HARNESS_INITIAL_INPUTS_PREPARED_MODE,
+        files: Object.freeze(preparedFiles),
+        totalBytes: preparedTotalBytes,
+        captureStarts: preparedCaptureStarts,
+        excluded: Object.freeze({
+          path: ".git" as const,
+          kind: "directory" as const,
+          contents: "not-enumerated-not-hashed" as const,
+          git: "not-started" as const,
+          identity: "pinned-before-between-after" as const,
+        }),
+      }),
+      passes: 2 as const,
+      captureStarts: counters.captureStarts,
+      chargedBytes: counters.chargedBytes,
+      chargeLimitBytes,
+      openedFiles: counters.openedFiles,
+      maxConcurrentOpenedFiles: counters.maxConcurrentOpenedFiles,
+      close: Object.freeze({
+        attempted: counters.closeAttempted,
+        settled: counters.closeSettled,
+        succeeded: counters.closeSucceeded,
+      }),
+      limitations: INITIAL_INPUT_LIMITATIONS,
+    });
+    if (Buffer.byteLength(JSON.stringify(observation), "utf8")
+      > NATIVE_HARNESS_OUTPUT_LIMITS.maxMetadataBytes) {
+      fail("too-large", "The retained initial-input metadata exceeds its byte bound.");
+    }
+    return { ok: true, observation };
+  } catch (error) {
+    const failure = controlFailure.value !== null
+      ? issuedFailures.get(controlFailure.value)
+      : (error instanceof OutputError ? issuedFailures.get(error) : undefined);
+    if (failure !== undefined) {
+      return {
+        ...failureResult(failure),
+        ...initialFailureCounters(counters, chargeLimitBytes, passesStarted, closeError.value),
+      };
+    }
+    const nativeCode = readOwnString(error, "code");
+    if (nativeCode !== null && NATIVE_FILE_FAILURE_CODES.has(nativeCode)) {
+      const code: NativeHarnessOutputFailure = nativeCode === "invalid-path" ? "unsafe-path"
+        : nativeCode === "non-text" ? "unsupported"
+        : nativeCode as NativeHarnessOutputFailure;
+      return {
+        ok: false,
+        code,
+        reason: boundedReason(readOwnString(error, "message") ?? "An initial-input observation was refused."),
+        ...initialFailureCounters(counters, chargeLimitBytes, passesStarted, closeError.value),
+      };
+    }
+    return {
+      ok: false,
+      code: isErrno(error, "ENOENT") ? "missing" : isErrno(error, "ELOOP") ? "unsafe-path" : "io-failure",
+      reason: isErrno(error, "ENOENT")
+        ? "An initial-input path disappeared during observation."
+        : isErrno(error, "ELOOP")
+          ? "An initial-input path is a symbolic link."
+          : "The initial-input observation failed without a serializable host error.",
+      ...initialFailureCounters(counters, chargeLimitBytes, passesStarted, closeError.value),
     };
   }
 }

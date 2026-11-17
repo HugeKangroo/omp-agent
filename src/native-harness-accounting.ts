@@ -261,6 +261,50 @@ export interface NativeHarnessAccountingProjection {
   readonly budgetBlocked: boolean;
 }
 
+/**
+ * Pure per-admission provenance copied from one already-owned V2 checkpoint.
+ * The replay highwater is raw cumulative USD and is never money-rounded here;
+ * the owner projection keeps the original rounding rule. This is historical
+ * fact only: it is not current permission, resume authority, a claim, an
+ * occupancy grant or a dispatch token, and no field mutates an owner.
+ */
+export interface NativeHarnessRecoveryAdmissionProjection {
+  readonly kind: "historical-admission-facts";
+  readonly ownerId: string;
+  readonly selectorSha256: string;
+  readonly checkpointRevision: number;
+  readonly admission: Readonly<{
+    readonly admissionId: string;
+    readonly sourceAssociationSha256: string;
+    readonly admittedAt: number;
+    readonly deadlineAt: number;
+    readonly allocatedUsd: number;
+    readonly reserveRevision: number;
+    readonly prepared: NativeHarnessAccountingPrepared | null;
+    readonly runId: string | null;
+    readonly settlement: NativeHarnessAccountingSettlement | null;
+    readonly preparedRevision: number | null;
+    readonly runRevision: number | null;
+  }>;
+  /** Exact cumulative observed highwater; never money-rounded. */
+  readonly observedUsd: number;
+  readonly unknownSticky: boolean;
+  readonly occupancyHeld: boolean;
+  readonly reserveCovered: boolean;
+  readonly originalSettled: boolean;
+  readonly latestClaimId: string | null;
+  readonly latestClaimAt: number | null;
+  readonly latestClaimOpen: boolean;
+  readonly remainingClaims: number;
+  readonly remainingFinishes: number;
+  readonly remainingCostObservations: number;
+  readonly remainingEvents: number;
+  readonly ownerProjection: NativeHarnessAccountingProjection;
+  readonly authority: "none";
+  readonly currentPermission: false;
+  readonly canResume: false;
+}
+
 export interface NativeHarnessAccountingCreateOptions {
   readonly storageRoot: string;
   readonly selectorSha256: string;
@@ -1701,10 +1745,10 @@ function assertRecoveryPrefixCapacity(
   }
 }
 
-function projectCheckpointV2(
+function projectRecoveryReplay(
   checkpoint: NativeHarnessRecoveryAccountingCheckpoint,
+  replay: RecoveryReplay,
 ): NativeHarnessAccountingProjection {
-  const replay = replayRecoveryCheckpoint(checkpoint);
   const totals = recoveryTotals(replay);
   assertRecoveryReservedBytes(
     Buffer.byteLength(encodeCheckpoint(checkpoint), "utf8"),
@@ -1720,6 +1764,12 @@ function projectCheckpointV2(
     retainedOperations: replay.states.length,
     budgetBlocked: recoveryBudgetBlocked(replay, checkpoint),
   });
+}
+
+function projectCheckpointV2(
+  checkpoint: NativeHarnessRecoveryAccountingCheckpoint,
+): NativeHarnessAccountingProjection {
+  return projectRecoveryReplay(checkpoint, replayRecoveryCheckpoint(checkpoint));
 }
 
 function projectAnyCheckpoint(
@@ -1781,6 +1831,89 @@ export function decodeNativeHarnessAccountingText(
 /** Pure bounded projection. Revalidates the complete known shape and timeline. */
 export function projectNativeHarnessAccounting(checkpoint: unknown): NativeHarnessAccountingProjection {
   return projectAnyCheckpoint(readAnyCheckpoint(checkpoint));
+}
+
+function copyRecoveryAdmissionRow(
+  row: NativeHarnessRecoveryAccountingAdmission,
+): NativeHarnessRecoveryAdmissionProjection["admission"] {
+  return Object.freeze({
+    admissionId: row.admissionId,
+    sourceAssociationSha256: row.sourceAssociationSha256,
+    admittedAt: row.admittedAt,
+    deadlineAt: row.deadlineAt,
+    allocatedUsd: row.allocatedUsd,
+    reserveRevision: row.reserveRevision,
+    prepared: row.prepared === null
+      ? null
+      : Object.freeze({
+        preparedRelativeRoot: row.prepared.preparedRelativeRoot,
+        storeRelativeRoot: row.prepared.storeRelativeRoot,
+        inputManifestSha256: row.prepared.inputManifestSha256,
+        sourceDescriptorSha256: row.prepared.sourceDescriptorSha256,
+      }),
+    runId: row.runId,
+    settlement: row.settlement === null
+      ? null
+      : Object.freeze({
+        revision: row.settlement.revision,
+        mode: row.settlement.mode,
+        observedUsd: row.settlement.observedUsd,
+        concurrencyHeld: row.settlement.concurrencyHeld,
+      }),
+    preparedRevision: row.preparedRevision,
+    runRevision: row.runRevision,
+  });
+}
+
+/**
+ * Pure readonly per-admission projection of one already-owned V2 checkpoint.
+ * It revalidates through the original strict V2 codec and private replay, then
+ * copies only plain data. V1, malformed ids, missing admissions and impossible
+ * timelines refuse; no V1 row is ever cast, migrated or upgraded. The raw
+ * replay highwater is returned exactly as stored, unlike the owner projection
+ * which keeps the original money rounding.
+ */
+export function projectNativeHarnessRecoveryAdmission(
+  checkpoint: unknown,
+  admissionId: unknown,
+): NativeHarnessRecoveryAdmissionProjection {
+  const checked = readAnyCheckpoint(checkpoint);
+  if (checked.schema !== NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2) {
+    fail(
+      "invalid-input",
+      "Recovery admission projection requires an explicit V2 checkpoint; V1 remains ordinary/diagnostic and is not cast or upgraded.",
+    );
+  }
+  const exactAdmissionId = readUuid(admissionId, "admissionId", "invalid-input");
+  const replay = replayRecoveryCheckpoint(checked);
+  const state = replay.byId.get(exactAdmissionId);
+  if (state === undefined) {
+    fail("invalid-input", "The checkpoint has no admission with this exact id; nothing was projected.");
+  }
+  const ownerProjection = projectRecoveryReplay(checked, replay);
+  return deepFreeze({
+    kind: "historical-admission-facts" as const,
+    ownerId: checked.ownerId,
+    selectorSha256: checked.selectorSha256,
+    checkpointRevision: checked.revision,
+    admission: copyRecoveryAdmissionRow(state.row),
+    observedUsd: state.highwater,
+    unknownSticky: state.unknownSticky,
+    occupancyHeld: state.occupancyHeld,
+    reserveCovered: state.reserveCovered,
+    originalSettled: state.originalSettled,
+    latestClaimId: state.latestClaimId,
+    latestClaimAt: state.latestClaimAt,
+    latestClaimOpen: state.latestClaimOpen,
+    remainingClaims: MAX_RECOVERY_CLAIMS - replay.claims,
+    remainingFinishes: MAX_RECOVERY_FINISHES - replay.finishes,
+    remainingCostObservations: MAX_RECOVERY_COST_OBSERVATIONS - replay.costs,
+    remainingEvents: MAX_RECOVERY_EVENTS - checked.events.length,
+    ownerProjection,
+    authority: "none" as const,
+    currentPermission: false as const,
+    canResume: false as const,
+  });
 }
 
 function parseLimitsText(text: unknown): NativeHarnessDelegationLimits {

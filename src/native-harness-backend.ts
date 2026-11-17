@@ -833,6 +833,37 @@ function existingInspectionRefusal(
   ) {
     return `existing inspection refused: primary-window-unstable${suffix}`;
   }
+  const initial = observation.initialInputs;
+  if (initial === undefined || initial.revoked) {
+    return `existing inspection refused: initial-inputs-${initial === undefined ? "missing" : "revoked"}${suffix}`;
+  }
+  if (initial.status === "stable") {
+    const initialObservation = initial.observation;
+    if (
+      initial.provisionalStatus !== "stable"
+      || initialObservation === null
+      || initialObservation.status !== "stable"
+      || initialObservation.observation !== "two-pass"
+      || initialObservation.passes !== 2
+      || initialObservation.captureStarts !== initial.captureStarts
+      || initialObservation.chargedBytes !== initial.chargedBytes
+      || initialObservation.chargeLimitBytes !== initial.chargeLimitBytes
+      || initialObservation.captureStarts < 1
+      || initialObservation.captureStarts > 32
+      || initialObservation.chargedBytes > initialObservation.chargeLimitBytes
+      || initialObservation.close.attempted !== initialObservation.openedFiles
+      || initialObservation.close.settled !== initialObservation.openedFiles
+      || initialObservation.close.succeeded !== initialObservation.openedFiles
+    ) {
+      return `existing inspection refused: initial-inputs-inconsistent${suffix}`;
+    }
+  } else if (initial.status === "not-applicable") {
+    if (initial.provisionalStatus !== "not-applicable" || initial.observation !== null) {
+      return `existing inspection refused: initial-inputs-not-applicable-inconsistent${suffix}`;
+    }
+  } else {
+    return `existing inspection refused: initial-inputs-${initial.status}${suffix}`;
+  }
   if (observation.lifecycle.window.roundsStarted !== 2 || observation.lifecycle.window.expired) {
     return `existing inspection refused: lifecycle-window-${observation.lifecycle.window.roundsStarted}${suffix}`;
   }
@@ -3335,6 +3366,7 @@ export function createNativeHarnessBackend(
       const observationOptions = (signal: AbortSignal): NativeHarnessReconciliationLifecycleOptions => ({
         signal,
         now,
+        verifyInitialPreparedInputs: true,
         ...(seams?.fileIo === null || seams?.fileIo === undefined ? {} : { fileIo: seams.fileIo }),
         ...(seams?.signalQuery === null || seams?.signalQuery === undefined ? {} : { signalQuery: seams.signalQuery }),
       });

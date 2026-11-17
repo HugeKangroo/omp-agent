@@ -4,11 +4,14 @@ import path from "node:path";
 import { readActualAbortSignal } from "./native-abort.ts";
 import {
   NATIVE_HARNESS_ACCOUNTING_MAX_BYTES,
+  NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2,
   NativeHarnessAccountingError,
   createNativeHarnessAccountingOwner,
+  createNativeHarnessRecoveryAccountingOwner,
   observeNativeHarnessAccountingOwner,
   type NativeHarnessAccountingHandle,
   type NativeHarnessAccountingObservation,
+  type NativeHarnessRecoveryAccountingHandle,
 } from "./native-harness-accounting.ts";
 import type { NativeHarnessHistoryReason } from "./native-harness-history.ts";
 import {
@@ -85,6 +88,17 @@ export interface NativeHarnessAccountingSessionOptions {
   /** Narrow owning-root currentness callback; receives the actual context. */
   readonly isOwnerCurrent: (context: unknown) => boolean;
   readonly now?: () => number;
+  /**
+   * Fixed constructor-time opt-in. Only a genuinely new owner created by this
+   * leaf uses the explicit V2 recovery schema when true. Existing owners are
+   * never migrated or upgraded, and this grants no continuation authority.
+   */
+  readonly recoveryAccounting?: boolean;
+}
+
+export interface NativeHarnessAccountingExistingIdentity {
+  readonly ownerId: string;
+  readonly selectorSha256: string;
 }
 
 export type NativeHarnessAccountingSessionFailureState =
@@ -118,6 +132,16 @@ export type NativeHarnessAccountingSessionResult =
 export interface NativeHarnessAccountingSession {
   ensure(
     context: unknown,
+    signal: unknown,
+    deadlineAt: number,
+  ): Promise<NativeHarnessAccountingSessionResult>;
+  /**
+   * Reads only an already-persisted association and the exact existing V2
+   * owner. It never ensures, creates, appends, repairs or returns authority.
+   */
+  observeExisting(
+    context: unknown,
+    expectedIdentity: NativeHarnessAccountingExistingIdentity,
     signal: unknown,
     deadlineAt: number,
   ): Promise<NativeHarnessAccountingSessionResult>;
@@ -239,6 +263,104 @@ function ownData(value: object, key: string, detail: string): unknown {
   const descriptor = Object.getOwnPropertyDescriptor(value, key);
   if (descriptor === undefined || !("value" in descriptor)) fail("shape", detail);
   return descriptor.value;
+}
+
+/**
+ * Reads one exact own-data field without invoking host code. Accessors,
+ * absent required fields and unreadable descriptors refuse as branch data.
+ */
+function branchOwnData(value: object, key: string, required: boolean): unknown {
+  let descriptor: PropertyDescriptor | undefined;
+  try {
+    descriptor = Object.getOwnPropertyDescriptor(value, key);
+  } catch {
+    fail("branch", "The actual session final branch entry is unreadable.");
+  }
+  if (descriptor === undefined) {
+    if (required) fail("branch", "The actual session final branch entry lacks own data.");
+    return undefined;
+  }
+  if (!("value" in descriptor) || descriptor.get !== undefined || descriptor.set !== undefined) {
+    fail("branch", "The actual session final branch entry is not plain own data.");
+  }
+  return descriptor.value;
+}
+
+/**
+ * Copies only own-data id, parentId and optional type from the already-captured
+ * bounded final branch into fresh plain entry records. Required fields must be
+ * own data; a type accessor refuses without invoking it and a missing type
+ * becomes the empty string. Unrelated payload fields are not copied and no
+ * accessor runs, so the sealed base cannot run host code after capture.
+ */
+function copyFinalBranchEntries(branch: readonly unknown[]): Record<string, unknown>[] {
+  const copies: Record<string, unknown>[] = [];
+  for (let index = 0; index < branch.length; index += 1) {
+    const value: unknown = branch[index];
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      fail("branch", "The actual session final branch entry is not a plain record.");
+    }
+    let prototype: object | null;
+    try {
+      prototype = Object.getPrototypeOf(value);
+    } catch {
+      fail("branch", "The actual session final branch entry is unreadable.");
+    }
+    if (prototype !== Object.prototype && prototype !== null) {
+      fail("branch", "The actual session final branch entry is not a plain record.");
+    }
+    const id = branchOwnData(value, "id", true);
+    const parentId = branchOwnData(value, "parentId", true);
+    const type = branchOwnData(value, "type", false);
+    copies.push({ id, parentId, type: typeof type === "string" ? type : "" });
+  }
+  return copies;
+}
+
+/**
+ * Constructor-only own-data read. An accessor or non-boolean is a fixed
+ * configuration error; an absent own field means the original V1 default.
+ * The captured value never re-reads the caller's options object.
+ */
+function readRecoveryAccountingOption(options: object): boolean {
+  const descriptor = Object.getOwnPropertyDescriptor(options, "recoveryAccounting");
+  if (descriptor === undefined) return false;
+  if (!("value" in descriptor)) {
+    throw new Error("Native accounting session recoveryAccounting must be own data, not an accessor.");
+  }
+  if (descriptor.value === undefined) return false;
+  if (typeof descriptor.value !== "boolean") {
+    throw new Error("Native accounting session recoveryAccounting must be a boolean when supplied.");
+  }
+  return descriptor.value;
+}
+
+/**
+ * Copies exact own-data expected identity before any await or host callback.
+ * Prototypes, symbols, accessors, extras and malformed UUID/SHA values refuse.
+ */
+function readExistingIdentity(value: unknown): NativeHarnessAccountingExistingIdentity {
+  if (!isPlainRecord(value)) fail("shape", "The expected accounting identity must be a plain object.");
+  if (Object.getOwnPropertySymbols(value).length !== 0) {
+    fail("shape", "The expected accounting identity must not carry symbol fields.");
+  }
+  const names = Object.getOwnPropertyNames(value);
+  if (
+    names.length !== 2
+    || !names.includes("ownerId")
+    || !names.includes("selectorSha256")
+  ) {
+    fail("shape", "The expected accounting identity must have exactly ownerId and selectorSha256.");
+  }
+  const ownerId = ownData(value, "ownerId", "The expected accounting owner id is unavailable.");
+  const selectorSha256 = ownData(value, "selectorSha256", "The expected accounting selector is unavailable.");
+  if (typeof ownerId !== "string" || !UUID_PATTERN.test(ownerId)) {
+    fail("shape", "The expected accounting owner id must be a canonical lowercase UUID.");
+  }
+  if (typeof selectorSha256 !== "string" || !SHA256_PATTERN.test(selectorSha256)) {
+    fail("shape", "The expected accounting selector must be 64 lowercase hexadecimal characters.");
+  }
+  return Object.freeze({ ownerId, selectorSha256 });
 }
 
 function boundedField(value: string, detail: string): string {
@@ -581,6 +703,9 @@ export function createNativeHarnessAccountingSession(
   if (typeof options !== "object" || options === null || Array.isArray(options)) {
     throw new TypeError("Native accounting session options must be an object.");
   }
+  // Copy the fixed own-data opt-in exactly once. Later caller mutation of the
+  // options object cannot change this instance's owner schema choice.
+  const recoveryAccounting = readRecoveryAccountingOption(options);
   if (!isCanonicalAbsolutePath(options.storageRoot)) {
     throw new Error("Native accounting session storageRoot must be a canonical absolute path.");
   }
@@ -821,6 +946,10 @@ export function createNativeHarnessAccountingSession(
     context: unknown,
     signal: unknown,
     deadlineAt: number,
+    expectation?: {
+      readonly ownerId: string;
+      readonly requireV2: boolean;
+    },
   ): Promise<NativeHarnessAccountingSessionResult> {
     const locator = observation.locator;
     if (locator === null || locator.selectorSha256 !== selectorSha256) {
@@ -836,6 +965,19 @@ export function createNativeHarnessAccountingSession(
       return refusal("unavailable", [
         reason("owner-unavailable", "The exact persisted accounting owner is unavailable or mismatched."),
       ]);
+    }
+    if (expectation !== undefined) {
+      if (owner.identity.ownerId !== expectation.ownerId
+        || locator.ownerId !== expectation.ownerId) {
+        return refusal("unavailable", [
+          reason("identity-conflict", "The persisted accounting owner id does not match the expected identity."),
+        ]);
+      }
+      if (expectation.requireV2 && owner.checkpoint.schema !== NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2) {
+        return refusal("unavailable", [
+          reason("schema", "The persisted accounting owner is V1; existing-only recovery observation requires an explicit V2 owner."),
+        ]);
+      }
     }
     if (!isCurrent(token, context, signal, deadlineAt)) {
       return refusal("invalidated", [reason("invalidated", "The session, owner, signal or deadline changed.")]);
@@ -1331,15 +1473,18 @@ export function createNativeHarnessAccountingSession(
         return refusal("invalidated", [reason("cancelled", "The actual host signal changed before owner creation.")]);
       }
       ownerId = randomUUID();
-      let handle: NativeHarnessAccountingHandle | null = null;
+      let handle: NativeHarnessAccountingHandle | NativeHarnessRecoveryAccountingHandle | null = null;
       try {
-        handle = await createNativeHarnessAccountingOwner({
+        const createOptions = {
           storageRoot,
           selectorSha256,
           ownerId,
           createdAt,
           limitsText,
-        });
+        };
+        handle = recoveryAccounting
+          ? await createNativeHarnessRecoveryAccountingOwner(createOptions)
+          : await createNativeHarnessAccountingOwner(createOptions);
         const snapshot = handle.snapshot();
         if (snapshot.ownerId !== ownerId || snapshot.selectorSha256 !== selectorSha256) {
           return refusal("unavailable", [
@@ -1516,93 +1661,302 @@ export function createNativeHarnessAccountingSession(
     );
   }
 
+  async function runExisting(
+    expected: NativeHarnessAccountingExistingIdentity,
+    token: symbol,
+    context: unknown,
+    signal: unknown,
+    deadlineAt: number,
+  ): Promise<NativeHarnessAccountingSessionResult> {
+    const initialBase = attemptBase(context, null);
+    if (initialBase === null) {
+      const read = readPublicationBase(context);
+      if (!read.ok) {
+        return refusal("invalidated", [read.reason]);
+      }
+      return refusal("invalidated", [
+        reason("session", "The actual main session identity is unavailable or self-inconsistent."),
+      ]);
+    }
+    if (initialBase.cwd !== initialBase.recordedCwd) {
+      return refusal("invalidated", [
+        reason("workspace", "The live and recorded session workspaces differ; relocation is refused."),
+      ]);
+    }
+    attemptIdentity = initialBase;
+    let selectorSha256: string;
+    let initialSession: StableSession;
+    try {
+      selectorSha256 = selectorSha256For(initialBase);
+      initialSession = stableSession(initialBase);
+      parseActiveBranch(initialBase.branch, initialBase.leafId);
+    } catch (error) {
+      return refusal("unavailable", [
+        errorReason(error, "session", "The actual main session identity or branch is unavailable."),
+      ]);
+    }
+    if (selectorSha256 !== expected.selectorSha256) {
+      return refusal("unavailable", [
+        reason("selector", "The expected accounting selector does not match the actual main session."),
+      ]);
+    }
+    if (selected !== null) {
+      if (
+        selected.ownerId !== expected.ownerId
+        || selected.selectorSha256 !== selectorSha256
+        || !sameStableSession(selected.session, initialSession)
+      ) {
+        return refusal("invalidated", [
+          reason("identity-conflict", "This instance already selected a different session or accounting owner identity."),
+        ]);
+      }
+    }
+    if (pendingAppend !== null) {
+      return refusal("pending", [
+        reason(
+          "append-unknown",
+          "A previously attempted append is pending; existing-only observation never confirms or repairs it.",
+        ),
+      ]);
+    }
+    if (!isCurrent(token, context, signal, deadlineAt)) {
+      return refusal("invalidated", [reason("invalidated", "The actual main session is not current.")]);
+    }
+    const observeBase = attemptBase(context, initialBase);
+    if (observeBase === null) {
+      return refusal("invalidated", [
+        reason("invalidated", "The actual session identity changed before journal observation."),
+      ]);
+    }
+
+    const observation = await observeAssociation(observeBase, token, context, signal, deadlineAt);
+    if (!observation.ok) return observation.failure;
+    if (!isCurrent(token, context, signal, deadlineAt)) {
+      return refusal("invalidated", [reason("invalidated", "The actual main session changed after journal observation.")]);
+    }
+    const afterJournal = attemptBase(context, observeBase);
+    if (afterJournal === null) {
+      return refusal("invalidated", [
+        reason("invalidated", "The actual session identity changed after journal observation."),
+      ]);
+    }
+    try {
+      parseActiveBranch(afterJournal.branch, afterJournal.leafId);
+    } catch (error) {
+      return refusal("unavailable", [
+        errorReason(error, "branch", "The actual session branch conflicts with its persisted facts."),
+      ]);
+    }
+    if (pendingAppend !== null) {
+      return refusal("pending", [
+        reason(
+          "append-unknown",
+          "A previously attempted append is pending; existing-only observation never confirms or repairs it.",
+        ),
+      ]);
+    }
+    if (observation.value.memoryOnly) {
+      return refusal("pending", [
+        reason("locator-unconfirmed", "A locator is visible in memory but not proven by its exact persisted entry."),
+      ]);
+    }
+    const locator = observation.value.locator;
+    if (locator === null) {
+      return refusal("unavailable", [
+        reason("locator", "No persisted accounting-owner locator exists for this session; existing-only observation creates none."),
+      ]);
+    }
+    if (locator.selectorSha256 !== selectorSha256 || locator.selectorSha256 !== expected.selectorSha256) {
+      return refusal("unavailable", [
+        reason("identity-conflict", "The persisted locator belongs to a different session selector."),
+      ]);
+    }
+    if (locator.ownerId !== expected.ownerId) {
+      return refusal("unavailable", [
+        reason("identity-conflict", "The persisted locator owner id does not match the expected identity."),
+      ]);
+    }
+    if (observation.value.journalEntries.length === 0) {
+      return refusal("unavailable", [
+        reason("locator", "The observed locator has no exact persisted journal entry."),
+      ]);
+    }
+    for (const entry of observation.value.journalEntries) {
+      const disk = observation.value.journal.byId.get(entry.entryId);
+      if (
+        disk === undefined
+        || disk.parentId !== entry.parentId
+        || !hasValidAncestorChain(observation.value.journal, disk)
+      ) {
+        return refusal("unavailable", [
+          reason("branch", "The persisted locator conflicts with its journal ancestor chain."),
+        ]);
+      }
+    }
+
+    return reuseAssociation(
+      afterJournal,
+      selectorSha256,
+      observation.value,
+      false,
+      token,
+      context,
+      signal,
+      deadlineAt,
+      { ownerId: expected.ownerId, requireV2: true },
+    );
+  }
+
+  async function withAttempt(
+    context: unknown,
+    signal: unknown,
+    deadlineAt: number,
+    finalBranchRequired: boolean,
+    attempt: (
+      token: symbol,
+      context: unknown,
+      signal: unknown,
+      deadlineAt: number,
+    ) => Promise<NativeHarnessAccountingSessionResult>,
+  ): Promise<NativeHarnessAccountingSessionResult> {
+    if (disposed) {
+      return refusal("invalidated", [reason("disposed", "The accounting association leaf is disposed.")]);
+    }
+    if (operation !== null) {
+      return refusal("pending", [
+        reason("association-pending", "Another association operation currently owns this leaf."),
+      ]);
+    }
+    if (pendingEnsure !== null) {
+      return refusal("pending", [
+        reason("persist-pending", "An earlier actual persistence wait is still unsettled."),
+      ]);
+    }
+    const token = Symbol("native-harness-accounting-session-operation");
+    operation = token;
+    try {
+      if (typeof deadlineAt !== "number" || !Number.isFinite(deadlineAt)) {
+        return refusal("invalidated", [reason("deadline", "The caller-supplied original deadline is not finite.")]);
+      }
+      const abort = readActualAbortSignal(signal);
+      if (!abort.ok) {
+        return refusal("invalidated", [reason("signal", "The actual host AbortSignal is unavailable.")]);
+      }
+      if (abort.aborted) {
+        return refusal("invalidated", [reason("cancelled", "The actual host signal is already aborted.")]);
+      }
+      let startTime: number;
+      try {
+        startTime = clock();
+      } catch {
+        return refusal("invalidated", [reason("clock", "The trusted clock is unavailable.")]);
+      }
+      if (!(startTime < deadlineAt)) {
+        return refusal("invalidated", [reason("deadline", "The caller-supplied original deadline already elapsed.")]);
+      }
+      if (!ownerCurrent(context)) {
+        return refusal("invalidated", [reason("owner-changed", "The owning native root is not current.")]);
+      }
+      const result = await attempt(token, context, signal, deadlineAt);
+      if (result.state !== "confirmed") return result;
+      // The inner operation can complete synchronously up to its return while
+      // a queued abort/dispose microtask is still pending. Seal the exact
+      // captured attempt here without starting new I/O.
+      const expected = attemptIdentity;
+      if (expected === null) {
+        return refusal("invalidated", [reason("invalidated", "The attempt identity is unavailable for the final seal.")]);
+      }
+      // Complete the clock and owner callbacks before the final exact base
+      // read; they may replace the actual context manager.
+      let sealedTime: number;
+      try {
+        sealedTime = clock();
+      } catch {
+        return refusal("invalidated", [reason("clock", "The trusted clock is unavailable.")]);
+      }
+      if (!(sealedTime < deadlineAt) || !ownerCurrent(context)) {
+        return refusal("invalidated", [reason("invalidated", "The session, owner, manager or deadline changed before delivery.")]);
+      }
+      const sealedBase = attemptBase(context, expected);
+      if (sealedBase === null) {
+        return refusal("invalidated", [reason("invalidated", "The session, owner, manager or deadline changed before delivery.")]);
+      }
+      // Existing-only confirmation also seals the branch chain captured by the
+      // last base read. Only own data from that bounded captured array is
+      // copied and parsed; entry accessors never run and no host callback,
+      // clock read, I/O, ensure, append or repair starts.
+      if (finalBranchRequired) {
+        try {
+          parseActiveBranch(copyFinalBranchEntries(sealedBase.branch), sealedBase.leafId);
+        } catch (error) {
+          return refusal("unavailable", [
+            errorReason(error, "branch", "The actual session final branch is unavailable or malformed."),
+          ]);
+        }
+      }
+      // Pure checks only; no new I/O or callbacks after this point.
+      if (disposed || operation !== token) {
+        return refusal("invalidated", [reason("invalidated", "The owning leaf is no longer current.")]);
+      }
+      const sealAbort = readActualAbortSignal(signal);
+      if (!sealAbort.ok || sealAbort.aborted) {
+        return refusal("invalidated", [reason("cancelled", "The actual host signal aborted before delivery.")]);
+      }
+      return result;
+    } catch (error) {
+      return refusal("unavailable", [
+        errorReason(error, "association", "The accounting-owner association could not be completed."),
+      ]);
+    } finally {
+      if (operation === token) {
+        operation = null;
+        attemptIdentity = null;
+      }
+    }
+  }
+
   return Object.freeze({
     async ensure(
       context: unknown,
       signal: unknown,
       deadlineAt: number,
     ): Promise<NativeHarnessAccountingSessionResult> {
-      if (disposed) {
-        return refusal("invalidated", [reason("disposed", "The accounting association leaf is disposed.")]);
-      }
-      if (operation !== null) {
-        return refusal("pending", [
-          reason("association-pending", "Another association operation currently owns this leaf."),
-        ]);
-      }
-      if (pendingEnsure !== null) {
-        return refusal("pending", [
-          reason("persist-pending", "An earlier actual persistence wait is still unsettled."),
-        ]);
-      }
-      const token = Symbol("native-harness-accounting-session-operation");
-      operation = token;
+      return withAttempt(
+        context,
+        signal,
+        deadlineAt,
+        false,
+        (token, attemptContext, attemptSignal, attemptDeadline) =>
+          run(token, attemptContext, attemptSignal, attemptDeadline),
+      );
+    },
+    async observeExisting(
+      context: unknown,
+      expectedIdentity: NativeHarnessAccountingExistingIdentity,
+      signal: unknown,
+      deadlineAt: number,
+    ): Promise<NativeHarnessAccountingSessionResult> {
+      // Copy the exact expected identity before any await or host callback.
+      let expected: NativeHarnessAccountingExistingIdentity;
       try {
-        if (typeof deadlineAt !== "number" || !Number.isFinite(deadlineAt)) {
-          return refusal("invalidated", [reason("deadline", "The caller-supplied original deadline is not finite.")]);
-        }
-        const abort = readActualAbortSignal(signal);
-        if (!abort.ok) {
-          return refusal("invalidated", [reason("signal", "The actual host AbortSignal is unavailable.")]);
-        }
-        if (abort.aborted) {
-          return refusal("invalidated", [reason("cancelled", "The actual host signal is already aborted.")]);
-        }
-        let startTime: number;
-        try {
-          startTime = clock();
-        } catch {
-          return refusal("invalidated", [reason("clock", "The trusted clock is unavailable.")]);
-        }
-        if (!(startTime < deadlineAt)) {
-          return refusal("invalidated", [reason("deadline", "The caller-supplied original deadline already elapsed.")]);
-        }
-        if (!ownerCurrent(context)) {
-          return refusal("invalidated", [reason("owner-changed", "The owning native root is not current.")]);
-        }
-        const result = await run(token, context, signal, deadlineAt);
-        if (result.state !== "confirmed") return result;
-        // The inner operation can complete synchronously up to its return while
-        // a queued abort/dispose microtask is still pending. Seal the exact
-        // captured attempt here without starting new I/O.
-        const expected = attemptIdentity;
-        if (expected === null) {
-          return refusal("invalidated", [reason("invalidated", "The attempt identity is unavailable for the final seal.")]);
-        }
-        // Complete the clock and owner callbacks before the final exact base
-        // read; they may replace the actual context manager.
-        let sealedTime: number;
-        try {
-          sealedTime = clock();
-        } catch {
-          return refusal("invalidated", [reason("clock", "The trusted clock is unavailable.")]);
-        }
-        if (!(sealedTime < deadlineAt) || !ownerCurrent(context)) {
-          return refusal("invalidated", [reason("invalidated", "The session, owner, manager or deadline changed before delivery.")]);
-        }
-        const sealedBase = attemptBase(context, expected);
-        if (sealedBase === null) {
-          return refusal("invalidated", [reason("invalidated", "The session, owner, manager or deadline changed before delivery.")]);
-        }
-        // Pure checks only; no new I/O or callbacks after this point.
-        if (disposed || operation !== token) {
-          return refusal("invalidated", [reason("invalidated", "The owning leaf is no longer current.")]);
-        }
-        const sealAbort = readActualAbortSignal(signal);
-        if (!sealAbort.ok || sealAbort.aborted) {
-          return refusal("invalidated", [reason("cancelled", "The actual host signal aborted before delivery.")]);
-        }
-        return result;
+        expected = readExistingIdentity(expectedIdentity);
       } catch (error) {
-        return refusal("unavailable", [
-          errorReason(error, "association", "The accounting-owner association could not be completed."),
+        return refusal("invalidated", [
+          errorReason(
+            error,
+            "identity",
+            "The expected accounting identity is not exact plain ownerId/selectorSha256 data.",
+          ),
         ]);
-      } finally {
-        if (operation === token) {
-          operation = null;
-          attemptIdentity = null;
-        }
       }
+      return withAttempt(
+        context,
+        signal,
+        deadlineAt,
+        true,
+        (token, attemptContext, attemptSignal, attemptDeadline) =>
+          runExisting(expected, token, attemptContext, attemptSignal, attemptDeadline),
+      );
     },
     dispose(): void {
       disposed = true;
