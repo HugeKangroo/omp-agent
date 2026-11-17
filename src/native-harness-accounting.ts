@@ -12,6 +12,7 @@ import {
   type NativeFileHandle,
   type NativeFileIo,
   type NativeFileStats,
+  type NativeWorkspaceTextSnapshot,
 } from "./native-work.ts";
 
 /**
@@ -332,6 +333,17 @@ export interface NativeHarnessAccountingObserveOptions {
 export interface NativeHarnessAccountingObservation {
   readonly identity: NativeHarnessAccountingIdentity;
   readonly checkpoint: NativeHarnessAccountingCheckpoint;
+}
+
+/**
+ * Actual observe result: the base observation plus the exact raw primary
+ * bytes facts from that same single read. These hashes describe only the
+ * bytes observed at this moment; a later join must match its own raw SHA.
+ */
+export interface NativeHarnessAccountingOwnerRawObservation
+  extends NativeHarnessAccountingObservation {
+  readonly primarySha256: string;
+  readonly primaryBytes: number;
 }
 
 /**
@@ -2674,7 +2686,10 @@ function mapNativeFileError(error: NativeFileError): NativeHarnessAccountingErro
   return new NativeHarnessAccountingError(error.message, code);
 }
 
-async function readPrimary(io: NativeFileIo, pins: OwnerPins): Promise<string> {
+async function readPrimarySnapshot(
+  io: NativeFileIo,
+  pins: OwnerPins,
+): Promise<NativeWorkspaceTextSnapshot> {
   const boundedIo = withBoundedPinnedIo(io, [pins.root, pins.namespace, pins.owner]);
   let snapshot;
   try {
@@ -2688,7 +2703,11 @@ async function readPrimary(io: NativeFileIo, pins: OwnerPins): Promise<string> {
     || Buffer.byteLength(snapshot.text, "utf8") > NATIVE_HARNESS_ACCOUNTING_MAX_BYTES) {
     fail("too-large", `Accounting primary exceeds ${NATIVE_HARNESS_ACCOUNTING_MAX_BYTES} bytes.`);
   }
-  return snapshot.text;
+  return snapshot;
+}
+
+async function readPrimary(io: NativeFileIo, pins: OwnerPins): Promise<string> {
+  return (await readPrimarySnapshot(io, pins)).text;
 }
 
 function readTestOptions(value: unknown): {
@@ -3112,11 +3131,11 @@ export async function openNativeHarnessAccountingOwner(
  */
 export async function observeNativeHarnessAccountingOwner(
   options: NativeHarnessAccountingObserveOptions,
-): Promise<NativeHarnessAccountingObservation> {
+): Promise<NativeHarnessAccountingOwnerRawObservation> {
   const owned = readObserveOptions(options);
   const pins = await pinExistingOwner(nodeFileIo, owned.storageRoot, owned.selectorSha256);
-  const raw = await readPrimary(nodeFileIo, pins);
-  const checkpoint = decodeCheckpointText(raw, { selectorSha256: owned.selectorSha256 });
+  const snapshot = await readPrimarySnapshot(nodeFileIo, pins);
+  const checkpoint = decodeCheckpointText(snapshot.text, { selectorSha256: owned.selectorSha256 });
   await verifyPins(nodeFileIo, [pins.root, pins.namespace, pins.owner]);
   return deepFreeze({
     identity: Object.freeze({
@@ -3124,5 +3143,7 @@ export async function observeNativeHarnessAccountingOwner(
       selectorSha256: checkpoint.selectorSha256,
     }),
     checkpoint,
+    primarySha256: snapshot.file.sha256,
+    primaryBytes: snapshot.file.bytes,
   });
 }

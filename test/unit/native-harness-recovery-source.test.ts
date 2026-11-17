@@ -9,6 +9,7 @@ import {
   mkdtemp,
   open,
   readFile,
+  readdir,
   realpath,
   rename,
   rm,
@@ -26,6 +27,7 @@ import {
   NATIVE_HARNESS_RECOVERY_SEED_SCHEMA,
   NativeHarnessRecoverySourceError,
   decodeNativeHarnessRecoverySourceText,
+  openNativeHarnessRecoverySource,
   prepareNativeHarnessRecoverySource,
   verifyNativeHarnessRecoverySource,
   type NativeHarnessRecoverySourceTextExpectation,
@@ -38,7 +40,7 @@ import {
   type NativeHarnessWorkspaceDescriptor,
   type NativeHarnessWorkspaceManifestEntry,
 } from "../../src/native-harness-workspace.ts";
-import { sha256Hex } from "../../src/native-work.ts";
+import { nodeFileIo, sha256Hex, type NativeFileHandle } from "../../src/native-work.ts";
 
 const bases: string[] = [];
 
@@ -197,6 +199,65 @@ function sourceFileOf(descriptor: NativeHarnessWorkspaceDescriptor): string {
 async function writeExactSource(target: string, text: string): Promise<void> {
   await writeFile(target, text);
   await chmod(target, 0o600);
+}
+
+function openSource(
+  descriptor: NativeHarnessWorkspaceDescriptor,
+  sourceDescriptorSha256: string,
+  guard: () => void = noopGuard,
+  signal: AbortSignal = freshSignal(),
+): ReturnType<typeof openNativeHarnessRecoverySource> {
+  const storageRoot = path.dirname(descriptor.preparedRoot);
+  return openNativeHarnessRecoverySource(
+    {
+      storageRoot,
+      sourceRoot: descriptor.sourceRoot,
+      preparedRelativeRoot: path.basename(descriptor.preparedRoot),
+      sourceDescriptorSha256,
+    },
+    guard,
+    signal,
+  );
+}
+
+interface TreeEntry {
+  readonly relativePath: string;
+  readonly kind: string;
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly size: bigint;
+  readonly mtimeNs: bigint;
+  readonly mode: number;
+}
+
+async function treeSnapshot(root: string): Promise<TreeEntry[]> {
+  const entries: TreeEntry[] = [];
+  async function walk(directory: string, prefix: string): Promise<void> {
+    const names = (await readdir(directory)).sort();
+    for (const name of names) {
+      const absolute = path.join(directory, name);
+      const relativePath = prefix === "" ? name : `${prefix}/${name}`;
+      const info = await lstat(absolute, { bigint: true });
+      entries.push({
+        relativePath,
+        kind: info.isDirectory()
+          ? "directory"
+          : info.isFile()
+            ? "file"
+            : info.isSymbolicLink()
+              ? "link"
+              : "other",
+        dev: info.dev,
+        ino: info.ino,
+        size: info.size,
+        mtimeNs: info.mtimeNs,
+        mode: Number(info.mode & 0o7777n),
+      });
+      if (info.isDirectory()) await walk(absolute, relativePath);
+    }
+  }
+  await walk(root, "");
+  return entries;
 }
 
 async function prepare(
@@ -849,6 +910,267 @@ describe("native harness recovery source", () => {
       freshSignal(),
     ));
     expect(multibyteFailure.message).toContain(String(NATIVE_HARNESS_RECOVERY_SOURCE_MAX_BYTES));
+  });
+
+  test("readonly opens an existing source without creating, writing or reseeding", async () => {
+    const fixture = await makeRealWorkspace([{ relativePath: "hello.txt", content: "hello\n" }]);
+    const { descriptor } = fixture;
+    const input = makeInput(descriptor);
+    const prepared = await prepare(input);
+    const target = sourceFileOf(descriptor);
+    await writeFile(path.join(descriptor.storeRoot, "run-state.json"), "{\"run\":1}\n");
+    const rawBefore = await readFile(target);
+    const treeBefore = await treeSnapshot(fixture.base);
+    const rootBefore = await lstat(fixture.base, { bigint: true });
+
+    const opened = await openSource(descriptor, prepared.source.sha256);
+
+    expect(Object.keys(opened).sort()).toEqual(["document", "source"]);
+    expect("accountingPrepared" in opened).toBe(false);
+    expect("seedText" in opened).toBe(false);
+    expect("descriptor" in opened).toBe(false);
+    expect(Object.keys(opened.source).sort()).toEqual([
+      "bytes",
+      "pins",
+      "preparedRoot",
+      "relativePath",
+      "sha256",
+      "sourceRoot",
+      "storageRoot",
+      "storeRoot",
+      "text",
+      "workspaceRoot",
+    ]);
+    expect(opened.source.text).toBe(rawBefore.toString("utf8"));
+    expect(opened.source.text).toBe(prepared.source.text);
+    expect(opened.source.bytes).toBe(rawBefore.length);
+    expect(opened.source.sha256).toBe(sha256Hex(rawBefore));
+    expect(opened.document.bytes).toBe(rawBefore.length);
+    expect(opened.document.sha256).toBe(sha256Hex(rawBefore));
+    expect(opened.document.schema).toBe(NATIVE_HARNESS_RECOVERY_SOURCE_SCHEMA);
+    expect(opened.document.profile).toBe(NATIVE_HARNESS_RECOVERY_SOURCE_PROFILE);
+    expect(opened.document.accounting).toEqual(input.accounting);
+    expect(opened.document.association).toEqual(input.association);
+    expect(opened.document.inputs).toEqual(descriptor.inputManifest);
+    expect(opened.document.inputManifestSha256).toBe(descriptor.manifestSha256);
+    expect(opened.document.workspace).toEqual({
+      sourceRoot: descriptor.sourceRoot,
+      preparedRelativeRoot: path.basename(descriptor.preparedRoot),
+      workspaceRelativeRoot: `${path.basename(descriptor.preparedRoot)}/workspace`,
+      storeRelativeRoot: `${path.basename(descriptor.preparedRoot)}/store`,
+    });
+    expect(Object.isFrozen(opened)).toBe(true);
+    expect(Object.isFrozen(opened.source)).toBe(true);
+    expect(Object.isFrozen(opened.source.pins)).toBe(true);
+    expect(Object.isFrozen(opened.document)).toBe(true);
+
+    expect(opened.source.pins.map((pin) => pin.role)).toEqual([
+      "storage",
+      "prepared",
+      "workspace",
+      "store",
+    ]);
+    expect(opened.source.pins.map((pin) => pin.path)).toEqual([
+      path.dirname(descriptor.preparedRoot),
+      descriptor.preparedRoot,
+      descriptor.workspaceRoot,
+      descriptor.storeRoot,
+    ]);
+    for (const pin of opened.source.pins) {
+      const actual = await lstat(pin.path, { bigint: true });
+      expect(actual.isDirectory()).toBe(true);
+      expect(actual.isSymbolicLink()).toBe(false);
+      expect(actual.dev).toBe(pin.dev);
+      expect(actual.ino).toBe(pin.ino);
+    }
+
+    await verifyNativeHarnessRecoverySource(opened.source, noopGuard, freshSignal());
+
+    expect((await readFile(target)).equals(rawBefore)).toBe(true);
+    expect(await treeSnapshot(fixture.base)).toEqual(treeBefore);
+    const rootAfter = await lstat(fixture.base, { bigint: true });
+    expect(rootAfter.dev).toBe(rootBefore.dev);
+    expect(rootAfter.ino).toBe(rootBefore.ino);
+    expect(rootAfter.mtimeNs).toBe(rootBefore.mtimeNs);
+    // The pre-existing nonempty store is accepted as-is and never enumerated.
+    expect(await readFile(path.join(descriptor.storeRoot, "run-state.json"), "utf8")).toBe("{\"run\":1}\n");
+  });
+
+  test("readonly open refuses SHA, layout, link, size and actual abort", async () => {
+    const fixture = await makeRealWorkspace([{ relativePath: "hello.txt", content: "hello\n" }]);
+    const { descriptor } = fixture;
+    const prepared = await prepare(makeInput(descriptor));
+    const target = sourceFileOf(descriptor);
+    const sha = prepared.source.sha256;
+    const storageRoot = path.dirname(descriptor.preparedRoot);
+    const preparedRelativeRoot = path.basename(descriptor.preparedRoot);
+    const good = {
+      storageRoot,
+      sourceRoot: descriptor.sourceRoot,
+      preparedRelativeRoot,
+      sourceDescriptorSha256: sha,
+    };
+    const treeBefore = await treeSnapshot(fixture.base);
+
+    const wrongSha = await expectFailure(openSource(descriptor, "0".repeat(64)));
+    expect(wrongSha).toBeInstanceOf(NativeHarnessRecoverySourceError);
+    expect(wrongSha.message).toContain("SHA-256");
+    expect(await treeSnapshot(fixture.base)).toEqual(treeBefore);
+
+    const layoutCases: readonly unknown[] = [
+      { ...good, preparedRelativeRoot: "../escape" },
+      { ...good, preparedRelativeRoot: "not-owned" },
+      { ...good, sourceRoot: "relative/source" },
+      { ...good, storageRoot: descriptor.sourceRoot },
+      { ...good, descriptor },
+      { storageRoot, sourceRoot: descriptor.sourceRoot, preparedRelativeRoot },
+      { ...good, sourceDescriptorSha256: "A".repeat(64) },
+    ];
+    for (const candidate of layoutCases) {
+      let guardCalls = 0;
+      const failure = await expectFailure(openNativeHarnessRecoverySource(
+        candidate as never,
+        () => { guardCalls++; },
+        freshSignal(),
+      ));
+      expect(failure).toBeInstanceOf(NativeHarnessRecoverySourceError);
+      expect(guardCalls).toBe(0);
+    }
+    expect(await treeSnapshot(fixture.base)).toEqual(treeBefore);
+
+    let getterReads = 0;
+    const accessor = { ...good };
+    Object.defineProperty(accessor, "sourceRoot", {
+      enumerable: true,
+      configurable: true,
+      get() {
+        getterReads++;
+        return descriptor.sourceRoot;
+      },
+    });
+    const accessorFailure = await expectFailure(openNativeHarnessRecoverySource(
+      accessor as never,
+      noopGuard,
+      freshSignal(),
+    ));
+    expect(accessorFailure.message).toContain("data field");
+    expect(getterReads).toBe(0);
+
+    const inherited = Object.create({ inherited: true }) as Record<string, unknown>;
+    Object.assign(inherited, good);
+    const prototypeFailure = await expectFailure(openNativeHarnessRecoverySource(
+      inherited as never,
+      noopGuard,
+      freshSignal(),
+    ));
+    expect(prototypeFailure.message).toContain("plain object");
+
+    // The four fields are copied before the first guard callback: mutating the
+    // caller object cannot retarget the directories actually observed.
+    const mutable = { ...good };
+    let retargeted = false;
+    let retargetGuardCalls = 0;
+    const retargetGuard = (): void => {
+      retargetGuardCalls++;
+      if (!retargeted) {
+        retargeted = true;
+        mutable.storageRoot = path.join(fixture.base, "other-storage");
+        mutable.preparedRelativeRoot = "omp-harness-other";
+      }
+    };
+    const retargetedOpen = await openNativeHarnessRecoverySource(
+      mutable,
+      retargetGuard,
+      freshSignal(),
+    );
+    expect(retargeted).toBe(true);
+    expect(retargetGuardCalls).toBeGreaterThan(0);
+    expect(retargetedOpen.source.storageRoot).toBe(storageRoot);
+    expect(retargetedOpen.source.preparedRoot).toBe(descriptor.preparedRoot);
+    expect(retargetedOpen.document.workspace.preparedRelativeRoot).toBe(preparedRelativeRoot);
+    expect(retargetedOpen.source.sha256).toBe(sha);
+
+    const controller = new AbortController();
+    let abortGuardCalls = 0;
+    const abortFailure = await expectFailure(openNativeHarnessRecoverySource(
+      good,
+      () => {
+        abortGuardCalls++;
+        if (abortGuardCalls === 2) controller.abort();
+      },
+      controller.signal,
+    ));
+    expect(abortFailure).toBeInstanceOf(NativeHarnessRecoverySourceError);
+    expect(abortFailure.message).toContain("aborted");
+    expect(abortGuardCalls).toBe(2);
+    expect(await treeSnapshot(fixture.base)).toEqual(treeBefore);
+
+    await writeExactSource(target, "x".repeat(NATIVE_HARNESS_RECOVERY_SOURCE_MAX_BYTES + 1));
+    const oversized = await expectFailure(openSource(descriptor, sha));
+    expect(oversized.message).toContain(String(NATIVE_HARNESS_RECOVERY_SOURCE_MAX_BYTES));
+    await writeExactSource(target, prepared.source.text);
+
+    const outsideDocument = path.join(fixture.base, "outside.json");
+    await writeExactSource(outsideDocument, prepared.source.text);
+    await unlink(target);
+    await symlink(outsideDocument, target);
+    const linkedFailure = await expectFailure(openSource(descriptor, sha));
+    expect(linkedFailure).toBeInstanceOf(NativeHarnessRecoverySourceError);
+    await unlink(target);
+    await writeExactSource(target, prepared.source.text);
+
+    const movedPrepared = `${descriptor.preparedRoot}-moved`;
+    await rename(descriptor.preparedRoot, movedPrepared);
+    await symlink(movedPrepared, descriptor.preparedRoot);
+    const redirectedFailure = await expectFailure(openSource(descriptor, sha));
+    expect(redirectedFailure).toBeInstanceOf(NativeHarnessRecoverySourceError);
+    expect(redirectedFailure.message).toContain("real directory");
+  });
+
+  test("refuses a real handle whose close rejects without claiming it closed", async () => {
+    const fixture = await makeRealWorkspace([{ relativePath: "hello.txt", content: "hello\n" }]);
+    const { descriptor } = fixture;
+    const prepared = await prepare(makeInput(descriptor));
+    const target = sourceFileOf(descriptor);
+    const realOpen = nodeFileIo.open;
+    let physical: NativeFileHandle | undefined;
+    let sourceOpens = 0;
+    let closeRejections = 0;
+    const failingOpen: typeof realOpen = async (candidate, flags) => {
+      const handle = await realOpen(candidate, flags);
+      if (candidate !== target) return handle;
+      sourceOpens++;
+      physical = handle;
+      return {
+        stat: (options) => handle.stat(options),
+        read: (buffer, offset, length, position) => handle.read(buffer, offset, length, position),
+        close: async () => {
+          closeRejections++;
+          throw new Error("simulated actual close failure");
+        },
+      };
+    };
+    (nodeFileIo as unknown as { open: typeof realOpen }).open = failingOpen;
+    let failure: Error | undefined;
+    try {
+      failure = await expectFailure(openSource(descriptor, prepared.source.sha256));
+      expect(sourceOpens).toBe(1);
+      expect(closeRejections).toBe(1);
+      expect(failure.message).toContain("not claimed closed");
+      expect((failure as NativeHarnessRecoverySourceError).code).toBe("readback-failed");
+      expect(physical).toBeDefined();
+    } finally {
+      (nodeFileIo as unknown as { open: typeof realOpen }).open = realOpen;
+      if (physical !== undefined) {
+        // Physical reclamation only after the wrapper's rejected close.
+        await physical.close();
+      }
+    }
+
+    const opened = await openSource(descriptor, prepared.source.sha256);
+    await verifyNativeHarnessRecoverySource(opened.source, noopGuard, freshSignal());
+    expect(await exists(target)).toBe(true);
+    expect(await exists(`${target}.bak`)).toBe(false);
   });
 });
 

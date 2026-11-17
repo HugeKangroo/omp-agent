@@ -308,6 +308,17 @@ export interface NativeHarnessRecoverySourceTextExpectation {
 }
 
 /**
+ * Trusted host expectation for the readonly open. `sourceDescriptorSha256` is
+ * the exact SHA-256 of the raw `recovery-source.json` bytes from a previous
+ * preparation. It is an observation match, never a creation flag, serialized
+ * pin set or permission.
+ */
+export type NativeHarnessRecoverySourceOpenExpectation =
+  NativeHarnessRecoverySourceTextExpectation & {
+    readonly sourceDescriptorSha256: string;
+  };
+
+/**
  * Pure decoded shape of one already-read `recovery-source.json` document.
  * `sha256` hashes the exact caller-supplied UTF-8 bytes; reordered but
  * semantically equal JSON is not normalized back into the original digest.
@@ -974,7 +985,10 @@ async function sealPinnedDirectories(
   readSignalOnly(live);
 }
 
-async function pinWorkspace(live: LiveContext, owned: OwnedInput): Promise<readonly RecoverySourcePin[]> {
+async function pinWorkspace(
+  live: LiveContext,
+  owned: Pick<OwnedInput, "storageRoot" | "sourceRoot" | "preparedRoot" | "workspaceRoot" | "storeRoot">,
+): Promise<readonly RecoverySourcePin[]> {
   const storage = await inspectDirectory(live, owned.storageRoot, "storageRoot");
   const source = await inspectDirectory(live, owned.sourceRoot, "sourceRoot");
   if (
@@ -1233,13 +1247,16 @@ async function writeSourceDocument(
   assertLive(live);
 }
 
-async function readSourceBack(
+/**
+ * One actual bounded capture of the fixed source file. Reused by readback
+ * verification and the readonly open; the 16 KiB ceilings, strict UTF-8,
+ * mode/link/path shape, O_NONBLOCK wrapper, close-failure tracker and final
+ * pin/signal checks are all applied here and nowhere else.
+ */
+async function captureSourceBack(
   live: LiveContext,
   pins: readonly RecoverySourcePin[],
   preparedRoot: string,
-  expectedText: string,
-  expectedBytes: number,
-  expectedSha256: string,
 ): Promise<NativeWorkspaceTextSnapshot> {
   assertLive(live);
   await verifyPinnedDirectories(live, pins);
@@ -1257,6 +1274,18 @@ async function readSourceBack(
   await verifyPinnedDirectories(live, pins);
   assertLive(live);
   await assertSourceFileShape(live, pins, preparedRoot);
+  return snapshot;
+}
+
+async function readSourceBack(
+  live: LiveContext,
+  pins: readonly RecoverySourcePin[],
+  preparedRoot: string,
+  expectedText: string,
+  expectedBytes: number,
+  expectedSha256: string,
+): Promise<NativeWorkspaceTextSnapshot> {
+  const snapshot = await captureSourceBack(live, pins, preparedRoot);
   if (
     snapshot.file.relativePath !== NATIVE_HARNESS_RECOVERY_SOURCE_FILE
     || snapshot.text !== expectedText
@@ -1542,6 +1571,67 @@ function readSourceDocument(
   });
 }
 
+interface OwnedOpenExpectation {
+  readonly storageRoot: string;
+  readonly sourceRoot: string;
+  readonly preparedRelativeRoot: string;
+  readonly preparedRoot: string;
+  readonly workspaceRoot: string;
+  readonly storeRoot: string;
+  readonly sourceDescriptorSha256: string;
+}
+
+/**
+ * Exact four-field host expectation for a readonly open. Values are copied
+ * before any guard callback or await; only the fixed prepared/workspace/store
+ * layout is derived, so no caller-supplied artifact root, descriptor, pin set
+ * or creation flag can redirect the observed source.
+ */
+function readOpenExpectation(value: unknown): OwnedOpenExpectation {
+  const fields = readStrictFields(
+    value,
+    ["storageRoot", "sourceRoot", "preparedRelativeRoot", "sourceDescriptorSha256"],
+    "source open expectation",
+  );
+  const storageRoot = readString(fields.get("storageRoot"), "expectation.storageRoot", MAX_PATH_CHARS, true);
+  const sourceRoot = readString(fields.get("sourceRoot"), "expectation.sourceRoot", MAX_PATH_CHARS, true);
+  const preparedRelativeRoot = readRelativePath(
+    fields.get("preparedRelativeRoot"),
+    "expectation.preparedRelativeRoot",
+  );
+  const sourceDescriptorSha256 = readHex64(
+    fields.get("sourceDescriptorSha256"),
+    "expectation.sourceDescriptorSha256",
+  );
+  if (
+    isContained(storageRoot, sourceRoot)
+    || isContained(sourceRoot, storageRoot)
+  ) {
+    fail("invalid-input", "expectation.storageRoot and expectation.sourceRoot must be disjoint.");
+  }
+  const preparedRoot = path.join(storageRoot, preparedRelativeRoot);
+  if (path.dirname(preparedRoot) !== storageRoot) {
+    fail("invalid-input", "expectation.preparedRelativeRoot must be a direct child of storageRoot.");
+  }
+  if (!path.basename(preparedRoot).startsWith(OWNED_PREFIX)) {
+    fail("invalid-input", `expectation.preparedRelativeRoot must use the ${OWNED_PREFIX} owned prefix.`);
+  }
+  readString(preparedRoot, "expectation.preparedRoot", MAX_PATH_CHARS, true);
+  const workspaceRoot = path.join(storageRoot, `${preparedRelativeRoot}/workspace`);
+  const storeRoot = path.join(storageRoot, `${preparedRelativeRoot}/store`);
+  readString(workspaceRoot, "expectation.workspaceRoot", MAX_PATH_CHARS, true);
+  readString(storeRoot, "expectation.storeRoot", MAX_PATH_CHARS, true);
+  return Object.freeze({
+    storageRoot,
+    sourceRoot,
+    preparedRelativeRoot,
+    preparedRoot,
+    workspaceRoot,
+    storeRoot,
+    sourceDescriptorSha256,
+  });
+}
+
 /**
  * Pure bounded decoder for one already-read `recovery-source.json` text.
  * It reuses the writer's fixed field/value readers, verifies the exact
@@ -1558,6 +1648,80 @@ export function decodeNativeHarnessRecoverySourceText(
   expected: NativeHarnessRecoverySourceTextExpectation,
 ): NativeHarnessRecoverySourceDocument {
   return readSourceDocument(raw, expected);
+}
+
+/**
+ * Readonly opening of one existing source document. It pins the fixed four
+ * directories from the exact four-field host expectation, captures the fixed
+ * file once through the shared bounded reader, decodes that exact text and
+ * requires the raw captured SHA-256 to equal `sourceDescriptorSha256`, then
+ * reseals the original pins, guard and signal before freezing facts.
+ *
+ * It creates no directory, file, seed or prepared source, writes and removes
+ * nothing, reads no source input bytes and never treats supplied pins or a
+ * workspace descriptor as sufficient. The result is an observation only, not
+ * a permission, lease, durability claim or resume license; the file may
+ * change after this call and must be re-observed by a later join.
+ */
+export async function openNativeHarnessRecoverySource(
+  expected: NativeHarnessRecoverySourceOpenExpectation,
+  guard: () => void,
+  signal: AbortSignal,
+): Promise<Readonly<{
+  source: NativeHarnessRecoverySourceFacts;
+  document: NativeHarnessRecoverySourceDocument;
+}>> {
+  const owned = readOpenExpectation(expected);
+  const live = createLiveContext(guard, signal);
+  assertLive(live);
+
+  const pins = await pinWorkspace(live, owned);
+  assertLive(live);
+  // Apply the original file shape/ceiling before the common capture so an
+  // oversized or linked file is refused with the owned error classification.
+  await assertSourceFileShape(live, pins, owned.preparedRoot);
+
+  const snapshot = await captureSourceBack(live, pins, owned.preparedRoot);
+  const document = decodeNativeHarnessRecoverySourceText(snapshot.text, {
+    storageRoot: owned.storageRoot,
+    sourceRoot: owned.sourceRoot,
+    preparedRelativeRoot: owned.preparedRelativeRoot,
+  });
+  if (
+    snapshot.file.relativePath !== NATIVE_HARNESS_RECOVERY_SOURCE_FILE
+    || document.bytes !== snapshot.file.bytes
+    || document.sha256 !== snapshot.file.sha256
+  ) {
+    fail("readback-failed", "the decoded document does not describe the exact captured bytes.");
+  }
+  if (snapshot.file.sha256 !== owned.sourceDescriptorSha256) {
+    fail("readback-failed", "recovery-source.json raw SHA-256 does not match the expected source descriptor SHA-256.");
+  }
+
+  // Final original pin/guard/signal seal. No further host callback is made
+  // before the frozen observation is returned.
+  assertLive(live);
+  await verifyPinnedDirectories(live, pins);
+  assertLive(live);
+  await sealPinnedDirectories(live, pins);
+  // The seal's own final signal read happens before this async continuation
+  // resumes. Re-read the captured actual signal synchronously after the last
+  // await so an abort in that scheduling gap cannot return frozen facts.
+  readSignalOnly(live);
+
+  const source: NativeHarnessRecoverySourceFacts = deepFreeze({
+    storageRoot: owned.storageRoot,
+    sourceRoot: owned.sourceRoot,
+    preparedRoot: owned.preparedRoot,
+    workspaceRoot: owned.workspaceRoot,
+    storeRoot: owned.storeRoot,
+    relativePath: NATIVE_HARNESS_RECOVERY_SOURCE_FILE,
+    pins,
+    text: snapshot.text,
+    bytes: snapshot.file.bytes,
+    sha256: snapshot.file.sha256,
+  });
+  return deepFreeze({ source, document });
 }
 
 function buildSeedText(

@@ -1,5 +1,100 @@
 # Release notes
 
+## Same-lease host continuation and existing-source observation (R2-C2b2a/b)
+
+R2-C2b2a/b adds a fixed host-only same-lease Controller continuation API, optional Store
+final-seal hooks, a readonly opener for one existing recovery-source document, and the raw
+accounting-owner file SHA-256 and numeric byte count from the existing snapshot. It does not
+wire the actual backend, coordinator or current `NativeWork`, so same-leased product recovery
+is not enabled. Original marked continuation through `execute`/`resume` remains refused; the
+original initial `execute` path (`queued`, revision 0, no stages, no snapshot) stays
+available. All six product deliverables remain OPEN; G5 precedes G4, G6/G7 are canceled and
+the human C3 trial is mandatory.
+
+The original `HarnessController` constructor now accepts an optional own-data
+`recoveryContinuation:{prepare,refreshCurrent,revalidateCurrent,settled}`; absent or
+`undefined` keeps legacy construction. `continueWithRecoveryLease` acquires the original
+Store lease once and exposes only a frozen readonly `{runId,ownerSha256,assertCurrent}` view
+that closes after the operation, with no Store, token, release function or mutable record.
+`prepare` returns exact owned CAS facts from a future fixed backend post-claim B2
+observation; public inspection permission is not a substitute. Current refresh, pure seal
+and the original conditional commit precede the SAME `executeLocked` without a lease gap.
+A configured continuation latch prevents another execute/resume from crossing the operation.
+
+Phase booleans record actual prepare/commit/execution entry and settlement, never success.
+`settled` runs exactly once after prepare entry, with the marker set before the call,
+including throws, unknown claims and partial commits, and settles an ordinary `Promise<void>`
+under the lease. The lease is not released early while that Promise is pending; release runs
+in `finally`. The final ACK requires both `settled` and release and rechecks the last monotone
+positive clock, original minimum deadline, pure host currentness and intrinsic signal. Partial
+writes are retained with no rollback, re-clear, new run, budget reset or deadline reset; an
+unresolved `settled` Promise can hold the lease indefinitely and no hard whole-call timeout is
+claimed.
+
+A continuation-configured Controller fixes its original readonly own execution references and
+internal Store/Library roots; the caller Runner is not frozen, and the original run function
+and receiver are captured in a fixed forwarder. Legacy constructors are unchanged. Execution
+bridges an actual external abort to the original internal `AbortController` before the first
+await, removes the listener in `finally`, and retains original cancel-file polling. The
+forwarding Runner rechecks clock, original deadline, pure currentness and intrinsic signal
+before every dispatch and clips the original timeout to the remaining window; existing loop,
+reservations, cost, stages, `createdAt` and configuration stay. The whole actual
+`NativeWork`/stop/accounting guard remains a future backend join.
+
+Original `Store.atomicWrite` now accepts an optional synchronous `undefined`-returning
+`finalSeal` after the awaited `beforeRename` and immediately before rename; it is not an
+async seal. The private save path passes the seal for both backup and primary, and
+`commitRecoveryInterrupted` applies the same optional pure gate before the exact matched
+cancel unlink and after the short write-lock release before ACK. Existing raw-SHA, revision,
+lease, identity and original minimum-deadline checks remain. An OS rename/unlink is not
+atomic with host state, so invalidation after an operation starts can leave writes; ACK and
+dispatch are refused and facts retained. No second lock or writer is added.
+
+`openNativeHarnessRecoverySource` validates four exact own-data fields, fixed layout and
+disjoint paths, pins the actual fresh four directories, and returns the frozen actual source
+facts plus the original decoded document. The original single bounded 16 KiB read,
+`O_NONBLOCK`, UTF-8/no-BOM, mode/link and close-failure checks are retained; no fake
+descriptor, prepared source, seed, new run, directory, write, chmod or Git inspection is
+added. A nonempty store is allowed. It checks the source document, not input-file contents,
+current intent or stop, so a future B2 observation is still required.
+
+`observeNativeHarnessAccountingOwner` now returns
+`NativeHarnessAccountingOwnerRawObservation`, extending the old basic interface with the raw
+primary SHA and byte count (`primarySha256` exact raw-file SHA-256; `primaryBytes` a numeric
+byte count) from the same original snapshot capture; no raw byte array is returned and the
+underlying original checkpoint remains returned. It adds no IO, JSON re-encoding, handle,
+owner creation/migration or claim, and old basic fake ports remain valid. V1/V2 raw-format
+differences change the SHA even when the parsed checkpoint is identical; the future post-claim
+join must match that raw-file SHA, B2 and the original per-admission projection, not only
+revision.
+
+Validation: the final root check exited 0 in 93,142 ms with typecheck 0, 1,752 unit tests
+across 79 files (46,380 assertions, 87.86 s), 15 simulated human-review tests (155 assertions,
+2.20 s) and all 235 frozen files stable. Focused Controller 18/172, source/accounting 61/607,
+consumers 79/703 and package 5/392 overlap the full suite and are not additive. Independent
+Controller (407 ms, four families) and source (141 ms, two families) probes passed on actual
+temporary files and local Git, with 236 frozen files including each probe unchanged. Hashes
+and full evidence are in [Testing](testing.md#same-lease-host-continuation-and-existing-source-observation-r2-c2b2ab).
+
+Retained failures are not relabeled: the author legacy 119/1 and root full01 1,751/1 carried
+an old hardcoded package expected source id; only that literal changed after actual canonical
+manifest verification, with all other 234 files unchanged, and final full02 plus the package
+selection passed. Controller and source probe fixture/oracle errors are recorded in Testing.
+All actual authors completed with process groups gone; external OMP authoring is not product
+qualification.
+
+Next integration is mandatory before any product enablement: `continueWithRecoveryLease` first
+acquires the original lease, then invokes the fixed `prepare` hook. The actual backend must
+bind to the readonly source and inventory so direct pre-B2 observation that establishes all
+attempts stopped, the same-owner cost/claim and the post-claim full B2 observation all run
+inside that hook under the same Controller-owned lease; only afterwards does conditional
+commit continue into the original loop. The original coordinator supplies the new current
+Slot, `NativeWork`, same original admission, raw cost and deadline. Historical completion
+contributions must be rechecked rather than accepted from an old witness; old unknown
+inventory rows remain unknown. A fresh current capture/check/report and R3 actual two-parent
+worker interruption are still required.
+Same-leased product recovery is not available and the default entry/model/strategy are unchanged.
+
 ## Initial-input inspection and same-owner recovery observation (R2-C1b2/C2b1)
 
 R2-C1b2 adds actual initial-input observation to the existing host-only run inspection; R2-C2b1 adds frozen same-owner admission facts plus opt-in existing-only accounting-session observation. Both are bounded engineering acceptance and add no runtime continuation, resume eligibility, current intent, same-owner claim, Store transition, same-leased execution, worker stop or authority. Publication is handled separately.

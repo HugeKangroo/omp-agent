@@ -382,7 +382,8 @@ async function syncDirectory(path: string): Promise<void> {
   const dir = await open(path, "r");
   try { await dir.sync(); } finally { await dir.close(); }
 }
-export async function atomicWrite(path: string, contents: string, beforeRename?: () => Promise<void>): Promise<void> {
+export async function atomicWrite(path: string, contents: string, beforeRename?: () => Promise<void>, finalSeal?: () => void): Promise<void> {
+  const seal = ownedFinalSeal(finalSeal);
   const temporary = `${path}.${randomUUID()}.tmp`;
   const file = await open(temporary, "wx", 0o600);
   try { await file.writeFile(contents, "utf8"); await file.sync(); }
@@ -390,6 +391,7 @@ export async function atomicWrite(path: string, contents: string, beforeRename?:
   finally { await file.close(); }
   try {
     if (beforeRename !== undefined) await beforeRename();
+    invokeFinalSeal(seal);
     await rename(temporary, path);
     await syncDirectory(dirname(path));
   } finally { await rm(temporary, { force: true }); }
@@ -618,6 +620,8 @@ interface SaveLockedOptions {
   readonly maxBytes?: number;
   readonly beforePrimaryWrite?: () => Promise<void>;
   readonly beforePrimaryRename?: () => Promise<void>;
+  /** Synchronous host currentness seal immediately before each original rename. */
+  readonly finalSeal?: () => void;
   /**
    * Internal captured run directory already bound to a Store-issued lease.
    * Only the conditional lease-owned transition supplies this; ordinary save
@@ -644,6 +648,31 @@ const leaseStates = new WeakMap<RunStoreLease, LeaseState>();
 const ABORTED_GETTER = typeof AbortSignal === "undefined"
   ? undefined
   : Object.getOwnPropertyDescriptor(AbortSignal.prototype, "aborted")?.get;
+const NATIVE_PROMISE_PROTOTYPE = typeof Promise === "undefined" ? undefined : Promise.prototype;
+const NATIVE_PROMISE_THEN = typeof Promise === "undefined"
+  ? undefined
+  : Object.getOwnPropertyDescriptor(Promise.prototype, "then")?.value;
+
+/** Observe a refused genuine native Promise rejection without awaiting or accepting it. */
+function observeRefusedPromise(value: unknown): void {
+  if (NATIVE_PROMISE_PROTOTYPE === undefined || NATIVE_PROMISE_THEN === undefined) return;
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return;
+  let prototype: unknown;
+  try { prototype = Object.getPrototypeOf(value); }
+  catch { return; }
+  if (prototype !== NATIVE_PROMISE_PROTOTYPE) return;
+  for (const key of ["then", "constructor"] as const) {
+    let descriptor: PropertyDescriptor | undefined;
+    try { descriptor = Object.getOwnPropertyDescriptor(value, key); }
+    catch { return; }
+    if (descriptor !== undefined) return;
+  }
+  try {
+    Reflect.apply(NATIVE_PROMISE_THEN, value, [undefined, () => undefined]);
+  } catch {
+    // Refusal is synchronous; observing a foreign shape never changes it.
+  }
+}
 /** Intrinsic getter call: prototype spoofing and shadowed `aborted` fail closed. */
 function readSignalAborted(signal: AbortSignal): boolean {
   if (ABORTED_GETTER === undefined) throw new StoreConflictError("Recovery transition requires an actual AbortSignal");
@@ -652,6 +681,20 @@ function readSignalAborted(signal: AbortSignal): boolean {
   catch { throw new StoreConflictError("Recovery transition requires an actual AbortSignal"); }
   if (typeof value !== "boolean") throw new StoreConflictError("Recovery transition requires an actual AbortSignal");
   return value;
+}
+function ownedFinalSeal(value: unknown): (() => void) | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value !== "function") throw new StoreConflictError("Final seal must be one synchronous host function");
+  return value as () => void;
+}
+/** No await is allowed between this call and the effect it seals. */
+function invokeFinalSeal(seal: (() => void) | undefined): void {
+  if (seal === undefined) return;
+  const result: unknown = seal();
+  if (result !== undefined) {
+    observeRefusedPromise(result);
+    throw new StoreConflictError("Final seal must return undefined synchronously");
+  }
 }
 async function assertLeaseCurrent(state: LeaseState): Promise<void> {
   if (!state.active) throw new StoreConflictError(`Run lease is no longer active: ${state.runId}`);
@@ -682,7 +725,7 @@ async function assertLeaseCurrent(state: LeaseState): Promise<void> {
   await assertScope();
   if (!state.active) throw new StoreConflictError(`Run lease is no longer active: ${state.runId}`);
 }
-function recoveryDeadline(record: RunRecord): number {
+export function recoveryDeadline(record: RunRecord): number {
   const origin = record.recoveryOrigin;
   if (origin === undefined) throw new StoreConflictError(`Run ${record.id} is not a marked recovery run`);
   const createdAt = Date.parse(record.createdAt);
@@ -695,7 +738,7 @@ function recoveryDeadline(record: RunRecord): number {
   }
   return Math.min(outer, inner);
 }
-function assertRecoveryDeadline(record: RunRecord, now: number = Date.now()): void {
+export function assertRecoveryDeadline(record: RunRecord, now: number = Date.now()): void {
   const origin = record.recoveryOrigin;
   if (origin === undefined) throw new StoreConflictError(`Run ${record.id} is not a marked recovery run`);
   if (!Number.isSafeInteger(now) || now <= 0) {
@@ -824,10 +867,11 @@ export class RunStore {
         throw new RangeError(`Recovery record exceeds the ${options.maxBytes}-byte profile.`);
       }
     }
+    const finalSeal = ownedFinalSeal(options?.finalSeal);
     if (options?.beforePrimaryWrite !== undefined) await options.beforePrimaryWrite();
     const directory = options?.targetDirectory ?? this.runDir(id);
-    await atomicWrite(join(directory, "run.json.bak"), backupText);
-    await atomicWrite(join(directory, "run.json"), nextText, options?.beforePrimaryRename);
+    await atomicWrite(join(directory, "run.json.bak"), backupText, undefined, finalSeal);
+    await atomicWrite(join(directory, "run.json"), nextText, options?.beforePrimaryRename, finalSeal);
     return next;
   }
   async save(record: RunRecord, expectedRevision: number): Promise<RunRecord> {
@@ -985,6 +1029,7 @@ export class RunStore {
     expectedCancelSha256: string | null,
     signal: AbortSignal,
     currentness: () => void | Promise<void>,
+    finalSeal?: () => void,
   ): Promise<RunRecord> {
     if (typeof runId !== "string") throw new StoreConflictError("Recovery run ID must be a string");
     validId(runId);
@@ -993,6 +1038,7 @@ export class RunStore {
     if (expectedCancelSha256 !== null && (typeof expectedCancelSha256 !== "string" || !RECOVERY_SHA256.test(expectedCancelSha256))) throw new StoreConflictError("Recovery cancel SHA must be null or 64 lowercase hex characters");
     if (typeof AbortSignal === "undefined" || !(signal instanceof AbortSignal)) throw new StoreConflictError("Recovery transition requires an actual AbortSignal");
     if (typeof currentness !== "function") throw new StoreConflictError("Recovery transition requires a host currentness assertion");
+    const fixedFinalSeal = ownedFinalSeal(finalSeal);
     const state = leaseStates.get(lease);
     if (state === undefined || state.store !== this || state.runId !== runId) {
       throw new StoreConflictError(`Run lease was not issued by this Store for ${runId}`);
@@ -1030,10 +1076,11 @@ export class RunStore {
       await assertLeaseCurrent(state);
       if (readSignalAborted(signalRef)) throw new Error("Cancellation requested");
     };
-    // Synchronous control seal, used only after a frontier's final await.
+    // Synchronous control seal used only after a frontier's final await:
+    // original clock, captured pure host seal, then actual intrinsic signal.
     const seal = (record: RunRecord): void => {
-      if (readSignalAborted(signalRef)) throw new Error("Cancellation requested");
       assertClock(record);
+      invokeFinalSeal(fixedFinalSeal);
       if (readSignalAborted(signalRef)) throw new Error("Cancellation requested");
     };
     const checkHost = async (record: RunRecord | undefined): Promise<void> => {
@@ -1102,6 +1149,9 @@ export class RunStore {
           maxBytes: RECOVERY_RUN_MAX_BYTES,
           beforePrimaryWrite: beforePublication,
           beforePrimaryRename: beforePublication,
+          // The rename-time window re-runs the full synchronous clock, host
+          // seal and actual intrinsic signal, not the host seal alone.
+          finalSeal: () => seal(record),
           targetDirectory: directory,
         });
         const savedText = serialize(saved);

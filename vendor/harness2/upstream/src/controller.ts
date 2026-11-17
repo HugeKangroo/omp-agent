@@ -1,7 +1,7 @@
 import { randomUUID, createHash } from "node:crypto";
 import { mkdir, readFile, writeFile, copyFile, lstat, unlink } from "node:fs/promises";
 import path from "node:path";
-import { RunStore, LibraryStore, readRegular, StoreConflictError } from "./store.ts";
+import { RunStore, LibraryStore, readRegular, StoreConflictError, assertRecoveryDeadline, recoveryDeadline, type RunStoreLease } from "./store.ts";
 import { captureSnapshot, materializeSnapshot, materializeCandidate, diffWorkspace, applyWorkspace } from "./workspace.ts";
 import { baseHarness, makeHarness, parseHarness, parseJsonResponse, parseLesson, ValidationError } from "./surface.ts";
 import { proposalPrompt, composePrompt, selectorPrompt, reflectionPrompt } from "./prompts.ts";
@@ -16,7 +16,7 @@ import { CapabilityRegistry } from "./capabilities";
 import { executeEvolution, newEvolution } from "./evolution";
 import { validateExecutionProfile, type ApprovalHandler } from "./runtime-policy";
 import { OmpRpcRunner } from "./runner.ts";
-import type { ApplyResult, CandidateId, ExplorationEvaluation, Change, HarnessBundle, RunConfig, RunEvent, RunRecord, Runner, StageId, WorkerRequest } from "./types.ts";
+import type { ApplyResult, CandidateId, ExplorationEvaluation, Change, HarnessBundle, RunConfig, RunEvent, RunRecord, Runner, StageId, WorkerRequest, WorkerResult } from "./types.ts";
 
 const SOLVERS: readonly StageId[] = CANDIDATE_IDS;
 interface StageOptions {
@@ -56,14 +56,16 @@ const NATIVE_PROMISE_PROTOTYPE = typeof Promise === "undefined" ? undefined : Pr
 const NATIVE_PROMISE_THEN = typeof Promise === "undefined"
   ? undefined
   : Object.getOwnPropertyDescriptor(Promise.prototype, "then")?.value;
+const SIGNAL_ADD_EVENT_LISTENER = typeof AbortSignal === "undefined" ? undefined : AbortSignal.prototype.addEventListener;
+const SIGNAL_REMOVE_EVENT_LISTENER = typeof AbortSignal === "undefined" ? undefined : AbortSignal.prototype.removeEventListener;
 
 /** Intrinsic getter only; a shadowed `aborted` property or duck type refuses. */
 function readActualSignal(signal: AbortSignal): boolean {
-  if (SIGNAL_ABORTED_GETTER === undefined) throw new Error("Recovery inspection requires an actual AbortSignal");
+  if (SIGNAL_ABORTED_GETTER === undefined) throw new Error("Recovery requires an actual AbortSignal");
   let value: unknown;
   try { value = Reflect.apply(SIGNAL_ABORTED_GETTER, signal, []); }
-  catch { throw new Error("Recovery inspection requires an actual AbortSignal"); }
-  if (typeof value !== "boolean") throw new Error("Recovery inspection requires an actual AbortSignal");
+  catch { throw new Error("Recovery requires an actual AbortSignal"); }
+  if (typeof value !== "boolean") throw new Error("Recovery requires an actual AbortSignal");
   return value;
 }
 /**
@@ -103,6 +105,24 @@ function settleNativePromise(value: unknown): Promise<unknown> | null {
   } catch { return null; }
 }
 
+/** Observe a refused genuine native Promise rejection without awaiting or accepting it. */
+function observeRefusedNativePromise(value: unknown): void {
+  if (NATIVE_PROMISE_PROTOTYPE === undefined || NATIVE_PROMISE_THEN === undefined) return;
+  if (value === null || (typeof value !== "object" && typeof value !== "function")) return;
+  let prototype: unknown;
+  try { prototype = Object.getPrototypeOf(value); }
+  catch { return; }
+  if (prototype !== NATIVE_PROMISE_PROTOTYPE) return;
+  for (const key of ["then", "constructor"] as const) {
+    let descriptor: PropertyDescriptor | undefined;
+    try { descriptor = Object.getOwnPropertyDescriptor(value, key); }
+    catch { return; }
+    if (descriptor !== undefined) return;
+  }
+  try { Reflect.apply(NATIVE_PROMISE_THEN, value, [undefined, () => undefined]); }
+  catch { /* Refusal stays synchronous. */ }
+}
+
 /** Own-data-only inspector capture; accessors and prototypes are refused. */
 function ownedRecoveryInspector(options: object): HarnessRecoveryInspector | undefined {
   let descriptor: PropertyDescriptor | undefined;
@@ -116,6 +136,134 @@ function ownedRecoveryInspector(options: object): HarnessRecoveryInspector | und
   if (value === undefined) return undefined;
   if (typeof value !== "function") throw new Error("Recovery inspector must be one trusted host function");
   return value as HarnessRecoveryInspector;
+}
+
+/** Exact post-claim CAS facts from the future fixed backend. They are not a
+ * permission object and are never exposed through readonly inspection. */
+export interface HarnessRecoveryCasFacts {
+  readonly expectedRevision: number;
+  readonly expectedPrimarySha256: string;
+  readonly expectedCancelSha256: string | null;
+}
+/** Phase observations only; no field asserts claim success or settlement truth. */
+export interface HarnessRecoverySettlementFacts {
+  readonly prepareEntered: boolean;
+  readonly prepareReturned: boolean;
+  readonly commitEntered: boolean;
+  readonly commitConfirmed: boolean;
+  readonly executionEntered: boolean;
+  readonly executionSettled: boolean;
+}
+export interface HarnessRecoveryContinuationHooks {
+  readonly prepare: (view: HarnessRecoveryInspectionView, signal: AbortSignal) => Promise<HarnessRecoveryCasFacts>;
+  readonly refreshCurrent: () => void | Promise<void>;
+  readonly revalidateCurrent: () => void;
+  readonly settled: (
+    view: HarnessRecoveryInspectionView,
+    signal: AbortSignal,
+    facts: HarnessRecoverySettlementFacts,
+  ) => void | Promise<void>;
+}
+
+/** Own-data-only continuation capture; inherited callbacks/accessors are refused. */
+function ownedRecoveryContinuation(options: object): HarnessRecoveryContinuationHooks | undefined {
+  let descriptor: PropertyDescriptor | undefined;
+  try { descriptor = Object.getOwnPropertyDescriptor(options, "recoveryContinuation"); }
+  catch { throw new Error("Recovery continuation descriptor is unreadable"); }
+  if (descriptor === undefined) return undefined;
+  if (!("value" in descriptor) || descriptor.get !== undefined || descriptor.set !== undefined) {
+    throw new Error("Recovery continuation must be one own-data host object");
+  }
+  const value: unknown = descriptor.value;
+  if (value === undefined) return undefined;
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Recovery continuation must be a plain own-data object");
+  }
+  let prototype: unknown;
+  try { prototype = Object.getPrototypeOf(value); }
+  catch { throw new Error("Recovery continuation prototype is unreadable"); }
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new Error("Recovery continuation must be a plain own-data object");
+  }
+  if (Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new Error("Recovery continuation must not have symbol properties");
+  }
+  const names = ["prepare", "refreshCurrent", "revalidateCurrent", "settled"] as const;
+  const actual = Object.getOwnPropertyNames(value);
+  if (actual.length !== names.length || !names.every(name => actual.includes(name))) {
+    throw new Error("Recovery continuation must have exactly prepare, refreshCurrent, revalidateCurrent and settled");
+  }
+  const captured = names.map(name => {
+    const property = Object.getOwnPropertyDescriptor(value, name);
+    if (property === undefined || !("value" in property)) {
+      throw new Error(`Recovery continuation ${name} must be an own data function`);
+    }
+    if (typeof property.value !== "function") {
+      throw new Error(`Recovery continuation ${name} must be an own data function`);
+    }
+    return property.value as (...args: never[]) => unknown;
+  });
+  return Object.freeze({
+    prepare: captured[0] as HarnessRecoveryContinuationHooks["prepare"],
+    refreshCurrent: captured[1] as HarnessRecoveryContinuationHooks["refreshCurrent"],
+    revalidateCurrent: captured[2] as HarnessRecoveryContinuationHooks["revalidateCurrent"],
+    settled: captured[3] as HarnessRecoveryContinuationHooks["settled"],
+  });
+}
+
+const RECOVERY_FACT_SHA256 = /^[a-f0-9]{64}$/;
+
+/** Exact own-data CAS capture: no accessors, extras, symbols or inherited shape. */
+function ownedRecoveryCasFacts(value: unknown): HarnessRecoveryCasFacts {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Recovery prepare must resolve one plain CAS facts object");
+  }
+  const prototype = Object.getPrototypeOf(value);
+  if (prototype !== Object.prototype && prototype !== null) {
+    throw new Error("Recovery prepare must resolve one plain CAS facts object");
+  }
+  if (Object.getOwnPropertySymbols(value).length !== 0) {
+    throw new Error("Recovery prepare CAS facts must not have symbol properties");
+  }
+  const names = ["expectedRevision", "expectedPrimarySha256", "expectedCancelSha256"] as const;
+  const actual = Object.getOwnPropertyNames(value);
+  if (actual.length !== names.length || !names.every(name => actual.includes(name))) {
+    throw new Error("Recovery prepare CAS facts must have exactly expectedRevision, expectedPrimarySha256 and expectedCancelSha256");
+  }
+  const facts = names.map(name => {
+    const property = Object.getOwnPropertyDescriptor(value, name);
+    if (property === undefined || !("value" in property)) {
+      throw new Error(`Recovery prepare ${name} must be an own data property`);
+    }
+    return property.value as unknown;
+  });
+  const expectedRevision = facts[0];
+  const expectedPrimarySha256 = facts[1];
+  const expectedCancelSha256 = facts[2];
+  if (!Number.isSafeInteger(expectedRevision) || (expectedRevision as number) < 0) {
+    throw new Error("Recovery prepare expectedRevision must be a safe nonnegative integer");
+  }
+  if (typeof expectedPrimarySha256 !== "string" || !RECOVERY_FACT_SHA256.test(expectedPrimarySha256)) {
+    throw new Error("Recovery prepare expectedPrimarySha256 must be 64 lowercase hex characters");
+  }
+  if (expectedCancelSha256 !== null
+    && (typeof expectedCancelSha256 !== "string" || !RECOVERY_FACT_SHA256.test(expectedCancelSha256))) {
+    throw new Error("Recovery prepare expectedCancelSha256 must be null or 64 lowercase hex characters");
+  }
+  return Object.freeze({
+    expectedRevision: expectedRevision as number,
+    expectedPrimarySha256,
+    expectedCancelSha256: expectedCancelSha256 as string | null,
+  });
+}
+
+/** One captured host hook call per await; no foreign then/getter is consulted. */
+async function settleVoidHook(value: unknown, label: string): Promise<void> {
+  if (value === undefined) return;
+  const pending = settleNativePromise(value);
+  if (pending === null) throw new Error(`${label} must return undefined or a genuine native Promise<void>`);
+  const resolved: unknown = await pending;
+  if (resolved !== undefined) throw new Error(`${label} Promise must resolve undefined`);
 }
 
 function ownedRecoverySeedText(creation: RecoveryCreation | undefined): string | undefined {
@@ -155,6 +303,13 @@ function configOf(value: Partial<RunConfig> & { model: string }): RunConfig {
   return config;
 }
 
+interface RecoveryExecutionContinuation {
+  readonly signal: AbortSignal;
+  readonly deadline: number;
+  readonly revalidateCurrent: () => void;
+  lastClock: number;
+}
+
 export function accountedCost(record: RunRecord): number {
   return (record.evolution?.attempts.reduce((sum, a) => sum + a.cost, 0) ?? 0) + Object.values(record.stages).reduce((sum, stage) => sum + (stage?.accountedCostUsd ?? stage?.result?.usage.costUsd ?? 0), 0);
 }
@@ -169,8 +324,12 @@ export class HarnessController {
   readonly approvals: ApprovalChannel;
   private readonly approval: ApprovalHandler | undefined;
   private readonly recoveryInspector: HarnessRecoveryInspector | undefined;
-  constructor(options: { workspace: string; storeRoot?: string; runner?: Runner; approval?: ApprovalHandler; recoveryInspector?: HarnessRecoveryInspector }) {
+  private readonly recoveryContinuation: HarnessRecoveryContinuationHooks | undefined;
+  private continuationActive = false;
+  private continuationDispatch: ((request: WorkerRequest) => WorkerRequest) | undefined;
+  constructor(options: { workspace: string; storeRoot?: string; runner?: Runner; approval?: ApprovalHandler; recoveryInspector?: HarnessRecoveryInspector; recoveryContinuation?: HarnessRecoveryContinuationHooks }) {
     const recoveryInspector = ownedRecoveryInspector(options);
+    const recoveryContinuation = ownedRecoveryContinuation(options);
     this.workspace = path.resolve(options.workspace);
     this.storeRoot = path.resolve(options.storeRoot ?? path.join(this.workspace, ".harness2"));
     this.store = new RunStore(path.join(this.storeRoot, "runs"));
@@ -180,6 +339,31 @@ export class HarnessController {
     this.approval = options.approval;
     this.runner = options.runner ?? new OmpRpcRunner();
     this.recoveryInspector = recoveryInspector;
+    this.recoveryContinuation = recoveryContinuation;
+    if (recoveryContinuation !== undefined) {
+      // Capture the original run function and receiver once. Caller mutation
+      // of the runner object or its `run` property cannot retarget execution.
+      const originalRunner = this.runner;
+      const originalRun = originalRunner.run;
+      if (typeof originalRun !== "function") throw new Error("Recovery continuation requires a Runner with a run function");
+      this.runner = Object.freeze({
+        run: (request: WorkerRequest): Promise<WorkerResult> => {
+          const guard = this.continuationDispatch;
+          const effective = guard === undefined ? request : guard(request);
+          return Reflect.apply(originalRun, originalRunner, [effective]) as Promise<WorkerResult>;
+        },
+      });
+      // Fix only this controller's own references and the roots of its
+      // internally created stores. The caller's runner object is not frozen.
+      for (const name of ["workspace", "storeRoot", "store", "library", "runner", "capabilities", "approvals", "approval", "recoveryInspector", "recoveryContinuation"] as const) {
+        const current: unknown = (this as unknown as Record<string, unknown>)[name];
+        Object.defineProperty(this, name, { value: current, writable: false, configurable: false, enumerable: true });
+      }
+      for (const owned of [this.store, this.library, this.capabilities, this.approvals] as const) {
+        const root = owned.root;
+        Object.defineProperty(owned, "root", { value: root, writable: false, configurable: false, enumerable: true });
+      }
+    }
   }
 
   async create(task: string, options: Partial<RunConfig> & { model: string }, creation?: RecoveryCreation): Promise<RunRecord> {
@@ -242,6 +426,7 @@ export class HarnessController {
       && record.snapshot === undefined;
   }
   async execute(id: string): Promise<RunRecord> {
+    if (this.continuationActive) throw new Error("Recovery continuation is active; ordinary execute is refused");
     await this.required(id);
     const release = await this.store.acquire(id);
     try {
@@ -258,6 +443,7 @@ export class HarnessController {
     } finally { await release(); }
   }
   async resume(id: string): Promise<RunRecord> {
+    if (this.continuationActive) throw new Error("Recovery continuation is active; ordinary resume is refused");
     await this.required(id);
     const release = await this.store.acquire(id);
     try {
@@ -320,18 +506,212 @@ export class HarnessController {
     if (readActualSignal(signal)) throw new Error("Recovery inspection signal aborted after lease release");
   }
 
-  private async executeLocked(record: RunRecord): Promise<RunRecord> {
+  /**
+   * One actual lease, exact CAS commit, then the original execution path.
+   * Trusted host hooks only supply currentness and settlement observations;
+   * this method exposes no lease, token, mutable record or release authority.
+   */
+  async continueWithRecoveryLease(id: string, actualSignal: AbortSignal): Promise<RunRecord> {
+    const hooks = this.recoveryContinuation;
+    if (hooks === undefined) throw new Error("Recovery continuation is not configured; no lease was acquired");
+    if (typeof id !== "string") throw new Error("Recovery continuation requires a run id string");
+    try { this.store.runDir(id); }
+    catch { throw new Error("Recovery continuation requires a valid run id"); }
+    const signalRef = actualSignal;
+    if (readActualSignal(signalRef)) throw new Error("Recovery continuation signal is already aborted; no lease was acquired");
+    if (this.continuationActive) throw new Error("Recovery continuation is already active on this controller");
+    this.continuationActive = true;
+    const store = this.store;
+    const runId = id;
+    const refreshCurrent = async (): Promise<void> => {
+      await settleVoidHook(hooks.refreshCurrent(), "Recovery continuation refreshCurrent");
+    };
+    const revalidateCurrent = (): void => {
+      const result: unknown = hooks.revalidateCurrent();
+      if (result !== undefined) {
+        observeRefusedNativePromise(result);
+        throw new Error("Recovery continuation revalidateCurrent must return undefined synchronously");
+      }
+    };
+    const phase = {
+      prepareEntered: false,
+      prepareReturned: false,
+      commitEntered: false,
+      commitConfirmed: false,
+      executionEntered: false,
+      executionSettled: false,
+    };
+    let lease: RunStoreLease | undefined;
+    let view: HarnessRecoveryInspectionView | undefined;
+    let closed = false;
+    let record: RunRecord | undefined;
+    let deadline: number | undefined;
+    // Tagged wrappers because a hook may legitimately throw undefined/null.
+    let failure: { readonly value: unknown } | undefined;
+    let settledFailure: { readonly value: unknown } | undefined;
+    let releaseFailure: { readonly value: unknown } | undefined;
+    let lastClock = 0;
+    try {
+      lease = await store.acquireWithContext(runId);
+      const activeLease = lease;
+      view = Object.freeze({
+        runId,
+        ownerSha256: activeLease.ownerSha256,
+        assertCurrent: async (): Promise<void> => {
+          if (closed) throw new StoreConflictError(`Recovery continuation lease is no longer active: ${runId}`);
+          await activeLease.assertCurrent();
+          if (closed) throw new StoreConflictError(`Recovery continuation lease is no longer active: ${runId}`);
+        },
+      });
+      if (readActualSignal(signalRef)) throw new Error("Recovery continuation signal aborted before preparation");
+      await activeLease.assertCurrent();
+      if (readActualSignal(signalRef)) throw new Error("Recovery continuation signal aborted before preparation");
+      phase.prepareEntered = true;
+      const returned: unknown = hooks.prepare(view, signalRef);
+      const pending = settleNativePromise(returned);
+      if (pending === null) throw new Error("Recovery continuation prepare must return a genuine native Promise");
+      const resolved: unknown = await pending;
+      phase.prepareReturned = true;
+      const facts = ownedRecoveryCasFacts(resolved);
+      await refreshCurrent();
+      revalidateCurrent();
+      if (readActualSignal(signalRef)) throw new Error("Cancellation requested");
+      await activeLease.assertCurrent();
+      phase.commitEntered = true;
+      const committed = await store.commitRecoveryInterrupted(
+        activeLease,
+        runId,
+        facts.expectedRevision,
+        facts.expectedPrimarySha256,
+        facts.expectedCancelSha256,
+        signalRef,
+        refreshCurrent,
+        revalidateCurrent,
+      );
+      phase.commitConfirmed = true;
+      deadline = recoveryDeadline(committed);
+      await refreshCurrent();
+      const now = Date.now();
+      if (!Number.isSafeInteger(now) || now <= 0) throw new Error(`Recovery clock for ${runId} is not a safe positive time`);
+      if (now < lastClock) throw new Error(`Recovery clock moved backwards for ${runId}`);
+      lastClock = now;
+      assertRecoveryDeadline(committed, now);
+      if (now >= deadline) throw new Error(`Original recovery deadline expired for ${runId}`);
+      revalidateCurrent();
+      if (readActualSignal(signalRef)) throw new Error("Cancellation requested");
+      await activeLease.assertCurrent();
+      const control: RecoveryExecutionContinuation = {
+        signal: signalRef,
+        deadline,
+        revalidateCurrent,
+        lastClock,
+      };
+      // The fixed forwarding runner invokes this synchronously after the
+      // original stage_started/event awaits and immediately before each
+      // dispatch. No other continuation can cross it: execute/resume refuse
+      // while this instance's continuation latch is active.
+      this.continuationDispatch = (request: WorkerRequest): WorkerRequest => {
+        const remaining = this.assertContinuationCurrent(committed, control);
+        if (!Number.isFinite(request.timeoutMs) || request.timeoutMs <= 0) {
+          throw new Error("Recovery dispatch requires a positive finite worker timeout");
+        }
+        return request.timeoutMs > remaining ? { ...request, timeoutMs: remaining } : request;
+      };
+      phase.executionEntered = true;
+      try {
+        record = await this.executeLocked(committed, control);
+      } finally {
+        lastClock = control.lastClock;
+        this.continuationDispatch = undefined;
+        phase.executionSettled = true;
+      }
+    } catch (error) {
+      failure = { value: error };
+    }
+    if (phase.prepareEntered && view !== undefined && lease !== undefined) {
+      try {
+        const settledResult: unknown = hooks.settled(view, signalRef, Object.freeze({ ...phase }));
+        await settleVoidHook(settledResult, "Recovery continuation settled");
+      } catch (error) {
+        settledFailure = { value: error };
+      }
+    }
+    closed = true;
+    if (lease !== undefined) {
+      try { await lease.release(); }
+      catch (error) { releaseFailure = { value: error }; }
+    }
+    this.continuationActive = false;
+    if (failure !== undefined) throw failure.value;
+    if (settledFailure !== undefined) throw settledFailure.value;
+    if (releaseFailure !== undefined) throw releaseFailure.value;
+    if (record === undefined || deadline === undefined) throw new Error("Recovery continuation produced no original record");
+    // Final ACK: last owned clock and original min-deadline first, then the
+    // pure host seal, then the intrinsic signal so abort inside the seal wins.
+    const ackNow = Date.now();
+    if (!Number.isSafeInteger(ackNow) || ackNow <= 0) throw new Error(`Recovery clock for ${runId} is not a safe positive time`);
+    if (ackNow < lastClock) throw new Error(`Recovery clock moved backwards for ${runId}`);
+    lastClock = ackNow;
+    assertRecoveryDeadline(record, ackNow);
+    if (ackNow >= deadline) throw new Error(`Original recovery deadline expired for ${runId}`);
+    revalidateCurrent();
+    if (readActualSignal(signalRef)) throw new Error("Recovery continuation signal aborted after lease release");
+    return record;
+  }
+
+  private assertContinuationCurrent(record: RunRecord, continuation: RecoveryExecutionContinuation): number {
+    // One owned clock reading; every deadline/window decision precedes the
+    // pure host seal and the final intrinsic signal check.
+    const now = Date.now();
+    if (!Number.isSafeInteger(now) || now <= 0) throw new Error(`Recovery clock for ${record.id} is not a safe positive time`);
+    if (now < continuation.lastClock) throw new Error(`Recovery clock moved backwards for ${record.id}`);
+    continuation.lastClock = now;
+    assertRecoveryDeadline(record, now);
+    if (now >= continuation.deadline) throw new Error(`Original recovery deadline expired for ${record.id}`);
+    continuation.revalidateCurrent();
+    if (readActualSignal(continuation.signal)) throw new Error("Cancellation requested");
+    return continuation.deadline - now;
+  }
+
+  private async executeLocked(record: RunRecord, continuation?: RecoveryExecutionContinuation): Promise<RunRecord> {
     if (["completed", "applied"].includes(record.status)) return record;
+    if (continuation !== undefined) this.assertContinuationCurrent(record, continuation);
     const abort = new AbortController();
+    const external = continuation?.signal;
+    const onExternalAbort = (): void => { abort.abort(new Error("Cancellation requested")); };
+    let listenerInstalled = false;
     const checkCancel = async () => {
       try { await lstat(this.cancelPath(record.id)); abort.abort(new Error("Cancellation requested")); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") abort.abort(error); }
     };
-    await checkCancel();
-    const timer = setInterval(() => { void checkCancel(); }, 100);
+    let timer: ReturnType<typeof setInterval> | undefined;
+    let deadlineTimer: ReturnType<typeof setTimeout> | undefined;
     try {
+      if (external !== undefined) {
+        // Join the actual external signal before the first await, then recheck
+        // the intrinsic getter immediately in case abort raced the install.
+        if (readActualSignal(external)) abort.abort(new Error("Cancellation requested"));
+        else {
+          if (SIGNAL_ADD_EVENT_LISTENER === undefined || SIGNAL_REMOVE_EVENT_LISTENER === undefined) {
+            throw new Error("Recovery continuation requires native AbortSignal listeners");
+          }
+          Reflect.apply(SIGNAL_ADD_EVENT_LISTENER, external, ["abort", onExternalAbort]);
+          listenerInstalled = true;
+          if (readActualSignal(external)) abort.abort(new Error("Cancellation requested"));
+        }
+      }
+      if (continuation !== undefined) {
+        const remaining = continuation.deadline - Date.now();
+        if (remaining <= 0) throw new Error(`Original recovery deadline expired for ${record.id}`);
+        // Bounded original-deadline abort; it never renews or extends duration.
+        deadlineTimer = setTimeout(() => { abort.abort(new Error("Original recovery deadline expired")); }, remaining);
+        (deadlineTimer as { unref?: () => void }).unref?.();
+      }
+      await checkCancel();
+      timer = setInterval(() => { void checkCancel(); }, 100);
       if (abort.signal.aborted) throw new Error("Cancellation requested");
       await this.assertNoOrphanWorkers(record);
+      if (continuation !== undefined) this.assertContinuationCurrent(record, continuation);
       record.status = "running";
       delete record.error;
       await this.save(record);
@@ -341,6 +721,7 @@ export class HarnessController {
         await this.save(record);
         await this.event(record, "snapshot", `Frozen ${record.snapshot.files.length} files; excluded ${record.snapshot.excludedPaths?.length ?? 0} paths`);
       }
+      if (continuation !== undefined) this.assertContinuationCurrent(record, continuation);
       if (record.config.strategy === "adaptive") await executeEvolution({ record, runner: this.runner, root: this.store.runDir(record.id), registry: this.capabilities, save: () => this.save(record), signal: abort.signal, ...(record.config.execution === undefined ? {} : { execution: record.config.execution }), approval: this.approval ?? this.approvals.handler(Date.parse(record.createdAt) + record.config.maxDurationMs) });
       else if ((record.config.strategy ?? "legacy") === "legacy") await this.executeLegacy(record, abort.signal);
       else await this.executeAdaptive(record, abort.signal);
@@ -348,10 +729,12 @@ export class HarnessController {
       const adopted = record.stages[record.winner!]!.harness!;
       await checkCancel();
       if (abort.signal.aborted) throw new Error("Cancellation requested before publishing experience");
+      if (continuation !== undefined) this.assertContinuationCurrent(record, continuation);
       if (record.lesson) {
         await this.library.add({ schemaVersion: 1, id: record.id, runId: record.id, domain: record.config.domain,
           model: record.config.model, createdAt: record.createdAt, harness: adopted, lesson: record.lesson });
       }
+      if (continuation !== undefined) this.assertContinuationCurrent(record, continuation);
       record.status = "completed";
       await this.save(record);
       await this.event(record, "completed", `Selected ${record.winner}; changes await explicit apply`);
@@ -360,7 +743,15 @@ export class HarnessController {
       record.error = error instanceof Error ? error.message.slice(0, 2000) : "Unknown execution error";
       await this.save(record);
       await this.event(record, record.status, record.error);
-    } finally { clearInterval(timer); }
+    } finally {
+      if (timer !== undefined) clearInterval(timer);
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      // Remove the external listener after the runner and execution settle,
+      // even when the initial cancellation check itself throws.
+      if (listenerInstalled && external !== undefined && SIGNAL_REMOVE_EVENT_LISTENER !== undefined) {
+        Reflect.apply(SIGNAL_REMOVE_EVENT_LISTENER, external, ["abort", onExternalAbort]);
+      }
+    }
     return record;
   }
 

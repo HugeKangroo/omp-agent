@@ -5,9 +5,11 @@ import path from "node:path";
 import {
   NATIVE_HARNESS_ACCOUNTING_MAX_BYTES,
   NATIVE_HARNESS_ACCOUNTING_SCHEMA,
+  NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2,
   NATIVE_HARNESS_ACCOUNTING_TRANSITION_SCHEMA,
   NativeHarnessAccountingError,
   createNativeHarnessAccountingOwner,
+  createNativeHarnessRecoveryAccountingOwner,
   decodeNativeHarnessAccountingText,
   observeNativeHarnessAccountingOwner,
   openNativeHarnessAccountingOwner,
@@ -20,7 +22,7 @@ import {
   type NativeHarnessAccountingSettlement,
 } from "../../src/native-harness-accounting.ts";
 import type { NativeHarnessDelegationLimits } from "../../src/native-harness-delegation.ts";
-import { nodeFileIo, type NativeFileIo } from "../../src/native-work.ts";
+import { nodeFileIo, sha256Hex, type NativeFileIo } from "../../src/native-work.ts";
 
 const OWNER = "11111111-1111-4111-8111-111111111111";
 const SELECTOR = "a".repeat(64);
@@ -771,6 +773,74 @@ describe("native accounting readonly discovery", () => {
     const reopened = await openOwner(root, { ownerId: observed.identity.ownerId });
     expect(reopened.snapshot()).toEqual(handle.snapshot());
     expect(await primaryText(root)).toBe(before);
+  });
+
+  test("observes the exact raw primary SHA-256 and byte count from that single read", async () => {
+    const root = await makeRoot();
+    const handle = await createOwner(root);
+    const raw = await readFile(primaryPath(root));
+    const statBefore = await stat(primaryPath(root));
+    const entriesBefore = await readdir(ownerDir(root));
+
+    const observed = await observeNativeHarnessAccountingOwner({
+      storageRoot: root,
+      selectorSha256: SELECTOR,
+    });
+
+    expect(observed.identity).toEqual(IDENTITY);
+    expect(observed.checkpoint).toEqual(handle.snapshot());
+    expect(observed.primarySha256).toBe(sha256Hex(raw));
+    expect(observed.primaryBytes).toBe(raw.length);
+    expect(Object.isFrozen(observed)).toBe(true);
+    expect((await readFile(primaryPath(root))).equals(raw)).toBe(true);
+    const statAfter = await stat(primaryPath(root));
+    expect(statAfter.dev).toBe(statBefore.dev);
+    expect(statAfter.ino).toBe(statBefore.ino);
+    expect(statAfter.mtimeMs).toBe(statBefore.mtimeMs);
+    expect(await readdir(ownerDir(root))).toEqual(entriesBefore);
+  });
+
+  test("returns raw primary facts for an existing V2 owner", async () => {
+    const root = await makeRoot();
+    const handle = await createNativeHarnessRecoveryAccountingOwner({
+      storageRoot: root,
+      selectorSha256: SELECTOR,
+      ownerId: OWNER,
+      createdAt: CREATED_AT,
+      limitsText: LIMITS_TEXT,
+    });
+    const raw = await readFile(primaryPath(root));
+
+    const observed = await observeNativeHarnessAccountingOwner({
+      storageRoot: root,
+      selectorSha256: SELECTOR,
+    });
+
+    expect(observed.checkpoint.schema).toBe(NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2);
+    expect(observed.checkpoint).toEqual(handle.snapshot());
+    expect(observed.primarySha256).toBe(sha256Hex(raw));
+    expect(observed.primaryBytes).toBe(raw.length);
+  });
+
+  test("raw SHA follows whitespace while the decoded checkpoint stays equal", async () => {
+    const root = await makeRoot();
+    const handle = await createOwner(root);
+    const original = await readFile(primaryPath(root), "utf8");
+    const compact = `${JSON.stringify(JSON.parse(original))}\n`;
+    expect(compact).not.toBe(original);
+    expect(decodeRaw(compact)).toEqual(handle.snapshot());
+    await writeFile(primaryPath(root), compact, "utf8");
+
+    const observed = await observeNativeHarnessAccountingOwner({
+      storageRoot: root,
+      selectorSha256: SELECTOR,
+    });
+
+    expect(observed.checkpoint).toEqual(handle.snapshot());
+    expect(observed.primarySha256).toBe(sha256Hex(Buffer.from(compact, "utf8")));
+    expect(observed.primarySha256).not.toBe(sha256Hex(Buffer.from(original, "utf8")));
+    expect(observed.primaryBytes).toBe(Buffer.byteLength(compact, "utf8"));
+    expect(observed.primaryBytes).not.toBe(Buffer.byteLength(original, "utf8"));
   });
 
   test("missing and partial owners refuse without creating anything", async () => {
