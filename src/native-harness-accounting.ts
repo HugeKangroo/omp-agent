@@ -31,10 +31,22 @@ import {
 export const NATIVE_HARNESS_ACCOUNTING_SCHEMA = "omp-agent.native-harness-accounting.v1";
 export const NATIVE_HARNESS_ACCOUNTING_TRANSITION_SCHEMA =
   "omp-agent.native-harness-accounting-transition.v1";
+export const NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2 = "omp-agent.native-harness-accounting.v2";
+export const NATIVE_HARNESS_ACCOUNTING_RECOVERY_TRANSITION_SCHEMA =
+  "omp-agent.native-harness-accounting-transition.v2";
 export const NATIVE_HARNESS_ACCOUNTING_MAX_BYTES = 65_536;
 
 const MAX_RETENTION = 16;
 const MAX_POINTS = 33;
+const MAX_RECOVERY_CLAIMS = 8;
+const MAX_RECOVERY_FINISHES = 8;
+const MAX_RECOVERY_COST_OBSERVATIONS = 64;
+const MAX_RECOVERY_EVENTS = 80;
+const MAX_RECOVERY_ACTIONS = 16 + 16 + 16 + 16 + 1 + MAX_RECOVERY_EVENTS;
+const RECOVERY_EVENT_RESERVE_BYTES = 512;
+const RECOVERY_SETTLEMENT_RESERVE_BYTES = 256;
+const RECOVERY_BLOCK_RESERVE_BYTES = 256;
+const RECOVERY_FORMAT_RESERVE_BYTES = 64;
 const USD_EPSILON = 1e-9;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -78,6 +90,34 @@ const PREPARED_KEYS = [
 ] as const;
 const SETTLEMENT_KEYS = ["revision", "mode", "observedUsd", "concurrencyHeld"] as const;
 const BUDGET_BLOCK_KEYS = ["admissionId", "revision", "reason"] as const;
+const RECOVERY_CHECKPOINT_KEYS = [...CHECKPOINT_KEYS, "events"] as const;
+const RECOVERY_ADMISSION_KEYS = [...ADMISSION_KEYS, "preparedRevision", "runRevision"] as const;
+const CLAIM_EVENT_KEYS = [
+  "revision",
+  "kind",
+  "admissionId",
+  "continuationId",
+  "predecessorId",
+  "claimedAt",
+] as const;
+const FINISH_EVENT_KEYS = [
+  "revision",
+  "kind",
+  "admissionId",
+  "continuationId",
+  "mode",
+  "observedUsd",
+  "concurrencyHeld",
+] as const;
+const OBSERVE_COST_EVENT_KEYS = [
+  "revision",
+  "kind",
+  "admissionId",
+  "continuationId",
+  "observationId",
+  "observedUsd",
+  "workerOverspend",
+] as const;
 
 export type NativeHarnessAccountingErrorCode =
   | "invalid-input"
@@ -140,7 +180,7 @@ export interface NativeHarnessAccountingBudgetBlock {
   readonly reason: "observed-worker-overspend";
 }
 
-export interface NativeHarnessAccountingCheckpoint {
+export interface NativeHarnessAccountingV1Checkpoint {
   readonly schema: typeof NATIVE_HARNESS_ACCOUNTING_SCHEMA;
   readonly revision: number;
   readonly ownerId: string;
@@ -150,6 +190,66 @@ export interface NativeHarnessAccountingCheckpoint {
   readonly budgetBlock: NativeHarnessAccountingBudgetBlock | null;
   readonly admissions: readonly NativeHarnessAccountingAdmission[];
 }
+
+export interface NativeHarnessRecoveryAccountingAdmission extends NativeHarnessAccountingAdmission {
+  /** Revision consumed by the original bindPrepared, or null before it. */
+  readonly preparedRevision: number | null;
+  /** Revision consumed by the original bindRun, or null before it. */
+  readonly runRevision: number | null;
+}
+
+export interface NativeHarnessAccountingClaimEvent {
+  readonly revision: number;
+  readonly kind: "claim";
+  readonly admissionId: string;
+  readonly continuationId: string;
+  readonly predecessorId: string | null;
+  readonly claimedAt: number;
+}
+
+export interface NativeHarnessAccountingFinishEvent {
+  readonly revision: number;
+  readonly kind: "finish";
+  readonly admissionId: string;
+  readonly continuationId: string;
+  readonly mode: "known" | "unknown";
+  readonly observedUsd: number | null;
+  readonly concurrencyHeld: boolean;
+}
+
+export interface NativeHarnessAccountingObserveCostEvent {
+  readonly revision: number;
+  readonly kind: "observe-cost";
+  readonly admissionId: string;
+  readonly continuationId: string | null;
+  readonly observationId: string;
+  readonly observedUsd: number;
+  readonly workerOverspend: boolean;
+}
+
+export type NativeHarnessAccountingContinuationEvent =
+  | NativeHarnessAccountingClaimEvent
+  | NativeHarnessAccountingFinishEvent
+  | NativeHarnessAccountingObserveCostEvent;
+
+export interface NativeHarnessRecoveryAccountingCheckpoint {
+  readonly schema: typeof NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2;
+  readonly revision: number;
+  readonly ownerId: string;
+  readonly selectorSha256: string;
+  readonly createdAt: number;
+  readonly limits: NativeHarnessDelegationLimits;
+  readonly budgetBlock: NativeHarnessAccountingBudgetBlock | null;
+  readonly admissions: readonly NativeHarnessRecoveryAccountingAdmission[];
+  readonly events: readonly NativeHarnessAccountingContinuationEvent[];
+}
+
+/** Strict discriminated union returned by generic open/decode/observe. */
+export type NativeHarnessAccountingCheckpoint =
+  | NativeHarnessAccountingV1Checkpoint
+  | NativeHarnessRecoveryAccountingCheckpoint;
+
+type NativeHarnessAccountingAnyCheckpoint = NativeHarnessAccountingCheckpoint;
 
 export interface NativeHarnessAccountingProjection {
   readonly accountedUsd: number;
@@ -213,6 +313,21 @@ export interface NativeHarnessAccountingHandle {
   close(): void;
 }
 
+/**
+ * V2 handle returned by explicit recovery-owner creation. Generic open
+ * returns NativeHarnessAccountingHandle whose snapshot/commit expose the
+ * discriminated V1|V2 union; an already-stored V2 primary keeps the same V2
+ * methods at runtime, and generic observe/decode expose that same union.
+ */
+export interface NativeHarnessRecoveryAccountingHandle {
+  snapshot(): NativeHarnessRecoveryAccountingCheckpoint;
+  commit(
+    expectedRevision: number,
+    transitionText: string,
+  ): Promise<NativeHarnessRecoveryAccountingCheckpoint>;
+  close(): void;
+}
+
 interface PinnedDirectory {
   readonly path: string;
   readonly dev: bigint;
@@ -268,6 +383,38 @@ type ParsedTransition =
   | ParsedBindRunTransition
   | ParsedSettleTransition
   | ParsedBlockBudgetTransition;
+
+interface ParsedClaimContinuationTransition {
+  readonly action: "claimContinuation";
+  readonly admissionId: string;
+  readonly continuationId: string;
+  readonly predecessorId: string | null;
+  readonly claimedAt: number;
+}
+
+interface ParsedFinishContinuationTransition {
+  readonly action: "finishContinuation";
+  readonly admissionId: string;
+  readonly continuationId: string;
+  readonly mode: "known" | "unknown";
+  readonly observedUsd: number | null;
+  readonly concurrencyHeld: boolean;
+}
+
+interface ParsedObserveCostTransition {
+  readonly action: "observeCost";
+  readonly admissionId: string;
+  readonly continuationId: string | null;
+  readonly observationId: string;
+  readonly observedUsd: number;
+  readonly workerOverspend: boolean;
+}
+
+type ParsedRecoveryTransition =
+  | ParsedTransition
+  | ParsedClaimContinuationTransition
+  | ParsedFinishContinuationTransition
+  | ParsedObserveCostTransition;
 
 function fail(code: NativeHarnessAccountingErrorCode, message: string): never {
   throw new NativeHarnessAccountingError(message, code);
@@ -524,7 +671,7 @@ function readBudgetBlock(value: unknown, checkpointRevision: number): NativeHarn
   return Object.freeze({ admissionId, revision, reason: "observed-worker-overspend" as const });
 }
 
-function readCheckpoint(value: unknown): NativeHarnessAccountingCheckpoint {
+function readCheckpoint(value: unknown): NativeHarnessAccountingV1Checkpoint {
   const record = plainRecord(value, "accounting checkpoint");
   requireExactKeys(record, CHECKPOINT_KEYS, "accounting checkpoint");
   if (record.schema !== NATIVE_HARNESS_ACCOUNTING_SCHEMA) {
@@ -654,11 +801,305 @@ function readCheckpoint(value: unknown): NativeHarnessAccountingCheckpoint {
   });
 }
 
+function readClaimEvent(
+  value: unknown,
+  label: string,
+  checkpointRevision: number,
+): NativeHarnessAccountingClaimEvent {
+  const record = plainRecord(value, label);
+  requireExactKeys(record, CLAIM_EVENT_KEYS, label);
+  const revision = readSafeInteger(record.revision, `${label}.revision`, 1);
+  if (revision > checkpointRevision) fail("corrupt", `${label}.revision must be within the checkpoint.`);
+  if (record.kind !== "claim") fail("corrupt", `${label}.kind must be claim.`);
+  const predecessorId = record.predecessorId === null
+    ? null
+    : readUuid(record.predecessorId, `${label}.predecessorId`);
+  return Object.freeze({
+    revision,
+    kind: "claim" as const,
+    admissionId: readUuid(record.admissionId, `${label}.admissionId`),
+    continuationId: readUuid(record.continuationId, `${label}.continuationId`),
+    predecessorId,
+    claimedAt: readSafeInteger(record.claimedAt, `${label}.claimedAt`, 1),
+  });
+}
+
+function readFinishEvent(
+  value: unknown,
+  label: string,
+  checkpointRevision: number,
+): NativeHarnessAccountingFinishEvent {
+  const record = plainRecord(value, label);
+  requireExactKeys(record, FINISH_EVENT_KEYS, label);
+  const revision = readSafeInteger(record.revision, `${label}.revision`, 1);
+  if (revision > checkpointRevision) fail("corrupt", `${label}.revision must be within the checkpoint.`);
+  if (record.kind !== "finish") fail("corrupt", `${label}.kind must be finish.`);
+  const mode = readSettlementMode(record.mode, label);
+  if (mode === "no-dispatch") fail("corrupt", `${label}.mode must be known or unknown.`);
+  const observedUsd = record.observedUsd === null
+    ? null
+    : readNonNegativeUsd(record.observedUsd, `${label}.observedUsd`);
+  if (typeof record.concurrencyHeld !== "boolean") {
+    fail("corrupt", `${label}.concurrencyHeld must be a boolean.`);
+  }
+  return Object.freeze({
+    revision,
+    kind: "finish" as const,
+    admissionId: readUuid(record.admissionId, `${label}.admissionId`),
+    continuationId: readUuid(record.continuationId, `${label}.continuationId`),
+    mode,
+    observedUsd,
+    concurrencyHeld: record.concurrencyHeld,
+  });
+}
+
+function readObserveCostEvent(
+  value: unknown,
+  label: string,
+  checkpointRevision: number,
+): NativeHarnessAccountingObserveCostEvent {
+  const record = plainRecord(value, label);
+  requireExactKeys(record, OBSERVE_COST_EVENT_KEYS, label);
+  const revision = readSafeInteger(record.revision, `${label}.revision`, 1);
+  if (revision > checkpointRevision) fail("corrupt", `${label}.revision must be within the checkpoint.`);
+  if (record.kind !== "observe-cost") fail("corrupt", `${label}.kind must be observe-cost.`);
+  if (typeof record.workerOverspend !== "boolean") {
+    fail("corrupt", `${label}.workerOverspend must be a boolean.`);
+  }
+  return Object.freeze({
+    revision,
+    kind: "observe-cost" as const,
+    admissionId: readUuid(record.admissionId, `${label}.admissionId`),
+    continuationId: record.continuationId === null
+      ? null
+      : readUuid(record.continuationId, `${label}.continuationId`),
+    observationId: readUuid(record.observationId, `${label}.observationId`),
+    observedUsd: readNonNegativeUsd(record.observedUsd, `${label}.observedUsd`),
+    workerOverspend: record.workerOverspend,
+  });
+}
+
+function readRecoveryEvent(
+  value: unknown,
+  label: string,
+  checkpointRevision: number,
+): NativeHarnessAccountingContinuationEvent {
+  const record = plainRecord(value, label);
+  if (record.kind === "claim") return readClaimEvent(record, label, checkpointRevision);
+  if (record.kind === "finish") return readFinishEvent(record, label, checkpointRevision);
+  if (record.kind === "observe-cost") return readObserveCostEvent(record, label, checkpointRevision);
+  fail("corrupt", `${label}.kind is not a continuation event kind.`);
+}
+
+function readCheckpointV2(value: unknown): NativeHarnessRecoveryAccountingCheckpoint {
+  const record = plainRecord(value, "recovery accounting checkpoint");
+  requireExactKeys(record, RECOVERY_CHECKPOINT_KEYS, "recovery accounting checkpoint");
+  if (record.schema !== NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2) {
+    fail("corrupt", "accounting checkpoint schema is not v2.");
+  }
+  const revision = readSafeInteger(record.revision, "revision", 0);
+  if (revision > MAX_RECOVERY_ACTIONS) {
+    fail("corrupt", `recovery accounting revision must not exceed ${MAX_RECOVERY_ACTIONS}.`);
+  }
+  const ownerId = readUuid(record.ownerId, "ownerId");
+  const selectorSha256 = readSha256(record.selectorSha256, "selectorSha256");
+  const createdAt = readSafeInteger(record.createdAt, "createdAt", 1);
+  const limits = readLimits(record.limits);
+  const rawAdmissions = readArray(record.admissions, "admissions");
+  const maxRows = Math.min(MAX_RETENTION, limits.maxRetainedOperations);
+  if (rawAdmissions.length > maxRows) {
+    fail("corrupt", `admissions must not exceed ${maxRows} rows.`);
+  }
+
+  const admissions: NativeHarnessRecoveryAccountingAdmission[] = [];
+  const admissionIds = new Set<string>();
+  const runIds = new Set<string>();
+  const actionRevisions: number[] = [];
+  let previousReserveRevision = 0;
+
+  for (let index = 0; index < rawAdmissions.length; index += 1) {
+    const label = `admissions[${index}]`;
+    const row = plainRecord(rawAdmissions[index], label);
+    requireExactKeys(row, RECOVERY_ADMISSION_KEYS, label);
+    const admissionId = readUuid(row.admissionId, `${label}.admissionId`);
+    if (admissionIds.has(admissionId)) fail("corrupt", `${label}.admissionId is not unique.`);
+    admissionIds.add(admissionId);
+    const sourceAssociationSha256 = readSha256(
+      row.sourceAssociationSha256,
+      `${label}.sourceAssociationSha256`,
+    );
+    const admittedAt = readSafeInteger(row.admittedAt, `${label}.admittedAt`, 1);
+    const deadlineAt = readSafeRangeNumber(row.deadlineAt, `${label}.deadlineAt`);
+    if (!(deadlineAt > admittedAt) || deadlineAt !== admittedAt + limits.maxDurationMs) {
+      fail("corrupt", `${label}.deadlineAt must be admittedAt + limits.maxDurationMs and later.`);
+    }
+    const allocatedUsd = readSafeRangeNumber(row.allocatedUsd, `${label}.allocatedUsd`);
+    if (allocatedUsd !== limits.perRunUsd) {
+      fail("corrupt", `${label}.allocatedUsd must equal limits.perRunUsd.`);
+    }
+    const reserveRevision = readSafeInteger(row.reserveRevision, `${label}.reserveRevision`, 1);
+    if (reserveRevision > revision || reserveRevision <= previousReserveRevision) {
+      fail("corrupt", `${label}.reserveRevision must increase with row creation and stay within the checkpoint.`);
+    }
+    previousReserveRevision = reserveRevision;
+    const prepared = row.prepared === null ? null : readPrepared(row.prepared, `${label}.prepared`);
+    const preparedRevision = row.preparedRevision === null
+      ? null
+      : readSafeInteger(row.preparedRevision, `${label}.preparedRevision`, 1);
+    if ((prepared === null) !== (preparedRevision === null)) {
+      fail("corrupt", `${label}.prepared and preparedRevision must both be null or both be set.`);
+    }
+    if (preparedRevision !== null && preparedRevision <= reserveRevision) {
+      fail("corrupt", `${label}.preparedRevision must follow the reservation.`);
+    }
+    const runId = row.runId === null ? null : readUuid(row.runId, `${label}.runId`);
+    const runRevision = row.runRevision === null
+      ? null
+      : readSafeInteger(row.runRevision, `${label}.runRevision`, 1);
+    if ((runId === null) !== (runRevision === null)) {
+      fail("corrupt", `${label}.runId and runRevision must both be null or both be set.`);
+    }
+    if (runId !== null) {
+      if (prepared === null || preparedRevision === null) {
+        fail("corrupt", `${label}.runId requires prepared metadata.`);
+      }
+      if (runRevision! <= preparedRevision) {
+        fail("corrupt", `${label}.runRevision must follow preparedRevision.`);
+      }
+      if (runIds.has(runId)) fail("corrupt", `${label}.runId is not unique for this owner.`);
+      runIds.add(runId);
+    }
+    const settlement = row.settlement === null
+      ? null
+      : readSettlement(row.settlement, `${label}.settlement`, { runId, reserveRevision }, revision);
+    if (settlement !== null) {
+      if (preparedRevision !== null && settlement.revision <= preparedRevision) {
+        fail("corrupt", `${label}.settlement.revision must follow preparedRevision.`);
+      }
+      if (runRevision !== null && settlement.revision <= runRevision) {
+        fail("corrupt", `${label}.settlement.revision must follow runRevision.`);
+      }
+    }
+    actionRevisions.push(reserveRevision);
+    if (preparedRevision !== null) actionRevisions.push(preparedRevision);
+    if (runRevision !== null) actionRevisions.push(runRevision);
+    if (settlement !== null) actionRevisions.push(settlement.revision);
+    admissions.push(Object.freeze({
+      admissionId,
+      sourceAssociationSha256,
+      admittedAt,
+      deadlineAt,
+      allocatedUsd,
+      reserveRevision,
+      prepared,
+      runId,
+      settlement,
+      preparedRevision,
+      runRevision,
+    }));
+  }
+
+  const budgetBlock = record.budgetBlock === null
+    ? null
+    : readBudgetBlock(record.budgetBlock, revision);
+  if (budgetBlock !== null) {
+    actionRevisions.push(budgetBlock.revision);
+    const row = admissions.find((candidate) => candidate.admissionId === budgetBlock.admissionId);
+    if (row === undefined) fail("corrupt", "budgetBlock must reference an existing admission.");
+    if (budgetBlock.revision <= row.reserveRevision) {
+      fail("corrupt", "budgetBlock must follow the referenced reservation.");
+    }
+    if (row.settlement !== null && budgetBlock.revision >= row.settlement.revision) {
+      fail("corrupt", "budgetBlock must precede the referenced settlement.");
+    }
+  }
+
+  const rawEvents = readArray(record.events, "events");
+  if (rawEvents.length > MAX_RECOVERY_EVENTS) {
+    fail("corrupt", `events must not exceed ${MAX_RECOVERY_EVENTS} rows.`);
+  }
+  const events: NativeHarnessAccountingContinuationEvent[] = [];
+  const claimIds = new Set<string>();
+  const observationIds = new Set<string>();
+  let claims = 0;
+  let finishes = 0;
+  let costs = 0;
+  let previousEventRevision = 0;
+  for (let index = 0; index < rawEvents.length; index += 1) {
+    const label = `events[${index}]`;
+    const event = readRecoveryEvent(rawEvents[index], label, revision);
+    if (event.revision <= previousEventRevision) {
+      fail("corrupt", "events must have strictly increasing revisions.");
+    }
+    previousEventRevision = event.revision;
+    if (event.kind === "claim") {
+      claims += 1;
+      if (claims > MAX_RECOVERY_CLAIMS) fail("corrupt", `claim events must not exceed ${MAX_RECOVERY_CLAIMS}.`);
+      if (claimIds.has(event.continuationId)) {
+        fail("corrupt", `${label}.continuationId is not unique for this owner.`);
+      }
+      claimIds.add(event.continuationId);
+    } else if (event.kind === "finish") {
+      finishes += 1;
+      if (finishes > MAX_RECOVERY_FINISHES) {
+        fail("corrupt", `finish events must not exceed ${MAX_RECOVERY_FINISHES}.`);
+      }
+    } else {
+      costs += 1;
+      if (costs > MAX_RECOVERY_COST_OBSERVATIONS) {
+        fail("corrupt", `observe-cost events must not exceed ${MAX_RECOVERY_COST_OBSERVATIONS}.`);
+      }
+      if (observationIds.has(event.observationId)) {
+        fail("corrupt", `${label}.observationId is not unique for this owner.`);
+      }
+      observationIds.add(event.observationId);
+    }
+    actionRevisions.push(event.revision);
+    events.push(event);
+  }
+
+  if (actionRevisions.length !== revision) {
+    fail("corrupt", "recovery accounting revision must equal the exact owned action count.");
+  }
+  const sortedRevisions = [...actionRevisions].sort((left, right) => left - right);
+  for (let index = 0; index < sortedRevisions.length; index += 1) {
+    if (sortedRevisions[index] !== index + 1) {
+      fail("corrupt", "recovery accounting revisions must be contiguous with no collisions or gaps.");
+    }
+  }
+  if (admissions.length === 0 && revision !== 0) {
+    fail("corrupt", "An empty recovery checkpoint must be revision 0.");
+  }
+  if (admissions.length > 0 && admissions[0]!.reserveRevision !== 1) {
+    fail("corrupt", "The first recovery reservation must use revision 1.");
+  }
+
+  return deepFreeze({
+    schema: NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2,
+    revision,
+    ownerId,
+    selectorSha256,
+    createdAt,
+    limits,
+    budgetBlock,
+    admissions: Object.freeze(admissions),
+    events: Object.freeze(events),
+  });
+}
+
+function readAnyCheckpoint(value: unknown): NativeHarnessAccountingAnyCheckpoint {
+  const record = plainRecord(value, "accounting checkpoint");
+  if (record.schema === NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2) {
+    return readCheckpointV2(record);
+  }
+  return readCheckpoint(record);
+}
+
 function money(value: number): number {
   return Math.round(value * 1e9) / 1e9;
 }
 
-function projectCheckpoint(checkpoint: NativeHarnessAccountingCheckpoint): NativeHarnessAccountingProjection {
+function projectCheckpoint(checkpoint: NativeHarnessAccountingV1Checkpoint): NativeHarnessAccountingProjection {
   type Point =
     | { readonly kind: "reserve"; readonly revision: number; readonly row: NativeHarnessAccountingAdmission }
     | {
@@ -785,6 +1226,510 @@ function projectCheckpoint(checkpoint: NativeHarnessAccountingCheckpoint): Nativ
   });
 }
 
+interface RecoveryAdmissionState {
+  readonly row: NativeHarnessRecoveryAccountingAdmission;
+  highwater: number;
+  unknownSticky: boolean;
+  occupancyHeld: boolean;
+  reserveCovered: boolean;
+  originalSettled: boolean;
+  preparedBoundRevision: number | null;
+  runBoundRevision: number | null;
+  readonly claimIds: Set<string>;
+  claimCount: number;
+  latestClaimId: string | null;
+  latestClaimAt: number | null;
+  latestClaimOpen: boolean;
+}
+
+interface RecoveryReplay {
+  readonly states: RecoveryAdmissionState[];
+  readonly byId: Map<string, RecoveryAdmissionState>;
+  claims: number;
+  finishes: number;
+  costs: number;
+  observationIds: Set<string>;
+  workerOverspend: boolean;
+  sawBudgetBlock: boolean;
+  lifetimeExceeded: boolean;
+}
+
+type RecoveryPoint =
+  | { readonly kind: "reserve"; readonly revision: number; readonly row: NativeHarnessRecoveryAccountingAdmission }
+  | { readonly kind: "bind-prepared"; readonly revision: number; readonly row: NativeHarnessRecoveryAccountingAdmission }
+  | { readonly kind: "bind-run"; readonly revision: number; readonly row: NativeHarnessRecoveryAccountingAdmission }
+  | { readonly kind: "settle"; readonly revision: number; readonly row: NativeHarnessRecoveryAccountingAdmission }
+  | { readonly kind: "block"; readonly revision: number }
+  | { readonly kind: "claim"; readonly revision: number; readonly event: NativeHarnessAccountingClaimEvent }
+  | { readonly kind: "finish"; readonly revision: number; readonly event: NativeHarnessAccountingFinishEvent }
+  | { readonly kind: "observe"; readonly revision: number; readonly event: NativeHarnessAccountingObserveCostEvent };
+
+function recoveryContribution(state: RecoveryAdmissionState): number {
+  const allocation = state.row.allocatedUsd;
+  return state.reserveCovered ? Math.max(allocation, state.highwater) : state.highwater;
+}
+
+function recoveryTotals(replay: RecoveryReplay): {
+  readonly accountedUsd: number;
+  readonly observedUsd: number;
+  readonly unknownUsd: number;
+  readonly overspendUsd: number;
+  readonly activeOperations: number;
+} {
+  let accountedUsd = 0;
+  let observedUsd = 0;
+  let unknownUsd = 0;
+  let overspendUsd = 0;
+  let activeOperations = 0;
+  for (const state of replay.states) {
+    const allocation = state.row.allocatedUsd;
+    accountedUsd += recoveryContribution(state);
+    observedUsd += state.highwater;
+    if (state.unknownSticky) unknownUsd += allocation;
+    if (state.highwater > allocation) overspendUsd += state.highwater - allocation;
+    if (state.occupancyHeld) activeOperations += 1;
+  }
+  return { accountedUsd, observedUsd, unknownUsd, overspendUsd, activeOperations };
+}
+
+function recoveryBudgetBlocked(
+  replay: RecoveryReplay,
+  checkpoint: NativeHarnessRecoveryAccountingCheckpoint,
+): boolean {
+  if (replay.sawBudgetBlock || replay.workerOverspend || replay.lifetimeExceeded) return true;
+  const totals = recoveryTotals(replay);
+  if (totals.accountedUsd > checkpoint.limits.lifetimeUsd + USD_EPSILON) return true;
+  return replay.states.some((state) => state.highwater > state.row.allocatedUsd);
+}
+
+function recordRecoveryLifetime(
+  replay: RecoveryReplay,
+  checkpoint: NativeHarnessRecoveryAccountingCheckpoint,
+): void {
+  if (recoveryTotals(replay).accountedUsd > checkpoint.limits.lifetimeUsd + USD_EPSILON) {
+    replay.lifetimeExceeded = true;
+  }
+}
+
+function replayRecoveryCheckpoint(
+  checkpoint: NativeHarnessRecoveryAccountingCheckpoint,
+): RecoveryReplay {
+  const points: RecoveryPoint[] = [];
+  for (const row of checkpoint.admissions) {
+    points.push({ kind: "reserve", revision: row.reserveRevision, row });
+    if (row.preparedRevision !== null) {
+      points.push({ kind: "bind-prepared", revision: row.preparedRevision, row });
+    }
+    if (row.runRevision !== null) {
+      points.push({ kind: "bind-run", revision: row.runRevision, row });
+    }
+    if (row.settlement !== null) {
+      points.push({ kind: "settle", revision: row.settlement.revision, row });
+    }
+  }
+  if (checkpoint.budgetBlock !== null) {
+    points.push({ kind: "block", revision: checkpoint.budgetBlock.revision });
+  }
+  for (const event of checkpoint.events) {
+    if (event.kind === "claim") {
+      points.push({ kind: "claim", revision: event.revision, event });
+    } else if (event.kind === "finish") {
+      points.push({ kind: "finish", revision: event.revision, event });
+    } else {
+      points.push({ kind: "observe", revision: event.revision, event });
+    }
+  }
+  points.sort((left, right) => left.revision - right.revision);
+  if (points.length !== checkpoint.revision) {
+    fail("corrupt", "Recovery replay does not contain exactly one point per owned action.");
+  }
+
+  const replay: RecoveryReplay = {
+    states: [],
+    byId: new Map(),
+    claims: 0,
+    finishes: 0,
+    costs: 0,
+    observationIds: new Set(),
+    workerOverspend: false,
+    sawBudgetBlock: false,
+    lifetimeExceeded: false,
+  };
+
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index]!;
+    if (point.revision !== index + 1) {
+      fail("corrupt", "Recovery replay revisions must be contiguous with no collisions or gaps.");
+    }
+
+    if (point.kind === "reserve") {
+      if (point.row.reserveRevision !== point.revision) {
+        fail("corrupt", "A recovery reservation point does not match its stored revision.");
+      }
+      if (replay.byId.has(point.row.admissionId)) {
+        fail("corrupt", "A recovery reservation is repeated.");
+      }
+      if (replay.costs >= MAX_RECOVERY_COST_OBSERVATIONS) {
+        fail("corrupt", "A historical reservation follows exhausted cost-observation capacity.");
+      }
+      if (replay.states.length >= checkpoint.limits.maxRetainedOperations) {
+        fail("corrupt", "A historical reservation exceeds maxRetainedOperations.");
+      }
+      const totals = recoveryTotals(replay);
+      if (totals.activeOperations >= checkpoint.limits.maxConcurrent) {
+        fail("corrupt", "A historical reservation exceeds maxConcurrent.");
+      }
+      if (recoveryBudgetBlocked(replay, checkpoint)) {
+        fail("corrupt", "A historical reservation follows a sticky budget block.");
+      }
+      if (totals.accountedUsd + point.row.allocatedUsd
+        > checkpoint.limits.lifetimeUsd + USD_EPSILON) {
+        fail("corrupt", "A historical reservation exceeds the lifetime budget at its own prefix.");
+      }
+      const state: RecoveryAdmissionState = {
+        row: point.row,
+        highwater: 0,
+        unknownSticky: false,
+        occupancyHeld: true,
+        reserveCovered: true,
+        originalSettled: false,
+        preparedBoundRevision: null,
+        runBoundRevision: null,
+        claimIds: new Set(),
+        claimCount: 0,
+        latestClaimId: null,
+        latestClaimAt: null,
+        latestClaimOpen: false,
+      };
+      replay.states.push(state);
+      replay.byId.set(point.row.admissionId, state);
+      recordRecoveryLifetime(replay, checkpoint);
+      continue;
+    }
+
+    if (point.kind === "block") {
+      if (checkpoint.budgetBlock === null || checkpoint.budgetBlock.revision !== point.revision) {
+        fail("corrupt", "A budget-block point does not match the stored block.");
+      }
+      const state = replay.byId.get(checkpoint.budgetBlock.admissionId);
+      if (state === undefined) fail("corrupt", "budgetBlock precedes its referenced reservation.");
+      if (state.originalSettled) fail("corrupt", "budgetBlock follows the referenced settlement.");
+      if (state.claimCount !== 0) {
+        fail("corrupt", "budgetBlock follows a continuation claim on the referenced admission.");
+      }
+      replay.sawBudgetBlock = true;
+      continue;
+    }
+
+    if (point.kind === "claim") {
+      const event = point.event;
+      const state = replay.byId.get(event.admissionId);
+      if (state === undefined) fail("corrupt", "A claim references an unknown admission.");
+      if (state.runBoundRevision === null) {
+        fail("corrupt", "A claim precedes its original run binding.");
+      }
+      if (replay.claims >= MAX_RECOVERY_CLAIMS) {
+        fail("corrupt", "Claim events exceed the owner cap.");
+      }
+      if (replay.costs >= MAX_RECOVERY_COST_OBSERVATIONS) {
+        fail("corrupt", "A claim follows exhausted cost-observation capacity.");
+      }
+      if (event.predecessorId !== state.latestClaimId) {
+        fail("corrupt", "A claim predecessor is not the exact latest claim or null.");
+      }
+      if (event.claimedAt < state.row.admittedAt
+        || (state.latestClaimAt !== null && event.claimedAt < state.latestClaimAt)
+        || !(event.claimedAt < state.row.deadlineAt)) {
+        fail("corrupt", "A claim time is outside the admitted/latest/deadline window.");
+      }
+      const totals = recoveryTotals(replay);
+      if (recoveryBudgetBlocked(replay, checkpoint)) {
+        fail("corrupt", "A claim follows a sticky budget block.");
+      }
+      if (!(state.highwater < state.row.allocatedUsd)) {
+        fail("corrupt", "A claim has zero known remaining allocation.");
+      }
+      if (!state.occupancyHeld
+        && totals.activeOperations >= checkpoint.limits.maxConcurrent) {
+        fail("corrupt", "A claim would exceed maxConcurrent while reacquiring occupancy.");
+      }
+      if (!state.reserveCovered) {
+        const recover = Math.max(0, state.row.allocatedUsd - state.highwater);
+        if (totals.accountedUsd + recover > checkpoint.limits.lifetimeUsd + USD_EPSILON) {
+          fail("corrupt", "A claim cannot re-cover released allocation within the current lifetime budget.");
+        }
+      }
+      if (!state.originalSettled) state.unknownSticky = true;
+      if (state.latestClaimId !== null && state.latestClaimOpen) state.unknownSticky = true;
+      state.occupancyHeld = true;
+      state.reserveCovered = true;
+      state.claimIds.add(event.continuationId);
+      state.claimCount += 1;
+      state.latestClaimId = event.continuationId;
+      state.latestClaimAt = event.claimedAt;
+      state.latestClaimOpen = true;
+      replay.claims += 1;
+      recordRecoveryLifetime(replay, checkpoint);
+      continue;
+    }
+
+    if (point.kind === "finish") {
+      const event = point.event;
+      const state = replay.byId.get(event.admissionId);
+      if (state === undefined) fail("corrupt", "A finish references an unknown admission.");
+      if (state.latestClaimId === null || event.continuationId !== state.latestClaimId
+        || !state.latestClaimOpen) {
+        fail("corrupt", "A finish is not for the latest unfinished claim generation.");
+      }
+      if (replay.finishes >= MAX_RECOVERY_FINISHES) {
+        fail("corrupt", "Finish events exceed the owner cap.");
+      }
+      if (!state.occupancyHeld) fail("corrupt", "A finish generation does not hold occupancy.");
+      if (event.mode === "known") {
+        if (state.unknownSticky) fail("corrupt", "A known finish follows historical unknown usage.");
+        if (typeof event.observedUsd !== "number" || event.observedUsd < state.highwater) {
+          fail("corrupt", "A known finish is below the cumulative observed highwater.");
+        }
+        if (event.concurrencyHeld) fail("corrupt", "A known finish cannot retain occupancy.");
+        state.highwater = event.observedUsd;
+        state.reserveCovered = false;
+        state.occupancyHeld = false;
+      } else {
+        state.unknownSticky = true;
+        state.reserveCovered = true;
+        if (typeof event.observedUsd === "number") {
+          state.highwater = Math.max(state.highwater, event.observedUsd);
+        }
+        state.occupancyHeld = event.concurrencyHeld;
+      }
+      state.latestClaimOpen = false;
+      replay.finishes += 1;
+      recordRecoveryLifetime(replay, checkpoint);
+      continue;
+    }
+
+    if (point.kind === "observe") {
+      const event = point.event;
+      const state = replay.byId.get(event.admissionId);
+      if (state === undefined) fail("corrupt", "A cost observation references an unknown admission.");
+      if (state.runBoundRevision === null) {
+        fail("corrupt", "A cost observation precedes its original run binding.");
+      }
+      if (event.continuationId !== null && !state.claimIds.has(event.continuationId)) {
+        fail("corrupt", "A cost observation references an unseen claim generation.");
+      }
+      if (replay.costs >= MAX_RECOVERY_COST_OBSERVATIONS) {
+        fail("corrupt", "Cost observations exceed the owner cap.");
+      }
+      if (replay.observationIds.has(event.observationId)) {
+        fail("corrupt", "A cost observationId is not unique for this owner.");
+      }
+      replay.observationIds.add(event.observationId);
+      state.highwater = Math.max(state.highwater, event.observedUsd);
+      if (event.workerOverspend) replay.workerOverspend = true;
+      replay.costs += 1;
+      recordRecoveryLifetime(replay, checkpoint);
+      continue;
+    }
+
+    const state = replay.byId.get(point.row.admissionId);
+    if (state === undefined) fail("corrupt", "A bind or settlement references an unknown admission.");
+
+    if (point.kind === "bind-prepared") {
+      if (state.originalSettled) fail("corrupt", "A bind follows the original settlement.");
+      if (state.claimCount !== 0) fail("corrupt", "A bind follows the first continuation claim.");
+      if (state.preparedBoundRevision !== null) fail("corrupt", "Prepared metadata is bound twice.");
+      if (point.row.prepared === null || point.row.preparedRevision !== point.revision) {
+        fail("corrupt", "A prepared bind point does not match its stored revision.");
+      }
+      state.preparedBoundRevision = point.revision;
+      continue;
+    }
+
+    if (point.kind === "bind-run") {
+      if (state.originalSettled) fail("corrupt", "A run bind follows the original settlement.");
+      if (state.claimCount !== 0) fail("corrupt", "A run bind follows the first continuation claim.");
+      if (state.preparedBoundRevision === null) {
+        fail("corrupt", "A run bind precedes its prepared bind.");
+      }
+      if (state.runBoundRevision !== null) fail("corrupt", "A runId is bound twice.");
+      if (point.row.runId === null || point.row.runRevision !== point.revision) {
+        fail("corrupt", "A run bind point does not match its stored revision.");
+      }
+      state.runBoundRevision = point.revision;
+      continue;
+    }
+
+    if (point.row.settlement === null || point.row.settlement.revision !== point.revision) {
+      fail("corrupt", "A settlement point does not match its stored revision.");
+    }
+    if (state.originalSettled) fail("corrupt", "An admission is settled twice.");
+    if (state.claimCount !== 0) fail("corrupt", "An original settlement follows a continuation claim.");
+    const settlement = point.row.settlement;
+    if (settlement.mode === "known") {
+      if (state.runBoundRevision === null) fail("corrupt", "A known settlement precedes its run binding.");
+      if (typeof settlement.observedUsd !== "number" || settlement.observedUsd < state.highwater) {
+        fail("corrupt", "A known settlement is below the cumulative observed highwater.");
+      }
+      if (!state.occupancyHeld) fail("corrupt", "A known settlement releases unheld occupancy.");
+      state.highwater = settlement.observedUsd;
+      state.reserveCovered = false;
+      state.occupancyHeld = false;
+    } else if (settlement.mode === "unknown") {
+      if (!state.occupancyHeld) fail("corrupt", "An unknown settlement releases unheld occupancy.");
+      state.unknownSticky = true;
+      state.reserveCovered = true;
+      if (typeof settlement.observedUsd === "number") {
+        state.highwater = Math.max(state.highwater, settlement.observedUsd);
+      }
+      state.occupancyHeld = settlement.concurrencyHeld;
+    } else {
+      if (state.highwater !== 0) fail("corrupt", "A no-dispatch settlement has observed cost.");
+      if (!state.occupancyHeld) fail("corrupt", "A no-dispatch settlement releases unheld occupancy.");
+      state.reserveCovered = false;
+      state.occupancyHeld = false;
+    }
+    state.originalSettled = true;
+    recordRecoveryLifetime(replay, checkpoint);
+  }
+
+  if (replay.states.length !== checkpoint.admissions.length) {
+    fail("corrupt", "Recovery replay state count does not match the admission rows.");
+  }
+  if (replay.claims > MAX_RECOVERY_CLAIMS
+    || replay.finishes > MAX_RECOVERY_FINISHES
+    || replay.costs > MAX_RECOVERY_COST_OBSERVATIONS) {
+    fail("corrupt", "Recovery event caps are exceeded.");
+  }
+  const totals = recoveryTotals(replay);
+  if (![totals.accountedUsd, totals.observedUsd, totals.unknownUsd, totals.overspendUsd]
+    .every(Number.isFinite)) {
+    fail("corrupt", "Recovery accounting totals are not finite.");
+  }
+  return replay;
+}
+
+function recoveryReserveBytes(checkpoint: {
+  readonly budgetBlock: NativeHarnessAccountingBudgetBlock | null;
+  readonly admissions: readonly { readonly settlement: NativeHarnessAccountingSettlement | null }[];
+  readonly events: readonly NativeHarnessAccountingContinuationEvent[];
+}): number {
+  let claims = 0;
+  let finishes = 0;
+  let costs = 0;
+  for (const event of checkpoint.events) {
+    if (event.kind === "claim") claims += 1;
+    else if (event.kind === "finish") finishes += 1;
+    else costs += 1;
+  }
+  const remainingEvents = (MAX_RECOVERY_CLAIMS - claims)
+    + (MAX_RECOVERY_FINISHES - finishes)
+    + (MAX_RECOVERY_COST_OBSERVATIONS - costs);
+  const nullSettlements = checkpoint.admissions.filter(
+    (row) => row.settlement === null,
+  ).length;
+  return remainingEvents * RECOVERY_EVENT_RESERVE_BYTES
+    + nullSettlements * RECOVERY_SETTLEMENT_RESERVE_BYTES
+    + (checkpoint.budgetBlock === null ? RECOVERY_BLOCK_RESERVE_BYTES : 0)
+    + RECOVERY_FORMAT_RESERVE_BYTES;
+}
+
+function assertRecoveryReservedBytes(
+  encodedBytes: number,
+  checkpoint: {
+    readonly budgetBlock: NativeHarnessAccountingBudgetBlock | null;
+    readonly admissions: readonly { readonly settlement: NativeHarnessAccountingSettlement | null }[];
+    readonly events: readonly NativeHarnessAccountingContinuationEvent[];
+  },
+): void {
+  if (encodedBytes + recoveryReserveBytes(checkpoint) > NATIVE_HARNESS_ACCOUNTING_MAX_BYTES) {
+    fail(
+      "too-large",
+      `Serialized recovery checkpoint plus its finite reserved tail exceeds ${NATIVE_HARNESS_ACCOUNTING_MAX_BYTES} bytes.`,
+    );
+  }
+}
+
+function recoveryPrefixCheckpoint(
+  checkpoint: NativeHarnessRecoveryAccountingCheckpoint,
+  revision: number,
+): NativeHarnessRecoveryAccountingCheckpoint {
+  const admissions = checkpoint.admissions
+    .filter((row) => row.reserveRevision <= revision)
+    .map((row) => {
+      const preparedEnacted = row.preparedRevision !== null && row.preparedRevision <= revision;
+      const runEnacted = row.runRevision !== null && row.runRevision <= revision;
+      const settlementEnacted = row.settlement !== null && row.settlement.revision <= revision;
+      return {
+        admissionId: row.admissionId,
+        sourceAssociationSha256: row.sourceAssociationSha256,
+        admittedAt: row.admittedAt,
+        deadlineAt: row.deadlineAt,
+        allocatedUsd: row.allocatedUsd,
+        reserveRevision: row.reserveRevision,
+        prepared: preparedEnacted ? row.prepared : null,
+        runId: runEnacted ? row.runId : null,
+        settlement: settlementEnacted ? row.settlement : null,
+        preparedRevision: preparedEnacted ? row.preparedRevision : null,
+        runRevision: runEnacted ? row.runRevision : null,
+      };
+    });
+  const events = checkpoint.events.filter((event) => event.revision <= revision);
+  const budgetBlock = checkpoint.budgetBlock !== null && checkpoint.budgetBlock.revision <= revision
+    ? checkpoint.budgetBlock
+    : null;
+  return {
+    schema: NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2,
+    revision,
+    ownerId: checkpoint.ownerId,
+    selectorSha256: checkpoint.selectorSha256,
+    createdAt: checkpoint.createdAt,
+    limits: checkpoint.limits,
+    budgetBlock,
+    admissions,
+    events,
+  };
+}
+
+function assertRecoveryPrefixCapacity(
+  checkpoint: NativeHarnessRecoveryAccountingCheckpoint,
+): void {
+  for (let revision = 0; revision <= checkpoint.revision; revision += 1) {
+    const prefix = recoveryPrefixCheckpoint(checkpoint, revision);
+    const encoded = encodeCheckpoint(prefix);
+    assertRecoveryReservedBytes(Buffer.byteLength(encoded, "utf8"), prefix);
+  }
+}
+
+function projectCheckpointV2(
+  checkpoint: NativeHarnessRecoveryAccountingCheckpoint,
+): NativeHarnessAccountingProjection {
+  const replay = replayRecoveryCheckpoint(checkpoint);
+  const totals = recoveryTotals(replay);
+  assertRecoveryReservedBytes(
+    Buffer.byteLength(encodeCheckpoint(checkpoint), "utf8"),
+    checkpoint,
+  );
+  assertRecoveryPrefixCapacity(checkpoint);
+  return deepFreeze({
+    accountedUsd: money(totals.accountedUsd),
+    observedUsd: money(totals.observedUsd),
+    unknownUsd: money(totals.unknownUsd),
+    overspendUsd: money(totals.overspendUsd),
+    activeOperations: totals.activeOperations,
+    retainedOperations: replay.states.length,
+    budgetBlocked: recoveryBudgetBlocked(replay, checkpoint),
+  });
+}
+
+function projectAnyCheckpoint(
+  checkpoint: NativeHarnessAccountingAnyCheckpoint,
+): NativeHarnessAccountingProjection {
+  return checkpoint.schema === NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2
+    ? projectCheckpointV2(checkpoint)
+    : projectCheckpoint(checkpoint);
+}
+
 function decodeCheckpointText(
   raw: unknown,
   expected: { readonly ownerId?: string; readonly selectorSha256: string },
@@ -799,12 +1744,15 @@ function decodeCheckpointText(
   } catch {
     fail("corrupt", "Accounting checkpoint text is not valid JSON. No fallback was applied.");
   }
-  const checkpoint = readCheckpoint(value);
+  const checkpoint = readAnyCheckpoint(value);
   if (checkpoint.selectorSha256 !== expected.selectorSha256
     || (expected.ownerId !== undefined && checkpoint.ownerId !== expected.ownerId)) {
     fail("identity-mismatch", "Accounting checkpoint identity does not match the expected owner/selector.");
   }
-  projectCheckpoint(checkpoint);
+  if (checkpoint.schema === NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2) {
+    assertRecoveryReservedBytes(Buffer.byteLength(raw, "utf8"), checkpoint);
+  }
+  projectAnyCheckpoint(checkpoint);
   return checkpoint;
 }
 
@@ -832,7 +1780,7 @@ export function decodeNativeHarnessAccountingText(
 
 /** Pure bounded projection. Revalidates the complete known shape and timeline. */
 export function projectNativeHarnessAccounting(checkpoint: unknown): NativeHarnessAccountingProjection {
-  return projectCheckpoint(readCheckpoint(checkpoint));
+  return projectAnyCheckpoint(readAnyCheckpoint(checkpoint));
 }
 
 function parseLimitsText(text: unknown): NativeHarnessDelegationLimits {
@@ -911,21 +1859,7 @@ function parseSettleTransition(value: Record<string, unknown>): ParsedSettleTran
   };
 }
 
-function parseTransitionText(text: unknown): ParsedTransition {
-  if (typeof text !== "string") fail("invalid-transition", "Transition must be JSON text.");
-  if (Buffer.byteLength(text, "utf8") > NATIVE_HARNESS_ACCOUNTING_MAX_BYTES) {
-    fail("too-large", `Transition text exceeds ${NATIVE_HARNESS_ACCOUNTING_MAX_BYTES} bytes.`);
-  }
-  let value: unknown;
-  try {
-    value = JSON.parse(text);
-  } catch {
-    fail("invalid-transition", "Transition text is not valid JSON.");
-  }
-  const record = plainRecord(value, "transition", "invalid-transition");
-  if (record.schema !== NATIVE_HARNESS_ACCOUNTING_TRANSITION_SCHEMA) {
-    fail("invalid-transition", "Transition schema is not v1.");
-  }
+function parseV1TransitionRecord(record: Record<string, unknown>): ParsedTransition {
   if (record.action === "reserve") return parseReserveTransition(record);
   if (record.action === "bindPrepared") {
     requireExactKeys(record, ["schema", "action", "admissionId", "prepared"], "bindPrepared transition", "invalid-transition");
@@ -954,6 +1888,146 @@ function parseTransitionText(text: unknown): ParsedTransition {
   fail("invalid-transition", "Transition action is not supported.");
 }
 
+function parseTransitionRecord(text: unknown): Record<string, unknown> {
+  if (typeof text !== "string") fail("invalid-transition", "Transition must be JSON text.");
+  if (Buffer.byteLength(text, "utf8") > NATIVE_HARNESS_ACCOUNTING_MAX_BYTES) {
+    fail("too-large", `Transition text exceeds ${NATIVE_HARNESS_ACCOUNTING_MAX_BYTES} bytes.`);
+  }
+  let value: unknown;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    fail("invalid-transition", "Transition text is not valid JSON.");
+  }
+  return plainRecord(value, "transition", "invalid-transition");
+}
+
+function parseTransitionText(text: unknown): ParsedTransition {
+  const record = parseTransitionRecord(text);
+  if (record.schema !== NATIVE_HARNESS_ACCOUNTING_TRANSITION_SCHEMA) {
+    fail("invalid-transition", "Transition schema is not v1.");
+  }
+  return parseV1TransitionRecord(record);
+}
+
+function parseRecoveryClaimTransition(
+  record: Record<string, unknown>,
+): ParsedClaimContinuationTransition {
+  requireExactKeys(
+    record,
+    ["schema", "action", "admissionId", "continuationId", "predecessorId", "claimedAt"],
+    "claimContinuation transition",
+    "invalid-transition",
+  );
+  return {
+    action: "claimContinuation",
+    admissionId: readUuid(record.admissionId, "claimContinuation.admissionId", "invalid-transition"),
+    continuationId: readUuid(
+      record.continuationId,
+      "claimContinuation.continuationId",
+      "invalid-transition",
+    ),
+    predecessorId: record.predecessorId === null
+      ? null
+      : readUuid(record.predecessorId, "claimContinuation.predecessorId", "invalid-transition"),
+    claimedAt: readSafeInteger(
+      record.claimedAt,
+      "claimContinuation.claimedAt",
+      1,
+      "invalid-transition",
+    ),
+  };
+}
+
+function parseRecoveryFinishTransition(
+  record: Record<string, unknown>,
+): ParsedFinishContinuationTransition {
+  requireExactKeys(
+    record,
+    ["schema", "action", "admissionId", "continuationId", "mode", "observedUsd", "concurrencyHeld"],
+    "finishContinuation transition",
+    "invalid-transition",
+  );
+  let mode: "known" | "unknown";
+  if (record.mode === "known") mode = "known";
+  else if (record.mode === "unknown") mode = "unknown";
+  else fail("invalid-transition", "finishContinuation.mode must be known or unknown.");
+  if (typeof record.concurrencyHeld !== "boolean") {
+    fail("invalid-transition", "finishContinuation.concurrencyHeld must be a boolean.");
+  }
+  const observedUsd = record.observedUsd === null
+    ? null
+    : readNonNegativeUsd(record.observedUsd, "finishContinuation.observedUsd", "invalid-transition");
+  if (mode === "known" && typeof observedUsd !== "number") {
+    fail("invalid-transition", "finishContinuation known requires numeric observedUsd.");
+  }
+  if (mode === "known" && record.concurrencyHeld !== false) {
+    fail("invalid-transition", "finishContinuation known requires concurrencyHeld false.");
+  }
+  return {
+    action: "finishContinuation",
+    admissionId: readUuid(record.admissionId, "finishContinuation.admissionId", "invalid-transition"),
+    continuationId: readUuid(
+      record.continuationId,
+      "finishContinuation.continuationId",
+      "invalid-transition",
+    ),
+    mode,
+    observedUsd,
+    concurrencyHeld: record.concurrencyHeld,
+  };
+}
+
+function parseRecoveryObserveCostTransition(
+  record: Record<string, unknown>,
+): ParsedObserveCostTransition {
+  requireExactKeys(
+    record,
+    [
+      "schema",
+      "action",
+      "admissionId",
+      "continuationId",
+      "observationId",
+      "observedUsd",
+      "workerOverspend",
+    ],
+    "observeCost transition",
+    "invalid-transition",
+  );
+  if (typeof record.workerOverspend !== "boolean") {
+    fail("invalid-transition", "observeCost.workerOverspend must be a boolean.");
+  }
+  return {
+    action: "observeCost",
+    admissionId: readUuid(record.admissionId, "observeCost.admissionId", "invalid-transition"),
+    continuationId: record.continuationId === null
+      ? null
+      : readUuid(record.continuationId, "observeCost.continuationId", "invalid-transition"),
+    observationId: readUuid(record.observationId, "observeCost.observationId", "invalid-transition"),
+    observedUsd: readNonNegativeUsd(
+      record.observedUsd,
+      "observeCost.observedUsd",
+      "invalid-transition",
+    ),
+    workerOverspend: record.workerOverspend,
+  };
+}
+
+function parseRecoveryTransitionText(text: unknown): ParsedRecoveryTransition {
+  const record = parseTransitionRecord(text);
+  if (record.schema === NATIVE_HARNESS_ACCOUNTING_TRANSITION_SCHEMA) {
+    return parseV1TransitionRecord(record);
+  }
+  if (record.schema !== NATIVE_HARNESS_ACCOUNTING_RECOVERY_TRANSITION_SCHEMA) {
+    fail("invalid-transition", "Transition schema is neither the supported v1 nor recovery v2 schema.");
+  }
+  if (record.action === "claimContinuation") return parseRecoveryClaimTransition(record);
+  if (record.action === "finishContinuation") return parseRecoveryFinishTransition(record);
+  if (record.action === "observeCost") return parseRecoveryObserveCostTransition(record);
+  fail("invalid-transition", "Recovery transition action is not supported.");
+}
+
 function copyAdmission(row: NativeHarnessAccountingAdmission): Record<string, unknown> {
   return {
     admissionId: row.admissionId,
@@ -969,7 +2043,7 @@ function copyAdmission(row: NativeHarnessAccountingAdmission): Record<string, un
 }
 
 function applyTransition(
-  checkpoint: NativeHarnessAccountingCheckpoint,
+  checkpoint: NativeHarnessAccountingV1Checkpoint,
   transition: ParsedTransition,
   nextRevision: number,
 ): Record<string, unknown> {
@@ -1088,7 +2162,285 @@ function applyTransition(
   return candidate;
 }
 
-function encodeCheckpoint(checkpoint: NativeHarnessAccountingCheckpoint): string {
+function copyRecoveryAdmission(
+  row: NativeHarnessRecoveryAccountingAdmission,
+): Record<string, unknown> {
+  return {
+    admissionId: row.admissionId,
+    sourceAssociationSha256: row.sourceAssociationSha256,
+    admittedAt: row.admittedAt,
+    deadlineAt: row.deadlineAt,
+    allocatedUsd: row.allocatedUsd,
+    reserveRevision: row.reserveRevision,
+    prepared: row.prepared === null ? null : { ...row.prepared },
+    runId: row.runId,
+    settlement: row.settlement === null ? null : { ...row.settlement },
+    preparedRevision: row.preparedRevision,
+    runRevision: row.runRevision,
+  };
+}
+
+function applyTransitionV2(
+  checkpoint: NativeHarnessRecoveryAccountingCheckpoint,
+  transition: ParsedRecoveryTransition,
+  nextRevision: number,
+): Record<string, unknown> {
+  const replay = replayRecoveryCheckpoint(checkpoint);
+  const rows = checkpoint.admissions.map(copyRecoveryAdmission);
+  const events: Record<string, unknown>[] = checkpoint.events.map((event) => ({ ...event }));
+  const candidate: Record<string, unknown> = {
+    schema: checkpoint.schema,
+    revision: nextRevision,
+    ownerId: checkpoint.ownerId,
+    selectorSha256: checkpoint.selectorSha256,
+    createdAt: checkpoint.createdAt,
+    limits: { ...checkpoint.limits },
+    budgetBlock: checkpoint.budgetBlock === null ? null : { ...checkpoint.budgetBlock },
+    admissions: rows,
+    events,
+  };
+
+  if (transition.action === "reserve") {
+    if (rows.some((row) => row.admissionId === transition.admissionId)) {
+      fail("invalid-transition", "Reserve admissionId already exists.");
+    }
+    if (transition.deadlineAt !== transition.admittedAt + checkpoint.limits.maxDurationMs
+      || !(transition.deadlineAt > transition.admittedAt)) {
+      fail("invalid-transition", "Reserve deadlineAt must equal admittedAt + limits.maxDurationMs and be later.");
+    }
+    if (transition.allocatedUsd !== checkpoint.limits.perRunUsd) {
+      fail("invalid-transition", "Reserve allocatedUsd must equal the stored limits.perRunUsd.");
+    }
+    const reserveRevision = transition.reserveRevision ?? nextRevision;
+    if (reserveRevision !== nextRevision) {
+      fail("invalid-transition", "Reserve reserveRevision must be the consumed revision.");
+    }
+    if (replay.states.length >= checkpoint.limits.maxRetainedOperations) {
+      fail("invalid-transition", "Reserve would exceed maxRetainedOperations.");
+    }
+    if (replay.costs >= MAX_RECOVERY_COST_OBSERVATIONS) {
+      fail("exhausted", "Reserve is refused after all cost-observation events are used.");
+    }
+    const totals = recoveryTotals(replay);
+    if (totals.activeOperations >= checkpoint.limits.maxConcurrent) {
+      fail("invalid-transition", "Reserve would exceed maxConcurrent.");
+    }
+    if (recoveryBudgetBlocked(replay, checkpoint)) {
+      fail("invalid-transition", "Reserve follows a sticky budget block.");
+    }
+    if (totals.accountedUsd + checkpoint.limits.perRunUsd
+      > checkpoint.limits.lifetimeUsd + USD_EPSILON) {
+      fail("invalid-transition", "Reserve would exceed the lifetime accounting budget.");
+    }
+    rows.push({
+      admissionId: transition.admissionId,
+      sourceAssociationSha256: transition.sourceAssociationSha256,
+      admittedAt: transition.admittedAt,
+      deadlineAt: transition.deadlineAt,
+      allocatedUsd: transition.allocatedUsd,
+      reserveRevision,
+      prepared: null,
+      runId: null,
+      settlement: null,
+      preparedRevision: null,
+      runRevision: null,
+    });
+    return candidate;
+  }
+
+  const index = rows.findIndex((row) => row.admissionId === transition.admissionId);
+  if (index < 0) fail("invalid-transition", "Transition references an unknown admission.");
+  const row = rows[index]!;
+  const state = replay.byId.get(transition.admissionId);
+  if (state === undefined) fail("invalid-transition", "Transition state is unavailable.");
+  const totals = recoveryTotals(replay);
+
+  if (transition.action === "bindPrepared") {
+    if (state.originalSettled) fail("invalid-transition", "Cannot bind prepared metadata after settlement.");
+    if (state.claimCount !== 0) {
+      fail("invalid-transition", "Original prepared binding is closed after the first continuation claim.");
+    }
+    if (row.prepared !== null) fail("invalid-transition", "Prepared metadata is already bound.");
+    rows[index] = { ...row, prepared: { ...transition.prepared }, preparedRevision: nextRevision };
+    return candidate;
+  }
+
+  if (transition.action === "bindRun") {
+    if (state.originalSettled) fail("invalid-transition", "Cannot bind runId after settlement.");
+    if (state.claimCount !== 0) {
+      fail("invalid-transition", "Original run binding is closed after the first continuation claim.");
+    }
+    if (row.prepared === null) fail("invalid-transition", "runId requires already-bound prepared metadata.");
+    if (row.runId !== null) fail("invalid-transition", "runId is already bound.");
+    if (rows.some((other, otherIndex) => otherIndex !== index && other.runId === transition.runId)) {
+      fail("invalid-transition", "runId must be unique for this owner.");
+    }
+    rows[index] = { ...row, runId: transition.runId, runRevision: nextRevision };
+    return candidate;
+  }
+
+  if (transition.action === "blockBudget") {
+    if (checkpoint.budgetBlock !== null) {
+      fail("invalid-transition", "A sticky budget block already exists.");
+    }
+    if (state.originalSettled) fail("invalid-transition", "blockBudget requires an unsettled admission.");
+    if (state.claimCount !== 0) {
+      fail("invalid-transition", "Original blockBudget is closed after the first continuation claim.");
+    }
+    candidate.budgetBlock = {
+      admissionId: transition.admissionId,
+      revision: nextRevision,
+      reason: "observed-worker-overspend",
+    };
+    return candidate;
+  }
+
+  if (transition.action === "settle") {
+    if (state.originalSettled) fail("invalid-transition", "Admission is already settled.");
+    if (state.claimCount !== 0) {
+      fail("invalid-transition", "Original settlement is closed after the first continuation claim.");
+    }
+    if (!state.occupancyHeld) {
+      fail("invalid-transition", "Original settlement requires the original occupancy.");
+    }
+    if (transition.mode === "no-dispatch") {
+      if (row.runId !== null || state.runBoundRevision !== null
+        || transition.observedUsd !== 0 || transition.concurrencyHeld !== false) {
+        fail("invalid-transition", "no-dispatch requires observedUsd 0, held false and no runId.");
+      }
+    } else if (transition.mode === "known") {
+      if (row.runId === null || state.runBoundRevision === null
+        || typeof transition.observedUsd !== "number"
+        || transition.observedUsd < state.highwater
+        || transition.concurrencyHeld !== false) {
+        fail("invalid-transition", "known settlement requires a runId, held false and observedUsd at or above the highwater.");
+      }
+    }
+    rows[index] = {
+      ...row,
+      settlement: {
+        revision: nextRevision,
+        mode: transition.mode,
+        observedUsd: transition.observedUsd,
+        concurrencyHeld: transition.concurrencyHeld,
+      },
+    };
+    return candidate;
+  }
+
+  if (transition.action === "claimContinuation") {
+    if (state.runBoundRevision === null) {
+      fail("invalid-transition", "A continuation claim requires an already bound original run.");
+    }
+    if (replay.claims >= MAX_RECOVERY_CLAIMS) {
+      fail("exhausted", "Continuation claim events are exhausted.");
+    }
+    if (replay.costs >= MAX_RECOVERY_COST_OBSERVATIONS) {
+      fail("exhausted", "Continuation claims are refused after all cost-observation events are used.");
+    }
+    if (transition.predecessorId !== state.latestClaimId) {
+      fail("invalid-transition", "Claim predecessorId must be the exact latest claim or null.");
+    }
+    if (transition.claimedAt < state.row.admittedAt
+      || (state.latestClaimAt !== null && transition.claimedAt < state.latestClaimAt)
+      || !(transition.claimedAt < state.row.deadlineAt)) {
+      fail("invalid-transition", "Claim claimedAt must be admittedAt-or-later, monotonic and before deadlineAt.");
+    }
+    if (checkpoint.events.some(
+      (event) => event.kind === "claim" && event.continuationId === transition.continuationId,
+    )) {
+      fail("conflict", "Claim continuationId is not unique for this owner.");
+    }
+    if (recoveryBudgetBlocked(replay, checkpoint)) {
+      fail("invalid-transition", "Claim follows a sticky budget block.");
+    }
+    if (!(state.highwater < state.row.allocatedUsd)) {
+      fail("invalid-transition", "Claim has zero known remaining allocation.");
+    }
+    if (!state.occupancyHeld && totals.activeOperations >= checkpoint.limits.maxConcurrent) {
+      fail("invalid-transition", "Claim cannot reacquire occupancy beyond maxConcurrent.");
+    }
+    if (!state.reserveCovered) {
+      const recover = Math.max(0, state.row.allocatedUsd - state.highwater);
+      if (totals.accountedUsd + recover > checkpoint.limits.lifetimeUsd + USD_EPSILON) {
+        fail("invalid-transition", "Claim cannot re-cover released allocation within the current lifetime budget.");
+      }
+    }
+    events.push({
+      revision: nextRevision,
+      kind: "claim",
+      admissionId: transition.admissionId,
+      continuationId: transition.continuationId,
+      predecessorId: transition.predecessorId,
+      claimedAt: transition.claimedAt,
+    });
+    return candidate;
+  }
+
+  if (transition.action === "finishContinuation") {
+    if (state.latestClaimId === null || transition.continuationId !== state.latestClaimId
+      || !state.latestClaimOpen) {
+      fail("invalid-transition", "Finish must reference the latest unfinished claim generation.");
+    }
+    if (replay.finishes >= MAX_RECOVERY_FINISHES) {
+      fail("exhausted", "Continuation finish events are exhausted.");
+    }
+    if (!state.occupancyHeld) {
+      fail("invalid-transition", "Finish generation does not hold occupancy.");
+    }
+    if (transition.mode === "known") {
+      if (state.unknownSticky) {
+        fail("invalid-transition", "Known finish is refused after historical unknown usage.");
+      }
+      if (typeof transition.observedUsd !== "number"
+        || transition.observedUsd < state.highwater) {
+        fail("invalid-transition", "Known finish requires cumulative cost at or above the highwater.");
+      }
+    }
+    events.push({
+      revision: nextRevision,
+      kind: "finish",
+      admissionId: transition.admissionId,
+      continuationId: transition.continuationId,
+      mode: transition.mode,
+      observedUsd: transition.observedUsd,
+      concurrencyHeld: transition.concurrencyHeld,
+    });
+    return candidate;
+  }
+
+  if (state.runBoundRevision === null) {
+    fail("invalid-transition", "A cost observation requires an already bound original run.");
+  }
+  if (transition.continuationId !== null
+    && !checkpoint.events.some(
+      (event) => event.kind === "claim"
+        && event.admissionId === transition.admissionId
+        && event.continuationId === transition.continuationId,
+    )) {
+    fail("invalid-transition", "Cost observation references an unseen claim generation.");
+  }
+  if (replay.costs >= MAX_RECOVERY_COST_OBSERVATIONS) {
+    fail("exhausted", "Cost-observation events are exhausted.");
+  }
+  if (checkpoint.events.some(
+    (event) => event.kind === "observe-cost" && event.observationId === transition.observationId,
+  )) {
+    fail("conflict", "Cost observationId is already recorded with a different fact.");
+  }
+  events.push({
+    revision: nextRevision,
+    kind: "observe-cost",
+    admissionId: transition.admissionId,
+    continuationId: transition.continuationId,
+    observationId: transition.observationId,
+    observedUsd: transition.observedUsd,
+    workerOverspend: transition.workerOverspend,
+  });
+  return candidate;
+}
+
+function encodeCheckpoint(checkpoint: unknown): string {
   return `${JSON.stringify(checkpoint, null, 2)}\n`;
 }
 
@@ -1293,19 +2645,32 @@ async function pinExistingOwner(
 }
 
 function makeHandle(
-  initial: NativeHarnessAccountingCheckpoint,
+  initial: NativeHarnessAccountingV1Checkpoint,
   pins: OwnerPins,
   io: NativeFileIo,
   hook: NativeHarnessAccountingTestOptions["testAfterPrimaryWrite"],
-): NativeHarnessAccountingHandle {
-  let checkpoint = initial;
+): NativeHarnessAccountingHandle;
+function makeHandle(
+  initial: NativeHarnessRecoveryAccountingCheckpoint,
+  pins: OwnerPins,
+  io: NativeFileIo,
+  hook: NativeHarnessAccountingTestOptions["testAfterPrimaryWrite"],
+): NativeHarnessRecoveryAccountingHandle;
+function makeHandle(
+  initial: NativeHarnessAccountingAnyCheckpoint,
+  pins: OwnerPins,
+  io: NativeFileIo,
+  hook: NativeHarnessAccountingTestOptions["testAfterPrimaryWrite"],
+): NativeHarnessAccountingHandle | NativeHarnessRecoveryAccountingHandle {
+  let checkpoint: NativeHarnessAccountingAnyCheckpoint = initial;
+  const version = initial.schema === NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2 ? 2 : 1;
   let closed = false;
   let poisoned = false;
 
   const commit = async (
     expectedRevision: number,
     transitionText: string,
-  ): Promise<NativeHarnessAccountingCheckpoint> => {
+  ): Promise<NativeHarnessAccountingAnyCheckpoint> => {
     if (closed) fail("closed", "Accounting handle is closed.");
     if (poisoned) fail("ambiguous", "Accounting handle is poisoned by an ambiguous write.");
     if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
@@ -1314,7 +2679,9 @@ function makeHandle(
     if (expectedRevision !== checkpoint.revision) {
       fail("conflict", "Accounting handle revision is stale.");
     }
-    const transition = parseTransitionText(transitionText);
+    const transition = version === 1
+      ? parseTransitionText(transitionText)
+      : parseRecoveryTransitionText(transitionText);
     await verifyPins(io, [pins.root, pins.namespace, pins.owner]);
 
     let writeAttempted = false;
@@ -1324,26 +2691,65 @@ function makeHandle(
         if (poisoned) fail("ambiguous", "Accounting handle is poisoned by an ambiguous write.");
         await verifyPins(io, [pins.root, pins.namespace, pins.owner]);
         const raw = await readPrimary(io, pins);
-        const disk = decodeNativeHarnessAccountingText(raw, {
+        const disk = decodeCheckpointText(raw, {
           ownerId: checkpoint.ownerId,
           selectorSha256: checkpoint.selectorSha256,
         });
         await verifyPins(io, [pins.root, pins.namespace, pins.owner]);
+        if ((disk.schema === NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2) !== (version === 2)) {
+          fail("changed", "Accounting checkpoint schema changed across this handle.");
+        }
         if (disk.revision !== expectedRevision) {
           fail("conflict", "Accounting checkpoint revision changed before commit.");
         }
         if (JSON.stringify(disk) !== JSON.stringify(checkpoint)) {
           fail("changed", "Accounting checkpoint no longer matches the complete handle snapshot at this revision.");
         }
+        if (version === 2 && transition.action === "observeCost") {
+          const existing = (disk as NativeHarnessRecoveryAccountingCheckpoint).events.find(
+            (event) => event.kind === "observe-cost"
+              && event.observationId === transition.observationId,
+          );
+          if (existing !== undefined) {
+            if (existing.kind !== "observe-cost"
+              || existing.admissionId !== transition.admissionId
+              || existing.continuationId !== transition.continuationId
+              || existing.observedUsd !== transition.observedUsd
+              || existing.workerOverspend !== transition.workerOverspend) {
+              fail("conflict", "Cost observationId is already recorded with a different fact.");
+            }
+            if (closed) fail("closed", "Accounting handle is closed.");
+            if (poisoned) fail("ambiguous", "Accounting handle is poisoned by an ambiguous write.");
+            return checkpoint;
+          }
+        }
         if (disk.revision >= Number.MAX_SAFE_INTEGER) {
           fail("exhausted", "Accounting checkpoint revision counter is exhausted.");
         }
         const nextRevision = disk.revision + 1;
-        const candidate = applyTransition(disk, transition, nextRevision);
-        const validated = readCheckpoint(candidate);
-        projectCheckpoint(validated);
+        const candidate = version === 1
+          ? applyTransition(
+            disk as NativeHarnessAccountingV1Checkpoint,
+            transition as ParsedTransition,
+            nextRevision,
+          )
+          : applyTransitionV2(
+            disk as NativeHarnessRecoveryAccountingCheckpoint,
+            transition as ParsedRecoveryTransition,
+            nextRevision,
+          );
+        const validated = version === 1
+          ? readCheckpoint(candidate)
+          : readCheckpointV2(candidate);
+        projectAnyCheckpoint(validated);
         const encoded = encodeCheckpoint(validated);
         assertEncodedSize(encoded);
+        if (version === 2) {
+          assertRecoveryReservedBytes(
+            Buffer.byteLength(encoded, "utf8"),
+            validated as NativeHarnessRecoveryAccountingCheckpoint,
+          );
+        }
         if (closed) fail("closed", "Accounting handle is closed.");
         await verifyPins(io, [pins.root, pins.namespace, pins.owner]);
         if (closed) fail("closed", "Accounting handle is closed.");
@@ -1384,7 +2790,7 @@ function makeHandle(
     close: () => {
       closed = true;
     },
-  });
+  }) as NativeHarnessAccountingHandle | NativeHarnessRecoveryAccountingHandle;
 }
 
 /**
@@ -1392,10 +2798,21 @@ function makeHandle(
  * The supplied limits text is used exactly; no policy defaults or second
  * normalization are applied. EEXIST refuses even for an empty owner directory.
  */
-export async function createNativeHarnessAccountingOwner(
+function createAccountingOwnerAtVersion(
   options: NativeHarnessAccountingCreateOptions,
-  testOptions?: NativeHarnessAccountingTestOptions,
-): Promise<NativeHarnessAccountingHandle> {
+  testOptions: NativeHarnessAccountingTestOptions | undefined,
+  version: 1,
+): Promise<NativeHarnessAccountingHandle>;
+function createAccountingOwnerAtVersion(
+  options: NativeHarnessAccountingCreateOptions,
+  testOptions: NativeHarnessAccountingTestOptions | undefined,
+  version: 2,
+): Promise<NativeHarnessRecoveryAccountingHandle>;
+async function createAccountingOwnerAtVersion(
+  options: NativeHarnessAccountingCreateOptions,
+  testOptions: NativeHarnessAccountingTestOptions | undefined,
+  version: 1 | 2,
+): Promise<NativeHarnessAccountingHandle | NativeHarnessRecoveryAccountingHandle> {
   const owned = readCreateOptions(options);
   const test = readTestOptions(testOptions);
   const limits = parseLimitsText(owned.limitsText);
@@ -1421,19 +2838,37 @@ export async function createNativeHarnessAccountingOwner(
   const owner = await pinExistingDirectory(test.io, paths.ownerPath);
   await verifyPins(test.io, [root, namespace, owner]);
 
-  const checkpoint = readCheckpoint({
-    schema: NATIVE_HARNESS_ACCOUNTING_SCHEMA,
-    revision: 0,
-    ownerId: owned.ownerId,
-    selectorSha256: owned.selectorSha256,
-    createdAt: owned.createdAt,
-    limits,
-    budgetBlock: null,
-    admissions: [],
-  });
-  projectCheckpoint(checkpoint);
+  const checkpoint: NativeHarnessAccountingAnyCheckpoint = version === 1
+    ? readCheckpoint({
+      schema: NATIVE_HARNESS_ACCOUNTING_SCHEMA,
+      revision: 0,
+      ownerId: owned.ownerId,
+      selectorSha256: owned.selectorSha256,
+      createdAt: owned.createdAt,
+      limits,
+      budgetBlock: null,
+      admissions: [],
+    })
+    : readCheckpointV2({
+      schema: NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2,
+      revision: 0,
+      ownerId: owned.ownerId,
+      selectorSha256: owned.selectorSha256,
+      createdAt: owned.createdAt,
+      limits,
+      budgetBlock: null,
+      admissions: [],
+      events: [],
+    });
+  projectAnyCheckpoint(checkpoint);
   const encoded = encodeCheckpoint(checkpoint);
   assertEncodedSize(encoded);
+  if (version === 2) {
+    assertRecoveryReservedBytes(
+      Buffer.byteLength(encoded, "utf8"),
+      checkpoint as NativeHarnessRecoveryAccountingCheckpoint,
+    );
+  }
   const pins: OwnerPins = {
     root,
     namespace,
@@ -1480,7 +2915,34 @@ export async function createNativeHarnessAccountingOwner(
     const detail = error instanceof Error ? error.message : "lock release failed";
     fail("ambiguous", `Initial accounting checkpoint write or lock release is ambiguous: ${detail}`);
   }
-  return makeHandle(checkpoint, pins, test.io, test.hook);
+  return checkpoint.schema === NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2
+    ? makeHandle(checkpoint, pins, test.io, test.hook)
+    : makeHandle(checkpoint, pins, test.io, test.hook);
+}
+
+/**
+ * Creates a genuinely fresh V1 owner directory and initial revision-0
+ * checkpoint. This default factory never creates or upgrades the V2
+ * continuation schema.
+ */
+export async function createNativeHarnessAccountingOwner(
+  options: NativeHarnessAccountingCreateOptions,
+  testOptions?: NativeHarnessAccountingTestOptions,
+): Promise<NativeHarnessAccountingHandle> {
+  return await createAccountingOwnerAtVersion(options, testOptions, 1);
+}
+
+/**
+ * Creates a genuinely fresh V2 owner using the same owner path, fresh-directory
+ * refusal, pins, write lock, atomic writer and poisoning rules. It is an
+ * explicit foundation only; it grants no recovery or dispatch authority and
+ * performs no migration from an existing V1 owner.
+ */
+export async function createNativeHarnessRecoveryAccountingOwner(
+  options: NativeHarnessAccountingCreateOptions,
+  testOptions?: NativeHarnessAccountingTestOptions,
+): Promise<NativeHarnessRecoveryAccountingHandle> {
+  return await createAccountingOwnerAtVersion(options, testOptions, 2);
 }
 
 /**
@@ -1496,11 +2958,14 @@ export async function openNativeHarnessAccountingOwner(
   const test = readTestOptions(testOptions);
   const pins = await pinExistingOwner(test.io, owned.storageRoot, owned.selectorSha256);
   const raw = await readPrimary(test.io, pins);
-  const checkpoint = decodeNativeHarnessAccountingText(raw, {
+  const checkpoint = decodeCheckpointText(raw, {
     ownerId: owned.ownerId,
     selectorSha256: owned.selectorSha256,
   });
   await verifyPins(test.io, [pins.root, pins.namespace, pins.owner]);
+  if (checkpoint.schema === NATIVE_HARNESS_ACCOUNTING_SCHEMA_V2) {
+    return makeHandle(checkpoint, pins, test.io, test.hook);
+  }
   return makeHandle(checkpoint, pins, test.io, test.hook);
 }
 
